@@ -173,6 +173,9 @@ func validateRBAC(config *configv1alpha1.OperatorConfiguration) field.ErrorList 
 	if config.Namespace.Restricted == "" && config.RBAC.EPPClusterRoleName == "" {
 		allErrs = append(allErrs, field.Required(fldPath.Child("eppClusterRoleName"), "EPP ClusterRole name is required in cluster-wide mode"))
 	}
+	if config.Namespace.Restricted == "" && config.RBAC.FrontendClusterRoleName == "" {
+		allErrs = append(allErrs, field.Required(fldPath.Child("frontendClusterRoleName"), "frontend ClusterRole name is required in cluster-wide mode"))
+	}
 
 	return allErrs
 }

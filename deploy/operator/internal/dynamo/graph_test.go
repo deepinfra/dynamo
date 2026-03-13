@@ -122,6 +122,11 @@ func TestGenerateDynamoComponentsDeployments(t *testing.T) {
 								commonconsts.KubeLabelDynamoNamespace:           "default-test-dynamographdeployment",
 								commonconsts.KubeLabelDynamoGraphDeploymentName: "test-dynamographdeployment",
 							},
+							ExtraPodSpec: &v1alpha1.ExtraPodSpec{
+								PodSpec: &corev1.PodSpec{
+									ServiceAccountName: commonconsts.FrontendServiceAccountName,
+								},
+							},
 						},
 					},
 				},
@@ -227,6 +232,11 @@ func TestGenerateDynamoComponentsDeployments(t *testing.T) {
 								commonconsts.KubeLabelDynamoComponent:           "service1",
 								commonconsts.KubeLabelDynamoNamespace:           "default-test-dynamographdeployment",
 								commonconsts.KubeLabelDynamoGraphDeploymentName: "test-dynamographdeployment",
+							},
+							ExtraPodSpec: &v1alpha1.ExtraPodSpec{
+								PodSpec: &corev1.PodSpec{
+									ServiceAccountName: commonconsts.FrontendServiceAccountName,
+								},
 							},
 						},
 					},
@@ -341,6 +351,11 @@ func TestGenerateDynamoComponentsDeployments(t *testing.T) {
 							Ingress: &v1alpha1.IngressSpec{
 								Enabled: true,
 								Host:    "test-dynamographdeployment",
+							},
+							ExtraPodSpec: &v1alpha1.ExtraPodSpec{
+								PodSpec: &corev1.PodSpec{
+									ServiceAccountName: commonconsts.FrontendServiceAccountName,
+								},
 							},
 						},
 					},
@@ -464,6 +479,11 @@ func TestGenerateDynamoComponentsDeployments(t *testing.T) {
 								{
 									Name:  "DYN_DEPLOYMENT_CONFIG",
 									Value: fmt.Sprintf(`{"service1":{"ServiceArgs":{"Resources":{"CPU":"2","GPU":"2","Memory":"2Gi"},"Workers":2},"port":%d}}`, commonconsts.DynamoServicePort),
+								},
+							},
+							ExtraPodSpec: &v1alpha1.ExtraPodSpec{
+								PodSpec: &corev1.PodSpec{
+									ServiceAccountName: commonconsts.FrontendServiceAccountName,
 								},
 							},
 						},
@@ -593,6 +613,9 @@ func TestGenerateDynamoComponentsDeployments(t *testing.T) {
 								commonconsts.KubeLabelDynamoGraphDeploymentName: "test-dynamographdeployment",
 							},
 							ExtraPodSpec: &v1alpha1.ExtraPodSpec{
+								PodSpec: &corev1.PodSpec{
+									ServiceAccountName: commonconsts.FrontendServiceAccountName,
+								},
 								MainContainer: &corev1.Container{
 									Command: []string{"sh", "-c"},
 									Args:    []string{"echo hello world", "sleep 99999"},
@@ -714,6 +737,11 @@ func TestGenerateDynamoComponentsDeployments(t *testing.T) {
 								commonconsts.KubeLabelDynamoComponent:           "service1",
 								commonconsts.KubeLabelDynamoNamespace:           "default-test-dynamographdeployment",
 								commonconsts.KubeLabelDynamoGraphDeploymentName: "test-dynamographdeployment",
+							},
+							ExtraPodSpec: &v1alpha1.ExtraPodSpec{
+								PodSpec: &corev1.PodSpec{
+									ServiceAccountName: commonconsts.FrontendServiceAccountName,
+								},
 							},
 						},
 					},
@@ -1439,6 +1467,7 @@ func TestGenerateGrovePodCliqueSet(t *testing.T) {
 												},
 											},
 										},
+										ServiceAccountName:            commonconsts.FrontendServiceAccountName,
 										TerminationGracePeriodSeconds: ptr.To(int64(10)),
 										SecurityContext: &corev1.PodSecurityContext{
 											FSGroup: ptr.To(int64(commonconsts.DefaultSecurityContextFSGroup)),
@@ -2430,6 +2459,7 @@ func TestGenerateGrovePodCliqueSet(t *testing.T) {
 												Name: "frontend-secret",
 											},
 										},
+										ServiceAccountName:            commonconsts.FrontendServiceAccountName,
 										TerminationGracePeriodSeconds: ptr.To(int64(10)),
 										SecurityContext: &corev1.PodSecurityContext{
 											FSGroup: ptr.To(int64(commonconsts.DefaultSecurityContextFSGroup)),
@@ -3416,6 +3446,7 @@ func TestGenerateGrovePodCliqueSet(t *testing.T) {
 												Name: "frontend-secret",
 											},
 										},
+										ServiceAccountName:            commonconsts.FrontendServiceAccountName,
 										TerminationGracePeriodSeconds: ptr.To(int64(10)),
 										SecurityContext: &corev1.PodSecurityContext{
 											FSGroup: ptr.To(int64(commonconsts.DefaultSecurityContextFSGroup)),

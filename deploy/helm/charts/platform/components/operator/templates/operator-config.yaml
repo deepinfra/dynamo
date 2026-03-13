@@ -123,6 +123,7 @@ data:
       plannerClusterRoleName: {{ include "dynamo-operator.fullname" . }}-planner
       dgdrProfilingClusterRoleName: {{ include "dynamo-operator.fullname" . }}-dgdr-profiling
       eppClusterRoleName: {{ include "dynamo-operator.fullname" . }}-epp
+      frontendClusterRoleName: {{ include "dynamo-operator.fullname" . }}-frontend
     {{- end }}
     {{- if .Values.dynamo.mpiRun.secretName }}
     mpi:

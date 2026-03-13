@@ -281,6 +281,22 @@ func (r *DynamoGraphDeploymentReconciler) reconcileResources(ctx context.Context
 				return ReconcileResult{}, fmt.Errorf("failed to ensure EPP RBAC: %w", err)
 			}
 		}
+
+		// Ensure frontend RBAC exists in cluster-wide mode if frontend service is present
+		if dynamoDeployment.HasFrontendService() {
+			if r.Config.RBAC.FrontendClusterRoleName == "" {
+				return ReconcileResult{}, fmt.Errorf("frontend ClusterRole name is required in cluster-wide mode when frontend service is present")
+			}
+			if err := r.RBACManager.EnsureServiceAccountWithRBAC(
+				ctx,
+				dynamoDeployment.Namespace,
+				consts.FrontendServiceAccountName,
+				r.Config.RBAC.FrontendClusterRoleName,
+			); err != nil {
+				logger.Error(err, "Failed to ensure frontend RBAC")
+				return ReconcileResult{}, fmt.Errorf("failed to ensure frontend RBAC: %w", err)
+			}
+		}
 	}
 
 	// Reconcile top-level PVCs first
