@@ -331,6 +331,16 @@ func (dgd *DynamoGraphDeployment) HasEPPService() bool {
 	return false
 }
 
+// HasFrontendService returns true if any service in the DGD has frontend component type
+func (dgd *DynamoGraphDeployment) HasFrontendService() bool {
+	for _, component := range dgd.Spec.Services {
+		if component != nil && component.ComponentType == consts.ComponentTypeFrontend {
+			return true
+		}
+	}
+	return false
+}
+
 // GetDynamoNamespaceForService returns the Dynamo namespace for a given service.
 func (s *DynamoGraphDeployment) GetDynamoNamespaceForService(service *DynamoComponentDeploymentSharedSpec) string {
 	return ComputeDynamoNamespace(service.GlobalDynamoNamespace, s.GetNamespace(), s.GetName())

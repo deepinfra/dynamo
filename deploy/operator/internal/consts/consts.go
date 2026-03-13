@@ -78,9 +78,10 @@ const (
 	ComponentTypeDecode       = "decode"
 	ComponentTypeEPP          = "epp"
 	ComponentTypeDefault      = "default"
-	PlannerServiceAccountName = "planner-serviceaccount"
-	EPPServiceAccountName     = "epp-serviceaccount"
-	EPPClusterRoleName        = "epp-cluster-role"
+	PlannerServiceAccountName  = "planner-serviceaccount"
+	EPPServiceAccountName      = "epp-serviceaccount"
+	EPPClusterRoleName         = "epp-cluster-role"
+	FrontendServiceAccountName = "frontend-serviceaccount"
 
 	DefaultIngressSuffix = "local"
 

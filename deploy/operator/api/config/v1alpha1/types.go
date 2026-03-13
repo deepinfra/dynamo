@@ -228,6 +228,8 @@ type RBACConfiguration struct {
 	DGDRProfilingClusterRoleName string `json:"dgdrProfilingClusterRoleName"`
 	// EPPClusterRoleName is the ClusterRole for EPP
 	EPPClusterRoleName string `json:"eppClusterRoleName"`
+	// FrontendClusterRoleName is the ClusterRole for frontend
+	FrontendClusterRoleName string `json:"frontendClusterRoleName"`
 }
 
 // MPIConfiguration holds MPI SSH secret settings.

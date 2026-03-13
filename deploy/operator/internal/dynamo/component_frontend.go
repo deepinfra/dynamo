@@ -22,6 +22,12 @@ func NewFrontendDefaults() *FrontendDefaults {
 	return &FrontendDefaults{&BaseComponentDefaults{}}
 }
 
+func (f *FrontendDefaults) GetBasePodSpec(context ComponentContext) (corev1.PodSpec, error) {
+	podSpec := f.getCommonPodSpec()
+	podSpec.ServiceAccountName = commonconsts.FrontendServiceAccountName
+	return podSpec, nil
+}
+
 func (f *FrontendDefaults) GetBaseContainer(context ComponentContext) (corev1.Container, error) {
 	// Frontend doesn't need backend-specific config
 	container := f.getCommonContainer(context)

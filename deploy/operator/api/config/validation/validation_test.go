@@ -32,6 +32,9 @@ func validConfig() *configv1alpha1.OperatorConfiguration {
 	cfg.MPI.SSHSecretName = "mpi-ssh"
 	cfg.MPI.SSHSecretNamespace = "default"
 	cfg.RBAC.PlannerClusterRoleName = "planner-role"
+	cfg.RBAC.DGDRProfilingClusterRoleName = "dgdr-profiling-role"
+	cfg.RBAC.EPPClusterRoleName = "epp-role"
+	cfg.RBAC.FrontendClusterRoleName = "frontend-role"
 	return cfg
 }
 

@@ -361,6 +361,16 @@ func generateSingleDCD(
 		deployment.Spec.ExtraPodSpec.PodSpec.ServiceAccountName = commonconsts.PlannerServiceAccountName
 	}
 
+	if component.ComponentType == commonconsts.ComponentTypeFrontend {
+		if deployment.Spec.ExtraPodSpec == nil {
+			deployment.Spec.ExtraPodSpec = &v1alpha1.ExtraPodSpec{}
+		}
+		if deployment.Spec.ExtraPodSpec.PodSpec == nil {
+			deployment.Spec.ExtraPodSpec.PodSpec = &corev1.PodSpec{}
+		}
+		deployment.Spec.ExtraPodSpec.PodSpec.ServiceAccountName = commonconsts.FrontendServiceAccountName
+	}
+
 	if deployment.IsFrontendComponent() && defaultIngressSpec != nil && deployment.Spec.Ingress == nil {
 		deployment.Spec.Ingress = defaultIngressSpec
 	}
