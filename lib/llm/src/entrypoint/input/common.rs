@@ -69,6 +69,16 @@ pub async fn prepare_engine(
             let model_manager = Arc::new(ModelManager::new());
             // Create metrics for migration tracking (not exposed via /metrics in Dynamic engine mode)
             let metrics = Arc::new(Metrics::new());
+            // Pass the frontend's local model path so the discovery watcher can
+            // use it for config/tokenizer files instead of the worker's paths.
+            let local_model_path = {
+                let p = local_model.path();
+                if p.as_os_str().is_empty() {
+                    None
+                } else {
+                    Some(p.to_path_buf())
+                }
+            };
             let watch_obj = Arc::new(ModelWatcher::new(
                 distributed_runtime.clone(),
                 model_manager.clone(),
@@ -76,6 +86,7 @@ pub async fn prepare_engine(
                 local_model.migration_limit(),
                 None,
                 metrics,
+                local_model_path,
             ));
             let discovery = distributed_runtime.discovery();
             let discovery_stream = discovery

@@ -42,12 +42,21 @@ pub async fn run(
                 model.namespace(),
                 model.namespace_prefix(),
             );
+            let local_model_path = {
+                let p = model.path();
+                if p.as_os_str().is_empty() {
+                    None
+                } else {
+                    Some(p.to_path_buf())
+                }
+            };
             run_watcher(
                 distributed_runtime.clone(),
                 grpc_service.state().manager_clone(),
                 router_config.clone(),
                 migration_limit,
                 namespace_filter,
+                local_model_path,
             )
             .await?;
             grpc_service
@@ -111,6 +120,7 @@ async fn run_watcher(
     router_config: RouterConfig,
     migration_limit: u32,
     namespace_filter: NamespaceFilter,
+    local_model_path: Option<std::path::PathBuf>,
 ) -> anyhow::Result<()> {
     // Create metrics for migration tracking (not exposed via /metrics in gRPC mode)
     let metrics = Arc::new(Metrics::new());
@@ -121,6 +131,7 @@ async fn run_watcher(
         migration_limit,
         None,
         metrics,
+        local_model_path,
     );
     tracing::debug!("Waiting for remote model");
     let discovery = runtime.discovery();

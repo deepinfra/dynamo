@@ -342,6 +342,7 @@ mod integration_tests {
             0, // migration_limit
             None,
             service.state().metrics_clone(),
+            None,
         );
         // Start watching for model registrations via discovery interface
         let discovery = distributed_runtime.discovery();
@@ -518,6 +519,7 @@ mod integration_tests {
                 0, // migration_limit
                 None,
                 service.state().metrics_clone(),
+                None,
             );
 
             // Get all model entries for our test model

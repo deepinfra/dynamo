@@ -608,7 +608,7 @@ impl ModelDeploymentCard {
     }
 
     /// Update the directory for files like tokenizer.json be in here.
-    fn update_dir(&mut self, dir: &Path) {
+    pub fn update_dir(&mut self, dir: &Path) {
         if let Some(model_info) = self.model_info.as_mut() {
             model_info.update_dir(dir);
         }

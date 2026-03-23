@@ -81,6 +81,14 @@ pub async fn run(
                 model.namespace(),
                 model.namespace_prefix(),
             );
+            let local_model_path = {
+                let p = model.path();
+                if p.as_os_str().is_empty() {
+                    None
+                } else {
+                    Some(p.to_path_buf())
+                }
+            };
             run_watcher(
                 distributed_runtime.clone(),
                 http_service.state().manager_clone(),
@@ -90,6 +98,7 @@ pub async fn run(
                 Arc::new(http_service.clone()),
                 http_service.state().metrics_clone(),
                 chat_engine_factory.clone(),
+                local_model_path,
             )
             .await?;
             http_service
@@ -167,6 +176,7 @@ async fn run_watcher(
     http_service: Arc<HttpService>,
     metrics: Arc<crate::http::service::metrics::Metrics>,
     chat_engine_factory: Option<ChatEngineFactoryCallback>,
+    local_model_path: Option<std::path::PathBuf>,
 ) -> anyhow::Result<()> {
     let mut watch_obj = ModelWatcher::new(
         runtime.clone(),
@@ -175,6 +185,7 @@ async fn run_watcher(
         migration_limit,
         chat_engine_factory,
         metrics.clone(),
+        local_model_path,
     );
     tracing::debug!("Waiting for remote model");
     let discovery = runtime.discovery();
