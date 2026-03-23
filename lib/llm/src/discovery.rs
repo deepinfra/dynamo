@@ -15,6 +15,7 @@ pub use runtime_configs::{RuntimeConfigWatch, runtime_config_watch};
 
 mod watcher;
 pub use watcher::{ModelUpdate, ModelWatcher};
+pub(crate) use watcher::prepare_card_for_download;
 
 mod worker_monitor;
 pub use worker_monitor::{

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Notify;
 use tokio::sync::mpsc::Sender;
@@ -78,8 +78,8 @@ pub struct ModelWatcher {
     /// Guards against concurrent pipeline construction for the same (model, namespace).
     registering_worker_sets: DashSet<String>,
     /// Local model path from the frontend's `--model-path` flag. When set,
-    /// discovered workers will use this path for config/tokenizer files instead
-    /// of attempting to download from the worker's advertised (remote) path.
+    /// the frontend re-points discovered cards' config/tokenizer file references
+    /// to this directory instead of downloading from the worker's advertised path.
     local_model_path: Option<PathBuf>,
 }
 
@@ -113,6 +113,20 @@ fn is_model_type_list_empty(manager: &ModelManager, model_type: ModelType) -> bo
     } else {
         true
     }
+}
+
+/// If the frontend has a local model path (from `--model-path`), re-point the
+/// card's config/tokenizer file references to that directory, then download any
+/// remaining files. This handles the disaggregated case where the worker's
+/// advertised paths are local to the worker nodes and don't exist on the frontend.
+pub(crate) async fn prepare_card_for_download(
+    card: &mut ModelDeploymentCard,
+    local_model_path: Option<&Path>,
+) -> anyhow::Result<()> {
+    if let Some(local_path) = local_model_path {
+        card.update_dir(local_path);
+    }
+    card.download_config().await
 }
 
 impl ModelWatcher {
@@ -418,15 +432,7 @@ impl ModelWatcher {
         mcid: &ModelCardInstanceId,
         card: &mut ModelDeploymentCard,
     ) -> anyhow::Result<()> {
-        // If the frontend has a local model path (from --model-path), re-point the
-        // card's config/tokenizer file references to that directory. This handles the
-        // disaggregated case where the worker's advertised paths are local to the
-        // worker nodes and don't exist on the frontend.
-        if let Some(ref local_path) = self.local_model_path {
-            card.update_dir(local_path);
-        }
-
-        card.download_config().await?;
+        prepare_card_for_download(card, self.local_model_path.as_deref()).await?;
 
         let component = self
             .drt
