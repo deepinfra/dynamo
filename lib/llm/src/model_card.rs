@@ -1080,37 +1080,22 @@ mod tests {
     use std::collections::HashSet;
     use std::path::Path;
 
-    /// Helper: build a ModelDeploymentCard from the TinyLlama sample model on disk.
     fn card_from_tiny_llama() -> ModelDeploymentCard {
         let model_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/data/sample-models/TinyLlama_v1.1");
         ModelDeploymentCard::load_from_disk(&model_dir, None).unwrap()
     }
 
-    // ---------------------------------------------------------------
-    // Test that exercises `prepare_card_for_download` — the actual
-    // watcher code path. This test FAILS without the fix because
-    // `prepare_card_for_download` without `local_model_path` does not
-    // call `update_dir` and `download_config` fails.
-    // ---------------------------------------------------------------
-
-    /// Helper: build a card simulating what the frontend receives from a worker.
-    /// The card has valid structure (from TinyLlama) but its file paths point to
-    /// a directory that only exists on the worker node.
+    /// Build a card whose file paths point to a non-existent worker directory.
     fn card_simulating_worker_discovery() -> ModelDeploymentCard {
         let mut card = card_from_tiny_llama();
-        // Simulate: the worker serialized its card with its own local paths.
-        // On the frontend, these paths don't exist.
         let worker_path = Path::new("/data/weights/vllm-google--gemma-3-27b-it-fp8/001");
         card.update_dir(worker_path);
         card.set_source_path(worker_path.to_path_buf());
-        assert!(!card.has_local_files(), "precondition: worker paths should not exist on frontend");
+        assert!(!card.has_local_files(), "worker paths should not exist locally");
         card
     }
 
-    /// FIX SCENARIO: `prepare_card_for_download` with a valid local_model_path
-    /// (the new behavior) succeeds because it re-points the card's file
-    /// references to the frontend's local directory before downloading.
     #[tokio::test]
     async fn test_prepare_card_with_local_path_succeeds() {
         let mut card = card_simulating_worker_discovery();
@@ -1118,23 +1103,14 @@ mod tests {
         let frontend_path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/data/sample-models/TinyLlama_v1.1");
 
-        // With local_model_path — this is the fixed behavior
         let result = crate::discovery::prepare_card_for_download(
             &mut card,
             Some(frontend_path.as_path()),
         )
         .await;
 
-        assert!(
-            result.is_ok(),
-            "prepare_card_for_download with local_model_path should succeed: {result:?}"
-        );
-
-        // Verify the card's files now point to the frontend's directory
-        assert!(
-            card.has_local_files(),
-            "After prepare_card_for_download, card should have local files"
-        );
+        assert!(result.is_ok(), "should succeed with local_model_path: {result:?}");
+        assert!(card.has_local_files(), "card should have local files after prepare");
     }
 
     #[test]

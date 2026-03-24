@@ -77,9 +77,7 @@ pub struct ModelWatcher {
     metrics: Arc<Metrics>,
     /// Guards against concurrent pipeline construction for the same (model, namespace).
     registering_worker_sets: DashSet<String>,
-    /// Local model path from the frontend's `--model-path` flag. When set,
-    /// the frontend re-points discovered cards' config/tokenizer file references
-    /// to this directory instead of downloading from the worker's advertised path.
+    /// Frontend's `--model-path`, used to resolve config/tokenizer files locally.
     local_model_path: Option<PathBuf>,
 }
 
@@ -115,10 +113,7 @@ fn is_model_type_list_empty(manager: &ModelManager, model_type: ModelType) -> bo
     }
 }
 
-/// If the frontend has a local model path (from `--model-path`), re-point the
-/// card's config/tokenizer file references to that directory, then download any
-/// remaining files. This handles the disaggregated case where the worker's
-/// advertised paths are local to the worker nodes and don't exist on the frontend.
+/// Re-point the card to `local_model_path` (if set), then download any missing config.
 pub(crate) async fn prepare_card_for_download(
     card: &mut ModelDeploymentCard,
     local_model_path: Option<&Path>,

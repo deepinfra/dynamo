@@ -69,8 +69,6 @@ pub async fn prepare_engine(
             let model_manager = Arc::new(ModelManager::new());
             // Create metrics for migration tracking (not exposed via /metrics in Dynamic engine mode)
             let metrics = Arc::new(Metrics::new());
-            // Pass the frontend's local model path so the discovery watcher can
-            // use it for config/tokenizer files instead of the worker's paths.
             let local_model_path = {
                 let p = local_model.path();
                 if p.as_os_str().is_empty() {
