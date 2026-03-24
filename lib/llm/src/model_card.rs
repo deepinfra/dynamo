@@ -1089,7 +1089,7 @@ mod tests {
     /// Build a card whose file paths point to a non-existent worker directory.
     fn card_simulating_worker_discovery() -> ModelDeploymentCard {
         let mut card = card_from_tiny_llama();
-        let worker_path = Path::new("/data/weights/vllm-google--gemma-3-27b-it-fp8/001");
+        let worker_path = Path::new("/remote/worker/models/my-model");
         card.update_dir(worker_path);
         card.set_source_path(worker_path.to_path_buf());
         assert!(!card.has_local_files(), "worker paths should not exist locally");
