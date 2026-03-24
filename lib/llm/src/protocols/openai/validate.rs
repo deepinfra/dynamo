@@ -97,7 +97,11 @@ pub const MAX_REPETITION_PENALTY: f32 = 2.0;
 // Shared Fields
 //
 
-/// Validates that no unsupported fields are present in the request
+/// Validates unsupported fields in the request.
+/// Instead of rejecting requests with unsupported fields, this now logs a warning
+/// and allows the request to proceed. This improves compatibility with clients
+/// that send extra parameters (e.g. add_special_tokens, prompt_cache_key,
+/// request_id, chat_template).
 pub fn validate_no_unsupported_fields(
     unsupported_fields: &std::collections::HashMap<String, serde_json::Value>,
 ) -> Result<(), anyhow::Error> {
@@ -106,7 +110,7 @@ pub fn validate_no_unsupported_fields(
             .keys()
             .map(|s| format!("`{}`", s))
             .collect();
-        anyhow::bail!("Unsupported parameter(s): {}", fields.join(", "));
+        tracing::warn!("Ignoring unsupported parameter(s): {}", fields.join(", "));
     }
     Ok(())
 }

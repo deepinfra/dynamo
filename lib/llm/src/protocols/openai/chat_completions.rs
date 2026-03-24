@@ -426,4 +426,29 @@ mod tests {
             assert_eq!(output_options.skip_special_tokens, Some(skip_value));
         }
     }
+
+    #[test]
+    fn test_unsupported_fields_warn_not_error() {
+        use crate::engines::ValidateRequest;
+
+        let json_str = json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "add_special_tokens": true,
+            "prompt_cache_key": "key123",
+            "request_id": "req-456",
+            "chat_template": "custom"
+        });
+        let request: NvCreateChatCompletionRequest =
+            serde_json::from_value(json_str).expect("Failed to deserialize request");
+
+        // These fields should be captured as unsupported
+        assert!(request.unsupported_fields.contains_key("add_special_tokens"));
+        assert!(request.unsupported_fields.contains_key("prompt_cache_key"));
+        assert!(request.unsupported_fields.contains_key("request_id"));
+        assert!(request.unsupported_fields.contains_key("chat_template"));
+
+        // Validation should succeed (warn, not error)
+        assert!(ValidateRequest::validate(&request).is_ok());
+    }
 }

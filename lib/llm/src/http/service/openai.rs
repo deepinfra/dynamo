@@ -2786,17 +2786,9 @@ mod tests {
         assert!(request.unsupported_fields.contains_key("documents"));
         assert!(request.unsupported_fields.contains_key("chat_template"));
 
+        // Unsupported fields should now produce a warning but not an error
         let result = validate_chat_completion_fields_generic(&request);
-        assert!(result.is_err());
-        if let Err(error_response) = result {
-            assert_eq!(error_response.0, StatusCode::BAD_REQUEST);
-            let msg = &error_response.1.message;
-            assert!(msg.contains("Unsupported parameter"));
-            // Verify all fields appear in the error message
-            assert!(msg.contains("add_special_tokens"));
-            assert!(msg.contains("documents"));
-            assert!(msg.contains("chat_template"));
-        }
+        assert!(result.is_ok());
     }
 
     #[test]
@@ -2819,16 +2811,9 @@ mod tests {
         );
         assert!(request.unsupported_fields.contains_key("response_format"));
 
+        // Unsupported fields should now produce a warning but not an error
         let result = validate_completion_fields_generic(&request);
-        assert!(result.is_err());
-        if let Err(error_response) = result {
-            assert_eq!(error_response.0, StatusCode::BAD_REQUEST);
-            let msg = &error_response.1.message;
-            assert!(msg.contains("Unsupported parameter"));
-            // Verify both fields appear in error message
-            assert!(msg.contains("add_special_tokens"));
-            assert!(msg.contains("response_format"));
-        }
+        assert!(result.is_ok());
     }
 
     #[tokio::test]
