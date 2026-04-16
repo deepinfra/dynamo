@@ -274,25 +274,33 @@ kind: ConfigMap
 metadata:
   name: dsv32-trtllm-config-b200
 data:
+  # SLA target for this config:
+  #   TTFT p99 <= 2.5 s
+  #   ITL unconstrained (decode TPS/user as low as ~5 tok/s is acceptable)
+  # This is a throughput-heavy regime: pack as much concurrent decode as
+  # possible, keep prefill lean to avoid queue tail on TTFT p99.
   prefill.yaml: |
     # Prefill: single HGX B200 node, TP=8, EP=8.
-    # Small batch size, large max_num_tokens -- minimize TTFT.
+    # Keep batch SMALL (saturate GPU with min parallelism) so queue
+    # depth is what it is -- this protects TTFT p99. Large max_num_tokens
+    # lets a single long prompt finish in one iter. Enable chunked prefill
+    # + block reuse for prefix cache hits.
     cache_transceiver_config:
       backend: UCX
       max_tokens_in_buffer: 120000
-    max_num_tokens: 8192
+    max_num_tokens: 16384
     enable_chunked_prefill: true
     cuda_graph_config:
-      max_batch_size: 32
+      max_batch_size: 8
       enable_padding: true
     disable_overlap_scheduler: true
     enable_attention_dp: true
     kv_cache_config:
       dtype: fp8
       enable_block_reuse: true
-      free_gpu_memory_fraction: 0.85
+      free_gpu_memory_fraction: 0.90
       tokens_per_block: 64
-    max_batch_size: 32
+    max_batch_size: 8
     max_seq_len: 121000
     moe_config:
       backend: TRTLLM
@@ -301,29 +309,33 @@ data:
     tensor_parallel_size: 8
   decode.yaml: |
     # Decode: 2x HGX B200 nodes, TP=16, EP=16 WideEP over InfiniBand.
+    # ITL is unconstrained -> run VERY large decode batches to maximize
+    # per-GPU throughput. stream_interval=20 halves scheduler overhead
+    # vs. every-token streaming (5 tps/user is well within tolerance).
+    # free_gpu_memory_fraction=0.90 to fit more concurrent KV.
     # Note: allreduce_strategy intentionally omitted -- MNNVL is GB200-only;
     # default strategy picks NCCL ring/tree over IB which is correct for B200 HGX.
     cache_transceiver_config:
       backend: UCX
       max_tokens_in_buffer: 120000
-    max_num_tokens: 8192
+    max_num_tokens: 16384
     cuda_graph_config:
-      max_batch_size: 512
+      max_batch_size: 1024
       enable_padding: true
-      batch_sizes: [1, 2, 4, 8, 16, 32, 64, 128, 256, 384, 512]
+      batch_sizes: [1, 2, 4, 8, 16, 32, 64, 128, 256, 384, 512, 768, 1024]
     enable_attention_dp: true
     kv_cache_config:
       dtype: fp8
       enable_block_reuse: false
-      free_gpu_memory_fraction: 0.85
+      free_gpu_memory_fraction: 0.90
       tokens_per_block: 64
-    max_batch_size: 512
+    max_batch_size: 1024
     max_seq_len: 121000
     moe_config:
       backend: WIDEEP
       use_low_precision_moe_combine: true
     moe_expert_parallel_size: 16
-    num_postprocess_workers: 8
+    num_postprocess_workers: 16
     print_iter_log: true
-    stream_interval: 10
+    stream_interval: 20
     tensor_parallel_size: 16
