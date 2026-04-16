@@ -3,11 +3,24 @@
 #
 # DeepSeek-V3 / V3.2 NVFP4 disaggregated (KV-aware routing) on HGX B200 with InfiniBand.
 #
+# Target workload:
+#   - ISL ~8000, OSL ~300  (Ctx:Gen ~27; with 67% prefix cache hit -> ~9)
+#   - Prefix cache hit rate ~67% (KV-aware routing does the work)
+#   - TTFT p99 <= 2.5 s
+#   - ITL unconstrained (>=5 tok/s per user is acceptable)
+#
+# This workload is strongly prefill-heavy. Compute demand ratio
+# prefill:decode is ~7:1 after accounting for prefix cache hits, so the
+# topology is inverted vs. the GB200 recipe: MORE prefill than decode.
+#
 # Target hardware (high-throughput):
 #   - 3x HGX B200 nodes (8x B200 180GB per node) = 24 GPUs
-#   - 1 node for prefill (TP=8, EP=8)
-#   - 2 nodes for decode with WideEP (TP=16, EP=16, attention-DP)
+#   - 2 nodes for prefill (2 replicas x TP=8, EP=8)  -- capacity bottleneck
+#   - 1 node for decode  (TP=8, EP=8, attention-DP)  -- 1k-batch on single node
 #   - InfiniBand between nodes (RoCEv2 also OK with NCCL_IB_GID_INDEX=3)
+#
+# If p99 TTFT drifts above budget under peak load, add a 3rd prefill
+# replica (4th node) before scaling decode.
 #
 # Differences vs. the GB200 NVL72 sibling config (deploy.yaml):
 #   - arch: arm64 -> removed (B200 HGX is x86_64)
@@ -153,7 +166,7 @@ spec:
             emptyDir:
               medium: Memory
               sizeLimit: 80Gi
-      replicas: 1
+      replicas: 2
       resources:
         limits:
           gpu: "8"
@@ -261,8 +274,6 @@ spec:
             emptyDir:
               medium: Memory
               sizeLimit: 80Gi
-      multinode:
-        nodeCount: 2
       replicas: 1
       resources:
         limits:
@@ -308,13 +319,15 @@ data:
     print_iter_log: true
     tensor_parallel_size: 8
   decode.yaml: |
-    # Decode: 2x HGX B200 nodes, TP=16, EP=16 WideEP over InfiniBand.
-    # ITL is unconstrained -> run VERY large decode batches to maximize
-    # per-GPU throughput. stream_interval=20 halves scheduler overhead
-    # vs. every-token streaming (5 tps/user is well within tolerance).
-    # free_gpu_memory_fraction=0.90 to fit more concurrent KV.
-    # Note: allreduce_strategy intentionally omitted -- MNNVL is GB200-only;
-    # default strategy picks NCCL ring/tree over IB which is correct for B200 HGX.
+    # Decode: 1x HGX B200 node, TP=8, EP=8, attention-DP.
+    # With ISL 8k + OSL 300 the decode compute is small relative to
+    # prefill; a single node with batch=1024 has plenty of headroom.
+    # WideEP + multi-node dropped -- single-node avoids inter-node
+    # alltoall entirely (NVSwitch-only MoE comms).
+    # ITL is unconstrained -> big decode batches + stream_interval=20
+    # to minimize scheduler overhead. KV fraction 0.90 so ~1.1 TB of KV
+    # survives weights+activations -> room for ~15-20k concurrent 8k
+    # contexts before KV becomes the binding constraint.
     cache_transceiver_config:
       backend: UCX
       max_tokens_in_buffer: 120000
@@ -332,10 +345,9 @@ data:
     max_batch_size: 1024
     max_seq_len: 121000
     moe_config:
-      backend: WIDEEP
-      use_low_precision_moe_combine: true
-    moe_expert_parallel_size: 16
+      backend: TRTLLM
+    moe_expert_parallel_size: 8
     num_postprocess_workers: 16
     print_iter_log: true
     stream_interval: 20
-    tensor_parallel_size: 16
+    tensor_parallel_size: 8
