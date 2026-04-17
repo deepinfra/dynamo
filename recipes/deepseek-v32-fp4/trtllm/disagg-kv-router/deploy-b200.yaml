@@ -319,15 +319,26 @@ data:
     print_iter_log: true
     tensor_parallel_size: 8
   decode.yaml: |
-    # Decode: 1x HGX B200 node, TP=8, EP=8, attention-DP.
+    # Decode: 1x HGX B200 node, TP=8, EP=8, attention-DP, MTP-3.
+    #
     # With ISL 8k + OSL 300 the decode compute is small relative to
     # prefill; a single node with batch=1024 has plenty of headroom.
     # WideEP + multi-node dropped -- single-node avoids inter-node
     # alltoall entirely (NVSwitch-only MoE comms).
-    # ITL is unconstrained -> big decode batches + stream_interval=20
-    # to minimize scheduler overhead. KV fraction 0.90 so ~1.1 TB of KV
-    # survives weights+activations -> room for ~15-20k concurrent 8k
-    # contexts before KV becomes the binding constraint.
+    #
+    # Key decode throughput optimizations (ITL budget is loose):
+    # - MTP (Multi-Token Prediction) with num_nextn_predict_layers=3:
+    #   DeepSeek-V3 ships a built-in MTP module. MTP-Eagle reuses that
+    #   single module 3x per step to speculate 3 draft tokens, verified
+    #   in one main-model forward pass. Expected 1.6-2.3x decode
+    #   throughput at ~85% acceptance on DS-V3 production workloads.
+    # - stream_interval=20: scheduler sends a streamed token every 20
+    #   iters (~0.6 s at typical decode rate). OK because ITL budget
+    #   allows >=5 tok/s per user.
+    # - max_batch_size=1024 with cuda-graph padding: cover the whole
+    #   batch ladder so we never fall back to eager.
+    # - KV fraction 0.85: leave headroom for MTP draft-KV + activation
+    #   buffers. At 8x B200 180GB this still yields ~850 GB of KV pool.
     cache_transceiver_config:
       backend: UCX
       max_tokens_in_buffer: 120000
@@ -340,7 +351,7 @@ data:
     kv_cache_config:
       dtype: fp8
       enable_block_reuse: false
-      free_gpu_memory_fraction: 0.90
+      free_gpu_memory_fraction: 0.85
       tokens_per_block: 64
     max_batch_size: 1024
     max_seq_len: 121000
@@ -349,5 +360,8 @@ data:
     moe_expert_parallel_size: 8
     num_postprocess_workers: 16
     print_iter_log: true
+    speculative_config:
+      decoding_type: MTP
+      num_nextn_predict_layers: 3
     stream_interval: 20
     tensor_parallel_size: 8
