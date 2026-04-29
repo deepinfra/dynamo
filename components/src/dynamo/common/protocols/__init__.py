@@ -5,8 +5,15 @@
 
 This module provides protocol types for various modalities:
 - video_protocol: NvCreateVideoRequest, NvVideosResponse for video generation
+- music_protocol: NvCreateMusicRequest, NvMusicResponse for music generation
 """
 
+from dynamo.common.protocols.music_protocol import (
+    MusicData,
+    MusicNvExt,
+    NvCreateMusicRequest,
+    NvMusicResponse,
+)
 from dynamo.common.protocols.video_protocol import (
     NvCreateVideoRequest,
     NvVideosResponse,
@@ -14,7 +21,11 @@ from dynamo.common.protocols.video_protocol import (
 )
 
 __all__ = [
+    "MusicData",
+    "MusicNvExt",
+    "NvCreateMusicRequest",
     "NvCreateVideoRequest",
+    "NvMusicResponse",
     "NvVideosResponse",
     "VideoData",
 ]
