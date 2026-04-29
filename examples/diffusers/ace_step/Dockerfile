@@ -39,6 +39,7 @@ ENV ACESTEP_PROJECT_ROOT=/opt/ACE-Step-1.5
 RUN echo "Installing ACE-Step ${ACESTEP_REF} for TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}" \
  && . /opt/dynamo/venv/bin/activate \
  && uv pip install hatchling setuptools_scm scikit-build-core cmake ninja \
+ && uv pip install vllm \
  && git clone --depth 1 --branch "${ACESTEP_REF}" \
       https://github.com/ace-step/ACE-Step-1.5.git "${ACESTEP_PROJECT_ROOT}" \
  && uv pip install --no-build-isolation "${ACESTEP_PROJECT_ROOT}" \
