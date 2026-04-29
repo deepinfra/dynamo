@@ -266,6 +266,24 @@ def main() -> int:
         dest="audio_format",
         choices=("flac", "wav", "mp3"),
     )
+    # Custom-prompt flags (when set, replace the built-in PROMPTS list with
+    # a single user-supplied prompt — useful for ad-hoc quality checks).
+    parser.add_argument(
+        "--prompt",
+        default=None,
+        help="Caption for a single custom generation. Overrides the built-in 3-prompt set.",
+    )
+    parser.add_argument(
+        "--lyrics",
+        default=None,
+        help="Lyrics for the custom prompt. Default: '[Instrumental]'. Ignored unless --prompt is set.",
+    )
+    parser.add_argument(
+        "--prompt-id",
+        default=None,
+        dest="prompt_id",
+        help="Identifier used in the output filename. Default: 'custom'. Ignored unless --prompt is set.",
+    )
     # ACE-Step pipeline knobs (defaults match the worker scaffold).
     parser.add_argument("--dit-config", default="acestep-v15-xl-sft", dest="dit_config")
     parser.add_argument("--lm-model", default="acestep-5Hz-lm-4B", dest="lm_model")
@@ -300,9 +318,20 @@ def main() -> int:
         device=args.device,
     )
 
+    if args.prompt:
+        prompts_to_run = [
+            (
+                args.prompt_id or "custom",
+                args.prompt,
+                args.lyrics or "[Instrumental]",
+            )
+        ]
+    else:
+        prompts_to_run = PROMPTS
+
     rows = []
     failed = 0
-    for prompt_id, caption, lyrics in PROMPTS:
+    for prompt_id, caption, lyrics in prompts_to_run:
         print(f"[benchmark] -> {prompt_id}: {caption[:60]}...", flush=True)
         try:
             audio_path, sr, seed_used, gen_s = _generate_one(
@@ -369,7 +398,7 @@ def main() -> int:
             r.setdefault("error", "")
             w.writerow(r)
 
-    total = len(PROMPTS)
+    total = len(prompts_to_run)
     ok = total - failed
     print(
         f"[benchmark] done: {ok}/{total} ok, {failed} failed. "
