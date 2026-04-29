@@ -4,7 +4,7 @@
 # Runtime image for the ACE-Step music generation worker.
 # Mirrors examples/diffusers/Dockerfile (FastVideo) but installs ACE-Step.
 
-FROM nvidia/cuda:13.1.1-devel-ubuntu24.04
+FROM nvidia/cuda:12.4.1-devel-ubuntu22.04
 
 RUN apt-get update \
  && apt-get install -yq libucx0 python3-dev python3-pip python3-venv git \
@@ -17,7 +17,7 @@ ENV UV_LINK_MODE=copy
 RUN uv venv /opt/dynamo/venv --python 3.12 \
  && . /opt/dynamo/venv/bin/activate \
  && uv pip install pip setuptools packaging ninja psutil uvloop \
- && uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130 \
+ && uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124 \
  && uv pip install flashinfer-python
 
 ENV VIRTUAL_ENV=/opt/dynamo/venv
@@ -42,7 +42,7 @@ RUN echo "Installing ACE-Step ${ACESTEP_REF} for TORCH_CUDA_ARCH_LIST=${TORCH_CU
  && git clone --depth 1 --branch "${ACESTEP_REF}" \
       https://github.com/ace-step/ACE-Step-1.5.git "${ACESTEP_PROJECT_ROOT}" \
  && uv pip install --no-build-isolation "${ACESTEP_PROJECT_ROOT}" \
- && uv pip install vllm soundfile librosa
+ && uv pip install soundfile librosa
 
 # Cache directory for HuggingFace weights (mount a PVC at this path in k8s).
 ENV HF_HOME=/models/huggingface
