@@ -45,6 +45,8 @@ Request format (sent to /v1/videos):
 import argparse
 import asyncio
 import base64
+import hashlib
+import json
 import logging
 import os
 import tempfile
@@ -146,6 +148,7 @@ def _coerce_optional_float(value: object) -> float | None:
 class FastVideoBackend:
     def __init__(self, args: argparse.Namespace) -> None:
         self.model_name: str = args.model
+        self.served_model_name: str = args.served_model_name or args.model
         self.num_gpus: int = args.num_gpus
         self.enable_optimizations: bool = args.enable_optimizations
         self.attention_backend: str = args.attention_backend
@@ -163,16 +166,27 @@ class FastVideoBackend:
         loop = asyncio.get_running_loop()
 
         def _load():
+            # Import here so the module is found whether worker.py runs
+            # from /opt/app inside the container or from a local checkout.
+            from ltx2_config import standard_kwargs, fp4_kwargs
+
             pipeline_config = PipelineConfig.from_pretrained(self.model_name)
-            optimization_kwargs = {}
-            if self.enable_optimizations:
+
+            # Default path: standard kwargs (matches the warmup cache the
+            # image was baked against). FP4 path is opt-in and requires a
+            # separately-baked image.
+            if not self.enable_optimizations:
+                optimization_kwargs = standard_kwargs()
+            else:
                 major, minor = torch.cuda.get_device_capability()
                 if major < 10:
                     logger.warning(
-                        "FP4 quantization is only supported on NVIDIA Blackwell GPUs (compute capability 10.0+). Detected compute capability: %d.%d. Continuing without FP4 optimizations.",
-                        major,
-                        minor,
+                        "FP4 quantization is only supported on NVIDIA Blackwell GPUs "
+                        "(compute capability 10.0+). Detected compute capability: %d.%d. "
+                        "Continuing without FP4 optimizations.",
+                        major, minor,
                     )
+                    optimization_kwargs = standard_kwargs()
                 else:
                     logger.info(
                         "Using FP4 quantization for VideoGenerator model=%s",
@@ -189,25 +203,7 @@ class FastVideoBackend:
                             "FastVideo version that includes fp4_config."
                         ) from exc
                     pipeline_config.dit_config.quant_config = FP4Config()
-
-                optimization_kwargs = {
-                    "ltx2_refine_enabled": True,
-                    "ltx2_refine_lora_path": "",  # disable refine lora for distilled model
-                    "ltx2_refine_num_inference_steps": 2,
-                    "ltx2_refine_guidance_scale": 1.0,
-                    "ltx2_refine_add_noise": True,
-                    "enable_torch_compile": True,
-                    "enable_torch_compile_text_encoder": True,
-                    "torch_compile_kwargs": {
-                        "backend": "inductor",
-                        "fullgraph": True,
-                        "mode": "max-autotune-no-cudagraphs",
-                    },
-                    "dit_cpu_offload": False,
-                    "vae_cpu_offload": False,
-                    "text_encoder_cpu_offload": False,
-                    "ltx2_vae_tiling": False,
-                }
+                    optimization_kwargs = fp4_kwargs()
 
             return VideoGenerator.from_pretrained(
                 self.model_name,
@@ -282,6 +278,109 @@ class FastVideoBackend:
 
             return data
 
+    # ── Preflight ─────────────────────────────────────────────────────────────
+
+    async def preflight(self) -> None:
+        """
+        Warm in-memory torch.compile state for every shape the API admits,
+        so the FIRST customer request lands at steady-state latency
+        regardless of which shape arrives first.
+
+        Opt-in via LTX2_PREFLIGHT=1 (callers gate the call, not this method)
+        because it costs ~25 min wall time for the soft-launch 10-shape menu
+        even with a baked cache -- the per-shape compile / kernel-load /
+        autotune-confirm work is mostly insensitive to num_inference_steps,
+        so we can't make this fast just by making the inference cheap.
+
+        Reads warmup_shapes.json (must be at /opt/app/warmup_shapes.json,
+        configurable via WARMUP_SHAPES_JSON_PATH). For each shape, runs one
+        generation with num_inference_steps=1 and a short dummy prompt.
+
+        Failures abort pod boot. If the cache shipped in the image doesn't
+        cover a menu shape (or there is a code/version mismatch between the
+        warmup that built the cache and this worker), pod crash-loops --
+        better than serving customer traffic with ~15-minute first-shape
+        recompiles.
+        """
+        if self.generator is None:
+            raise RuntimeError(
+                "preflight called before initialize_model; this is a bug."
+            )
+
+        shapes_path = os.environ.get(
+            "WARMUP_SHAPES_JSON_PATH", "/opt/app/warmup_shapes.json"
+        )
+        if not os.path.isfile(shapes_path):
+            logger.warning(
+                "preflight: %s not found; skipping. Customer first-request "
+                "latency will be uneven across shapes. Fix the image build, "
+                "or set LTX2_PREFLIGHT_SKIP=1 to acknowledge.",
+                shapes_path,
+            )
+            return
+
+        with open(shapes_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        shapes = cfg.get("shapes", [])
+        fps = int(cfg.get("fps", 24))
+        guidance_scale = float(cfg.get("guidance_scale", 1.0))
+
+        logger.info("preflight: warming %d shapes from %s", len(shapes), shapes_path)
+        t_total = time.perf_counter()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for idx, shape in enumerate(shapes, 1):
+                # Reset dynamo state so each preflight compile/load matches
+                # what create_video() will see at request time. See
+                # claude_plans/2026-05-13-ltx2-cache-order-dependence.md.
+                torch._dynamo.reset()
+                torch.cuda.empty_cache()
+                w = int(shape["width"])
+                h = int(shape["height"])
+                nf = int(shape["num_frames"])
+                tag = "%dx%d@%df" % (w, h, nf)
+                out_path = os.path.join(tmpdir, "preflight_%s.mp4" % tag)
+
+                t_shape = time.perf_counter()
+                try:
+                    await asyncio.to_thread(
+                        self.generator.generate_video,
+                        prompt="warmup",
+                        save_video=True,
+                        return_frames=False,
+                        output_path=out_path,
+                        width=w,
+                        height=h,
+                        num_frames=nf,
+                        fps=fps,
+                        num_inference_steps=1,
+                        guidance_scale=guidance_scale,
+                        seed=42,
+                    )
+                except Exception as exc:
+                    elapsed = time.perf_counter() - t_shape
+                    logger.error(
+                        "preflight: %s FAILED after %.1fs",
+                        tag, elapsed, exc_info=True,
+                    )
+                    raise RuntimeError(
+                        "preflight failed for shape %s; refusing to start. "
+                        "Likely cause: baked compile cache doesn't cover this "
+                        "shape, or a code/version mismatch between the warmup "
+                        "that built the cache and this worker. See "
+                        "dynamo/examples/diffusers/RUNBOOK.md."
+                        % tag
+                    ) from exc
+
+                elapsed = time.perf_counter() - t_shape
+                logger.info(
+                    "preflight: %s warmed in %.1fs (%d/%d)",
+                    tag, elapsed, idx, len(shapes),
+                )
+
+        total = time.perf_counter() - t_total
+        logger.info("preflight: complete in %.1fs", total)
+
     # ── Dynamo endpoint ───────────────────────────────────────────────────────
 
     @dynamo_endpoint(VideoCreateRequest, VideoCreateResponse)
@@ -293,6 +392,12 @@ class FastVideoBackend:
         field, then yields a single VideoCreateResponse with data[0].b64_json
         containing the complete MP4 file encoded in base64.
         """
+        # Reset dynamo state at the start of each request so this request's
+        # compile-cache lookups match the fresh-state keys produced by
+        # warmup. Without this, state accumulates across customer requests
+        # and the second+ request misses the cache.
+        torch._dynamo.reset()
+        torch.cuda.empty_cache()
         if self.generator is None:
             raise RuntimeError("Generator is not initialized")
 
@@ -388,16 +493,16 @@ class FastVideoBackend:
 # ── Dynamo wiring ─────────────────────────────────────────────────────────────
 
 
-async def _register_model(endpoint, model_name: str) -> None:
+async def _register_model(endpoint, served_name: str, model_path: str) -> None:
     try:
         await register_llm(
             ModelInput.Text,  # type: ignore[attr-defined]
             ModelType.Videos,
             endpoint,
-            model_name,
-            model_name,
+            model_path,
+            served_name,
         )
-        logger.info("Successfully registered model: %s", model_name)
+        logger.info("Successfully registered model: %s (path=%s)", served_name, model_path)
     except Exception as e:
         logger.error("Failed to register model: %s", e, exc_info=True)
         raise RuntimeError("Model registration failed") from e
@@ -415,10 +520,18 @@ async def backend_worker(runtime: DistributedRuntime, args: argparse.Namespace) 
 
     backend = FastVideoBackend(args)
     await backend.initialize_model()
+    # Preflight is opt-in (LTX2_PREFLIGHT=1) because, even with a baked
+    # cache, it pays full first-call cost per shape -- ~25 minutes for our
+    # 10-shape menu. For low-volume soft-launch traffic that's worse than
+    # accepting that the first customer per shape per pod pays the cold
+    # cost. Re-enable when traffic patterns make the trade-off favor
+    # uniform latency at the cost of long pod boots.
+    if os.environ.get("LTX2_PREFLIGHT") == "1":
+        await backend.preflight()
 
     await asyncio.gather(
         endpoint.serve_endpoint(backend.create_video),  # type: ignore[arg-type]
-        _register_model(endpoint, backend.model_name),
+        _register_model(endpoint, backend.served_model_name, backend.model_name),
     )
 
 
@@ -430,6 +543,11 @@ def _parse_args() -> argparse.Namespace:
         "--model",
         default=DEFAULT_MODEL,
         help=f"HuggingFace model path (default: {DEFAULT_MODEL})",
+    )
+    parser.add_argument(
+        "--served-model-name",
+        default=None,
+        help="Name advertised to the Dynamo discovery layer (default: same as --model)",
     )
     parser.add_argument(
         "--num-gpus",
@@ -468,8 +586,100 @@ async def main(args: argparse.Namespace) -> None:
         )
     logger.info("Using discovery backend: %s", discovery_backend)
     logger.info("Resolved worker namespace: %s", _get_worker_namespace())
-    runtime = DistributedRuntime(loop, discovery_backend, "tcp")
+    # Pass enable_nats=False explicitly: the bundled ai-dynamo-runtime 1.0.0
+    # is from before upstream commit af0ff07 ("remove enable_nats usage")
+    # and so its DistributedRuntime ctor still requires the 4th positional
+    # arg to gate the NATS client. Omitting it defaults to True, which
+    # makes the worker hard-fail at startup with "Failed to connect to
+    # NATS: Connection refused" because the cluster runs ZMQ-only
+    # (DYN_EVENT_PLANE=zmq, deepinfra has no NATS).
+    runtime = DistributedRuntime(loop, discovery_backend, "tcp", False)
     await backend_worker(runtime, args)
+
+
+def _compute_menu_hash(shapes_json_path: str) -> tuple[str, int]:
+    """
+    Hash the canonical shape-tuple list from a warmup_shapes.json. Must
+    match the algorithm in:
+      - dynamo/examples/diffusers/run-benchmark.sh / docker bake step
+      - backend/tests/test_ltx_shape_menu.py
+    Anywhere this hash is referenced, it is the first 8 hex chars of
+    sha256(json.dumps(sorted(shape_tuples), separators=(',',':'))).
+
+    Returns (hash, shape_count) so callers can log both without re-reading.
+    """
+    with open(shapes_json_path, "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+    shapes = sorted(
+        (int(s["width"]), int(s["height"]), int(s["num_frames"]))
+        for s in cfg["shapes"]
+    )
+    canonical = json.dumps(shapes, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode()).hexdigest()[:8], len(shapes)
+
+
+def _assert_shape_menu_hash_matches() -> None:
+    """
+    Refuse to start if the image's baked compile cache doesn't match the
+    shape menu the worker is about to serve. The image's Dockerfile sets
+    IMAGE_SHAPE_HASH at bake time; we recompute the same hash here from
+    warmup_shapes.json and abort on mismatch.
+
+    If IMAGE_SHAPE_HASH is unset (dev runs, or images built before this
+    invariant landed), we log a warning and continue. Production images
+    are expected to have it set.
+
+    The procedure for resolving a mismatch is documented in:
+      dynamo/examples/diffusers/RUNBOOK.md
+    """
+    expected = os.environ.get("IMAGE_SHAPE_HASH")
+    if not expected:
+        logger.warning(
+            "IMAGE_SHAPE_HASH is unset; skipping image/menu hash check. "
+            "This is expected for dev runs and for images built before "
+            "the bake step started writing IMAGE_SHAPE_HASH. Production "
+            "images must set it -- see the RUNBOOK."
+        )
+        return
+
+    shapes_json = os.environ.get(
+        "WARMUP_SHAPES_JSON_PATH", "/opt/app/warmup_shapes.json"
+    )
+    if not os.path.isfile(shapes_json):
+        raise RuntimeError(
+            f"warmup_shapes.json not found at {shapes_json}. "
+            f"Cannot verify the image/menu hash. Set "
+            f"WARMUP_SHAPES_JSON_PATH to the correct location, or "
+            f"check your image build."
+        )
+
+    actual, shape_count = _compute_menu_hash(shapes_json)
+    if actual != expected:
+        raise RuntimeError(
+            f"FATAL: image/menu shape-hash mismatch -- refusing to start.\n"
+            f"\n"
+            f"  Image baked with hash: {expected}  (env IMAGE_SHAPE_HASH, set at "
+            f"bake time)\n"
+            f"  Current menu hash:     {actual}  (recomputed from {shapes_json})\n"
+            f"\n"
+            f"This means the compile cache shipped in the image was produced "
+            f"for a different shape menu than the one this worker is about to "
+            f"serve. Customer requests for any shape in the gap would hit a "
+            f"15+ minute torch.compile, violating our latency SLO.\n"
+            f"\n"
+            f"Either:\n"
+            f"  A) Roll back the model config to the last image whose tag ends "
+            f"in -{actual}, OR\n"
+            f"  B) Build a new image for the current menu (~3 hours on B200).\n"
+            f"\n"
+            f"Procedures: dynamo/examples/diffusers/RUNBOOK.md"
+        )
+
+    logger.info(
+        "image/menu shape-hash check OK (%s); %d shapes in menu",
+        actual,
+        shape_count,
+    )
 
 
 if __name__ == "__main__":
@@ -483,5 +693,8 @@ if __name__ == "__main__":
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
         force=True,
     )
+    # Refuse to start if image cache and shape menu disagree. Runs before
+    # any model load or networking so we fail fast with a clear message.
+    _assert_shape_menu_hash_matches()
     uvloop.install()
     asyncio.run(main(_args))
