@@ -5,31 +5,34 @@
 Pre-compile LTX-2 torch.compile / triton / inductor caches for every
 production shape so the first production request is fast.
 
-DEFAULT MODE: single-process. One VideoGenerator load, all shapes
-generated in sequence in one Python process. This mirrors what a
-production worker does, so the compile-cache keys we produce match
-what production reads back. Order matches warmup_shapes.json so
-downstream code (worker preflight, etc.) can rely on it.
+Two driver modes, with very different cache properties:
 
-LEGACY MODE: --legacy-subprocess. Each shape runs in a fresh Python
-subprocess. This was the original mode and exists for emergency
-isolation: if a particular shape crashes the process hard, the
-isolation prevents one bad shape from killing the whole batch. The
-trade-off is that the cache it produces is keyed by per-process
-fresh dynamo state, which does NOT match production's single-process
-access state -- production reads of those cache entries miss, and
-we end up paying the full compile cost on first request per shape.
-Use legacy mode only when debugging shape-level crashes.
+SINGLE-PROCESS MODE (default). One VideoGenerator load, all shapes
+generated sequentially in one process. As of 2026-05-14 this mode
+is known to produce an ORDER-DEPENDENT cache: `_dynamo.reset()`
+between shapes clears dynamo state but not the in-process Triton /
+CUDA module / autotuner state (we haven't isolated which one), so
+each shape's compile-cache key reflects state left by earlier shapes.
+A fresh production worker asked to serve shape N first cannot
+reproduce that key and recompiles. Kept for diagnostic / benchmark
+use; NOT the path that builds the ship cache.
 
-Two driver-mode options:
-  * default            single-process; shape failures abort the run
-  * --legacy-subprocess  subprocess-per-shape; isolated, but produces
-                         cache that doesn't match production access
+SUBPROCESS-PER-SHAPE MODE (--legacy-subprocess). Each shape runs in
+a fresh Python subprocess pointed at its own per-shape cache dirs
+under /cache/per-shape/<shape_key>/{torchinductor,triton}. Fresh
+process state plus isolated cache dirs means each shape's cache key
+is computed from clean kernel state and can be reproduced by a fresh
+production worker pointed at the same per-shape dir. As of 2026-05-14
+THIS IS THE PRODUCTION CACHE-BUILD PATH. Flag name retained for diff
+size; rename deferred. Phase 2 (separate change) teaches the worker
+to switch TORCHINDUCTOR_CACHE_DIR / TRITON_CACHE_DIR per request.
 
-Usage (driver, default single-process):
+See ~/backend/claude_plans/2026-05-14-ltx2-per-shape-cache.md.
+
+Usage (single-process, diagnostic):
   python warmup.py --shapes warmup_shapes.json --output-dir /tmp/warmup
 
-Usage (legacy isolated subprocess):
+Usage (subprocess-per-shape, production cache build):
   python warmup.py --legacy-subprocess --shapes warmup_shapes.json
 
 Usage (single-shape worker, internal -- only used by --legacy-subprocess):
@@ -242,16 +245,19 @@ def _final_summary(
 
 def _run_driver_single_process(args: argparse.Namespace) -> int:
     """
-    Default driver: load VideoGenerator once, generate all shapes in one
-    process, in the order given by warmup_shapes.json.
+    Single-process driver: load VideoGenerator once, generate all shapes
+    in one process, in the order given by warmup_shapes.json.
 
-    The cache produced here is keyed by single-process dynamo state,
-    which is the same state production workers see. Therefore production
-    reads of the cache will hit cleanly.
+    DIAGNOSTIC USE ONLY. The cache produced here is order-dependent:
+    `_dynamo.reset()` clears dynamo state between shapes but not the
+    in-process Triton / CUDA module / autotuner state (we haven't
+    isolated which one), so each shape's compile-cache key reflects
+    state left by earlier shapes. A fresh production worker cannot
+    reproduce those keys. Use --legacy-subprocess to build the ship
+    cache.
 
     A shape that raises an exception aborts the whole run -- single-process
-    has no isolation. Use --legacy-subprocess if you need to debug shape
-    crashes in isolation.
+    has no isolation.
     """
     _ensure_cache_env()
     cfg = _read_shapes_config(args)
@@ -284,9 +290,12 @@ def _run_driver_single_process(args: argparse.Namespace) -> int:
     for idx, shape in enumerate(shapes, 1):
         # Reset dynamo state between shapes so compile-cache keys are keyed
         # only on shape parameters, not on guards accumulated from prior
-        # shapes. Production workers reset before each request, so cache
-        # lookups there match what we bake here. See claude_plans/
-        # 2026-05-13-ltx2-cache-order-dependence.md.
+        # shapes. NOTE (2026-05-14): _dynamo.reset() does not clear the
+        # in-process Triton / CUDA module / autotuner state (we haven't
+        # isolated which one), so single-process warmup still produces
+        # order-dependent caches. The real fix is --legacy-subprocess
+        # (subprocess-per-shape, per-shape cache dirs). See
+        # claude_plans/2026-05-14-ltx2-per-shape-cache.md.
         torch._dynamo.reset()
         torch.cuda.empty_cache()
         w = int(shape["width"])
@@ -358,15 +367,18 @@ def _run_driver_single_process(args: argparse.Namespace) -> int:
 
 def _run_driver_subprocess(args: argparse.Namespace) -> int:
     """
-    Legacy driver: spawn one fresh Python subprocess per shape.
+    Subprocess-per-shape driver: spawn one fresh Python subprocess per
+    shape, each pointed at its own /cache/per-shape/<shape_key>/{torch-
+    inductor,triton} cache directory.
 
-    Useful for crash isolation: if a shape's GPU subprocess dies hard, the
-    other shapes still run. The trade-off is that each subprocess sees
-    fresh dynamo state, so the cache it produces is keyed differently
-    from production's single-process access. Use --single-process (the
-    default) for cache builds intended for production.
+    PRODUCTION CACHE-BUILD PATH (as of 2026-05-14). Fresh-process state
+    plus isolated cache dirs gives each shape a compile-cache key derived
+    from clean kernel state, reproducible by a fresh production worker
+    pointed at the same per-shape dir (Phase 2). Flag name retained for
+    compatibility; rename deferred.
     """
-    _ensure_cache_env()
+    # Parent is just a dispatcher; per-shape cache dirs are set on each
+    # child via env= below, so we do NOT call _ensure_cache_env() here.
     cfg = _read_shapes_config(args)
 
     model = cfg.get("model", "FastVideo/LTX2-Distilled-Diffusers")
@@ -379,13 +391,12 @@ def _run_driver_subprocess(args: argparse.Namespace) -> int:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    inductor_cache = Path(os.environ["TORCHINDUCTOR_CACHE_DIR"])
-    triton_cache = Path(os.environ["TRITON_CACHE_DIR"])
-    cache_before = _du_bytes(inductor_cache) + _du_bytes(triton_cache)
+    per_shape_root = Path("/cache/per-shape")
+    cache_before = _du_bytes(per_shape_root)
     print(
-        f"[warmup] driver start (legacy-subprocess): {len(shapes)} shape(s), "
+        f"[warmup] driver start (subprocess-per-shape): {len(shapes)} shape(s), "
         f"model={model}, cache_before={_human(cache_before)} "
-        f"(inductor={inductor_cache} triton={triton_cache})",
+        f"root={per_shape_root}",
         flush=True,
     )
 
@@ -400,6 +411,11 @@ def _run_driver_subprocess(args: argparse.Namespace) -> int:
         out_path = output_dir / f"shape_{tag}.mp4"
         if out_path.exists():
             out_path.unlink()
+
+        shape_inductor = per_shape_root / tag / "torchinductor"
+        shape_triton = per_shape_root / tag / "triton"
+        shape_inductor.mkdir(parents=True, exist_ok=True)
+        shape_triton.mkdir(parents=True, exist_ok=True)
 
         cmd = [
             sys.executable,
@@ -419,12 +435,21 @@ def _run_driver_subprocess(args: argparse.Namespace) -> int:
             f"[warmup] ({idx}/{len(shapes)}) launching {tag} -> {out_path}",
             flush=True,
         )
+        print(
+            f"[warmup] ({idx}/{len(shapes)}) per-shape cache dir: "
+            f"{per_shape_root}/{tag}",
+            flush=True,
+        )
+        child_env = os.environ.copy()
+        child_env["TORCHINDUCTOR_CACHE_DIR"] = str(shape_inductor)
+        child_env["TRITON_CACHE_DIR"] = str(shape_triton)
         t0 = time.perf_counter()
         try:
             result = subprocess.run(
                 cmd,
                 check=False,
                 timeout=args.per_shape_timeout,
+                env=child_env,
             )
         except subprocess.TimeoutExpired:
             elapsed = time.perf_counter() - t0
@@ -452,7 +477,7 @@ def _run_driver_subprocess(args: argparse.Namespace) -> int:
             if args.fail_fast:
                 break
 
-    cache_after = _du_bytes(inductor_cache) + _du_bytes(triton_cache)
+    cache_after = _du_bytes(per_shape_root)
     return _final_summary(
         successes, failures, len(shapes),
         cache_before, cache_after, args.min_cache_growth_bytes,
