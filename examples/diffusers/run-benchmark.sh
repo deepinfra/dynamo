@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Run benchmark.py inside a baked FastVideo ship image, pinned to a
-# specific GPU UUID. Hides the docker invocation so engineers don't
+# Run ltx2/benchmark.py inside a baked FastVideo ship image, pinned to
+# a specific GPU UUID. Hides the docker invocation so engineers don't
 # need to remember --gpus quoting, --ipc, --shm-size, volume mounts,
 # or working directory.
 #
@@ -19,9 +19,9 @@
 #   nohup ./run-benchmark.sh <image-tag> <gpu-uuid> \
 #     > ~/benchmark.log 2>&1 &
 #
-# The image must be a FastVideo build that contains benchmark.py at
-# /opt/app/benchmark.py and warmup_shapes.json next to it (i.e. the
-# script bind-mounts the local examples/diffusers/ directory over
+# The image must be a FastVideo build that contains ltx2/benchmark.py
+# at /opt/app/ltx2/benchmark.py and ltx2/shapes.json next to it (i.e.
+# the script bind-mounts the local examples/diffusers/ directory over
 # /opt/app inside the container, so whatever is on disk here is what
 # the container sees).
 
@@ -29,9 +29,9 @@ set -euo pipefail
 
 if [[ $# -lt 2 ]]; then
   cat >&2 <<USAGE
-Usage: $0 <image-tag> <gpu-uuid> [output-dir] [extra benchmark.py flags...]
+Usage: $0 <image-tag> <gpu-uuid> [output-dir] [extra ltx2/benchmark.py flags...]
 
-Run benchmark.py inside the given image, pinned to the given GPU UUID.
+Run ltx2/benchmark.py inside the given image, pinned to the given GPU UUID.
 Run this on the SAME host that has the GPU reservation (not your laptop).
 
 Arguments:
@@ -41,7 +41,7 @@ Arguments:
                (find with: nvidia-smi -L)
   output-dir   Where to write MP4s and timings.csv.
                Default: /tmp/benchmark-outputs
-  extra ...    Any further args are forwarded to benchmark.py.
+  extra ...    Any further args are forwarded to ltx2/benchmark.py.
                Useful for --prompt-major (forces shape-switch between
                consecutive generations to test in-memory cache eviction).
 
@@ -86,8 +86,8 @@ exec docker run --rm \
   -v "$OUTPUT_DIR:$OUTPUT_DIR" \
   -w /opt/app \
   "$IMAGE" \
-  python3 benchmark.py \
-    --shapes warmup_shapes.json \
+  python3 ltx2/benchmark.py \
+    --shapes ltx2/shapes.json \
     --output-dir "$OUTPUT_DIR" \
     --csv "$OUTPUT_DIR/timings.csv" \
     --gpu-uuid "$GPU_UUID" \

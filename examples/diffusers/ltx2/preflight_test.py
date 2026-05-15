@@ -2,12 +2,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """
-Standalone smoke-test of FastVideoBackend.preflight() without spinning
+Standalone smoke-test of GenericVideoBackend.preflight() without spinning
 up the Dynamo distributed runtime. Loads the model, runs the preflight
 loop, exits. Logs per-shape timings and total wall time.
 
 Used to verify that a candidate ship image's preflight will:
-  - Find warmup_shapes.json
+  - Find ltx2/shapes.json
   - Successfully warm every shape's in-memory cache
   - Complete in a reasonable wall-clock budget for pod startup
 """
@@ -21,8 +21,10 @@ import os
 import sys
 import time
 
-# Make worker.py importable: this script lives next to it in /opt/app.
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# Put examples/diffusers/ on sys.path so the lib / ltx2 packages
+# resolve. This script lives at examples/diffusers/ltx2/preflight_test.py;
+# parent dir = examples/diffusers/.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def _parse_args() -> argparse.Namespace:
@@ -41,16 +43,30 @@ def _parse_args() -> argparse.Namespace:
 
 
 async def _amain(model: str) -> int:
-    from worker import FastVideoBackend
+    from lib.backend import GenericVideoBackend
+    from ltx2.factory import load_model
 
     backend_args = argparse.Namespace(
         model=model,
+        served_model_name=None,
         num_gpus=1,
         enable_optimizations=False,
         attention_backend="TORCH_SDPA",
     )
 
-    backend = FastVideoBackend(backend_args)
+    backend = GenericVideoBackend(
+        args=backend_args,
+        model_factory_callable=load_model,
+        model_factory_dotted="ltx2.factory:load_model",
+        model_label="ltx2-distilled",
+    )
+
+    # Match production: default the shapes-JSON path so preflight can
+    # find the menu without an explicit env var.
+    if "WARMUP_SHAPES_JSON_PATH" not in os.environ:
+        os.environ["WARMUP_SHAPES_JSON_PATH"] = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "shapes.json"
+        )
 
     t_init = time.perf_counter()
     print("[preflight-test] initialize_model() ...", flush=True)
@@ -80,7 +96,7 @@ async def _amain(model: str) -> int:
 def main() -> int:
     args = _parse_args()
 
-    # Pin GPU before any torch import (worker.py imports torch at module load).
+    # Pin GPU before any torch import (the factory imports torch).
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_uuid
 
     # Match worker.py's logging setup so preflight's log lines look the same.

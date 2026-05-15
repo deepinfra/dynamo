@@ -1,12 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """
-Unit tests for warmup_shapes.json + the menu-hash algorithm.
+Unit tests for ltx2/shapes.json + the menu-hash algorithm.
 
 The hash is the load-bearing identifier across the whole pipeline:
 
   - bake step embeds it in IMAGE_SHAPE_HASH (Dockerfile env)
-  - worker.py asserts it matches at boot (refuses to start on mismatch)
+  - lib/menu.py asserts it matches at boot (refuses to start on mismatch)
   - backend's i model-add admission check rejects images whose hash
     doesn't match the vendored menu
 
@@ -16,7 +16,7 @@ backend/tests/test_ltx_shape_menu.py; both must agree.
 
 This module reimplements the canonical hash inline so it can run in CI
 without FastVideo / torch. A second cross-check test imports the live
-implementation from worker.py and skips if heavy deps aren't available
+implementation from lib.menu and skips if heavy deps aren't available
 -- that's the canary against the in-container algorithm drifting.
 """
 
@@ -30,7 +30,7 @@ import sys
 import pytest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SHAPES_JSON = os.path.join(HERE, "warmup_shapes.json")
+SHAPES_JSON = os.path.join(HERE, "shapes.json")
 
 # Pinned hash for the current 10-shape soft-launch menu. This is the
 # value that ends up in the runtime image tag (e.g. fastvideo-runtime:
@@ -49,11 +49,11 @@ ACTIVATION_BUDGET = INT32_LIMIT // 2
 
 
 def _canonical_menu_hash(shapes_json_path: str) -> tuple[str, int]:
-    """Reimplements worker._compute_menu_hash inline so this test file has
-    no FastVideo / torch dependency. Must stay byte-identical to:
-      - examples/diffusers/worker.py::_compute_menu_hash
+    """Reimplements ``lib.menu.compute_menu_hash`` inline so this test
+    file has no FastVideo / torch dependency. Must stay byte-identical to:
+      - examples/diffusers/lib/menu.py::compute_menu_hash
       - backend/tests/test_ltx_shape_menu.py
-      - the bake step documented in RUNBOOK.md
+      - the bake step documented in ltx2/RUNBOOK.md
     """
     with open(shapes_json_path, "r", encoding="utf-8") as f:
         cfg = json.load(f)
@@ -129,7 +129,7 @@ def test_canonical_menu_hash_changes_when_menu_changes(tmp_path) -> None:
     assertion can't catch drift."""
     cfg = _load_shapes()
     cfg["shapes"].append({"width": 64, "height": 64, "num_frames": 17})
-    new_path = tmp_path / "warmup_shapes_modified.json"
+    new_path = tmp_path / "shapes_modified.json"
     new_path.write_text(json.dumps(cfg))
 
     original_hash, _ = _canonical_menu_hash(SHAPES_JSON)
@@ -143,30 +143,32 @@ def test_canonical_menu_hash_order_independent(tmp_path) -> None:
     reorder for readability without breaking caches."""
     cfg = _load_shapes()
     cfg["shapes"] = list(reversed(cfg["shapes"]))
-    reversed_path = tmp_path / "warmup_shapes_reversed.json"
+    reversed_path = tmp_path / "shapes_reversed.json"
     reversed_path.write_text(json.dumps(cfg))
     h1, _ = _canonical_menu_hash(SHAPES_JSON)
     h2, _ = _canonical_menu_hash(str(reversed_path))
     assert h1 == h2
 
 
-def test_worker_compute_menu_hash_matches_canonical() -> None:
-    """Cross-check: worker.py's live implementation must agree with the
-    inline algorithm. Skipped if FastVideo / torch aren't installed (CI
-    can run the rest of this file without them)."""
-    sys.path.insert(0, HERE)
+def test_lib_compute_menu_hash_matches_canonical() -> None:
+    """Cross-check: ``lib.menu.compute_menu_hash``'s live implementation
+    must agree with the inline algorithm. Skipped if the package isn't
+    importable in this env (e.g., CI runs without the package root on
+    sys.path)."""
+    # Put examples/diffusers/ on sys.path so ``lib.menu`` resolves.
+    sys.path.insert(0, os.path.dirname(HERE))
     # Pre-declare so static analyzers (CodeQL) don't flag the call site
     # below as potentially-unbound. pytest.skip() raises so the call is
     # actually unreachable on the ImportError path, but the analyzer
     # doesn't model that.
-    _compute_menu_hash = None
+    compute_menu_hash = None
     try:
-        from worker import _compute_menu_hash  # type: ignore
+        from lib.menu import compute_menu_hash  # type: ignore
     except ImportError as exc:
-        pytest.skip(f"worker.py not importable in this env: {exc}")
+        pytest.skip(f"lib.menu not importable in this env: {exc}")
     canonical_hash, _ = _canonical_menu_hash(SHAPES_JSON)
-    worker_hash, _ = _compute_menu_hash(SHAPES_JSON)
-    assert canonical_hash == worker_hash
+    library_hash, _ = compute_menu_hash(SHAPES_JSON)
+    assert canonical_hash == library_hash
 
 
 if __name__ == "__main__":

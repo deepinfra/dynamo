@@ -22,8 +22,8 @@ distilled models (refine + tiling + compile); a different model family
 may want to edit those defaults.
 
 Usage (inside the container):
-  python3 benchmark.py \\
-    --shapes warmup_shapes.json \\
+  python3 ltx2/benchmark.py \\
+    --shapes ltx2/shapes.json \\
     --output-dir /tmp/benchmark-outputs \\
     --csv /tmp/benchmark-outputs/timings.csv \\
     --gpu-uuid GPU-xxxx-yyyy-zzzz
@@ -119,7 +119,11 @@ def _load_generator(model: str):
     import torch  # noqa: F401
     from fastvideo import VideoGenerator
     from fastvideo.configs.pipelines.base import PipelineConfig
-    from ltx2_config import standard_kwargs
+
+    # Put examples/diffusers/ on sys.path so the package import resolves
+    # regardless of where the script is invoked from.
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from ltx2.config import standard_kwargs
 
     print(f"[benchmark] loading VideoGenerator model={model}", flush=True)
     t0 = time.perf_counter()
@@ -145,7 +149,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--shapes",
-        default="warmup_shapes.json",
+        default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "shapes.json"),
         help="path to the shapes JSON (must match the menu the image was baked for)",
     )
     parser.add_argument(
@@ -201,7 +205,7 @@ def main() -> int:
         default=None,
         help="If set, permute shape access order with this seed before the "
         "iteration loop. Tests whether the cache survives customer "
-        "access patterns that differ from warmup_shapes.json order. "
+        "access patterns that differ from shapes.json order. "
         "Default (None): no shuffle, matches warmup access order -- "
         "best-case cache hit. Suggested post-bake validation: one pass "
         "without this flag (matched-order baseline) plus one pass with "
