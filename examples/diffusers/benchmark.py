@@ -43,21 +43,26 @@ import sys
 import time
 from pathlib import Path
 
-
 PROMPTS = [
-    ("dog",
-     "A close-up tracking shot of a golden retriever sprinting toward the "
-     "camera through a sunlit alpine meadow at golden hour, paws kicking up "
-     "wildflowers, ears flapping, tongue out in joyful pants, shallow depth "
-     "of field, shot on ARRI Alexa 65, 4K, photorealistic"),
-    ("city",
-     "Aerial drone shot over Tokyo at twilight, neon-lit skyscrapers "
-     "reflected in rain-slicked streets, cinematic anamorphic lens with "
-     "soft bokeh falloff, dramatic lighting, photorealistic"),
-    ("nature",
-     "A waterfall cascading down moss-covered cliffs in a tropical "
-     "rainforest, mist catching shafts of golden sunlight, slow-motion, "
-     "photorealistic, shot on RED Komodo"),
+    (
+        "dog",
+        "A close-up tracking shot of a golden retriever sprinting toward the "
+        "camera through a sunlit alpine meadow at golden hour, paws kicking up "
+        "wildflowers, ears flapping, tongue out in joyful pants, shallow depth "
+        "of field, shot on ARRI Alexa 65, 4K, photorealistic",
+    ),
+    (
+        "city",
+        "Aerial drone shot over Tokyo at twilight, neon-lit skyscrapers "
+        "reflected in rain-slicked streets, cinematic anamorphic lens with "
+        "soft bokeh falloff, dramatic lighting, photorealistic",
+    ),
+    (
+        "nature",
+        "A waterfall cascading down moss-covered cliffs in a tropical "
+        "rainforest, mist catching shafts of golden sunlight, slow-motion, "
+        "photorealistic, shot on RED Komodo",
+    ),
 ]
 
 
@@ -77,6 +82,7 @@ def _select_gpu(gpu_uuid: str) -> None:
     os.environ["CUDA_VISIBLE_DEVICES"] = gpu_uuid
 
     import torch  # imported here so CUDA_VISIBLE_DEVICES is honoured
+
     if not torch.cuda.is_available():
         print(
             f"[benchmark] FATAL: no CUDA device visible. CUDA_VISIBLE_DEVICES="
@@ -134,7 +140,7 @@ def _load_generator(model: str):
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Benchmark a baked FastVideo ship image: N shapes x M prompts "
-                    "generations, with per-generation timings and saved MP4s.",
+        "generations, with per-generation timings and saved MP4s.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
@@ -161,57 +167,56 @@ def main() -> int:
         "--gpu-uuid",
         required=True,
         help="GPU UUID to pin the run to (e.g. 'GPU-d1062f6e-...'); sets "
-             "CUDA_VISIBLE_DEVICES so torch sees only this device, and "
-             "is recorded in the script's startup log so the benchmark "
-             "output unambiguously identifies which physical GPU it ran on.",
+        "CUDA_VISIBLE_DEVICES so torch sees only this device, and "
+        "is recorded in the script's startup log so the benchmark "
+        "output unambiguously identifies which physical GPU it ran on.",
     )
     parser.add_argument(
         "--prompt-major",
         action="store_true",
         help="Iterate prompts in the OUTER loop (every shape gets prompt 1, "
-             "then every shape gets prompt 2, etc.). Forces a shape switch "
-             "between every two consecutive generations. Useful for measuring "
-             "whether torch.compile's in-memory state survives shape revisits "
-             "or gets evicted -- mimics production where requests come in "
-             "arbitrary shape order. Default (without flag): shape-major, "
-             "which measures first-hit-per-shape and same-shape steady state.",
+        "then every shape gets prompt 2, etc.). Forces a shape switch "
+        "between every two consecutive generations. Useful for measuring "
+        "whether torch.compile's in-memory state survives shape revisits "
+        "or gets evicted -- mimics production where requests come in "
+        "arbitrary shape order. Default (without flag): shape-major, "
+        "which measures first-hit-per-shape and same-shape steady state.",
     )
     parser.add_argument(
         "--reset",
         action="store_true",
         help="Call torch._dynamo.reset() before each generation. Clears "
-             "dynamo's accumulated guard / specialization state so each "
-             "compile happens in 'fresh process' state, producing "
-             "deterministic cache keys regardless of access order. Use this "
-             "to test whether the baked compile cache hits when the access "
-             "pattern (shape order) differs from how the cache was built. If "
-             "every generation lands at ~steady-state with --reset, the "
-             "cache is fully usable and we can use the same reset() in "
-             "production worker.py for predictable performance.",
+        "dynamo's accumulated guard / specialization state so each "
+        "compile happens in 'fresh process' state, producing "
+        "deterministic cache keys regardless of access order. Use this "
+        "to test whether the baked compile cache hits when the access "
+        "pattern (shape order) differs from how the cache was built. If "
+        "every generation lands at ~steady-state with --reset, the "
+        "cache is fully usable and we can use the same reset() in "
+        "production worker.py for predictable performance.",
     )
     parser.add_argument(
         "--shuffle-seed",
         type=int,
         default=None,
         help="If set, permute shape access order with this seed before the "
-             "iteration loop. Tests whether the cache survives customer "
-             "access patterns that differ from warmup_shapes.json order. "
-             "Default (None): no shuffle, matches warmup access order -- "
-             "best-case cache hit. Suggested post-bake validation: one pass "
-             "without this flag (matched-order baseline) plus one pass with "
-             "--shuffle-seed 42 (customer-like permutation); if the shuffled "
-             "pass shows any shape with cold-compile latency, the cache is "
-             "order-dependent and the bake is partially broken.",
+        "iteration loop. Tests whether the cache survives customer "
+        "access patterns that differ from warmup_shapes.json order. "
+        "Default (None): no shuffle, matches warmup access order -- "
+        "best-case cache hit. Suggested post-bake validation: one pass "
+        "without this flag (matched-order baseline) plus one pass with "
+        "--shuffle-seed 42 (customer-like permutation); if the shuffled "
+        "pass shows any shape with cold-compile latency, the cache is "
+        "order-dependent and the bake is partially broken.",
     )
     parser.add_argument(
         "--num-prompts",
         type=int,
         default=None,
         help="If set, use only the first N prompts from the hardcoded "
-             "PROMPTS list (default: all %d). For validation use 1 -- "
-             "sufficient to detect cold-compile latency per shape without "
-             "paying for redundant warm-state generations."
-             % len(PROMPTS),
+        "PROMPTS list (default: all %d). For validation use 1 -- "
+        "sufficient to detect cold-compile latency per shape without "
+        "paying for redundant warm-state generations." % len(PROMPTS),
     )
     args = parser.parse_args()
 
@@ -222,7 +227,7 @@ def main() -> int:
                 f"--num-prompts must be in [1, {len(PROMPTS)}], "
                 f"got {args.num_prompts}"
             )
-        prompts = PROMPTS[:args.num_prompts]
+        prompts = PROMPTS[: args.num_prompts]
         print(
             f"[benchmark] limited to first {args.num_prompts} of "
             f"{len(PROMPTS)} prompts",
@@ -244,6 +249,7 @@ def main() -> int:
 
     if args.shuffle_seed is not None:
         import random
+
         rng = random.Random(args.shuffle_seed)
         permuted = list(range(len(shapes)))
         rng.shuffle(permuted)
@@ -271,7 +277,7 @@ def main() -> int:
         flush=True,
     )
     print(
-        f"[benchmark]   watch -n 30 \"tail -20 ~/benchmark.log; echo; "
+        f'[benchmark]   watch -n 30 "tail -20 ~/benchmark.log; echo; '
         f"echo done: \\$(grep -cF '-> ' ~/benchmark.log) / {total}\"",
         flush=True,
     )
@@ -285,11 +291,19 @@ def main() -> int:
 
     with open(args.csv, "w", newline="", encoding="utf-8") as csv_file:
         writer = csv.writer(csv_file)
-        writer.writerow([
-            "shape", "width", "height", "num_frames",
-            "prompt_id", "seed", "wall_seconds",
-            "output_mp4", "mp4_bytes",
-        ])
+        writer.writerow(
+            [
+                "shape",
+                "width",
+                "height",
+                "num_frames",
+                "prompt_id",
+                "seed",
+                "wall_seconds",
+                "output_mp4",
+                "mp4_bytes",
+            ]
+        )
         csv_file.flush()
 
         n = 0
@@ -313,7 +327,11 @@ def main() -> int:
 
         for shape_idx, prompt_idx in order:
             shape = shapes[shape_idx]
-            w, h, nf = int(shape["width"]), int(shape["height"]), int(shape["num_frames"])
+            w, h, nf = (
+                int(shape["width"]),
+                int(shape["height"]),
+                int(shape["num_frames"]),
+            )
             tag = f"{w}x{h}@{nf}f"
             prompt_id, prompt_text = prompts[prompt_idx]
 
@@ -332,6 +350,7 @@ def main() -> int:
                 # next compile happens in fresh state and produces deterministic
                 # cache keys regardless of access order.
                 import torch._dynamo
+
                 torch._dynamo.reset()
 
             t0 = time.perf_counter()
@@ -352,24 +371,41 @@ def main() -> int:
                 elapsed = time.perf_counter() - t0
                 size = out_path.stat().st_size if out_path.exists() else 0
                 print(
-                    f"[benchmark]   -> {elapsed:.1f}s  "
-                    f"({size / 1_048_576:.1f} MB)",
+                    f"[benchmark]   -> {elapsed:.1f}s  " f"({size / 1_048_576:.1f} MB)",
                     flush=True,
                 )
-                writer.writerow([
-                    tag, w, h, nf, prompt_id, seed,
-                    f"{elapsed:.2f}", str(out_path), size,
-                ])
+                writer.writerow(
+                    [
+                        tag,
+                        w,
+                        h,
+                        nf,
+                        prompt_id,
+                        seed,
+                        f"{elapsed:.2f}",
+                        str(out_path),
+                        size,
+                    ]
+                )
             except Exception as exc:
                 elapsed = time.perf_counter() - t0
                 print(
                     f"[benchmark]   FAIL after {elapsed:.1f}s: {exc!r}",
                     flush=True,
                 )
-                writer.writerow([
-                    tag, w, h, nf, prompt_id, seed,
-                    f"{elapsed:.2f}", "", 0,
-                ])
+                writer.writerow(
+                    [
+                        tag,
+                        w,
+                        h,
+                        nf,
+                        prompt_id,
+                        seed,
+                        f"{elapsed:.2f}",
+                        "",
+                        0,
+                    ]
+                )
             csv_file.flush()
 
     print(f"[benchmark] done. timings -> {args.csv}", flush=True)

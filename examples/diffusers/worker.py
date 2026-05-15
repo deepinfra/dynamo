@@ -255,7 +255,7 @@ def _load_generator(
     path and the pool-mode _pool_worker_main entrypoint, so the two paths
     produce byte-identical compile-cache keys (same kwargs → same key).
     """
-    from ltx2_config import standard_kwargs, fp4_kwargs
+    from ltx2_config import fp4_kwargs, standard_kwargs
 
     pipeline_config = PipelineConfig.from_pretrained(model_name)
 
@@ -268,7 +268,8 @@ def _load_generator(
                 "FP4 quantization is only supported on NVIDIA Blackwell GPUs "
                 "(compute capability 10.0+). Detected compute capability: %d.%d. "
                 "Continuing without FP4 optimizations.",
-                major, minor,
+                major,
+                minor,
             )
             optimization_kwargs = standard_kwargs()
         else:
@@ -360,9 +361,9 @@ class SubprocessPool:
         self.num_gpus = num_gpus
         self.enable_optimizations = enable_optimizations
         self.attention_backend = attention_backend
-        self._handles: collections.OrderedDict[str, _SubprocessHandle] = (
-            collections.OrderedDict()
-        )
+        self._handles: collections.OrderedDict[
+            str, _SubprocessHandle
+        ] = collections.OrderedDict()
         self._pool_lock = asyncio.Lock()
 
     async def route(self, shape_key: str, request: dict) -> dict:
@@ -447,8 +448,7 @@ class SubprocessPool:
         if kind == "ERROR":
             POOL_REQUEST_TOTAL.labels(shape_key=shape_key, status="ERROR").inc()
             err = (
-                f"{msg.get('exception_type', '?')} "
-                f"{msg.get('exception_repr', '?')}"
+                f"{msg.get('exception_type', '?')} " f"{msg.get('exception_repr', '?')}"
             )
             return {"status": "ERROR", "request_id": request_id, "error": err}
         if kind == "FATAL":
@@ -461,12 +461,12 @@ class SubprocessPool:
             # FATAL). _kill waits up to SIGTERM grace, then SIGKILLs if
             # still alive, then cancels drainers and closes the conn.
             await self._kill(handle)
-            err = (
-                f"{msg.get('reason', '?')}: "
-                f"{msg.get('exception_repr', '?')}"
-            )
+            err = f"{msg.get('reason', '?')}: " f"{msg.get('exception_repr', '?')}"
             logger.error(
-                "[pool/%s] FATAL %s. diag tail:\n%s", shape_key, err, tail,
+                "[pool/%s] FATAL %s. diag tail:\n%s",
+                shape_key,
+                err,
+                tail,
             )
             return {"status": "FATAL", "request_id": request_id, "error": err}
 
@@ -492,10 +492,12 @@ class SubprocessPool:
         Runs the blocking poll/recv in a worker thread so the asyncio
         event loop stays responsive during long generation calls.
         """
+
         def _do() -> dict:
             if not handle.conn.poll(timeout):
                 raise asyncio.TimeoutError()
             return handle.conn.recv()
+
         return await asyncio.to_thread(_do)
 
     def _update_pool_size(self) -> None:
@@ -537,18 +539,24 @@ class SubprocessPool:
             sys.executable,
             os.path.abspath(__file__),
             "--pool-worker",
-            "--shape-key", shape_key,
-            "--model", self.model_path,
-            "--num-gpus", str(self.num_gpus),
-            "--attention-backend", self.attention_backend,
-            "--protocol-fd", str(child_conn.fileno()),
+            "--shape-key",
+            shape_key,
+            "--model",
+            self.model_path,
+            "--num-gpus",
+            str(self.num_gpus),
+            "--attention-backend",
+            self.attention_backend,
+            "--protocol-fd",
+            str(child_conn.fileno()),
         ]
         if self.enable_optimizations:
             cmd.append("--enable-optimizations")
 
         logger.info(
             "[pool/%s] spawning subprocess (cache=%s)",
-            shape_key, inductor_dir,
+            shape_key,
+            inductor_dir,
         )
         try:
             try:
@@ -648,13 +656,18 @@ class SubprocessPool:
                 text = line.decode(errors="replace").rstrip("\n")
                 handle.diag_buf.append(text)
                 logger.info(
-                    "[pool/%s/%s] %s", handle.shape_key, label, text,
+                    "[pool/%s/%s] %s",
+                    handle.shape_key,
+                    label,
+                    text,
                 )
         except asyncio.CancelledError:
             return
         except Exception:
             logger.exception(
-                "[pool/%s] %s drainer crashed", handle.shape_key, label,
+                "[pool/%s] %s drainer crashed",
+                handle.shape_key,
+                label,
             )
 
     async def _evict_lru(self) -> None:
@@ -663,8 +676,11 @@ class SubprocessPool:
             return
         shape_key, handle = next(iter(self._handles.items()))
         POOL_EVICTION_TOTAL.labels(shape_key=shape_key).inc()
-        logger.info("[pool/%s] evicting LRU (idle %.0fs)",
-                    shape_key, time.monotonic() - handle.last_used)
+        logger.info(
+            "[pool/%s] evicting LRU (idle %.0fs)",
+            shape_key,
+            time.monotonic() - handle.last_used,
+        )
         self._handles.pop(shape_key, None)
         self._update_pool_size()
         await self._kill(handle)
@@ -686,7 +702,8 @@ class SubprocessPool:
                 proc.terminate()
             try:
                 await asyncio.wait_for(
-                    proc.wait(), timeout=LTX2_POOL_SIGTERM_GRACE_S,
+                    proc.wait(),
+                    timeout=LTX2_POOL_SIGTERM_GRACE_S,
                 )
             except asyncio.TimeoutError:
                 logger.warning(
@@ -748,7 +765,8 @@ class FastVideoBackend:
             logger.info(
                 "pool mode enabled: creating SubprocessPool "
                 "(max=%d, model=%s); no in-process generator load",
-                LTX2_POOL_MAX_SIZE, self.model_name,
+                LTX2_POOL_MAX_SIZE,
+                self.model_name,
             )
             self.pool = SubprocessPool(
                 model_path=self.model_name,
@@ -923,21 +941,25 @@ class FastVideoBackend:
                     elapsed = time.perf_counter() - t_shape
                     logger.error(
                         "preflight: %s FAILED after %.1fs",
-                        tag, elapsed, exc_info=True,
+                        tag,
+                        elapsed,
+                        exc_info=True,
                     )
                     raise RuntimeError(
                         "preflight failed for shape %s; refusing to start. "
                         "Likely cause: baked compile cache doesn't cover this "
                         "shape, or a code/version mismatch between the warmup "
                         "that built the cache and this worker. See "
-                        "dynamo/examples/diffusers/RUNBOOK.md."
-                        % tag
+                        "dynamo/examples/diffusers/RUNBOOK.md." % tag
                     ) from exc
 
                 elapsed = time.perf_counter() - t_shape
                 logger.info(
                     "preflight: %s warmed in %.1fs (%d/%d)",
-                    tag, elapsed, idx, len(shapes),
+                    tag,
+                    elapsed,
+                    idx,
+                    len(shapes),
                 )
 
         total = time.perf_counter() - t_total
@@ -961,9 +983,7 @@ class FastVideoBackend:
         shape_key = f"{width}x{height}@{num_frames}f"
         # Don't pre-create the file — fastvideo's generate_video writes
         # the path itself. Use a deterministic name keyed on video_id.
-        output_path = os.path.join(
-            tempfile.gettempdir(), f"ltx2-{video_id}.mp4"
-        )
+        output_path = os.path.join(tempfile.gettempdir(), f"ltx2-{video_id}.mp4")
         if os.path.exists(output_path):
             os.unlink(output_path)
 
@@ -1000,7 +1020,8 @@ class FastVideoBackend:
                 )
             logger.info(
                 "[%s] pool subprocess gen %dms",
-                video_id, result.get("elapsed_ms", 0),
+                video_id,
+                result.get("elapsed_ms", 0),
             )
             with open(output_path, "rb") as f:
                 return f.read()
@@ -1011,7 +1032,9 @@ class FastVideoBackend:
             except OSError as exc:
                 logger.warning(
                     "[%s] failed to delete %s: %s",
-                    video_id, output_path, exc,
+                    video_id,
+                    output_path,
+                    exc,
                 )
 
     @dynamo_endpoint(VideoCreateRequest, VideoCreateResponse)
@@ -1150,7 +1173,9 @@ async def _register_model(endpoint, served_name: str, model_path: str) -> None:
             model_path,
             served_name,
         )
-        logger.info("Successfully registered model: %s (path=%s)", served_name, model_path)
+        logger.info(
+            "Successfully registered model: %s (path=%s)", served_name, model_path
+        )
     except Exception as e:
         logger.error("Failed to register model: %s", e, exc_info=True)
         raise RuntimeError("Model registration failed") from e
@@ -1212,7 +1237,8 @@ async def backend_worker(runtime: DistributedRuntime, args: argparse.Namespace) 
         )
     else:
         logger.info(
-            "Pool metrics enabled on DYN_SYSTEM_PORT=%d", _system_port_int,
+            "Pool metrics enabled on DYN_SYSTEM_PORT=%d",
+            _system_port_int,
         )
 
     try:
@@ -1302,8 +1328,7 @@ def _compute_menu_hash(shapes_json_path: str) -> tuple[str, int]:
     with open(shapes_json_path, "r", encoding="utf-8") as f:
         cfg = json.load(f)
     shapes = sorted(
-        (int(s["width"]), int(s["height"]), int(s["num_frames"]))
-        for s in cfg["shapes"]
+        (int(s["width"]), int(s["height"]), int(s["num_frames"])) for s in cfg["shapes"]
     )
     canonical = json.dumps(shapes, separators=(",", ":"))
     return hashlib.sha256(canonical.encode()).hexdigest()[:8], len(shapes)
@@ -1392,18 +1417,21 @@ def _set_parent_death_signal(sig: int = signal.SIGTERM) -> None:
     """
     try:
         import ctypes
+
         libc = ctypes.CDLL("libc.so.6", use_errno=True)
         PR_SET_PDEATHSIG = 1
         if libc.prctl(PR_SET_PDEATHSIG, sig, 0, 0, 0) != 0:
             errno = ctypes.get_errno()
             print(
                 f"[pool-worker] prctl(PR_SET_PDEATHSIG) failed errno={errno}",
-                file=sys.stderr, flush=True,
+                file=sys.stderr,
+                flush=True,
             )
     except (OSError, AttributeError) as exc:
         print(
             f"[pool-worker] PR_SET_PDEATHSIG unavailable: {exc}",
-            file=sys.stderr, flush=True,
+            file=sys.stderr,
+            flush=True,
         )
 
 
@@ -1469,8 +1497,11 @@ def _pool_worker_main(
     def _on_sigterm(_signum, _frame):
         # Clean exit on SIGTERM (parent's eviction path); a blocked
         # conn.recv() would otherwise sit on the syscall forever.
-        print(f"[pool-worker/{shape_key}] SIGTERM received, exiting",
-              file=sys.stderr, flush=True)
+        print(
+            f"[pool-worker/{shape_key}] SIGTERM received, exiting",
+            file=sys.stderr,
+            flush=True,
+        )
         with suppress(Exception):
             conn.close()
         sys.exit(0)
@@ -1480,14 +1511,16 @@ def _pool_worker_main(
     print(
         f"[pool-worker/{shape_key}] loading model={model_path} "
         f"num_gpus={num_gpus} enable_optimizations={enable_optimizations}",
-        file=sys.stderr, flush=True,
+        file=sys.stderr,
+        flush=True,
     )
     t_load = time.perf_counter()
     generator = _load_generator(model_path, num_gpus, enable_optimizations)
     load_s = time.perf_counter() - t_load
     print(
         f"[pool-worker/{shape_key}] generator ready in {load_s:.1f}s",
-        file=sys.stderr, flush=True,
+        file=sys.stderr,
+        flush=True,
     )
 
     try:
@@ -1502,12 +1535,16 @@ def _pool_worker_main(
             if not isinstance(req, dict) or req.get("kind") != "REQUEST":
                 # Malformed message from parent (shouldn't happen with our
                 # well-typed sender, but report and keep going).
-                conn.send({
-                    "kind": "ERROR",
-                    "request_id": req.get("request_id", "_") if isinstance(req, dict) else "_",
-                    "exception_type": "ProtocolError",
-                    "exception_repr": f"unexpected message {req!r}",
-                })
+                conn.send(
+                    {
+                        "kind": "ERROR",
+                        "request_id": req.get("request_id", "_")
+                        if isinstance(req, dict)
+                        else "_",
+                        "exception_type": "ProtocolError",
+                        "exception_repr": f"unexpected message {req!r}",
+                    }
+                )
                 continue
             request_id = req.get("request_id", "_")
             try:
@@ -1531,11 +1568,13 @@ def _pool_worker_main(
                 t0 = time.perf_counter()
                 generator.generate_video(**kwargs)
                 elapsed_ms = int((time.perf_counter() - t0) * 1000)
-                conn.send({
-                    "kind": "DONE",
-                    "request_id": request_id,
-                    "elapsed_ms": elapsed_ms,
-                })
+                conn.send(
+                    {
+                        "kind": "DONE",
+                        "request_id": request_id,
+                        "elapsed_ms": elapsed_ms,
+                    }
+                )
             except Exception as exc:  # noqa: BLE001
                 msg = str(exc)
                 # CUDA-context-corrupting failures (OOM and other CUDA errors)
@@ -1550,15 +1589,18 @@ def _pool_worker_main(
                     # runs. The parent detects subprocess death via the
                     # drainer / recv EOF either way.
                     with suppress(Exception):
-                        conn.send({
-                            "kind": "FATAL",
-                            "request_id": request_id,
-                            "reason": "CUDA_FAULT",
-                            "exception_repr": repr(exc),
-                        })
+                        conn.send(
+                            {
+                                "kind": "FATAL",
+                                "request_id": request_id,
+                                "reason": "CUDA_FAULT",
+                                "exception_repr": repr(exc),
+                            }
+                        )
                     print(
                         f"[pool-worker/{shape_key}] CUDA fault, exiting",
-                        file=sys.stderr, flush=True,
+                        file=sys.stderr,
+                        flush=True,
                     )
                     with suppress(Exception):
                         conn.close()
@@ -1566,12 +1608,14 @@ def _pool_worker_main(
                 # Recoverable per-request error (validation, bad prompt, etc.).
                 # Report and stay alive — the persistent subprocess is the
                 # whole point of the pool; don't respawn on soft failures.
-                conn.send({
-                    "kind": "ERROR",
-                    "request_id": request_id,
-                    "exception_type": type(exc).__name__,
-                    "exception_repr": repr(exc),
-                })
+                conn.send(
+                    {
+                        "kind": "ERROR",
+                        "request_id": request_id,
+                        "exception_type": type(exc).__name__,
+                        "exception_repr": repr(exc),
+                    }
+                )
     except (BrokenPipeError, ConnectionResetError, OSError) as exc:
         # Parent disconnected mid-protocol (READY send, request-loop send,
         # or recv-side OSError). Exit cleanly with code 0 -- the parent
@@ -1581,7 +1625,8 @@ def _pool_worker_main(
         # consumer.
         print(
             f"[pool-worker/{shape_key}] parent connection lost: {exc}",
-            file=sys.stderr, flush=True,
+            file=sys.stderr,
+            flush=True,
         )
         with suppress(Exception):
             conn.close()
@@ -1610,7 +1655,8 @@ def _pool_worker_dispatch_if_requested() -> None:
     sub_parser.add_argument("--num-gpus", type=int, default=1)
     sub_parser.add_argument("--enable-optimizations", action="store_true")
     sub_parser.add_argument(
-        "--attention-backend", default=DEFAULT_ATTENTION_BACKEND,
+        "--attention-backend",
+        default=DEFAULT_ATTENTION_BACKEND,
     )
     sub_parser.add_argument("--protocol-fd", required=True, type=int)
     sub_args = sub_parser.parse_args()
@@ -1620,14 +1666,16 @@ def _pool_worker_dispatch_if_requested() -> None:
         stream=sys.stderr,
         force=True,
     )
-    sys.exit(_pool_worker_main(
-        shape_key=sub_args.shape_key,
-        model_path=sub_args.model,
-        num_gpus=sub_args.num_gpus,
-        enable_optimizations=sub_args.enable_optimizations,
-        attention_backend=sub_args.attention_backend,
-        protocol_fd=sub_args.protocol_fd,
-    ))
+    sys.exit(
+        _pool_worker_main(
+            shape_key=sub_args.shape_key,
+            model_path=sub_args.model,
+            num_gpus=sub_args.num_gpus,
+            enable_optimizations=sub_args.enable_optimizations,
+            attention_backend=sub_args.attention_backend,
+            protocol_fd=sub_args.protocol_fd,
+        )
+    )
 
 
 if __name__ == "__main__":

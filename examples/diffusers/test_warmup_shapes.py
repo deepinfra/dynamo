@@ -58,8 +58,7 @@ def _canonical_menu_hash(shapes_json_path: str) -> tuple[str, int]:
     with open(shapes_json_path, "r", encoding="utf-8") as f:
         cfg = json.load(f)
     shapes = sorted(
-        (int(s["width"]), int(s["height"]), int(s["num_frames"]))
-        for s in cfg["shapes"]
+        (int(s["width"]), int(s["height"]), int(s["num_frames"])) for s in cfg["shapes"]
     )
     canonical = json.dumps(shapes, separators=(",", ":"))
     return hashlib.sha256(canonical.encode()).hexdigest()[:8], len(shapes)

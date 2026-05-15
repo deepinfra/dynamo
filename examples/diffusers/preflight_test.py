@@ -65,8 +65,7 @@ async def _amain(model: str) -> int:
     print("[preflight-test] preflight() ...", flush=True)
     await backend.preflight()
     print(
-        "[preflight-test] preflight() done in %.1fs"
-        % (time.perf_counter() - t_pre),
+        "[preflight-test] preflight() done in %.1fs" % (time.perf_counter() - t_pre),
         flush=True,
     )
 
