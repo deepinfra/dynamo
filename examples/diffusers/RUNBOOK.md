@@ -261,6 +261,48 @@ Look at the actual error in `~/warmup.log`. Common modes:
 
 ---
 
+## Metrics
+
+Pool-internal metrics (subprocess pool size, spawns, evictions, request counts/latencies by shape, subprocess failures by reason) are emitted via Dynamo's worker-side `system_status_server`. This is a **separate HTTP endpoint** from the frontend's `/metrics` — the frontend does not aggregate worker metrics.
+
+### Required deployment environment
+
+Set on the worker pod:
+
+- `DYN_SYSTEM_PORT` — port for the metrics HTTP server (default: `-1`, disabled). Recommended: `9090`.
+- `DYN_SYSTEM_HOST` — bind address (default: `127.0.0.1`). Set to `0.0.0.0` if the scrape needs to reach across pod-network boundaries.
+- A `containerPort: 9090` declaration in the worker's k8s manifest.
+- A Prometheus scrape config targeting this port on worker pods (separate from the frontend scrape on `:8000`).
+
+Without these, `worker.py` logs a WARNING at startup:
+
+```
+DYN_SYSTEM_PORT is not set (or is '-1'); pool metrics will NOT be exposed.
+```
+
+### Metrics emitted
+
+All metrics prefixed `ltx2_pool_`, auto-injected with Dynamo hierarchy labels (`dynamo_namespace`, `dynamo_component`, `dynamo_endpoint`, `model`, `model_name`):
+
+| Metric | Type | Labels | Use |
+|---|---|---|---|
+| `ltx2_pool_size` | Gauge | — | Current live subprocess count |
+| `ltx2_pool_spawn_total` | Counter | `shape_key` | Pool churn rate; high values per shape suggest LRU thrash |
+| `ltx2_pool_eviction_total` | Counter | `shape_key` | LRU evictions; matches spawn rate if pool is saturated |
+| `ltx2_pool_request_total` | Counter | `shape_key`, `status` | Throughput; status ∈ {DONE, ERROR, FATAL} |
+| `ltx2_pool_request_latency_seconds` | Histogram | `shape_key` | End-to-end pool latency (route entry → DONE response) |
+| `ltx2_pool_cold_spawn_seconds` | Histogram | `shape_key` | Time from fork to READY message |
+| `ltx2_pool_subprocess_failure_total` | Counter | `reason` | Failure breakdown; reason ∈ {cuda_fault, parent_disconnect, spawn_timeout, spawn_eof, spawn_parse_error, gen_timeout, gen_eof, desync, parse_error, send_failed} |
+
+### Recommended alerts
+
+- `rate(ltx2_pool_eviction_total[5m]) > 0.1` — pool is thrashing; consider bumping `LTX2_POOL_MAX_SIZE` or pruning the shape menu.
+- `histogram_quantile(0.95, rate(ltx2_pool_cold_spawn_seconds_bucket[10m])) > 60` — cold-spawn latency degraded.
+- `rate(ltx2_pool_subprocess_failure_total{reason="cuda_fault"}[5m]) > 0` — CUDA faults observed; investigate.
+- `rate(ltx2_pool_request_total{status="FATAL"}[5m]) > 0` — same as above, surfaced from the request path.
+
+---
+
 ## What's in the cache
 
 The baked `/cache` contains:
