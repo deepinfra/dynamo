@@ -52,10 +52,9 @@ import os
 import subprocess
 import sys
 import time
-
-import torch
 from pathlib import Path
 
+import torch
 
 PROMPT = (
     "A close-up tracking shot of a golden retriever sprinting toward the camera "
@@ -360,8 +359,12 @@ def _run_driver_single_process(args: argparse.Namespace) -> int:
 
     cache_after = _du_bytes(inductor_cache) + _du_bytes(triton_cache)
     return _final_summary(
-        successes, failures, len(shapes),
-        cache_before, cache_after, args.min_cache_growth_bytes,
+        successes,
+        failures,
+        len(shapes),
+        cache_before,
+        cache_after,
+        args.min_cache_growth_bytes,
     )
 
 
@@ -421,15 +424,24 @@ def _run_driver_subprocess(args: argparse.Namespace) -> int:
             sys.executable,
             __file__,
             "--single-shape",
-            "--model", model,
-            "--width", str(w),
-            "--height", str(h),
-            "--num-frames", str(nf),
-            "--fps", str(fps),
-            "--num-inference-steps", str(num_inference_steps),
-            "--guidance-scale", str(guidance_scale),
-            "--seed", str(seed),
-            "--output", str(out_path),
+            "--model",
+            model,
+            "--width",
+            str(w),
+            "--height",
+            str(h),
+            "--num-frames",
+            str(nf),
+            "--fps",
+            str(fps),
+            "--num-inference-steps",
+            str(num_inference_steps),
+            "--guidance-scale",
+            str(guidance_scale),
+            "--seed",
+            str(seed),
+            "--output",
+            str(out_path),
         ]
         print(
             f"[warmup] ({idx}/{len(shapes)}) launching {tag} -> {out_path}",
@@ -479,8 +491,12 @@ def _run_driver_subprocess(args: argparse.Namespace) -> int:
 
     cache_after = _du_bytes(per_shape_root)
     return _final_summary(
-        successes, failures, len(shapes),
-        cache_before, cache_after, args.min_cache_growth_bytes,
+        successes,
+        failures,
+        len(shapes),
+        cache_before,
+        cache_after,
+        args.min_cache_growth_bytes,
     )
 
 
@@ -490,33 +506,46 @@ def _run_driver_subprocess(args: argparse.Namespace) -> int:
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="LTX-2 warmup / compile-cache populator. Default: single-process "
-                    "(matches production access). Use --legacy-subprocess for "
-                    "crash-isolated debug runs.",
+        "(matches production access). Use --legacy-subprocess for "
+        "crash-isolated debug runs.",
     )
     p.add_argument(
-        "--single-shape", action="store_true",
+        "--single-shape",
+        action="store_true",
         help="(internal) run one shape and exit; only used by --legacy-subprocess",
     )
 
     # driver args
     p.add_argument(
-        "--legacy-subprocess", action="store_true",
+        "--legacy-subprocess",
+        action="store_true",
         help="legacy driver mode: spawn one Python subprocess per shape. "
-             "Produces a cache keyed by fresh-process dynamo state, which "
-             "does NOT match production single-process access. Use only for "
-             "crash-isolation debugging.",
+        "Produces a cache keyed by fresh-process dynamo state, which "
+        "does NOT match production single-process access. Use only for "
+        "crash-isolation debugging.",
     )
-    p.add_argument("--shapes", default="warmup_shapes.json",
-                   help="path to shapes JSON")
-    p.add_argument("--output-dir", default="/tmp/warmup",
-                   help="where to save rendered MP4s")
-    p.add_argument("--per-shape-timeout", type=int, default=1800,
-                   help="per-shape subprocess timeout in seconds (legacy-subprocess only)")
-    p.add_argument("--fail-fast", action="store_true",
-                   help="stop on first shape failure (legacy-subprocess only; "
-                        "single-process always fails fast)")
-    p.add_argument("--min-cache-growth-bytes", type=int, default=0,
-                   help="fail if combined cache grew by fewer bytes than this")
+    p.add_argument("--shapes", default="warmup_shapes.json", help="path to shapes JSON")
+    p.add_argument(
+        "--output-dir", default="/tmp/warmup", help="where to save rendered MP4s"
+    )
+    p.add_argument(
+        "--per-shape-timeout",
+        type=int,
+        default=1800,
+        help="per-shape subprocess timeout in seconds (legacy-subprocess only)",
+    )
+    p.add_argument(
+        "--fail-fast",
+        action="store_true",
+        help="stop on first shape failure (legacy-subprocess only; "
+        "single-process always fails fast)",
+    )
+    p.add_argument(
+        "--min-cache-growth-bytes",
+        type=int,
+        default=0,
+        help="fail if combined cache grew by fewer bytes than this",
+    )
 
     # single-shape args
     p.add_argument("--model", default="FastVideo/LTX2-Distilled-Diffusers")
@@ -536,12 +565,14 @@ def main() -> int:
     args = _parse_args()
     if args.single_shape:
         missing = [
-            name for name, val in [
+            name
+            for name, val in [
                 ("--width", args.width),
                 ("--height", args.height),
                 ("--num-frames", args.num_frames),
                 ("--output", args.output),
-            ] if val is None
+            ]
+            if val is None
         ]
         if missing:
             print(f"[warmup] single-shape mode missing: {missing}", file=sys.stderr)
