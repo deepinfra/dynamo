@@ -64,8 +64,10 @@ import uvloop
 from fastvideo import VideoGenerator
 from fastvideo.configs.pipelines.base import PipelineConfig
 from fastvideo.platforms.interface import AttentionBackendEnum
+from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
 from pydantic import BaseModel, Field
 
+from dynamo.common.utils.prometheus import register_engine_metrics_callback
 from dynamo.llm import ModelInput, ModelType, register_llm  # type: ignore[attr-defined]
 from dynamo.runtime import DistributedRuntime, dynamo_endpoint
 
@@ -100,6 +102,66 @@ LTX2_POOL_GEN_TIMEOUT_S = 1800
 LTX2_POOL_SIGTERM_GRACE_S = 30
 # How many lines of subprocess stderr to retain for crash diagnostics.
 LTX2_POOL_STDERR_RING_LINES = 50
+
+# ── Pool metrics ──────────────────────────────────────────────────────────────
+# Dedicated registry so our series stay isolated from the prometheus_client
+# default registry. The parent registers a callback with the Dynamo runtime via
+# register_engine_metrics_callback(...) so these series flow through the
+# same /metrics scrape pipeline as Dynamo's built-in component metrics, with
+# dynamo_namespace/dynamo_component/dynamo_endpoint/worker_id/model labels
+# auto-injected by the helper. Pool subprocesses do not have an endpoint and
+# therefore do not register a callback -- all accounting happens in the parent.
+LTX2_REGISTRY = CollectorRegistry()
+
+POOL_SIZE = Gauge(
+    "ltx2_pool_size",
+    "Current number of live pool subprocesses",
+    registry=LTX2_REGISTRY,
+)
+POOL_SPAWN_TOTAL = Counter(
+    "ltx2_pool_spawn_total",
+    "Pool subprocess spawns",
+    ["shape_key"],
+    registry=LTX2_REGISTRY,
+)
+POOL_EVICTION_TOTAL = Counter(
+    "ltx2_pool_eviction_total",
+    "Pool LRU evictions",
+    ["shape_key"],
+    registry=LTX2_REGISTRY,
+)
+POOL_REQUEST_TOTAL = Counter(
+    "ltx2_pool_request_total",
+    "Pool routed requests by terminal status (clean-response path)",
+    ["shape_key", "status"],  # status: DONE, ERROR, FATAL
+    registry=LTX2_REGISTRY,
+)
+POOL_REQUEST_LATENCY = Histogram(
+    "ltx2_pool_request_latency_seconds",
+    "End-to-end pool request latency (route entry to clean DONE response)",
+    ["shape_key"],
+    buckets=(1, 2, 5, 10, 30, 60, 120, 300, 600, 1200, 1800),
+    registry=LTX2_REGISTRY,
+)
+POOL_COLD_SPAWN_SECONDS = Histogram(
+    "ltx2_pool_cold_spawn_seconds",
+    "Time from subprocess fork to READY message",
+    ["shape_key"],
+    buckets=(10, 25, 50, 100, 150, 200, 250, 300),
+    registry=LTX2_REGISTRY,
+)
+POOL_SUBPROCESS_FAILURE_TOTAL = Counter(
+    "ltx2_pool_subprocess_failure_total",
+    "Subprocess failures by cause",
+    ["reason"],
+    # reason: cuda_fault, spawn_timeout, spawn_eof, spawn_parse_error,
+    #         gen_timeout, gen_eof, desync, parse_error, send_failed.
+    # parent_disconnect is in the conceptual domain but is observed only
+    # from the subprocess (which has no endpoint to emit from), so no
+    # call site increments it today.
+    registry=LTX2_REGISTRY,
+)
+
 # FastVideo exposes NO_ATTENTION in the enum, but it is not a selectable
 # inference backend for this worker's FASTVIDEO_ATTENTION_BACKEND override.
 ATTENTION_BACKEND_CHOICES = tuple(
@@ -313,6 +375,7 @@ class SubprocessPool:
         plus 'request_id'. Raises RuntimeError if the subprocess dies,
         times out, or returns a desynced response.
         """
+        t_request_start = time.monotonic()
         handle = await self._get_or_spawn(shape_key)
         self._handles.move_to_end(shape_key)
         handle.last_used = time.monotonic()
@@ -323,6 +386,7 @@ class SubprocessPool:
         try:
             await asyncio.to_thread(handle.conn.send, payload)
         except (BrokenPipeError, ConnectionResetError, OSError, EOFError) as exc:
+            POOL_SUBPROCESS_FAILURE_TOTAL.labels(reason="send_failed").inc()
             tail = handle.diag_tail()
             await self._discard(shape_key, handle)
             raise RuntimeError(
@@ -333,6 +397,7 @@ class SubprocessPool:
         try:
             msg = await self._recv_msg(handle, LTX2_POOL_GEN_TIMEOUT_S)
         except asyncio.TimeoutError:
+            POOL_SUBPROCESS_FAILURE_TOTAL.labels(reason="gen_timeout").inc()
             tail = handle.diag_tail()
             await self._discard(shape_key, handle)
             raise RuntimeError(
@@ -340,6 +405,7 @@ class SubprocessPool:
                 f"{LTX2_POOL_GEN_TIMEOUT_S}s. diag tail:\n{tail}"
             )
         except (EOFError, OSError, ConnectionError) as exc:
+            POOL_SUBPROCESS_FAILURE_TOTAL.labels(reason="gen_eof").inc()
             tail = handle.diag_tail()
             await self._discard(shape_key, handle)
             raise RuntimeError(
@@ -348,6 +414,7 @@ class SubprocessPool:
             ) from exc
 
         if not isinstance(msg, dict):
+            POOL_SUBPROCESS_FAILURE_TOTAL.labels(reason="parse_error").inc()
             tail = handle.diag_tail()
             await self._discard(shape_key, handle)
             raise RuntimeError(
@@ -357,6 +424,7 @@ class SubprocessPool:
 
         resp_rid = msg.get("request_id")
         if resp_rid != request_id:
+            POOL_SUBPROCESS_FAILURE_TOTAL.labels(reason="desync").inc()
             tail = handle.diag_tail()
             await self._discard(shape_key, handle)
             raise RuntimeError(
@@ -367,20 +435,28 @@ class SubprocessPool:
 
         kind = msg.get("kind")
         if kind == "DONE":
+            POOL_REQUEST_TOTAL.labels(shape_key=shape_key, status="DONE").inc()
+            POOL_REQUEST_LATENCY.labels(shape_key=shape_key).observe(
+                time.monotonic() - t_request_start
+            )
             return {
                 "status": "DONE",
                 "request_id": request_id,
                 "elapsed_ms": int(msg.get("elapsed_ms", 0)),
             }
         if kind == "ERROR":
+            POOL_REQUEST_TOTAL.labels(shape_key=shape_key, status="ERROR").inc()
             err = (
                 f"{msg.get('exception_type', '?')} "
                 f"{msg.get('exception_repr', '?')}"
             )
             return {"status": "ERROR", "request_id": request_id, "error": err}
         if kind == "FATAL":
+            POOL_REQUEST_TOTAL.labels(shape_key=shape_key, status="FATAL").inc()
+            POOL_SUBPROCESS_FAILURE_TOTAL.labels(reason="cuda_fault").inc()
             tail = handle.diag_tail()
             self._handles.pop(shape_key, None)
+            self._update_pool_size()
             # Subprocess is exiting on its own (sys.exit(2) after sending
             # FATAL). _kill waits up to SIGTERM grace, then SIGKILLs if
             # still alive, then cancels drainers and closes the conn.
@@ -394,6 +470,7 @@ class SubprocessPool:
             )
             return {"status": "FATAL", "request_id": request_id, "error": err}
 
+        POOL_SUBPROCESS_FAILURE_TOTAL.labels(reason="parse_error").inc()
         tail = handle.diag_tail()
         await self._discard(shape_key, handle)
         raise RuntimeError(
@@ -421,6 +498,9 @@ class SubprocessPool:
             return handle.conn.recv()
         return await asyncio.to_thread(_do)
 
+    def _update_pool_size(self) -> None:
+        POOL_SIZE.set(len(self._handles))
+
     async def _get_or_spawn(self, shape_key: str) -> _SubprocessHandle:
         async with self._pool_lock:
             handle = self._handles.get(shape_key)
@@ -429,14 +509,17 @@ class SubprocessPool:
             if handle is not None:
                 # In dict but dead — clean up and respawn.
                 self._handles.pop(shape_key, None)
+                self._update_pool_size()
                 await self._kill(handle)
             while len(self._handles) >= LTX2_POOL_MAX_SIZE:
                 await self._evict_lru()
             handle = await self._spawn(shape_key)
             self._handles[shape_key] = handle
+            self._update_pool_size()
             return handle
 
     async def _spawn(self, shape_key: str) -> _SubprocessHandle:
+        POOL_SPAWN_TOTAL.labels(shape_key=shape_key).inc()
         inductor_dir = f"/cache/per-shape/{shape_key}/torchinductor"
         triton_dir = f"/cache/per-shape/{shape_key}/triton"
         env = os.environ.copy()
@@ -505,12 +588,14 @@ class SubprocessPool:
             try:
                 msg = await self._recv_msg(handle, LTX2_POOL_SPAWN_TIMEOUT_S)
             except asyncio.TimeoutError:
+                POOL_SUBPROCESS_FAILURE_TOTAL.labels(reason="spawn_timeout").inc()
                 tail = handle.diag_tail()
                 raise RuntimeError(
                     f"subprocess for {shape_key} failed to reach READY "
                     f"within {LTX2_POOL_SPAWN_TIMEOUT_S}s. diag tail:\n{tail}"
                 )
             except (EOFError, OSError, ConnectionError) as exc:
+                POOL_SUBPROCESS_FAILURE_TOTAL.labels(reason="spawn_eof").inc()
                 tail = handle.diag_tail()
                 raise RuntimeError(
                     f"subprocess for {shape_key} died before READY: {exc}. "
@@ -518,6 +603,7 @@ class SubprocessPool:
                 ) from exc
 
             if not isinstance(msg, dict) or msg.get("kind") != "READY":
+                POOL_SUBPROCESS_FAILURE_TOTAL.labels(reason="spawn_parse_error").inc()
                 tail = handle.diag_tail()
                 raise RuntimeError(
                     f"subprocess for {shape_key} sent unexpected first "
@@ -525,10 +611,9 @@ class SubprocessPool:
                     f"diag tail:\n{tail}"
                 )
 
-            logger.info(
-                "[pool/%s] READY in %.1fs",
-                shape_key, time.monotonic() - t_spawn,
-            )
+            cold_spawn_s = time.monotonic() - t_spawn
+            POOL_COLD_SPAWN_SECONDS.labels(shape_key=shape_key).observe(cold_spawn_s)
+            logger.info("[pool/%s] READY in %.1fs", shape_key, cold_spawn_s)
             return handle
         except BaseException:
             # Any failure after Popen — including unanticipated exceptions
@@ -577,9 +662,11 @@ class SubprocessPool:
         if not self._handles:
             return
         shape_key, handle = next(iter(self._handles.items()))
+        POOL_EVICTION_TOTAL.labels(shape_key=shape_key).inc()
         logger.info("[pool/%s] evicting LRU (idle %.0fs)",
                     shape_key, time.monotonic() - handle.last_used)
         self._handles.pop(shape_key, None)
+        self._update_pool_size()
         await self._kill(handle)
 
     async def _kill(self, handle: _SubprocessHandle) -> None:
@@ -619,6 +706,7 @@ class SubprocessPool:
     async def _discard(self, shape_key: str, handle: _SubprocessHandle) -> None:
         """Remove from pool and kill. Used for unrecoverable subprocess errors."""
         self._handles.pop(shape_key, None)
+        self._update_pool_size()
         await self._kill(handle)
 
     async def shutdown(self) -> None:
@@ -626,6 +714,7 @@ class SubprocessPool:
         async with self._pool_lock:
             handles = list(self._handles.values())
             self._handles.clear()
+            self._update_pool_size()
         for handle in handles:
             await self._kill(handle)
 
@@ -1087,6 +1176,20 @@ async def backend_worker(runtime: DistributedRuntime, args: argparse.Namespace) 
     # uniform latency at the cost of long pod boots.
     if os.environ.get("LTX2_PREFLIGHT") == "1":
         await backend.preflight()
+
+    # Wire ltx2_pool_* series into the Dynamo runtime's /metrics scrape.
+    # Registers unconditionally: in legacy in-process mode (LTX2_POOL_MODE=0)
+    # the series stay zero-valued, which is harmless and means dashboards
+    # don't break when toggling the env var.
+    register_engine_metrics_callback(
+        endpoint=endpoint,
+        registry=LTX2_REGISTRY,
+        metric_prefix_filters=["ltx2_"],
+        namespace_name=namespace_name,
+        component_name=component_name,
+        endpoint_name=endpoint_name,
+        model_name=backend.served_model_name,
+    )
 
     try:
         await asyncio.gather(
