@@ -1191,6 +1191,30 @@ async def backend_worker(runtime: DistributedRuntime, args: argparse.Namespace) 
         model_name=backend.served_model_name,
     )
 
+    # Pool metrics flow through dynamo's system-status server, which is
+    # disabled by default. If DYN_SYSTEM_PORT isn't set to a non-negative
+    # value, the /metrics endpoint never binds and our registered callback
+    # sits dormant -- operators would see zero pool visibility in
+    # production. Warn loudly so the misconfiguration is obvious in pod
+    # startup logs.
+    _system_port = os.environ.get("DYN_SYSTEM_PORT", "-1")
+    try:
+        _system_port_int = int(_system_port)
+    except ValueError:
+        _system_port_int = -1
+    if _system_port_int < 0:
+        logger.warning(
+            "DYN_SYSTEM_PORT is not set (or is %r); pool metrics will NOT "
+            "be exposed. Set DYN_SYSTEM_PORT to a port (e.g. 9090) and "
+            "DYN_SYSTEM_HOST=0.0.0.0 to enable the /metrics endpoint. "
+            "See examples/diffusers/RUNBOOK.md § Metrics.",
+            _system_port,
+        )
+    else:
+        logger.info(
+            "Pool metrics enabled on DYN_SYSTEM_PORT=%d", _system_port_int,
+        )
+
     try:
         await asyncio.gather(
             endpoint.serve_endpoint(backend.create_video),  # type: ignore[arg-type]
