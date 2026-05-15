@@ -493,45 +493,51 @@ class SubprocessPool:
             raise
 
         handle = _SubprocessHandle(shape_key, proc, parent_conn)
-        handle.stdout_drainer = asyncio.create_task(
-            self._drain_pipe(handle, proc.stdout, "stdout")
-        )
-        handle.stderr_drainer = asyncio.create_task(
-            self._drain_pipe(handle, proc.stderr, "stderr")
-        )
-
-        t_spawn = time.monotonic()
         try:
-            msg = await self._recv_msg(handle, LTX2_POOL_SPAWN_TIMEOUT_S)
-        except asyncio.TimeoutError:
-            tail = handle.diag_tail()
-            await self._kill(handle)
-            raise RuntimeError(
-                f"subprocess for {shape_key} failed to reach READY "
-                f"within {LTX2_POOL_SPAWN_TIMEOUT_S}s. diag tail:\n{tail}"
+            handle.stdout_drainer = asyncio.create_task(
+                self._drain_pipe(handle, proc.stdout, "stdout")
             )
-        except (EOFError, OSError, ConnectionError) as exc:
-            tail = handle.diag_tail()
-            await self._kill(handle)
-            raise RuntimeError(
-                f"subprocess for {shape_key} died before READY: {exc}. "
-                f"diag tail:\n{tail}"
-            ) from exc
-
-        if not isinstance(msg, dict) or msg.get("kind") != "READY":
-            tail = handle.diag_tail()
-            await self._kill(handle)
-            raise RuntimeError(
-                f"subprocess for {shape_key} sent unexpected first "
-                f"message {msg!r} (expected kind=READY). "
-                f"diag tail:\n{tail}"
+            handle.stderr_drainer = asyncio.create_task(
+                self._drain_pipe(handle, proc.stderr, "stderr")
             )
 
-        logger.info(
-            "[pool/%s] READY in %.1fs",
-            shape_key, time.monotonic() - t_spawn,
-        )
-        return handle
+            t_spawn = time.monotonic()
+            try:
+                msg = await self._recv_msg(handle, LTX2_POOL_SPAWN_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                tail = handle.diag_tail()
+                raise RuntimeError(
+                    f"subprocess for {shape_key} failed to reach READY "
+                    f"within {LTX2_POOL_SPAWN_TIMEOUT_S}s. diag tail:\n{tail}"
+                )
+            except (EOFError, OSError, ConnectionError) as exc:
+                tail = handle.diag_tail()
+                raise RuntimeError(
+                    f"subprocess for {shape_key} died before READY: {exc}. "
+                    f"diag tail:\n{tail}"
+                ) from exc
+
+            if not isinstance(msg, dict) or msg.get("kind") != "READY":
+                tail = handle.diag_tail()
+                raise RuntimeError(
+                    f"subprocess for {shape_key} sent unexpected first "
+                    f"message {msg!r} (expected kind=READY). "
+                    f"diag tail:\n{tail}"
+                )
+
+            logger.info(
+                "[pool/%s] READY in %.1fs",
+                shape_key, time.monotonic() - t_spawn,
+            )
+            return handle
+        except BaseException:
+            # Any failure after Popen — including unanticipated exceptions
+            # from _recv_msg, drainer task creation, or cancellation — must
+            # tear down the subprocess, drainers, and parent_conn before
+            # propagating. _kill is idempotent and safe on partial state
+            # (drainer fields may be None if create_task itself raised).
+            await self._kill(handle)
+            raise
 
     async def _drain_pipe(
         self,
@@ -1323,82 +1329,102 @@ def _pool_worker_main(
         file=sys.stderr, flush=True,
     )
 
-    conn.send({"kind": "READY", "request_id": "_", "shape_key": shape_key})
+    try:
+        conn.send({"kind": "READY", "request_id": "_", "shape_key": shape_key})
 
-    while True:
-        try:
-            req = conn.recv()
-        except EOFError:
-            # Parent closed the protocol channel; exit cleanly.
-            return 0
-        if not isinstance(req, dict) or req.get("kind") != "REQUEST":
-            # Malformed message from parent (shouldn't happen with our
-            # well-typed sender, but report and keep going).
-            conn.send({
-                "kind": "ERROR",
-                "request_id": req.get("request_id", "_") if isinstance(req, dict) else "_",
-                "exception_type": "ProtocolError",
-                "exception_repr": f"unexpected message {req!r}",
-            })
-            continue
-        request_id = req.get("request_id", "_")
-        try:
-            kwargs: dict = dict(
-                prompt=req["prompt"],
-                save_video=True,
-                return_frames=False,
-                output_path=req["output_path"],
-                width=req["width"],
-                height=req["height"],
-                num_frames=req["num_frames"],
-                fps=req["fps"],
-                num_inference_steps=req["num_inference_steps"],
-                guidance_scale=req["guidance_scale"],
-            )
-            if req.get("seed") is not None:
-                kwargs["seed"] = req["seed"]
-            if req.get("negative_prompt") is not None:
-                kwargs["negative_prompt"] = req["negative_prompt"]
-
-            t0 = time.perf_counter()
-            generator.generate_video(**kwargs)
-            elapsed_ms = int((time.perf_counter() - t0) * 1000)
-            conn.send({
-                "kind": "DONE",
-                "request_id": request_id,
-                "elapsed_ms": elapsed_ms,
-            })
-        except Exception as exc:  # noqa: BLE001
-            msg = str(exc)
-            # CUDA-context-corrupting failures (OOM and other CUDA errors)
-            # leave the context unrecoverable. Exit so the parent respawns
-            # fresh; recovering in-place is worse than paying one cold
-            # respawn. String matching because torch.cuda exception
-            # hierarchy doesn't cleanly cover every context-corrupting
-            # case (kernel asserts, illegal memory access).
-            if "CUDA out of memory" in msg or "CUDA error" in msg:
+        while True:
+            try:
+                req = conn.recv()
+            except EOFError:
+                # Parent closed the protocol channel; exit cleanly.
+                return 0
+            if not isinstance(req, dict) or req.get("kind") != "REQUEST":
+                # Malformed message from parent (shouldn't happen with our
+                # well-typed sender, but report and keep going).
                 conn.send({
-                    "kind": "FATAL",
+                    "kind": "ERROR",
+                    "request_id": req.get("request_id", "_") if isinstance(req, dict) else "_",
+                    "exception_type": "ProtocolError",
+                    "exception_repr": f"unexpected message {req!r}",
+                })
+                continue
+            request_id = req.get("request_id", "_")
+            try:
+                kwargs: dict = dict(
+                    prompt=req["prompt"],
+                    save_video=True,
+                    return_frames=False,
+                    output_path=req["output_path"],
+                    width=req["width"],
+                    height=req["height"],
+                    num_frames=req["num_frames"],
+                    fps=req["fps"],
+                    num_inference_steps=req["num_inference_steps"],
+                    guidance_scale=req["guidance_scale"],
+                )
+                if req.get("seed") is not None:
+                    kwargs["seed"] = req["seed"]
+                if req.get("negative_prompt") is not None:
+                    kwargs["negative_prompt"] = req["negative_prompt"]
+
+                t0 = time.perf_counter()
+                generator.generate_video(**kwargs)
+                elapsed_ms = int((time.perf_counter() - t0) * 1000)
+                conn.send({
+                    "kind": "DONE",
                     "request_id": request_id,
-                    "reason": "CUDA_FAULT",
+                    "elapsed_ms": elapsed_ms,
+                })
+            except Exception as exc:  # noqa: BLE001
+                msg = str(exc)
+                # CUDA-context-corrupting failures (OOM and other CUDA errors)
+                # leave the context unrecoverable. Exit so the parent respawns
+                # fresh; recovering in-place is worse than paying one cold
+                # respawn. String matching because torch.cuda exception
+                # hierarchy doesn't cleanly cover every context-corrupting
+                # case (kernel asserts, illegal memory access).
+                if "CUDA out of memory" in msg or "CUDA error" in msg:
+                    # FATAL send may itself raise BrokenPipeError if the
+                    # parent is gone; suppress so the CUDA exit path still
+                    # runs. The parent detects subprocess death via the
+                    # drainer / recv EOF either way.
+                    with suppress(Exception):
+                        conn.send({
+                            "kind": "FATAL",
+                            "request_id": request_id,
+                            "reason": "CUDA_FAULT",
+                            "exception_repr": repr(exc),
+                        })
+                    print(
+                        f"[pool-worker/{shape_key}] CUDA fault, exiting",
+                        file=sys.stderr, flush=True,
+                    )
+                    with suppress(Exception):
+                        conn.close()
+                    return 2
+                # Recoverable per-request error (validation, bad prompt, etc.).
+                # Report and stay alive — the persistent subprocess is the
+                # whole point of the pool; don't respawn on soft failures.
+                conn.send({
+                    "kind": "ERROR",
+                    "request_id": request_id,
+                    "exception_type": type(exc).__name__,
                     "exception_repr": repr(exc),
                 })
-                print(
-                    f"[pool-worker/{shape_key}] CUDA fault, exiting",
-                    file=sys.stderr, flush=True,
-                )
-                with suppress(Exception):
-                    conn.close()
-                return 2
-            # Recoverable per-request error (validation, bad prompt, etc.).
-            # Report and stay alive — the persistent subprocess is the
-            # whole point of the pool; don't respawn on soft failures.
-            conn.send({
-                "kind": "ERROR",
-                "request_id": request_id,
-                "exception_type": type(exc).__name__,
-                "exception_repr": repr(exc),
-            })
+    except (BrokenPipeError, ConnectionResetError, OSError) as exc:
+        # Parent disconnected mid-protocol (READY send, request-loop send,
+        # or recv-side OSError). Exit cleanly with code 0 -- the parent
+        # has already detected the subprocess as needing cleanup via its
+        # drainer / recv EOF, and an uncaught BrokenPipeError would just
+        # turn into a noisy exit-1 with a Python traceback that has no
+        # consumer.
+        print(
+            f"[pool-worker/{shape_key}] parent connection lost: {exc}",
+            file=sys.stderr, flush=True,
+        )
+        with suppress(Exception):
+            conn.close()
+        return 0
 
     # Unreachable: the `while True` loop above only exits via `return 0`
     # on parent EOF or `return 2` on CUDA fault. Explicit terminal
