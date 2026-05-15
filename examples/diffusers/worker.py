@@ -595,10 +595,8 @@ class SubprocessPool:
 
         proc = handle.proc
         if proc.returncode is None:
-            try:
+            with suppress(ProcessLookupError):
                 proc.terminate()
-            except ProcessLookupError:
-                pass
             try:
                 await asyncio.wait_for(
                     proc.wait(), timeout=LTX2_POOL_SIGTERM_GRACE_S,

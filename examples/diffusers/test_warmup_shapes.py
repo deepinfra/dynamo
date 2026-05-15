@@ -156,6 +156,11 @@ def test_worker_compute_menu_hash_matches_canonical() -> None:
     inline algorithm. Skipped if FastVideo / torch aren't installed (CI
     can run the rest of this file without them)."""
     sys.path.insert(0, HERE)
+    # Pre-declare so static analyzers (CodeQL) don't flag the call site
+    # below as potentially-unbound. pytest.skip() raises so the call is
+    # actually unreachable on the ImportError path, but the analyzer
+    # doesn't model that.
+    _compute_menu_hash = None
     try:
         from worker import _compute_menu_hash  # type: ignore
     except ImportError as exc:

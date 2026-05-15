@@ -46,6 +46,7 @@ Usage (single-shape worker, internal -- only used by --legacy-subprocess):
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import subprocess
@@ -189,10 +190,9 @@ def _du_bytes(path: Path) -> int:
     total = 0
     for root, _dirs, files in os.walk(path):
         for f in files:
-            try:
+            # File may have vanished between os.walk and stat; safe to skip.
+            with contextlib.suppress(OSError):
                 total += (Path(root) / f).stat().st_size
-            except OSError:
-                pass
     return total
 
 
