@@ -6,9 +6,20 @@ rollback, diagnosing failures) see [`RUNBOOK.md`](RUNBOOK.md). For the
 historical journey that produced this design, see the dated plan documents
 under `deepinfra/backend/claude_plans/` referenced at the end of this file.
 
-If you are reading `worker.py` and wondering why the IPC plumbing is so
-elaborate, or why subprocess management exists at all, this file is the
-answer. It is written so a future maintainer (human or AI) can read it
+**Code layout.** Generic video-pipeline infrastructure (subprocess pool,
+Connection-based IPC, Pydantic request/response models, Prometheus metrics,
+menu-hash check, Dynamo registration helpers) lives in the sibling
+[`../lib/`](../lib/) package. This document covers LTX-2-specific decisions
+and operational characteristics; the patterns described here apply to any
+future video model that plugs a factory function into the same
+infrastructure.
+
+If you are reading the worker code (the LTX-2 entry in
+[`worker.py`](worker.py), the pool / IPC in
+[`../lib/pool.py`](../lib/pool.py), or the backend / endpoint in
+[`../lib/backend.py`](../lib/backend.py)) and wondering why the IPC plumbing
+is so elaborate, or why subprocess management exists at all, this file is
+the answer. It is written so a future maintainer (human or AI) can read it
 cold and understand the constraints before changing anything.
 
 ## What this code serves
@@ -16,7 +27,7 @@ cold and understand the constraints before changing anything.
 LTX-2 is a FastVideo-backed text-to-video model (~19B parameters) served
 through the Dynamo runtime's `/v1/videos` endpoint. The pipeline accepts a
 fixed menu of ~10 supported `(width, height, num_frames)` shapes
-(`warmup_shapes.json`), runs ~5 diffusion inference steps per request, and
+(`shapes.json`), runs ~5 diffusion inference steps per request, and
 returns an MP4 as base64. Production hardware is B200 (178 GiB GPU memory).
 A request takes 5-50 seconds of steady-state inference and produces a
 0.3-2 MB MP4.
@@ -51,12 +62,14 @@ that shape. A production worker pointed at the same per-shape directory
 sees the same fresh-state key, finds the cached compiled kernels, and
 loads them rather than recompiling.
 
-`warmup.py` produces these per-shape caches at image-bake time
+[`warmup.py`](warmup.py) produces these per-shape caches at image-bake time
 (`--legacy-subprocess` mode, despite the name this is the production
 path; the in-process single-process mode is order-dependent and unsuitable
-for production cache builds). `worker.py` consumes them at runtime by
-spawning a subprocess per shape and pointing its env at the matching
-per-shape directory.
+for production cache builds). The runtime worker (this directory's
+[`worker.py`](worker.py) + the generic pool in
+[`../lib/pool.py`](../lib/pool.py)) consumes them at runtime by spawning a
+subprocess per shape and pointing its env at the matching per-shape
+directory.
 
 This is the **per-shape compile cache contract**. The cache layout under
 `/cache/per-shape/<shape_key>/` is the interface between the warmup
@@ -102,10 +115,10 @@ resident, leaves ~36 GiB for activation tensors and CUDA workspace).
 K=3 OOMs deterministically: the third subprocess's model load fails
 because there is only a few MiB of GPU memory left.
 
-`LTX2_POOL_MAX_SIZE` is env-overridable for larger hardware. H100
+`VIDEO_POOL_MAX_SIZE` is env-overridable for larger hardware. H100
 (80 GiB) cannot run pool mode for this model at all — K=1 leaves no
 headroom for activations. If LTX-2 is ever scheduled onto non-B200 GPUs,
-operationally either lower `LTX2_POOL_MAX_SIZE` to match the actual
+operationally either lower `VIDEO_POOL_MAX_SIZE` to match the actual
 per-slot fit or disable pool mode entirely.
 
 ## Why LRU eviction
@@ -159,24 +172,28 @@ intra-pod, intra-trust-boundary channel; pickle is fine here. Any
 future cross-tenant use of this pattern would need to switch to
 JSON-over-Connection.
 
-## Opt-in via `LTX2_POOL_MODE`
+## Opt-in via `VIDEO_POOL_MODE`
 
-Pool mode is **opt-in** for the first release: `LTX2_POOL_MODE=1`
+Pool mode is **opt-in** for the first release: `VIDEO_POOL_MODE=1`
 enables the pool path, anything else (default unset) keeps the legacy
 in-process generator. This lets us:
 
 1. Roll the image with pool code present but inactive — zero behavior
    change for the legacy in-process path.
-2. Flip `LTX2_POOL_MODE=1` in the model config as a separate,
+2. Flip `VIDEO_POOL_MODE=1` in the model config as a separate,
    instantly-revertable change.
 3. After a soft-launch period without incidents, a follow-up commit
    flips the default and deletes the legacy in-process path.
 
-Until that follow-up lands, both paths remain in `worker.py`. The
-shared `_load_generator(model_name, num_gpus, enable_optimizations)`
-factory is used by both, so compile-cache keys match byte-for-byte
-across the two paths (do not split this factory; if you do, one path
-will produce caches the other cannot hit).
+Until that follow-up lands, both paths remain in
+[`../lib/backend.py`](../lib/backend.py). The shared
+[`factory.load_model(model_name, num_gpus, enable_optimizations)`](factory.py)
+factory is used by both (legacy path: called directly from
+``GenericVideoBackend.initialize_model``; pool path: imported in pool
+subprocesses via the ``--model-factory ltx2.factory:load_model`` dotted
+reference), so compile-cache keys match byte-for-byte across the two paths
+(do not split this factory; if you do, one path will produce caches the
+other cannot hit).
 
 ## Operational costs to know
 
@@ -275,13 +292,39 @@ Operational procedures:
 - [`RUNBOOK.md`](RUNBOOK.md) — adding shapes, baking images, rollback,
   CI drift, diagnosing failures, updating FastVideo.
 
-Code:
-- [`worker.py`](worker.py) — Dynamo backend endpoint, pool
-  implementation, subprocess entry.
+Code (LTX-2-specific, this directory):
+- [`worker.py`](worker.py) — LTX-2 worker entry; CLI parse, namespace
+  resolution, endpoint registration, factory wiring.
+- [`factory.py`](factory.py) — `load_model()`: the shared
+  ``VideoGenerator.from_pretrained`` factory used by both the legacy
+  in-process path and pool subprocesses.
 - [`warmup.py`](warmup.py) — per-shape compile-cache producer.
-- [`ltx2_config.py`](ltx2_config.py) — canonical kwargs shared
+- [`benchmark.py`](benchmark.py) — post-bake validation harness.
+- [`config.py`](config.py) — canonical kwargs shared
   between warmup, benchmark, and worker.
-- [`warmup_shapes.json`](warmup_shapes.json) — the shape menu.
+- [`shapes.json`](shapes.json) — the shape menu.
+
+Code (generic infrastructure, in sibling `../lib/`):
+- [`../lib/pool.py`](../lib/pool.py) — `SubprocessPool`, the
+  Connection-based wire protocol, `_pool_worker_main`, the dispatch
+  entry point invoked by the top-level shim with `--pool-worker`,
+  `_set_parent_death_signal`.
+- [`../lib/backend.py`](../lib/backend.py) — `GenericVideoBackend`:
+  the Dynamo endpoint, the global serialization lock, the legacy
+  in-process path, and the pool routing path.
+- [`../lib/metrics.py`](../lib/metrics.py) — `video_pool_*`
+  Prometheus series with the `model` label.
+- [`../lib/models.py`](../lib/models.py) — Pydantic request/response
+  models.
+- [`../lib/menu.py`](../lib/menu.py) — `compute_menu_hash` +
+  `assert_shape_menu_hash_matches`; the algorithm that the IMAGE
+  bake-time hash, this worker's boot-assertion, and
+  ``backend/tests/test_ltx_shape_menu.py`` must all agree on.
+- [`../lib/dynamo_wiring.py`](../lib/dynamo_wiring.py) —
+  ``get_worker_namespace`` and ``register_model`` helpers.
+- [`../worker.py`](../worker.py) — top-level shim; dispatches
+  `--pool-worker` subprocesses into `lib.pool` BEFORE importing
+  `ltx2.worker`, so pool cold-start skips the parent-side import tree.
 
 Historical narrative (in `deepinfra/backend`):
 - `claude_plans/2026-05-13-ltx2-cache-order-dependence.md` — the

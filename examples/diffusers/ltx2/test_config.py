@@ -17,9 +17,11 @@ import sys
 
 import pytest
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# Put examples/diffusers/ on sys.path so ``ltx2.config`` resolves
+# regardless of how pytest is invoked.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from ltx2_config import (  # noqa: E402
+from ltx2.config import (  # noqa: E402
     LTX2_FP4_KWARGS,
     LTX2_STANDARD_KWARGS,
     fp4_kwargs,

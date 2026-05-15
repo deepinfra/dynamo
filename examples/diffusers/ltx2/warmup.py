@@ -30,13 +30,13 @@ to switch TORCHINDUCTOR_CACHE_DIR / TRITON_CACHE_DIR per request.
 See ~/backend/claude_plans/2026-05-14-ltx2-per-shape-cache.md.
 
 Usage (single-process, diagnostic):
-  python warmup.py --shapes warmup_shapes.json --output-dir /tmp/warmup
+  python ltx2/warmup.py --shapes ltx2/shapes.json --output-dir /tmp/warmup
 
 Usage (subprocess-per-shape, production cache build):
-  python warmup.py --legacy-subprocess --shapes warmup_shapes.json
+  python ltx2/warmup.py --legacy-subprocess --shapes ltx2/shapes.json
 
 Usage (single-shape worker, internal -- only used by --legacy-subprocess):
-  python warmup.py --single-shape --width 1920 --height 1088 \\
+  python ltx2/warmup.py --single-shape --width 1920 --height 1088 \\
       --num-frames 121 --fps 24 --num-inference-steps 5 \\
       --guidance-scale 1.0 --seed 42 \\
       --model FastVideo/LTX2-Distilled-Diffusers \\
@@ -55,6 +55,12 @@ import time
 from pathlib import Path
 
 import torch
+
+# Put the parent directory (examples/diffusers/) on sys.path so we can
+# import ``ltx2.config`` regardless of where this script is invoked from.
+# The script's subprocess-per-shape mode re-execs this same file, which
+# inherits the same path setup.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 PROMPT = (
     "A close-up tracking shot of a golden retriever sprinting toward the camera "
@@ -104,7 +110,7 @@ def _load_generator(model: str):
     # Import here (after _ensure_cache_env) so the local layout works whether
     # warmup.py is invoked at /opt/app/warmup.py (in-container) or from a
     # checkout (the parent dir is on sys.path either way).
-    from ltx2_config import standard_kwargs
+    from ltx2.config import standard_kwargs
 
     print(f"[warmup] loading VideoGenerator model={model}", flush=True)
     t_load = time.perf_counter()
@@ -245,7 +251,7 @@ def _final_summary(
 def _run_driver_single_process(args: argparse.Namespace) -> int:
     """
     Single-process driver: load VideoGenerator once, generate all shapes
-    in one process, in the order given by warmup_shapes.json.
+    in one process, in the order given by ltx2/shapes.json.
 
     DIAGNOSTIC USE ONLY. The cache produced here is order-dependent:
     `_dynamo.reset()` clears dynamo state between shapes but not the
@@ -524,7 +530,11 @@ def _parse_args() -> argparse.Namespace:
         "does NOT match production single-process access. Use only for "
         "crash-isolation debugging.",
     )
-    p.add_argument("--shapes", default="warmup_shapes.json", help="path to shapes JSON")
+    p.add_argument(
+        "--shapes",
+        default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "shapes.json"),
+        help="path to shapes JSON (default: ltx2/shapes.json next to this script)",
+    )
     p.add_argument(
         "--output-dir", default="/tmp/warmup", help="where to save rendered MP4s"
     )

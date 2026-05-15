@@ -25,15 +25,15 @@ This file is the canonical procedure document. Error messages from the pipeline 
 
 | File | Repo | Purpose |
 |---|---|---|
-| `examples/diffusers/warmup_shapes.json` | dynamo | Shape menu (one source of truth on dynamo side) |
-| `examples/diffusers/warmup.py` | dynamo | Pre-compiles torch.compile cache for every menu shape |
-| `examples/diffusers/benchmark.py` | dynamo | Validates a baked image: 30 generations + timings |
+| `examples/diffusers/shapes.json` | dynamo | Shape menu (one source of truth on dynamo side) |
+| `examples/diffusers/ltx2/warmup.py` | dynamo | Pre-compiles torch.compile cache for every menu shape |
+| `examples/diffusers/ltx2/benchmark.py` | dynamo | Validates a baked image: 30 generations + timings |
 | `examples/diffusers/run-benchmark.sh` | dynamo | Wrapper hiding the docker invocation |
 | `examples/diffusers/Dockerfile` | dynamo | Base FastVideo runtime image |
-| `examples/diffusers/worker.py` | dynamo | Dynamo backend endpoint |
+| `examples/diffusers/worker.py` (top-level shim) + `examples/diffusers/ltx2/worker.py` | dynamo | Dynamo backend endpoint |
 | `deepinfra/deepapi/inf_models/ltx.py` | backend | API admission: `SUPPORTED_SHAPES` + `_validate_shape_in_menu` |
 
-`SUPPORTED_SHAPES` and `warmup_shapes.json` must contain the same set of `(width, height, num_frames)` tuples. They live in different repos by necessity (API enforcement vs. image build); CI verifies they match.
+`SUPPORTED_SHAPES` and `shapes.json` must contain the same set of `(width, height, num_frames)` tuples. They live in different repos by necessity (API enforcement vs. image build); CI verifies they match.
 
 ---
 
@@ -49,7 +49,7 @@ fastvideo-runtime:<base-version>-ltx2-<sha8>
 sha256(json.dumps(sorted(shape_tuples), separators=(',', ':')))
 ```
 
-Tag's hash binds the image to a specific menu. If `warmup_shapes.json` changes, the hash changes, and the old image's tag no longer matches the menu. Layered safety checks (admission, runtime invariant) reject mismatches.
+Tag's hash binds the image to a specific menu. If `shapes.json` changes, the hash changes, and the old image's tag no longer matches the menu. Layered safety checks (admission, runtime invariant) reject mismatches.
 
 ---
 
@@ -64,7 +64,7 @@ End-to-end procedure for building a new ship image. Run when you change shapes, 
 
 ### Step 1: bring the menu in sync
 
-If you changed `warmup_shapes.json`, also edit `SUPPORTED_SHAPES` in backend's `ltx.py`. Both must contain the same set of tuples. If you only added/removed entries on one side, CI will fail; see [CI drift](#ci-drift).
+If you changed `shapes.json`, also edit `SUPPORTED_SHAPES` in backend's `ltx.py`. Both must contain the same set of tuples. If you only added/removed entries on one side, CI will fail; see [CI drift](#ci-drift).
 
 ### Step 2: build the base image
 
@@ -112,7 +112,7 @@ nohup docker run --rm \
   -v /tmp/warmup-outputs:/tmp/warmup-outputs \
   -w /opt/app \
   localhost:30500/fastvideo-runtime:<version>-ltx2-warmupbase \
-  python3 warmup.py --shapes warmup_shapes.json --output-dir /tmp/warmup-outputs \
+  python3 warmup.py --shapes shapes.json --output-dir /tmp/warmup-outputs \
   > ~/warmup.log 2>&1 &
 ```
 
@@ -126,7 +126,7 @@ Wall-clock: 2-3 hours. Look for `[warmup] done. success=N/N failures=[]`. Any fa
 ### Step 4: bake the cache into a ship image
 
 ```bash
-HASH=$(python3 -c "import hashlib, json; shapes = json.load(open('$HOME/dynamo/examples/diffusers/warmup_shapes.json'))['shapes']; canonical = json.dumps(sorted([(s['width'], s['height'], s['num_frames']) for s in shapes]), separators=(',',':')); print(hashlib.sha256(canonical.encode()).hexdigest()[:8])")
+HASH=$(python3 -c "import hashlib, json; shapes = json.load(open('$HOME/dynamo/examples/diffusers/shapes.json'))['shapes']; canonical = json.dumps(sorted([(s['width'], s['height'], s['num_frames']) for s in shapes]), separators=(',',':')); print(hashlib.sha256(canonical.encode()).hexdigest()[:8])")
 echo "Hash: $HASH"
 
 BAKE=/tmp/warmup-bake && rm -rf $BAKE && mkdir -p $BAKE && cd $BAKE
@@ -173,7 +173,7 @@ docker push localhost:30500/fastvideo-runtime:<version>-ltx2-$HASH
 
 ## Adding a shape
 
-1. Edit `examples/diffusers/warmup_shapes.json` to add the tuple. Width and height must be multiples of 32 (LTX-2 VAE constraint). Verify with `(w + 31) // 32 * 32 == w`.
+1. Edit `examples/diffusers/shapes.json` to add the tuple. Width and height must be multiples of 32 (LTX-2 VAE constraint). Verify with `(w + 31) // 32 * 32 == w`.
 2. Edit `deepinfra/deepapi/inf_models/ltx.py SUPPORTED_SHAPES` to match.
 3. Open one PR per file (or one PR touching both repos if your tooling supports it). CI in backend will fail if the lists drift.
 4. Once both PRs are reviewed and ready, do not merge yet. First, follow [Producing a ship image](#producing-a-ship-image) to build a new image whose tag-hash matches the new menu.
@@ -223,7 +223,7 @@ The worker has detected that the cache baked in its image doesn't match the menu
 
 ### CI drift
 
-CI fails: "warmup_shapes.json and SUPPORTED_SHAPES are out of sync".
+CI fails: "shapes.json and SUPPORTED_SHAPES are out of sync".
 
 **Cause**: someone edited one file without the other.
 
@@ -257,7 +257,7 @@ Look at the actual error in `~/warmup.log`. Common modes:
 
 - **`1920x1088@241f` and `1088x1920@241f` are excluded** from the menu because the VAE decoder's intermediate activation exceeds 2³¹ elements at 1080p × 241 frames, triggering `RuntimeError: input tensor must fit into 32-bit index math` in `F.pad`. 10-second video is offered at 720p and below.
 - **"Nominal 720p" is served as 1280×736 / 736×1280**, not 1280×720. The LTX-2 VAE has `spatial_compression_ratio=32`, so output dims must be multiples of 32. The field-validator in `ltx.py` rounds 720 → 736 automatically.
-- **First-request-per-shape after pod startup takes 200-600s** even with a baked cache. After that first request, subsequent same-shape requests are ~50s. Pod-startup latency is therefore ~5-10 min × number of distinct shapes the pod sees before reaching steady state. Future mitigation: a preflight loop in `worker.py` that runs one tiny generation per shape on boot.
+- **First-request-per-shape after pod startup takes 200-600s** even with a baked cache. After that first request, subsequent same-shape requests are ~50s. Pod-startup latency is therefore ~5-10 min × number of distinct shapes the pod sees before reaching steady state. Future mitigation: a preflight loop in `ltx2/worker.py` that runs one tiny generation per shape on boot.
 
 ---
 
@@ -274,7 +274,7 @@ Set on the worker pod:
 - A `containerPort: 9090` declaration in the worker's k8s manifest.
 - A Prometheus scrape config targeting this port on worker pods (separate from the frontend scrape on `:8000`).
 
-Without these, `worker.py` logs a WARNING at startup:
+Without these, `ltx2/worker.py` logs a WARNING at startup:
 
 ```
 DYN_SYSTEM_PORT is not set (or is '-1'); pool metrics will NOT be exposed.
@@ -282,24 +282,24 @@ DYN_SYSTEM_PORT is not set (or is '-1'); pool metrics will NOT be exposed.
 
 ### Metrics emitted
 
-All metrics prefixed `ltx2_pool_`, auto-injected with Dynamo hierarchy labels (`dynamo_namespace`, `dynamo_component`, `dynamo_endpoint`, `model`, `model_name`):
+All metrics prefixed `video_pool_`, auto-injected with Dynamo hierarchy labels (`dynamo_namespace`, `dynamo_component`, `dynamo_endpoint`, `model`, `model_name`):
 
 | Metric | Type | Labels | Use |
 |---|---|---|---|
-| `ltx2_pool_size` | Gauge | — | Current live subprocess count |
-| `ltx2_pool_spawn_total` | Counter | `shape_key` | Pool churn rate; high values per shape suggest LRU thrash |
-| `ltx2_pool_eviction_total` | Counter | `shape_key` | LRU evictions; matches spawn rate if pool is saturated |
-| `ltx2_pool_request_total` | Counter | `shape_key`, `status` | Throughput; status ∈ {DONE, ERROR, FATAL} |
-| `ltx2_pool_request_latency_seconds` | Histogram | `shape_key` | End-to-end pool latency (route entry → DONE response) |
-| `ltx2_pool_cold_spawn_seconds` | Histogram | `shape_key` | Time from fork to READY message |
-| `ltx2_pool_subprocess_failure_total` | Counter | `reason` | Failure breakdown; reason ∈ {cuda_fault, parent_disconnect, spawn_timeout, spawn_eof, spawn_parse_error, gen_timeout, gen_eof, desync, parse_error, send_failed} |
+| `video_pool_size` | Gauge | — | Current live subprocess count |
+| `video_pool_spawn_total` | Counter | `shape_key` | Pool churn rate; high values per shape suggest LRU thrash |
+| `video_pool_eviction_total` | Counter | `shape_key` | LRU evictions; matches spawn rate if pool is saturated |
+| `video_pool_request_total` | Counter | `shape_key`, `status` | Throughput; status ∈ {DONE, ERROR, FATAL} |
+| `video_pool_request_latency_seconds` | Histogram | `shape_key` | End-to-end pool latency (route entry → DONE response) |
+| `video_pool_cold_spawn_seconds` | Histogram | `shape_key` | Time from fork to READY message |
+| `video_pool_subprocess_failure_total` | Counter | `reason` | Failure breakdown; reason ∈ {cuda_fault, parent_disconnect, spawn_timeout, spawn_eof, spawn_parse_error, gen_timeout, gen_eof, desync, parse_error, send_failed} |
 
 ### Recommended alerts
 
-- `rate(ltx2_pool_eviction_total[5m]) > 0.1` — pool is thrashing; consider bumping `LTX2_POOL_MAX_SIZE` or pruning the shape menu.
-- `histogram_quantile(0.95, rate(ltx2_pool_cold_spawn_seconds_bucket[10m])) > 60` — cold-spawn latency degraded.
-- `rate(ltx2_pool_subprocess_failure_total{reason="cuda_fault"}[5m]) > 0` — CUDA faults observed; investigate.
-- `rate(ltx2_pool_request_total{status="FATAL"}[5m]) > 0` — same as above, surfaced from the request path.
+- `rate(video_pool_eviction_total[5m]) > 0.1` — pool is thrashing; consider bumping `VIDEO_POOL_MAX_SIZE` or pruning the shape menu.
+- `histogram_quantile(0.95, rate(video_pool_cold_spawn_seconds_bucket[10m])) > 60` — cold-spawn latency degraded.
+- `rate(video_pool_subprocess_failure_total{reason="cuda_fault"}[5m]) > 0` — CUDA faults observed; investigate.
+- `rate(video_pool_request_total{status="FATAL"}[5m]) > 0` — same as above, surfaced from the request path.
 
 ---
 
@@ -320,7 +320,7 @@ The cache does not eliminate **all** first-request cost: torch's in-memory compi
 
 - **Preflight loop in worker.py**: run one small generation per shape on pod startup, so the first customer request is steady-state fast.
 - **CI-driven warmup** ("Option A"): instead of manual warmup on a B200 host, have CI on a GPU runner do the bake on every shape-menu change. Removes the manual `i model-add` step and the human-in-the-loop. Requires B200 capacity in CI; not blocking for soft launch.
-- **Hash check in `worker.py`**: boot-asserts the baked cache matches the running shape menu. Currently planned, not yet implemented.
+- **Hash check in `lib/menu.py` (invoked from `ltx2/worker.py`)**: boot-asserts the baked cache matches the running shape menu. Currently planned, not yet implemented.
 - **`i model-add` admission check**: refuses images whose tag-hash doesn't match `SUPPORTED_SHAPES`. Currently planned, not yet implemented.
 
 ---
@@ -355,12 +355,12 @@ docker run --rm <image-tag> bash -c 'cd /tmp/FastVideo && git rev-parse HEAD'
 
 A non-exhaustive checklist — the actual surface depends on what changed upstream:
 
-1. Did `VideoGenerator.from_pretrained` kwargs change? Compare ours in `examples/diffusers/ltx2_config.py` against the upstream signature.
+1. Did `VideoGenerator.from_pretrained` kwargs change? Compare ours in `examples/diffusers/config.py` against the upstream signature.
 2. Did `generate_video` parameter names change (e.g., `num_frames`, `num_inference_steps`, `guidance_scale`)?
 3. Did the FastVideo MP-executor or VAE tiling behavior change in a way that breaks our `expandable_segments`-incompatible runtime constraint?
-4. Did any test in `tests/test_ltx2_config.py` or `tests/test_warmup_shapes.py` start failing after the bump?
+4. Did any test in `tests/test_config.py` or `tests/test_warmup_shapes.py` start failing after the bump?
 
-If any of (1)-(3), update `ltx2_config.py` along with the SHA bump, then re-bake.
+If any of (1)-(3), update `config.py` along with the SHA bump, then re-bake.
 
 ### Pinned SHA history
 
