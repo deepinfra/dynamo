@@ -283,96 +283,95 @@ def main() -> int:
 
     generator = _load_generator(args.model)
 
-    csv_file = open(args.csv, "w", newline="", encoding="utf-8")
-    writer = csv.writer(csv_file)
-    writer.writerow([
-        "shape", "width", "height", "num_frames",
-        "prompt_id", "seed", "wall_seconds",
-        "output_mp4", "mp4_bytes",
-    ])
-    csv_file.flush()
-
-    n = 0
-    if args.prompt_major:
-        # Outer loop over prompts: forces a shape switch between consecutive
-        # generations. Useful for measuring whether torch.compile's in-memory
-        # state is preserved across shape revisits, or evicted.
-        order = [
-            (s_idx, p_idx)
-            for p_idx in range(len(prompts))
-            for s_idx in range(len(shapes))
-        ]
-    else:
-        # Default shape-major: 3 prompts on each shape before moving to the
-        # next. Measures first-hit-per-shape and same-shape steady state.
-        order = [
-            (s_idx, p_idx)
-            for s_idx in range(len(shapes))
-            for p_idx in range(len(prompts))
-        ]
-
-    for shape_idx, prompt_idx in order:
-        shape = shapes[shape_idx]
-        w, h, nf = int(shape["width"]), int(shape["height"]), int(shape["num_frames"])
-        tag = f"{w}x{h}@{nf}f"
-        prompt_id, prompt_text = prompts[prompt_idx]
-
-        n += 1
-        seed = 1000 + shape_idx * 10 + prompt_idx  # deterministic, distinct
-        out_path = output_dir / f"{tag}_{prompt_id}.mp4"
-
-        print(
-            f"[benchmark] ({n}/{total}) {tag} prompt={prompt_id} "
-            f"seed={seed} -> {out_path}",
-            flush=True,
-        )
-
-        if args.reset:
-            # Clear dynamo's accumulated guard / specialization state so the
-            # next compile happens in fresh state and produces deterministic
-            # cache keys regardless of access order.
-            import torch._dynamo
-            torch._dynamo.reset()
-
-        t0 = time.perf_counter()
-        try:
-            generator.generate_video(
-                prompt=prompt_text,
-                save_video=True,
-                return_frames=False,
-                output_path=str(out_path),
-                width=w,
-                height=h,
-                num_frames=nf,
-                fps=fps,
-                num_inference_steps=num_inference_steps,
-                guidance_scale=guidance_scale,
-                seed=seed,
-            )
-            elapsed = time.perf_counter() - t0
-            size = out_path.stat().st_size if out_path.exists() else 0
-            print(
-                f"[benchmark]   -> {elapsed:.1f}s  "
-                f"({size / 1_048_576:.1f} MB)",
-                flush=True,
-            )
-            writer.writerow([
-                tag, w, h, nf, prompt_id, seed,
-                f"{elapsed:.2f}", str(out_path), size,
-            ])
-        except Exception as exc:
-            elapsed = time.perf_counter() - t0
-            print(
-                f"[benchmark]   FAIL after {elapsed:.1f}s: {exc!r}",
-                flush=True,
-            )
-            writer.writerow([
-                tag, w, h, nf, prompt_id, seed,
-                f"{elapsed:.2f}", "", 0,
-            ])
+    with open(args.csv, "w", newline="", encoding="utf-8") as csv_file:
+        writer = csv.writer(csv_file)
+        writer.writerow([
+            "shape", "width", "height", "num_frames",
+            "prompt_id", "seed", "wall_seconds",
+            "output_mp4", "mp4_bytes",
+        ])
         csv_file.flush()
 
-    csv_file.close()
+        n = 0
+        if args.prompt_major:
+            # Outer loop over prompts: forces a shape switch between consecutive
+            # generations. Useful for measuring whether torch.compile's in-memory
+            # state is preserved across shape revisits, or evicted.
+            order = [
+                (s_idx, p_idx)
+                for p_idx in range(len(prompts))
+                for s_idx in range(len(shapes))
+            ]
+        else:
+            # Default shape-major: 3 prompts on each shape before moving to the
+            # next. Measures first-hit-per-shape and same-shape steady state.
+            order = [
+                (s_idx, p_idx)
+                for s_idx in range(len(shapes))
+                for p_idx in range(len(prompts))
+            ]
+
+        for shape_idx, prompt_idx in order:
+            shape = shapes[shape_idx]
+            w, h, nf = int(shape["width"]), int(shape["height"]), int(shape["num_frames"])
+            tag = f"{w}x{h}@{nf}f"
+            prompt_id, prompt_text = prompts[prompt_idx]
+
+            n += 1
+            seed = 1000 + shape_idx * 10 + prompt_idx  # deterministic, distinct
+            out_path = output_dir / f"{tag}_{prompt_id}.mp4"
+
+            print(
+                f"[benchmark] ({n}/{total}) {tag} prompt={prompt_id} "
+                f"seed={seed} -> {out_path}",
+                flush=True,
+            )
+
+            if args.reset:
+                # Clear dynamo's accumulated guard / specialization state so the
+                # next compile happens in fresh state and produces deterministic
+                # cache keys regardless of access order.
+                import torch._dynamo
+                torch._dynamo.reset()
+
+            t0 = time.perf_counter()
+            try:
+                generator.generate_video(
+                    prompt=prompt_text,
+                    save_video=True,
+                    return_frames=False,
+                    output_path=str(out_path),
+                    width=w,
+                    height=h,
+                    num_frames=nf,
+                    fps=fps,
+                    num_inference_steps=num_inference_steps,
+                    guidance_scale=guidance_scale,
+                    seed=seed,
+                )
+                elapsed = time.perf_counter() - t0
+                size = out_path.stat().st_size if out_path.exists() else 0
+                print(
+                    f"[benchmark]   -> {elapsed:.1f}s  "
+                    f"({size / 1_048_576:.1f} MB)",
+                    flush=True,
+                )
+                writer.writerow([
+                    tag, w, h, nf, prompt_id, seed,
+                    f"{elapsed:.2f}", str(out_path), size,
+                ])
+            except Exception as exc:
+                elapsed = time.perf_counter() - t0
+                print(
+                    f"[benchmark]   FAIL after {elapsed:.1f}s: {exc!r}",
+                    flush=True,
+                )
+                writer.writerow([
+                    tag, w, h, nf, prompt_id, seed,
+                    f"{elapsed:.2f}", "", 0,
+                ])
+            csv_file.flush()
+
     print(f"[benchmark] done. timings -> {args.csv}", flush=True)
     return 0
 
