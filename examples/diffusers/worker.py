@@ -1352,6 +1352,37 @@ def _assert_shape_menu_hash_matches() -> None:
 # ── Pool-worker subprocess entrypoint (Phase 2) ──────────────────────────────
 
 
+def _set_parent_death_signal(sig: int = signal.SIGTERM) -> None:
+    """
+    Ask the kernel to send `sig` to this process when its parent thread
+    dies. Linux-only via prctl(PR_SET_PDEATHSIG). Closes the orphan
+    window where a parent crash would leave the FastVideo Worker child
+    holding ~70 GiB of GPU memory until container teardown.
+
+    Note: PR_SET_PDEATHSIG fires on parent THREAD death, not necessarily
+    parent PROCESS death. The dynamo worker parent is single-threaded
+    Python (uvloop event loop in the main thread), so the two are
+    equivalent for us. If the parent ever sprouts a long-lived non-main
+    thread that this subprocess inherits as its parent, this guarantee
+    weakens; revisit at that point.
+    """
+    try:
+        import ctypes
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        PR_SET_PDEATHSIG = 1
+        if libc.prctl(PR_SET_PDEATHSIG, sig, 0, 0, 0) != 0:
+            errno = ctypes.get_errno()
+            print(
+                f"[pool-worker] prctl(PR_SET_PDEATHSIG) failed errno={errno}",
+                file=sys.stderr, flush=True,
+            )
+    except (OSError, AttributeError) as exc:
+        print(
+            f"[pool-worker] PR_SET_PDEATHSIG unavailable: {exc}",
+            file=sys.stderr, flush=True,
+        )
+
+
 def _pool_worker_main(
     shape_key: str,
     model_path: str,
@@ -1390,6 +1421,11 @@ def _pool_worker_main(
     intra-pod, intra-trust-boundary channel. Any future cross-tenant use
     of this pattern would need to switch to JSON-over-Connection.
     """
+    # First action: ask the kernel to SIGTERM us if the parent dies.
+    # Must run before any model load -- a parent crash during the
+    # ~150-second cold-spawn window would otherwise orphan a child
+    # holding 70+ GiB of GPU memory until container teardown.
+    _set_parent_death_signal(signal.SIGTERM)
     # Defensive: parent should have already set these; setdefault keeps
     # things sane if someone runs this entrypoint by hand.
     os.environ.setdefault(
