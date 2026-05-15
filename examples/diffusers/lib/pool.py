@@ -161,6 +161,12 @@ class SubprocessPool:
             str, _SubprocessHandle
         ] = collections.OrderedDict()
         self._pool_lock = asyncio.Lock()
+        # Pre-initialize the labeled gauge so ``video_pool_size`` shows
+        # up at /metrics from boot (with value 0). Without this, the
+        # series wouldn't emit until first pool activity, which makes
+        # it hard for operators to confirm pool mode is configured
+        # before any traffic flows.
+        POOL_SIZE.labels(model=self.model_label).set(0)
 
     async def route(self, shape_key: str, request: dict) -> dict:
         """
