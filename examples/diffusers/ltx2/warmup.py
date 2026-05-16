@@ -46,6 +46,7 @@ Usage (single-shape worker, internal -- only used by --legacy-subprocess):
 from __future__ import annotations
 
 import argparse
+import asyncio
 import contextlib
 import json
 import os
@@ -376,18 +377,24 @@ def _run_driver_single_process(args: argparse.Namespace) -> int:
 
 def _run_driver_subprocess(args: argparse.Namespace) -> int:
     """
-    Subprocess-per-shape driver: spawn one fresh Python subprocess per
-    shape, each pointed at its own /cache/per-shape/<shape_key>/{torch-
-    inductor,triton} cache directory.
+    Pool-subprocess-per-shape driver: route each shape through the SAME
+    SubprocessPool code path that production uses
+    (lib.pool.SubprocessPool spawning worker.py --pool-worker). A fresh
+    K=1 pool is built per shape, the request is routed once, and the
+    pool is shut down before the next shape so each shape gets a fresh
+    pool subprocess writing to its own /cache/per-shape/<tag>/ dir.
 
-    PRODUCTION CACHE-BUILD PATH (as of 2026-05-14). Fresh-process state
-    plus isolated cache dirs gives each shape a compile-cache key derived
-    from clean kernel state, reproducible by a fresh production worker
-    pointed at the same per-shape dir (Phase 2). Flag name retained for
-    compatibility; rename deferred.
+    Using the production pool subprocess as the cache-building subprocess
+    is the load-bearing property: torch.compile / inductor fx_graph_cache
+    keys are sensitive to invocation context (__main__ identity, argv,
+    sys.modules layout). The prior driver spawned warmup.py --single-shape
+    children -- a different __main__, different argv -- and inductor
+    produced different fxgraph keys (and materially different compiled
+    artifacts) than the worker pool subprocess. Caches written never hit
+    at serve time.
     """
-    # Parent is just a dispatcher; per-shape cache dirs are set on each
-    # child via env= below, so we do NOT call _ensure_cache_env() here.
+    from lib.pool import SubprocessPool
+
     cfg = _read_shapes_config(args)
 
     model = cfg.get("model", "FastVideo/LTX2-Distilled-Diffusers")
@@ -403,7 +410,7 @@ def _run_driver_subprocess(args: argparse.Namespace) -> int:
     per_shape_root = Path("/cache/per-shape")
     cache_before = _du_bytes(per_shape_root)
     print(
-        f"[warmup] driver start (subprocess-per-shape): {len(shapes)} shape(s), "
+        f"[warmup] driver start (pool-subprocess-per-shape): {len(shapes)} shape(s), "
         f"model={model}, cache_before={_human(cache_before)} "
         f"root={per_shape_root}",
         flush=True,
@@ -411,6 +418,22 @@ def _run_driver_subprocess(args: argparse.Namespace) -> int:
 
     successes: list[str] = []
     failures: list[tuple[str, str]] = []
+
+    async def _route_one_shape_with_timeout(
+        tag: str, request: dict, timeout: float
+    ) -> dict:
+        pool = SubprocessPool(
+            model_path=model,
+            num_gpus=1,
+            enable_optimizations=False,
+            attention_backend="TORCH_SDPA",
+            model_factory_dotted="ltx2.factory:load_model",
+            model_label="ltx2-distilled",
+        )
+        try:
+            return await asyncio.wait_for(pool.route(tag, request), timeout=timeout)
+        finally:
+            await pool.shutdown()
 
     for idx, shape in enumerate(shapes, 1):
         w = int(shape["width"])
@@ -421,34 +444,28 @@ def _run_driver_subprocess(args: argparse.Namespace) -> int:
         if out_path.exists():
             out_path.unlink()
 
+        # The pool's _spawn sets TORCHINDUCTOR_CACHE_DIR / TRITON_CACHE_DIR
+        # on the child env using the shape_key, so we only need the dirs
+        # to exist (the pool subprocess writes into them).
         shape_inductor = per_shape_root / tag / "torchinductor"
         shape_triton = per_shape_root / tag / "triton"
         shape_inductor.mkdir(parents=True, exist_ok=True)
         shape_triton.mkdir(parents=True, exist_ok=True)
 
-        cmd = [
-            sys.executable,
-            __file__,
-            "--single-shape",
-            "--model",
-            model,
-            "--width",
-            str(w),
-            "--height",
-            str(h),
-            "--num-frames",
-            str(nf),
-            "--fps",
-            str(fps),
-            "--num-inference-steps",
-            str(num_inference_steps),
-            "--guidance-scale",
-            str(guidance_scale),
-            "--seed",
-            str(seed),
-            "--output",
-            str(out_path),
-        ]
+        request = {
+            "request_id": f"warmup_{tag}",
+            "prompt": PROMPT,
+            "width": w,
+            "height": h,
+            "num_frames": nf,
+            "fps": fps,
+            "num_inference_steps": num_inference_steps,
+            "guidance_scale": guidance_scale,
+            "seed": seed,
+            "negative_prompt": None,
+            "output_path": str(out_path),
+        }
+
         print(
             f"[warmup] ({idx}/{len(shapes)}) launching {tag} -> {out_path}",
             flush=True,
@@ -458,26 +475,36 @@ def _run_driver_subprocess(args: argparse.Namespace) -> int:
             f"{per_shape_root}/{tag}",
             flush=True,
         )
-        child_env = os.environ.copy()
-        child_env["TORCHINDUCTOR_CACHE_DIR"] = str(shape_inductor)
-        child_env["TRITON_CACHE_DIR"] = str(shape_triton)
+
         t0 = time.perf_counter()
         try:
-            result = subprocess.run(
-                cmd,
-                check=False,
-                timeout=args.per_shape_timeout,
-                env=child_env,
+            result = asyncio.run(
+                _route_one_shape_with_timeout(tag, request, args.per_shape_timeout)
             )
-        except subprocess.TimeoutExpired:
+        except asyncio.TimeoutError:
             elapsed = time.perf_counter() - t0
             msg = f"timeout after {elapsed:.1f}s"
             print(f"[warmup] FAIL {tag}: {msg}", flush=True)
             failures.append((tag, msg))
+            if args.fail_fast:
+                break
+            continue
+        except Exception as exc:
+            elapsed = time.perf_counter() - t0
+            msg = f"{type(exc).__name__}: {exc}"
+            print(f"[warmup] FAIL {tag}: {msg} (after {elapsed:.1f}s)", flush=True)
+            failures.append((tag, msg))
+            if args.fail_fast:
+                break
             continue
 
         elapsed = time.perf_counter() - t0
-        if result.returncode == 0 and out_path.exists() and out_path.stat().st_size > 0:
+        status = result.get("status")
+        if (
+            status == "DONE"
+            and out_path.exists()
+            and out_path.stat().st_size > 0
+        ):
             size_mb = out_path.stat().st_size / 1_048_576
             print(
                 f"[warmup] OK   {tag} in {elapsed:.1f}s ({size_mb:.1f}MB)",
@@ -486,7 +513,8 @@ def _run_driver_subprocess(args: argparse.Namespace) -> int:
             successes.append(tag)
         else:
             msg = (
-                f"rc={result.returncode} "
+                f"status={status} "
+                f"error={result.get('error', '?')} "
                 f"file_exists={out_path.exists()} "
                 f"size={out_path.stat().st_size if out_path.exists() else 0}"
             )
