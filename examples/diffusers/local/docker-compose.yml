@@ -45,6 +45,8 @@ services:
       python -m dynamo.frontend
         --http-port 8000
         --discovery-backend file
+        --request-plane tcp
+        --event-plane zmq
     environment:
       - DYN_FILE_KV=/tmp/dynamo-discovery
     volumes:
