@@ -35,7 +35,7 @@ if [[ -n "${WORKER_EXTRA_ARGS}" ]]; then
   worker_cmd+=("${worker_extra[@]}")
 fi
 
-frontend_cmd=("${PYTHON_BIN}" -m dynamo.frontend --http-port "${HTTP_PORT}" --discovery-backend file)
+frontend_cmd=("${PYTHON_BIN}" -m dynamo.frontend --http-port "${HTTP_PORT}" --discovery-backend file --request-plane tcp --event-plane zmq)
 if [[ -n "${FRONTEND_EXTRA_ARGS}" ]]; then
   # shellcheck disable=SC2206
   frontend_extra=( ${FRONTEND_EXTRA_ARGS} )
