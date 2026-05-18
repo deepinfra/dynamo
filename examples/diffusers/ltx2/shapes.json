@@ -1,0 +1,60 @@
+{
+  "_comment": "Strict superset of production LTX-2 shapes. Adding entries is fine; removing requires a new image tag (hash changes). 1080p@241f is excluded: the VAE decoder's intermediate activation exceeds 2^31 elements and F.pad throws an int32-indexing error. 10-second video (241 frames) is only available at <=720p for the soft launch. 'Nominal 720p' is served as 1280x736 / 736x1280 because the LTX-2 VAE spatial_compression_ratio=32 requires all output dims to be multiples of 32; ltx.py's field validator rounds customer requests of 720 up to 736.",
+  "model": "/data/default",
+  "fps": 24,
+  "num_inference_steps": 5,
+  "guidance_scale": 1.0,
+  "seed": 42,
+  "shapes": [
+    {
+      "width": 1920,
+      "height": 1088,
+      "num_frames": 121
+    },
+    {
+      "width": 1088,
+      "height": 1920,
+      "num_frames": 121
+    },
+    {
+      "width": 1280,
+      "height": 736,
+      "num_frames": 121
+    },
+    {
+      "width": 1280,
+      "height": 736,
+      "num_frames": 241
+    },
+    {
+      "width": 736,
+      "height": 1280,
+      "num_frames": 121
+    },
+    {
+      "width": 736,
+      "height": 1280,
+      "num_frames": 241
+    },
+    {
+      "width": 768,
+      "height": 512,
+      "num_frames": 121
+    },
+    {
+      "width": 768,
+      "height": 512,
+      "num_frames": 241
+    },
+    {
+      "width": 512,
+      "height": 768,
+      "num_frames": 121
+    },
+    {
+      "width": 512,
+      "height": 768,
+      "num_frames": 241
+    }
+  ]
+}
