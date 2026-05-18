@@ -88,31 +88,35 @@ Expect `TORCH_CUDA_ARCH_LIST=10.0a` and `CMAKE_ARGS=...FASTVIDEO_KERNEL_BUILD_TK
 
 ### Step 3: warmup (populate `/cache`)
 
-The default warmup mode is **single-process**: one VideoGenerator load,
-all shapes generated in sequence in one Python process. This produces
-a compile cache keyed by single-process dynamo state, which is exactly
-what production workers see at runtime, so the cache hits cleanly.
+Each shape is routed through `lib.pool.SubprocessPool` so the
+cache-building subprocess is byte-identical in code path to the runtime
+serving subprocess. Cache keys produced here match what production reads
+at serve time.
 
-A shape failure aborts the run (we want stability over partial results).
-If you need crash isolation for debugging a specific shape, opt into
-`--legacy-subprocess` mode — but be aware it produces a cache that
-**doesn't match production access** and isn't suitable for ship images.
+By default a shape failure is logged and the run continues to the next
+shape (pass `--fail-fast` to stop on first failure). See
+`claude_plans/2026-05-14-ltx2-phase2-subprocess-pool.md` "What we tried
+that was wrong" for the Phase 3A regression that motivated the
+pool-routed path.
 
 ```bash
-sudo mkdir -p /cache/torchinductor /cache/triton
+sudo mkdir -p /cache/per-shape
 sudo chown -R $USER:$USER /cache
 
 nohup docker run --rm \
   --gpus '"device=<GPU-UUID>"' \
   --ipc=host --shm-size=16g \
-  -e TORCHINDUCTOR_CACHE_DIR=/cache/torchinductor \
-  -e TRITON_CACHE_DIR=/cache/triton \
   -v /cache:/cache \
   -v "$HOME/dynamo/examples/diffusers:/opt/app" \
   -v /tmp/warmup-outputs:/tmp/warmup-outputs \
+  -v <path-to-weights>:/data/default:ro \
+  -e HF_HUB_OFFLINE=1 \
   -w /opt/app \
   localhost:30500/fastvideo-runtime:<version>-ltx2-warmupbase \
-  python3 warmup.py --shapes shapes.json --output-dir /tmp/warmup-outputs \
+  python3 ltx2/warmup.py \
+    --shapes ltx2/shapes.json \
+    --output-dir /tmp/warmup-outputs \
+    --model /data/default \
   > ~/warmup.log 2>&1 &
 ```
 
@@ -389,5 +393,5 @@ A: Whenever shapes change, or when we adopt a new FastVideo / torch / CUDA versi
 **Q: Who has B200 access?**
 A: The two-GPU reservation on di-slc-111 (UUIDs `GPU-d1062f6e-...` and `GPU-db888802-...`). Coordinate with the team before kicking off long builds.
 
-**Q: Why single-process warmup instead of subprocess-per-shape?**
-A: torch.compile's on-disk cache key folds in dynamo's accumulated in-memory state at compile time. Subprocess-per-shape compiles every shape with "fresh process" state, producing a cache keyed for that state. But production workers run all shapes in a single long-lived process, where dynamo's state evolves with each compile. The result: cache keys we baked don't match keys production looks up, and we pay a 5-15 minute recompile per shape on first request. Single-process warmup mirrors production's compile-state evolution, so the cache it builds actually hits at runtime. Use `--legacy-subprocess` only for crash-isolation debugging — the cache it produces is unsuitable for ship images.
+**Q: How does warmup produce a cache that hits at serve time?**
+A: Warmup routes each shape through the same `lib.pool.SubprocessPool` code path the runtime serving worker uses (spawning `worker.py --pool-worker` per shape). The cache-building subprocess IS the cache-reading subprocess by construction, so compile cache keys produced at warmup time match what runtime asks for at serve time. The load-bearing property: torch.compile / inductor fxgraph cache keys are sensitive to invocation context (__main__ identity, argv, sys.modules layout) in ways that diverge across invocation paths — using the production code path sidesteps the divergence. Validated 2026-05-16 di-slc-39: per-shape caches built this way produce byte-identical fxgraph keys to what runtime asks for (`fx_graph_cache hit` logs on byte-identical keys). See `claude_plans/2026-05-14-ltx2-phase2-subprocess-pool.md` "What we tried that was wrong" for the Phase 3A regression that motivated this design.
