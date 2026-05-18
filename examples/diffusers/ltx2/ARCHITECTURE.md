@@ -63,9 +63,8 @@ sees the same fresh-state key, finds the cached compiled kernels, and
 loads them rather than recompiling.
 
 [`warmup.py`](warmup.py) produces these per-shape caches at image-bake time
-(`--legacy-subprocess` mode, despite the name this is the production
-path; the in-process single-process mode is order-dependent and unsuitable
-for production cache builds). The runtime worker (this directory's
+by routing each shape through `lib.pool.SubprocessPool` — the same code
+path the runtime worker uses. The runtime worker (this directory's
 [`worker.py`](worker.py) + the generic pool in
 [`../lib/pool.py`](../lib/pool.py)) consumes them at runtime by spawning a
 subprocess per shape and pointing its env at the matching per-shape
