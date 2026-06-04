@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
-use crate::protocols::{WorkerId, WorkerWithDpRank};
+use crate::protocols::{KvCacheEventData, WorkerId, WorkerWithDpRank};
 use crate::recovery::{CursorObservation, CursorState};
 use crate::zmq_wire::{ZmqEventNormalizer, decode_event_batch};
 
@@ -272,9 +272,22 @@ impl ListenerLoop {
                 ) else {
                     continue;
                 };
-                let router_event = placement_event
+                let mut router_event = placement_event
                     .into_router_event()
                     .expect("local worker placement must convert to router event");
+                // Feed-layer measurement filters (same as apply_live_batch).
+                if super::ignore_evictions()
+                    && matches!(
+                        router_event.event.data,
+                        KvCacheEventData::Removed(_) | KvCacheEventData::Cleared
+                    )
+                {
+                    continue;
+                }
+                if super::merge_shards() {
+                    router_event.worker_id = 0;
+                    router_event.event.dp_rank = 0;
+                }
                 indexer.apply_event_routed(router_event).await;
             }
             watermark.store(seq, Ordering::Release);
@@ -341,9 +354,22 @@ impl ListenerLoop {
             ) else {
                 continue;
             };
-            let router_event = placement_event
+            let mut router_event = placement_event
                 .into_router_event()
                 .expect("local worker placement must convert to router event");
+            // Feed-layer measurement filters.
+            if super::ignore_evictions()
+                && matches!(
+                    router_event.event.data,
+                    KvCacheEventData::Removed(_) | KvCacheEventData::Cleared
+                )
+            {
+                continue;
+            }
+            if super::merge_shards() {
+                router_event.worker_id = 0;
+                router_event.event.dp_rank = 0;
+            }
             self.indexer.apply_event_routed(router_event).await;
             self.messages_processed += 1;
         }

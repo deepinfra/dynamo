@@ -31,7 +31,7 @@ pub mod registry;
 pub mod server;
 mod zmq;
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use tokio::net::TcpListener;
@@ -41,6 +41,27 @@ use crate::config::min_initial_workers_from_env;
 use registry::WorkerRegistry;
 use server::{AppState, create_router};
 
+// Process-global measurement-mode filter flags.
+//
+// Set once at startup by `run_server` from `IndexerConfig` and then read
+// in the hot listener path.  `OnceLock` is free after the first `get()`
+// (it is a thin wrapper around `Option`) and suits flags that are written
+// exactly once and read many times.
+static IGNORE_EVICTIONS: OnceLock<bool> = OnceLock::new();
+static MERGE_SHARDS: OnceLock<bool> = OnceLock::new();
+
+/// Returns `true` when this indexer instance should drop `Removed` and
+/// `Cleared` events, simulating a tree with infinite memory capacity.
+pub(crate) fn ignore_evictions() -> bool {
+    *IGNORE_EVICTIONS.get().unwrap_or(&false)
+}
+
+/// Returns `true` when this indexer instance should rewrite every event's
+/// `worker_id` and `dp_rank` to 0, simulating a single global shard.
+pub(crate) fn merge_shards() -> bool {
+    *MERGE_SHARDS.get().unwrap_or(&false)
+}
+
 pub struct IndexerConfig {
     pub block_size: Option<u32>,
     pub port: u16,
@@ -49,6 +70,14 @@ pub struct IndexerConfig {
     pub model_name: String,
     pub tenant_id: String,
     pub peers: Option<String>,
+    /// Drop `Removed` and `Cleared` events before applying to the tree.
+    /// Simulates infinite memory (evictions never happen). Useful for the
+    /// "ideal ceiling" and "∞ memory + sharded" measurement modes.
+    pub ignore_evictions: bool,
+    /// Rewrite every event's `worker_id` and `dp_rank` to 0 before applying
+    /// to the tree.  Simulates all engine shards as one global worker.
+    /// Combine with `ignore_evictions` for the "ideal ceiling" mode.
+    pub merge_shards: bool,
 }
 
 pub(super) fn validate_zmq_endpoint(endpoint: &str) -> anyhow::Result<()> {
@@ -135,6 +164,12 @@ pub fn parse_workers(s: &str) -> anyhow::Result<Vec<(u64, u32, String)>> {
 }
 
 pub async fn run_server(config: IndexerConfig) -> anyhow::Result<()> {
+    // Set process-global filter flags before spawning any listeners.
+    // `set` returns Err if already set; that should never happen since
+    // run_server is called once, so we discard the result.
+    let _ = IGNORE_EVICTIONS.set(config.ignore_evictions);
+    let _ = MERGE_SHARDS.set(config.merge_shards);
+
     let cancel_token = CancellationToken::new();
     let shutdown_token = cancel_token.clone();
     tokio::spawn(async move {

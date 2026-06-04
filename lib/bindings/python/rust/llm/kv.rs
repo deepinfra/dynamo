@@ -70,6 +70,18 @@ struct KvIndexerCli {
     /// Comma-separated peer URLs for P2P recovery (e.g. "http://host1:8090,http://host2:8091")
     #[arg(long)]
     peers: Option<String>,
+
+    /// Drop Removed and Cleared events before applying to the tree.
+    /// Simulates infinite memory (evictions never happen).
+    /// Use for the "ideal ceiling" and "infinite memory + sharded" measurement modes.
+    #[arg(long, default_value_t = false)]
+    ignore_evictions: bool,
+
+    /// Rewrite every event's worker_id and dp_rank to 0 before applying to the tree.
+    /// Simulates all engine shards as a single global worker.
+    /// Combine with --ignore-evictions for the "ideal ceiling" mode.
+    #[arg(long, default_value_t = false)]
+    merge_shards: bool,
 }
 
 pub fn run_kv_indexer_cli<I, T>(args: I) -> anyhow::Result<()>
@@ -95,6 +107,8 @@ where
             model_name: cli.model_name,
             tenant_id: cli.tenant_id,
             peers: cli.peers,
+            ignore_evictions: cli.ignore_evictions,
+            merge_shards: cli.merge_shards,
         }))
     }
 
