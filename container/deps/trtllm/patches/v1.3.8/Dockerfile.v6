@@ -1,0 +1,22 @@
+FROM localhost:30500/dynamo-di-trtllm:v1.3.8-drain-v5
+
+# DEEPINFRA: v6 closes the remaining gap from v5.
+# v5 shut down the Rust FpmDirectPublisher on pause_fpm so the worker stopped
+# emitting FPM events — but the planner's FpmEventSubscriber holds a
+# `latest_stats` cache keyed by worker_id and only prunes it when Task 2 sees
+# a `Removed` event on the ComponentModels (MDC) discovery watch. release_memory_occupation
+# only called unregister_endpoint_instance(), not unregister_model() — so the
+# model card stayed in MDC, known_workers still contained the drained worker,
+# and the planner kept reading the stale FPM forever.
+#
+# v6:
+#   - release_memory_occupation now also calls unregister_model(endpoint) so
+#     the planner-side cache prunes cleanly.
+#   - resume_memory_occupation calls a stashed _reregister_model_fn closure
+#     to put the model card back; the closure was bound at worker startup
+#     by llm_worker.py with the original register_model args.
+#   - handler gains set_reregister_model_fn(); llm_worker.py wires it after
+#     the initial register_model call.
+COPY publisher.py /opt/dynamo/venv/lib/python3.12/site-packages/dynamo/trtllm/publisher.py
+COPY handler_base.py /opt/dynamo/venv/lib/python3.12/site-packages/dynamo/trtllm/request_handlers/handler_base.py
+COPY llm_worker.py /opt/dynamo/venv/lib/python3.12/site-packages/dynamo/trtllm/workers/llm_worker.py
