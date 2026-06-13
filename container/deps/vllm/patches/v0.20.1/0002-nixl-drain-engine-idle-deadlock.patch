@@ -1,0 +1,126 @@
+From 0a0e4c51f1c28d462d210fc7256d110c97638455 Mon Sep 17 00:00:00 2001
+From: Alex Steiner <asteiner@nvidia.com>
+Date: Thu, 21 May 2026 10:09:28 -0700
+Subject: [PATCH] [Bugfix][NIXL] drain prefill _reqs_to_send when engine goes
+ idle (v0.20.1 backport)
+
+Backported from upstream (0a0e4c51) for v0.20.1. The original patch
+relies on `update_connector_output` to clear `_pending_after_send`
+when the worker reports `finished_sending`, but that method doesn't
+exist in v0.20.1. This backport tracks per-request TTL expiry
+directly in `_pending_after_send` (matching VLLM_NIXL_ABORT_REQUEST_TIMEOUT),
+so entries age out without an upstream notification hook.
+
+When a prefill-side vLLM engine using the NIXL KV connector finishes
+all user requests and `NixlConnectorWorker._reqs_to_send` still has
+entries pinned awaiting decode-side pull, `EngineCore.run_busy_loop`
+blocks indefinitely on `input_queue.get(block=True)`. While blocked,
+`scheduler.step()` never runs, so the worker's get_finished() TTL
+drain never runs. Blocks stay pinned until restart.
+
+Fix: scheduler-side connector tracks each pinned send with a TTL.
+`has_pending_kv_xfers()` returns True while any non-expired entry
+remains, and is consulted from `Scheduler.has_finished_requests()`
+to keep the engine busy loop stepping. Once TTLs elapse, the engine
+returns to idle. The worker's get_finished() drain runs naturally
+on each step.
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+---
+ .../kv_connector/v1/nixl/connector.py         |  8 ++++++++
+ .../kv_connector/v1/nixl/scheduler.py         | 25 +++++++++++++++++++
+ vllm/v1/core/sched/scheduler.py               | 18 ++++++++++++-
+ 3 files changed, 50 insertions(+), 1 deletion(-)
+
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py
+@@ -165,6 +165,14 @@ def update_connector_output(self, connector_output: KVConnectorOutput):
+         assert self.connector_scheduler is not None
+         self.connector_scheduler.update_connector_output(connector_output)
+
++    def has_pending_kv_xfers(self) -> bool:
++        """Delegate to scheduler-side connector. True while P-side blocks
++        remain pinned awaiting decode-side NIXL pull notification, so the
++        vLLM scheduler keeps the engine busy loop stepping to drain them."""
++        if self.connector_scheduler is None:
++            return False
++        return self.connector_scheduler.has_pending_kv_xfers()
++
+     def request_finished(
+         self,
+         request: "Request",
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/scheduler.py b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/scheduler.py
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/scheduler.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/scheduler.py
+@@ -100,6 +100,18 @@ def __init__(
+         # Reqs to send and their expiration time
+         self._reqs_need_send: dict[ReqId, float] = {}
+         self._reqs_in_batch: set[ReqId] = set()
++        # Track P-side requests whose blocks are pinned in
++        # NixlConnectorWorker._reqs_to_send awaiting decode-side NIXL pull.
++        # Value is TTL expiry (perf_counter() + VLLM_NIXL_ABORT_REQUEST_TIMEOUT)
++        # matching the worker's, so entries age out without requiring an
++        # upstream "finished_sending" hook (which v0.20.1's nixl scheduler
++        # lacks). The engine busy loop keeps stepping while any non-expired
++        # entry remains, letting worker.get_finished() process notifications
++        # + TTL expiry naturally. Without this, after the last user request
++        # finishes, the engine sits in input_queue.get(block=True) and the
++        # connector never gets a chance to drain -- prefill blocks stay
++        # pinned until the worker restarts.
++        self._pending_after_send: dict[ReqId, float] = {}
+         # Reqs to remove from processed set because they're not to send after
+         # remote prefill or aborted.
+         self._reqs_not_processed: set[ReqId] = set()
+@@ -486,6 +498,9 @@ def request_finished(
+             self._reqs_need_send[request.request_id] = (
+                 time.perf_counter() + envs.VLLM_NIXL_ABORT_REQUEST_TIMEOUT
+             )
++            self._pending_after_send[request.request_id] = (
++                time.perf_counter() + envs.VLLM_NIXL_ABORT_REQUEST_TIMEOUT
++            )
+             # NOTE HMA will "mark" empty/null blocks in groups with 0s (eg SWA ones),
+             # trimming down after allocating for the whole sequence length. Empty
+             # blocks are always at the start of the list.
+@@ -502,3 +517,13 @@ def request_finished(
+             remote_port=self.side_channel_port,
+             tp_size=self.vllm_config.parallel_config.tensor_parallel_size,
+         )
++
++    def has_pending_kv_xfers(self) -> bool:
++        """Return True while any pinned P-side send is within its TTL.
++        Aging out expired entries lets the engine return to idle once the
++        worker-side drain (notification or TTL expiry) has finished."""
++        now = time.perf_counter()
++        self._pending_after_send = {
++            r: exp for r, exp in self._pending_after_send.items() if exp > now
++        }
++        return bool(self._pending_after_send)
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -1882,7 +1882,23 @@ def get_num_unfinished_requests(self) -> int:
+         return num_waiting + len(self.running)
+
+     def has_finished_requests(self) -> bool:
+-        return len(self.finished_req_ids) > 0
++        # Also consider KV connector pending state: when a prior request's
++        # blocks are still pinned awaiting a remote KV pull notification
++        # (e.g. NIXL connector's worker-side _reqs_to_send), we must keep the
++        # engine busy loop stepping so the connector's notification/TTL
++        # drain code path inside worker.get_finished() actually runs.
++        # Without this, after the last user request finishes, the engine
++        # blocks indefinitely in input_queue.get(block=True) and the
++        # connector never frees those blocks -- they stay pinned until
++        # the worker restarts.
++        if len(self.finished_req_ids) > 0:
++            return True
++        if self.connector is not None and getattr(
++            self.connector, "has_pending_kv_xfers", None
++        ) is not None:
++            if self.connector.has_pending_kv_xfers():
++                return True
++        return False
+
+     def reset_prefix_cache(
+         self, reset_running_requests: bool = False, reset_connector: bool = False
