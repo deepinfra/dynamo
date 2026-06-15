@@ -453,6 +453,14 @@ impl<T: SyncIndexer> ThreadPoolIndexer<T> {
             .collect()
     }
 
+    /// Total number of (worker, block) entries currently tracked across all
+    /// worker lookup tables. Exposed for memory/observability gauges: in
+    /// kv-events mode the tree has no prune TTL, so this is the primary signal
+    /// for unbounded growth.
+    pub async fn total_blocks(&self) -> usize {
+        self.worker_lookup_stats().await.block_count()
+    }
+
     /// Enqueue a structural anchor on the same rank queue used by normal
     /// events for this source. Branch-sharded routing uses this to preserve
     /// Anchor-before-Stored ordering for the dependent suffix on that queue.
