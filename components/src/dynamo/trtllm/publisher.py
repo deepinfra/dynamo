@@ -717,8 +717,16 @@ class Publisher:
                     queued_sum_decode_kv_tokens = int(
                         ibs.get("numPausedKvTokens", 0)
                     ) + int(ibs.get("numQueuedGenKvTokens", 0))
-                    # iterLatencyMS is ms; the Rust snapshot expects seconds.
-                    wall_time_secs = float(stat.get("iterLatencyMS", 0.0)) / 1000.0
+                    # Prefer gpuForwardTimeMS (TRT-LLM PR #14922, available in
+                    # 1.3.0rc18+) — clean per-iter GPU-forward time that excludes
+                    # idle queue-wait and overlap-scheduler pipelining. Fall back
+                    # to iterLatencyMS on older engines. Both are in ms; the Rust
+                    # snapshot expects seconds. ``None``-check (not ``or``) so a
+                    # genuine 0.0 on an idle iter isn't replaced by iterLatencyMS.
+                    wall_time_ms = stat.get("gpuForwardTimeMS")
+                    if wall_time_ms is None:
+                        wall_time_ms = stat.get("iterLatencyMS", 0.0)
+                    wall_time_secs = float(wall_time_ms) / 1000.0
                     attention_dp_rank = stat.get("attentionDpRank")
                     dp_rank = (
                         int(attention_dp_rank) if attention_dp_rank is not None else 0
