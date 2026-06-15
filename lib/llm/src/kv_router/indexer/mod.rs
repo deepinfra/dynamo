@@ -5,7 +5,7 @@
 //! from router configuration with runtime-backed metrics and, when configured,
 //! a request-plane remote primary.
 
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use anyhow::Result;
 use dynamo_kv_router::{
@@ -13,9 +13,10 @@ use dynamo_kv_router::{
     approx::PruneConfig,
     config::{ApproximateCachePolicyKind, KvRouterConfig},
     indexer::{
-        ApproximateRetentionConfig, KvIndexer, KvIndexerMetrics, LowerTierIndexers,
-        ThreadPoolIndexer,
+        ApproximateRetentionConfig, KvIndexer, KvIndexerInterface, KvIndexerMetrics,
+        LowerTierIndexers, ThreadPoolIndexer,
     },
+    protocols::WorkerId,
 };
 
 // Re-export tiered-match types so internal callers (`indexer::TieredMatchDetails`)
@@ -26,7 +27,9 @@ pub(crate) use dynamo_kv_router::indexer::WireTieredMatchDetails;
 pub use dynamo_kv_router::services::indexer::backend::{Indexer, RemotePrimary, SideIndexer};
 pub(crate) use dynamo_kv_router::services::indexer::recording::ApproximateRequestLease;
 use dynamo_kv_router::services::indexer::session_updates::SessionUpdateSender;
-use dynamo_runtime::component::Component;
+use dynamo_runtime::{
+    component::Component, metrics::MetricsHierarchy, traits::DistributedRuntimeProvider,
+};
 pub(crate) use ingress::{RuntimeIngress, RuntimeIngressArgs};
 use tokio_util::sync::CancellationToken;
 
@@ -78,6 +81,114 @@ fn resolve_approximate_primary_policy(
         return Ok(ResolvedApproximatePrimaryPolicy::TtlRemoteFallback);
     }
     Ok(ResolvedApproximatePrimaryPolicy::Lru)
+}
+
+/// DEEPINFRA: periodically reconcile the kv-events radix tree against live
+/// discovery and purge blocks for departed workers.
+///
+/// In kv-events ("exact") mode the primary tree is built without a prune TTL
+/// (`ThreadPoolIndexer::new_with_metrics`), and — unlike the NATS recovery path
+/// (`recovery::jetstream`'s `purge_then_snapshot`) — the ZMQ event plane has no
+/// worker-departure reconciliation. A worker that restarts/scales/churns leaves
+/// its entire block set in the tree forever, which leaks unbounded memory
+/// (observed: frontend → ~500GB). This mirrors the NATS purge: list live
+/// instances and drop tree workers no longer present. It only removes workers
+/// that no longer exist in discovery, so it never evicts live cache state.
+fn spawn_zmq_worker_reconciliation(
+    component: Component,
+    indexer: Arc<ThreadPoolIndexer<ConcurrentRadixTreeCompressed>>,
+) {
+    const RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
+    let token = component.drt().primary_token();
+    // Publishes the tree's tracked-block count each tick. In kv-events mode the
+    // tree has no prune TTL, so this gauge is the primary signal for the
+    // unbounded-growth leak this reconciliation guards against. `.ok()` so a
+    // registration failure (e.g. duplicate) degrades to no gauge, not a panic.
+    let block_gauge = component
+        .metrics()
+        .create_intgauge(
+            "kv_indexer_tracked_blocks",
+            "Number of (worker, block) entries currently tracked in the KV router radix tree",
+            &[],
+        )
+        .map_err(|e| tracing::warn!("kv-indexer: failed to create tracked-blocks gauge: {e}"))
+        .ok();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(RECONCILE_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = token.cancelled() => break,
+                _ = ticker.tick() => {
+                    if let Some(gauge) = &block_gauge {
+                        gauge.set(indexer.total_blocks().await as i64);
+                    }
+                    let live: HashSet<WorkerId> = match component.list_instances().await {
+                        Ok(instances) => instances.iter().map(|i| i.instance_id).collect(),
+                        Err(e) => {
+                            tracing::warn!("kv-indexer worker reconciliation: list_instances failed: {e}");
+                            continue;
+                        }
+                    };
+                    for worker_id in workers_to_purge(&live, &indexer.get_workers().await) {
+                        tracing::info!(
+                            worker_id,
+                            "kv-indexer reconciliation: purging blocks for departed worker"
+                        );
+                        KvIndexerInterface::remove_worker(indexer.as_ref(), worker_id).await;
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Pure reconciliation step: given the live worker set from discovery and the
+/// workers currently in the tree, return those that should be purged (present
+/// in the tree but absent from discovery). An empty `live` set purges nothing,
+/// guarding against a transient empty discovery result wiping the whole tree.
+fn workers_to_purge(live: &HashSet<WorkerId>, tree_workers: &[WorkerId]) -> Vec<WorkerId> {
+    if live.is_empty() {
+        return Vec::new();
+    }
+    tree_workers
+        .iter()
+        .copied()
+        .filter(|worker_id| !live.contains(worker_id))
+        .collect()
+}
+
+#[cfg(test)]
+mod reconciliation_tests {
+    use super::{WorkerId, workers_to_purge};
+    use std::collections::HashSet;
+
+    fn live(ids: &[WorkerId]) -> HashSet<WorkerId> {
+        ids.iter().copied().collect()
+    }
+
+    #[test]
+    fn purges_departed_keeps_live() {
+        let mut purge = workers_to_purge(&live(&[1, 2]), &[1, 2, 3, 4]);
+        purge.sort_unstable();
+        assert_eq!(purge, vec![3, 4]);
+    }
+
+    #[test]
+    fn empty_discovery_purges_nothing() {
+        // Transient empty discovery must not wipe the tree.
+        assert!(workers_to_purge(&HashSet::new(), &[1, 2, 3]).is_empty());
+    }
+
+    #[test]
+    fn all_workers_live_purges_nothing() {
+        assert!(workers_to_purge(&live(&[1, 2, 3]), &[1, 2, 3]).is_empty());
+    }
+
+    #[test]
+    fn empty_tree_purges_nothing() {
+        assert!(workers_to_purge(&live(&[1, 2]), &[]).is_empty());
+    }
 }
 
 /// Build the frontend router's index for `kv_router_config`.
@@ -207,6 +318,10 @@ pub(crate) async fn build(
             block_size,
             Some(kv_indexer_metrics.clone()),
         ));
+        // DEEPINFRA: kv-events mode has no prune TTL and the ZMQ event plane
+        // has no worker-departure purge, so churned/restarted workers leak
+        // their block sets forever. Reconcile against discovery to drop them.
+        spawn_zmq_worker_reconciliation(component.clone(), primary.clone());
         let session_updates = session_prefix_index
             .map(|index| SessionUpdateSender::for_concurrent(index, Arc::clone(&primary)));
         return Ok(Indexer::Concurrent {
