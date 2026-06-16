@@ -480,6 +480,62 @@ class PrometheusAPIClient:
             )
         return None
 
+    def get_total_kv_blocks(
+        self,
+        component_name: Optional[str] = None,
+    ) -> Optional[int]:
+        """DEEPINFRA: query the TRT-LLM kv_cache_max_blocks gauge from VM.
+
+        TRT-LLM workers expose ``trtllm_kv_cache_max_blocks`` per worker. The
+        worker doesn't currently include ``total_kv_blocks`` in its
+        ``ModelRuntimeConfig`` at registration time (TRT-LLM lacks a sync
+        startup-time accessor — see ``trtllm/workers/llm_worker.py``
+        ``total_kv_blocks`` TODO), so the planner's
+        ``WorkerInfo.max_kv_tokens`` is ``None`` and both the consolidation
+        feasibility check and the KV-saturation scale-up trigger silently
+        no-op. Pull the value directly from VM as a fallback so KV-pressure
+        protection works on trtllm.
+
+        Returns None if no series found, the query fails, or values vary
+        across workers (which would indicate a mis-config worth surfacing
+        rather than averaging silently).
+        """
+        try:
+            # trtllm_* metrics use the raw namespace (with dashes) on the
+            # dynamo_namespace label — unlike dynamo_component_* metrics
+            # which normalize to underscores. Use the namespace as-is.
+            filters = [f'dynamo_namespace="{self.dynamo_namespace}"']
+            if component_name:
+                filters.append(f'dynamo_component="{component_name}"')
+            query = f"trtllm_kv_cache_max_blocks{{{','.join(filters)}}}"
+            result = self.prom.custom_query(query=query)
+            if not result:
+                logger.info(
+                    f"No prometheus data for trtllm_kv_cache_max_blocks "
+                    f"(component={component_name}, ns={self.dynamo_namespace})"
+                )
+                return None
+            values = sorted(
+                int(float(r["value"][1]))
+                for r in result
+                if not math.isnan(float(r["value"][1]))
+            )
+            if not values:
+                return None
+            # Workers backed by the same model+config should report identical
+            # max_blocks. If the spread is wide, log a warning but still
+            # return the minimum (conservative — gives the saturation check
+            # a tighter ceiling).
+            if values[-1] - values[0] > max(1, values[0] // 100):
+                logger.warning(
+                    f"trtllm_kv_cache_max_blocks varies across workers "
+                    f"(min={values[0]}, max={values[-1]}); using min"
+                )
+            return values[0]
+        except Exception as e:
+            logger.warning(f"Error getting total_kv_blocks: {e}")
+            return None
+
     def warn_if_router_not_scraped(self) -> None:
         """Warn if Prometheus is not scraping any dynamo_component_router_* series.
 

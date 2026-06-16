@@ -564,6 +564,23 @@ class PlannerConfig(BaseModel):
     load_scaling_down_sensitivity: int = (
         SLAPlannerDefaults.load_scaling_down_sensitivity
     )
+    # DEEPINFRA: KV saturation threshold for decode scale-up. When every
+    # decode engine's combined sched+queued KV utilisation exceeds this
+    # fraction of max_kv_tokens, force scale-up regardless of ITL. Catches
+    # the over-commit regime where the regression's ITL prediction looks
+    # healthy (only in-batch sequences are being serviced) but most
+    # incoming work is parked in disagg-transfer/eviction queues. Requires
+    # WorkerInfo.max_kv_tokens to be populated (MDC or VM backfill).
+    # Disabled when set to None or > 1.0.
+    decode_kv_saturation_threshold: Optional[float] = Field(
+        default=0.9,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "KV utilisation fraction (0.0-1.0) that triggers decode scale-up "
+            "when every engine breaches it. Set to None to disable."
+        ),
+    )
     prefill_scale_up_queue_tokens: Optional[int] = Field(
         default=SLAPlannerDefaults.prefill_scale_up_queue_tokens,
         ge=0,
