@@ -381,6 +381,28 @@ class NativePlannerBase:
             self.decode_worker_info.model_name or self.prefill_worker_info.model_name
         )
 
+        # DEEPINFRA: TRT-LLM workers don't publish total_kv_blocks to MDC
+        # (sync startup-time accessor is missing in TRT-LLM; the trtllm
+        # worker's llm_worker.py acknowledges this as a TODO). Without it,
+        # WorkerInfo.max_kv_tokens is None and both the consolidation
+        # feasibility check (scale-down) and the KV-saturation scale-up
+        # trigger silently no-op. Backfill from VM when MDC is missing it.
+        for side, info in (
+            ("prefill", self.prefill_worker_info),
+            ("decode", self.decode_worker_info),
+        ):
+            if info.total_kv_blocks is None and info.component_name:
+                fetched = self.prometheus_traffic_client.get_total_kv_blocks(
+                    component_name=info.component_name,
+                )
+                if fetched is not None:
+                    info.total_kv_blocks = fetched
+                    logger.info(
+                        f"{side} WorkerInfo total_kv_blocks=None at MDC time; "
+                        f"backfilled from VM: {fetched} "
+                        f"(component={info.component_name})"
+                    )
+
     def _resolve_runtime_namespace(self) -> str:
         if hasattr(self.connector, "get_worker_runtime_namespace"):
             return self.connector.get_worker_runtime_namespace(  # type: ignore[attr-defined]
