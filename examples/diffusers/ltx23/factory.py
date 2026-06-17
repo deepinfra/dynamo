@@ -91,9 +91,32 @@ def load_model(
                 logger.info("NVFP4 + mode=default compile (robust path)")
                 optimization_kwargs = standard_kwargs()
 
+    # LTX-2.3 distilled is a two-stage pipeline: a fast low-res denoise pass
+    # followed by a latent-upsample + refine pass (this is what buys the 1080p
+    # quality). The refine stage is enabled by the LTX-2.3 pipeline config, but
+    # our weights' model_index.json is a plain diffusers LTX2Pipeline index with
+    # no fastvideo_refine_* keys, so FastVideo's auto-discovery (which looks for
+    # a "spatial_upsampler" entry / fastvideo_refine_upsampler_path in the index)
+    # can't find the upsampler and load_modules raises
+    # "ltx2_refine_enabled is True but ltx2_refine_upsampler_path was not
+    # provided." Point it at the bundled spatial_upscaler component (a Diffusers
+    # dir: config.json + model.safetensors). No separate refine transformer ships
+    # with this checkpoint, so the refine pass reuses the main DiT.
+    extra_kwargs: dict[str, Any] = {}
+    upsampler_path = os.path.join(model_path, "spatial_upscaler")
+    if os.path.isdir(upsampler_path):
+        extra_kwargs["ltx2_refine_upsampler_path"] = upsampler_path
+    else:
+        logger.warning(
+            "LTX-2.3 refine upsampler dir not found at %s; refine stage will "
+            "fail to initialize. Check the weights layout.",
+            upsampler_path,
+        )
+
     return VideoGenerator.from_pretrained(
         model_path,
         num_gpus=num_gpus,
         pipeline_config=pipeline_config,
         **optimization_kwargs,
+        **extra_kwargs,
     )
