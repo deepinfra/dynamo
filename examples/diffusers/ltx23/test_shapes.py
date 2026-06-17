@@ -37,7 +37,7 @@ SHAPES_JSON = os.path.join(HERE, "shapes.json")
 # 2.1.3-ltx23-0a9a3bfe). Updating shapes.json -- adding, removing,
 # or renaming a shape -- changes this value, requires a new image bake,
 # and requires updating this fixture.
-EXPECTED_HASH = "0a9a3bfe"
+EXPECTED_HASH = "918a43cb"
 EXPECTED_SHAPE_COUNT = 2
 
 # Per-shape activation budget. The 1080p@241f shape is excluded from the
