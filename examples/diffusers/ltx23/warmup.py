@@ -161,10 +161,14 @@ def _run_driver(args: argparse.Namespace) -> int:
         pool = SubprocessPool(
             model_path=model,
             num_gpus=1,
-            enable_optimizations=False,
+            # LTX-2.3 bakes the NVFP4 cache so it MATCHES the NVFP4 serving path
+            # (serving runs the worker with --enable-optimizations). NVFP4 +
+            # mode=default by default; LTX23_FP4_MAX_AUTOTUNE=1 (inherited via
+            # env by the pool subprocess) switches to max-autotune for A/B.
+            enable_optimizations=True,
             attention_backend="TORCH_SDPA",
-            model_factory_dotted="ltx2.factory:load_model",
-            model_label="ltx2-distilled",
+            model_factory_dotted="ltx23.factory:load_model",
+            model_label="ltx2-3-distilled",
         )
         try:
             return await asyncio.wait_for(pool.route(tag, request), timeout=timeout)
