@@ -20,13 +20,17 @@ RUN apt-get update \
 COPY --from=ghcr.io/astral-sh/uv:0.10.11 /uv /uvx /bin/
 ENV UV_LINK_MODE=copy
 
-# Pin transformers to FastVideo's VALIDATED version (4.57.3). FastVideo's
-# pyproject floor is >=4.57.3, so a fresh install otherwise pulls transformers
-# 5.x (a major bump that changes text-encoder/tokenizer defaults and is NOT what
-# their published LTX-2.3 result was produced with -- and is what dragged in the
-# cu128-torchaudio mess earlier). The constraint holds it across every uv
-# resolution incl. the FastVideo install.
-RUN printf 'transformers==4.57.3\n' > /opt/uv-constraint.txt
+# Version pins applied to EVERY uv resolution in this image. (cu128 base, so no
+# +cuXXX index gymnastics needed -- these are plain version pins.)
+#  - torch==2.11.0: FastVideo's pinned torch. WITHOUT this, the flash-attn
+#    install (XOR-op repo) re-resolves and DOWNGRADES torch to 2.10.0, which
+#    then ABI-mismatches the 2.11 that FastVideo re-pins -> broken. The pin holds
+#    torch at 2.11.0 through every later install.
+#  - transformers==4.57.3: FastVideo's VALIDATED version. Their pyproject floor
+#    is >=4.57.3, so a fresh install otherwise pulls 5.x (a major bump that
+#    changes text-encoder/tokenizer defaults; not what their published LTX-2.3
+#    result was produced with).
+RUN printf 'torch==2.11.0\ntransformers==4.57.3\n' > /opt/uv-constraint.txt
 ENV UV_CONSTRAINT=/opt/uv-constraint.txt
 
 # torch 2.11.0 cu128, matching FastVideo's pyproject [tool.uv.sources]
