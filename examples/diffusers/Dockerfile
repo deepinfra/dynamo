@@ -60,7 +60,12 @@ ENV CMAKE_ARGS="-DCMAKE_CUDA_ARCHITECTURES=100a -DFASTVIDEO_KERNEL_BUILD_TK=OFF"
 # format ("100a", semicolon-separated without dots).
 RUN export FLASH_ATTN_CUDA_ARCHS=$(echo "${TORCH_CUDA_ARCH_LIST}" | sed 's/ /;/g; s/\.//g') \
  && echo "Building flash-attention for TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST} FLASH_ATTN_CUDA_ARCHS=${FLASH_ATTN_CUDA_ARCHS} MAX_JOBS=${MAX_JOBS}" \
- && git clone https://github.com/RandNMR73/flash-attention \
+ # Use FastVideo's exact FA4 fork (XOR-op/flash-attention@fa4-compile, the
+ # flash-attn-cute source in their pyproject [dreamverse] extra) instead of the
+ # RandNMR73 fork (a separate Dao-AILab fork). The FA4 cute kernels ARE the
+ # spatial-temporal attention; a divergent fork is the prime suspect for
+ # morphing-instead-of-motion / artifacts. Aligning to their validated fork.
+ && git clone https://github.com/XOR-op/flash-attention \
  && cd flash-attention \
  && git switch fa4-compile \
  && uv pip install . --no-build-isolation \
