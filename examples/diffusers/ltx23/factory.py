@@ -38,10 +38,23 @@ def load_model(
     internals.
     """
     import torch
+    import torch._inductor.config as _inductor
     from fastvideo import VideoGenerator
     from fastvideo.configs.pipelines.base import PipelineConfig
 
     from .config import fp4_kwargs, standard_kwargs
+
+    # Inductor knobs from FastVideo's LTX-2.3 reference example
+    # (basic_ltx2_3_distilled_i2v_typed.py). shape_padding=False is MANDATORY on
+    # Blackwell: without it the refine path hits a cuBLAS INVALID_VALUE crash
+    # inside pad_mm (every refine GEMM fails). The rest are their
+    # autotune-friendliness flags. Must be set before VideoGenerator triggers
+    # torch.compile below.
+    _inductor.shape_padding = False
+    _inductor.conv_1x1_as_mm = True
+    _inductor.coordinate_descent_tuning = True
+    _inductor.coordinate_descent_check_all_directions = True
+    _inductor.epilogue_fusion = False
 
     pipeline_config = PipelineConfig.from_pretrained(model_path)
 

@@ -20,59 +20,55 @@ without a coordinated rebuild.
 from copy import deepcopy
 from typing import Any
 
-# Standard ship-path kwargs. Used by warmup, benchmark, and production
-# worker (when no FP4 / max-autotune is requested).
+# THE recipe -- mirrors FastVideo's OWN LTX-2.3 distilled reference example
+# (examples/inference/basic/basic_ltx2_3_distilled_i2v_typed.py @ FASTVIDEO_SHA),
+# the path behind their "5s 1080p video in ~4.55s on a single B200" result (with
+# NVFP4 added -- the example itself runs bf16). Do NOT substitute hand-picked
+# values: reproduce their path, don't invent our own.
 #
-# torch_compile_kwargs notes:
-#   - mode="default" is what we ship. MEASURED ON LTX-2, NOT RE-VALIDATED FOR
-#     LTX-2.3 -- treat the numbers below as an LTX-2-derived expectation, not a
-#     2.3 measurement. We tested mode="max-autotune-no-cudagraphs"
-#     in 2.2.0-ltx2-c3266d71 (single-process bake, ~70 min) and found <1%
-#     improvement at 1080p steady state vs default mode. The 70-min bake cost
-#     wasn't justified. Document: 2026-04-29 benchmark on slc-111 B200 GPU 0,
-#     gens 11-14 default=50.4/50.2/15.2/40.6s vs max-autotune=49.8/49.4/15.2/39.8s.
-#     736×1280@121f saw a -20% improvement (18.9s -> 15.2s) -- worth re-investigating
-#     if that shape becomes a hot path, but not enough to justify the bake cost
-#     for the whole menu.
-#   - fullgraph=False -- LTX-2-derived claim, RE-VERIFY FOR LTX-2.3: on LTX-2
-#     the pipeline had Python control flow (refine on/off, audio branch) that
-#     dynamo couldn't trace as one graph. Confirm this still holds for LTX-2.3
-#     before relying on it.
+# IMPORTANT: the 2.3 recipe differs from the 2.0 Dreamverse streaming_demo.yaml.
+# 2.3 uses 8 denoise + 3 refine steps (not 5 + 2) and mode="default" (their
+# comment: "Inductor's default schedule matches max-autotune on this pipeline
+# while saving ~7 min of cold compile"). Denoise step count lives in
+# shapes.json (num_inference_steps=8); refine steps are here.
 #
-# ltx2_vae_tiling=True is mandatory for >=241-frame 1080p shapes; without
-# it the VAE decoder's intermediate tensor exceeds 2^31 elements and F.pad
-# trips PyTorch's int32 indexing limit. (For shapes that don't need
-# tiling, leaving it on costs ~1s of VAE decode time -- negligible.)
+# 2.3 example mapping:
+#   compile  -> enabled + text_encoder + VAE; inductor, fullgraph, mode=default, dynamic=false
+#   offload  -> all False (DiT / text-encoder / VAE resident on GPU)
+#   vae_tiling -> False
+#   refine   -> 3 steps, gs 1.0, add_noise true, no LoRA
+# Blackwell-mandatory Inductor knobs (shape_padding=False etc.) are set in
+# factory.py before compile -- without shape_padding=False the refine path
+# crashes cuBLAS (pad_mm INVALID_VALUE) on B200.
+# NVFP4 quant is set on pipeline_config in factory.py (enable_optimizations).
+# FLASH_ATTN via FASTVIDEO_ATTENTION_BACKEND in worker.py / warmup.py.
 LTX23_STANDARD_KWARGS: dict[str, Any] = {
     "ltx2_refine_enabled": True,
     "ltx2_refine_lora_path": "",
-    "ltx2_refine_num_inference_steps": 2,
+    "ltx2_refine_num_inference_steps": 3,
     "ltx2_refine_guidance_scale": 1.0,
     "ltx2_refine_add_noise": True,
     "enable_torch_compile": True,
     "enable_torch_compile_text_encoder": True,
+    "enable_torch_compile_vae": True,
     "torch_compile_kwargs": {
         "backend": "inductor",
-        "fullgraph": False,
+        "fullgraph": True,
         "mode": "default",
+        "dynamic": False,
     },
     "dit_cpu_offload": False,
     "vae_cpu_offload": False,
     "text_encoder_cpu_offload": False,
-    "ltx2_vae_tiling": True,
+    "ltx2_vae_tiling": False,
 }
 
 
-# FP4-specific overlays. Only applied when the caller explicitly requests
-# FP4 quantization (via worker.py --enable-optimizations). Switching to
-# this path requires a separate cache bake; the standard cache won't hit.
-LTX23_FP4_KWARGS: dict[str, Any] = {
-    "torch_compile_kwargs": {
-        "backend": "inductor",
-        "fullgraph": True,
-        "mode": "max-autotune-no-cudagraphs",
-    },
-}
+# The full-stack-optimized recipe now lives in LTX23_STANDARD_KWARGS (it IS the
+# FastVideo recipe), so there is no separate "fast" overlay anymore. Kept as an
+# empty overlay for import compatibility with factory.py's env switch; both
+# paths now resolve to the same recipe.
+LTX23_FP4_KWARGS: dict[str, Any] = {}
 
 
 def standard_kwargs() -> dict[str, Any]:
