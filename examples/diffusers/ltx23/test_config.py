@@ -1,13 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """
-Unit tests for ltx23.config: the canonical kwargs we pass to
-VideoGenerator.from_pretrained.
+Unit tests for ltx23.config — the TWO generation profiles (QUALITY, SPEED),
+each a faithful mirror of a FastVideo recipe (see ltx23/PROFILES.md).
 
-These flags determine the torch.compile cache key. If they drift, the
-shipped runtime image's compile cache will silently miss and customers
-will see 15+ minute first-call latencies. The tests below pin the
-ship-path invariants so a careless edit fails CI.
+These flags determine the torch.compile cache key + output quality. The tests
+pin each profile's invariants against its FastVideo source so a careless edit
+fails CI ("no nasty surprises about what we changed").
 """
 
 from __future__ import annotations
@@ -17,79 +16,70 @@ import sys
 
 import pytest
 
-# Put examples/diffusers/ on sys.path so ``ltx23.config`` resolves
-# regardless of how pytest is invoked.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from ltx23.config import (  # noqa: E402
-    LTX23_FP4_KWARGS,
-    LTX23_STANDARD_KWARGS,
-    fp4_kwargs,
-    standard_kwargs,
+    QUALITY_DENOISE_STEPS,
+    SPEED_DENOISE_STEPS,
+    profile_kwargs,
+    profile_uses_nvfp4,
 )
 
 
-def test_standard_kwargs_returns_fresh_copy() -> None:
-    """Mutating a returned dict must not poison the module-level constant."""
-    a = standard_kwargs()
-    a["torch_compile_kwargs"]["mode"] = "max-autotune"
-    a["ltx2_vae_tiling"] = False
-    b = standard_kwargs()
-    assert b["torch_compile_kwargs"]["mode"] == "default"
-    assert b["ltx2_vae_tiling"] is True
-
-
-def test_standard_kwargs_invariants() -> None:
-    """Pin the ship-path flags. Changing any of these requires a cache rebake."""
-    k = standard_kwargs()
-    assert k["enable_torch_compile"] is True
-    assert k["enable_torch_compile_text_encoder"] is True
-    assert k["torch_compile_kwargs"]["backend"] == "inductor"
-    assert k["torch_compile_kwargs"]["fullgraph"] is False
-    assert k["torch_compile_kwargs"]["mode"] == "default"
-    assert k["ltx2_vae_tiling"] is True
-    assert k["dit_cpu_offload"] is False
-    assert k["vae_cpu_offload"] is False
-    assert k["text_encoder_cpu_offload"] is False
+def test_quality_profile_mirrors_reference_example() -> None:
+    """QUALITY = basic_ltx2_3_distilled example: bf16, 3 refine, mode=default, VAE compile."""
+    k = profile_kwargs("quality")
     assert k["ltx2_refine_enabled"] is True
-    assert k["ltx2_refine_num_inference_steps"] == 2
+    assert k["ltx2_refine_num_inference_steps"] == 3
     assert k["ltx2_refine_guidance_scale"] == 1.0
     assert k["ltx2_refine_add_noise"] is True
+    assert k["enable_torch_compile"] is True
+    assert k["enable_torch_compile_text_encoder"] is True
+    assert k["enable_torch_compile_vae"] is True
+    assert k["torch_compile_kwargs"]["backend"] == "inductor"
+    assert k["torch_compile_kwargs"]["fullgraph"] is True
+    assert k["torch_compile_kwargs"]["mode"] == "default"
+    assert k["torch_compile_kwargs"]["dynamic"] is False
+    assert k["ltx2_vae_tiling"] is False
+    assert profile_uses_nvfp4("quality") is False
+    assert QUALITY_DENOISE_STEPS == 8
 
 
-def test_fp4_kwargs_overlays_standard() -> None:
-    """FP4 path overrides only torch_compile_kwargs; the rest of the standard
-    config (vae tiling, refine, offload flags) must survive."""
-    f = fp4_kwargs()
-    assert f["torch_compile_kwargs"]["fullgraph"] is True
-    assert f["torch_compile_kwargs"]["mode"] == "max-autotune-no-cudagraphs"
-    assert f["torch_compile_kwargs"]["backend"] == "inductor"
-    # Non-overlaid flags carry through.
-    assert f["ltx2_vae_tiling"] is True
-    assert f["enable_torch_compile"] is True
-    assert f["ltx2_refine_enabled"] is True
+def test_speed_profile_mirrors_streaming_demo() -> None:
+    """SPEED = streaming_demo.yaml: NVFP4, 2 refine, max-autotune, no VAE compile, pin_cpu_memory."""
+    k = profile_kwargs("speed")
+    assert k["ltx2_refine_num_inference_steps"] == 2
+    assert k["enable_torch_compile"] is True
+    assert k["enable_torch_compile_text_encoder"] is True
+    assert k["enable_torch_compile_vae"] is False          # streaming compiles only DiT+text_encoder
+    assert k["torch_compile_kwargs"]["mode"] == "max-autotune-no-cudagraphs"
+    assert k["torch_compile_kwargs"]["fullgraph"] is True
+    assert k["torch_compile_kwargs"]["dynamic"] is False
+    assert k["pin_cpu_memory"] is True
+    assert k["ltx2_vae_tiling"] is False
+    assert profile_uses_nvfp4("speed") is True
+    assert SPEED_DENOISE_STEPS == 5
 
 
-def test_fp4_kwargs_returns_fresh_copy() -> None:
-    """Same defensive-copy guarantee as standard_kwargs."""
-    a = fp4_kwargs()
-    a["torch_compile_kwargs"]["mode"] = "default"
-    a["ltx2_vae_tiling"] = False
-    b = fp4_kwargs()
-    assert b["torch_compile_kwargs"]["mode"] == "max-autotune-no-cudagraphs"
-    assert b["ltx2_vae_tiling"] is True
+def test_profile_kwargs_returns_fresh_copy() -> None:
+    """Mutating a returned dict must not poison the module-level profile."""
+    a = profile_kwargs("quality")
+    a["torch_compile_kwargs"]["mode"] = "mangled"
+    a["ltx2_refine_num_inference_steps"] = 99
+    b = profile_kwargs("quality")
+    assert b["torch_compile_kwargs"]["mode"] == "default"
+    assert b["ltx2_refine_num_inference_steps"] == 3
 
 
-def test_module_constants_not_mutated_by_calls() -> None:
-    """After many calls + mutations, the module dicts must be untouched."""
-    for _ in range(5):
-        d = standard_kwargs()
-        d.clear()
-        d2 = fp4_kwargs()
-        d2.clear()
-    assert LTX23_STANDARD_KWARGS["torch_compile_kwargs"]["mode"] == "default"
-    assert LTX23_STANDARD_KWARGS["ltx2_vae_tiling"] is True
-    assert LTX23_FP4_KWARGS["torch_compile_kwargs"]["fullgraph"] is True
+def test_unknown_profile_raises() -> None:
+    with pytest.raises(ValueError):
+        profile_kwargs("turbo")
+
+
+def test_default_profile_is_quality() -> None:
+    """No env / empty -> quality (the safe, vivid default)."""
+    assert profile_kwargs(None)["torch_compile_kwargs"]["mode"] == "default"
+    assert profile_uses_nvfp4(None) is False
 
 
 if __name__ == "__main__":

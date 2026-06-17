@@ -123,16 +123,20 @@ def _load_generator(model: str):
     # Put examples/diffusers/ on sys.path so the package import resolves
     # regardless of where the script is invoked from.
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    from ltx23.config import standard_kwargs
+    from ltx23.config import profile_kwargs
 
-    print(f"[benchmark] loading VideoGenerator model={model}", flush=True)
+    # Benchmark uses the QUALITY profile's load-time kwargs (bf16; no NVFP4 quant
+    # set here). For the SPEED profile, set LTX23_PROFILE=speed and go through
+    # factory.load_model instead (which applies NVFP4).
+    profile = os.environ.get("LTX23_PROFILE", "quality")
+    print(f"[benchmark] loading VideoGenerator model={model} profile={profile}", flush=True)
     t0 = time.perf_counter()
     pipeline_config = PipelineConfig.from_pretrained(model)
     generator = VideoGenerator.from_pretrained(
         model,
         num_gpus=1,
         pipeline_config=pipeline_config,
-        **standard_kwargs(),
+        **profile_kwargs(profile),
     )
     print(
         f"[benchmark] generator ready in {time.perf_counter() - t0:.1f}s",

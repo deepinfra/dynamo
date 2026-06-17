@@ -42,14 +42,22 @@ def load_model(
     from fastvideo import VideoGenerator
     from fastvideo.configs.pipelines.base import PipelineConfig
 
-    from .config import fp4_kwargs, standard_kwargs
+    from .config import profile_kwargs, profile_uses_nvfp4
 
-    # Inductor knobs from FastVideo's LTX-2.3 reference example
-    # (basic_ltx2_3_distilled_i2v_typed.py). shape_padding=False is MANDATORY on
-    # Blackwell: without it the refine path hits a cuBLAS INVALID_VALUE crash
-    # inside pad_mm (every refine GEMM fails). The rest are their
-    # autotune-friendliness flags. Must be set before VideoGenerator triggers
-    # torch.compile below.
+    # Profile selects which of the two FastVideo-mirrored recipes to build:
+    #   LTX23_PROFILE=quality (default) -> bf16, mode=default, VAE compile on
+    #                                      (mirrors basic_ltx2_3_distilled example)
+    #   LTX23_PROFILE=speed             -> NVFP4, max-autotune, no VAE compile
+    #                                      (mirrors streaming_demo.yaml, the 4.55s path)
+    # See ltx23/config.py / ltx23/PROFILES.md. The denoise step count (8 vs 5)
+    # lives in the shapes file / per-request num_inference_steps, not here.
+    profile = os.environ.get("LTX23_PROFILE", "quality").strip().lower()
+    optimization_kwargs = profile_kwargs(profile)
+
+    # Inductor knobs from FastVideo's LTX-2.3 reference (basic_ltx2_3_distilled).
+    # shape_padding=False is MANDATORY on Blackwell: without it the refine path
+    # hits a cuBLAS INVALID_VALUE crash inside pad_mm. The rest are their
+    # autotune-friendliness flags. Must be set before VideoGenerator compiles.
     _inductor.shape_padding = False
     _inductor.conv_1x1_as_mm = True
     _inductor.coordinate_descent_tuning = True
@@ -58,51 +66,23 @@ def load_model(
 
     pipeline_config = PipelineConfig.from_pretrained(model_path)
 
-    if not enable_optimizations:
-        optimization_kwargs = standard_kwargs()
-    else:
+    # Quant: SPEED profile uses NVFP4; QUALITY stays bf16 (quant_config=None).
+    # enable_optimizations gates NVFP4 as a safety (a caller asking for no-opt, or
+    # non-Blackwell hardware, falls back to bf16 even on the speed profile).
+    want_nvfp4 = profile_uses_nvfp4(profile) and enable_optimizations
+    if want_nvfp4:
         major, minor = torch.cuda.get_device_capability()
         if major < 10:
             logger.warning(
-                "FP4 quantization is only supported on NVIDIA Blackwell GPUs "
-                "(compute capability 10.0+). Detected compute capability: %d.%d. "
-                "Continuing without FP4 optimizations.",
-                major,
-                minor,
+                "NVFP4 (speed profile) needs Blackwell (cc>=10.0); detected %d.%d. "
+                "Falling back to bf16.", major, minor,
             )
-            optimization_kwargs = standard_kwargs()
         else:
-            logger.info(
-                "Using FP4 quantization for VideoGenerator model=%s",
-                model_path,
-            )
-            try:
-                # LTX-2.3 / post-#1288 FastVideo renamed FP4Config -> NVFP4Config
-                # (module fp4_config -> nvfp4_config). Verified present at the
-                # pinned target SHA (nvfp4_config.py:NVFP4Config).
-                from fastvideo.layers.quantization.nvfp4_config import NVFP4Config
-            except ImportError as exc:
-                raise RuntimeError(
-                    "FastVideo optimizations require "
-                    "fastvideo.layers.quantization.nvfp4_config, but this "
-                    "FastVideo build does not provide it. Re-run "
-                    "worker.py without --enable-optimizations or install a "
-                    "FastVideo version that includes nvfp4_config."
-                ) from exc
+            from fastvideo.layers.quantization.nvfp4_config import NVFP4Config
             pipeline_config.dit_config.quant_config = NVFP4Config()
-            # Compile-mode choice for the NVFP4 path (Phase-0 A/B on di-slc-47):
-            #   default (robust): mode="default" via standard_kwargs() -- portable
-            #     compile cache, fast bake, recompile-tolerant; aligned with the
-            #     never-recompile goal. NVFP4 quant is independent (set above).
-            #   LTX23_FP4_MAX_AUTOTUNE=1: fp4_kwargs() (fullgraph + max-autotune)
-            #     -- ~70-min bake, more env-fragile, <1% gain at 1080p in LTX-2
-            #     testing. Measure before adopting.
-            if os.environ.get("LTX23_FP4_MAX_AUTOTUNE") == "1":
-                logger.info("NVFP4 + max-autotune compile (LTX23_FP4_MAX_AUTOTUNE=1)")
-                optimization_kwargs = fp4_kwargs()
-            else:
-                logger.info("NVFP4 + mode=default compile (robust path)")
-                optimization_kwargs = standard_kwargs()
+            logger.info("LTX-2.3 profile=speed: NVFP4 + %s", optimization_kwargs["torch_compile_kwargs"]["mode"])
+    if pipeline_config.dit_config.quant_config is None:
+        logger.info("LTX-2.3 profile=%s: bf16 + %s", profile, optimization_kwargs["torch_compile_kwargs"]["mode"])
 
     # LTX-2.3 distilled is a two-stage pipeline: a fast low-res denoise pass
     # followed by a latent-upsample + refine pass (this is what buys the 1080p

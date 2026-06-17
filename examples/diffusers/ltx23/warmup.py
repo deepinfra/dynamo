@@ -161,12 +161,14 @@ def _run_driver(args: argparse.Namespace) -> int:
         pool = SubprocessPool(
             model_path=model,
             num_gpus=1,
-            # LTX-2.3 bakes the NVFP4 cache so it MATCHES the NVFP4 serving path
-            # (serving runs the worker with --enable-optimizations). NVFP4 +
-            # mode=default by default; LTX23_FP4_MAX_AUTOTUNE=1 (inherited via
-            # env by the pool subprocess) switches to max-autotune for A/B.
+            # Bake the cache so it MATCHES the serving path. The recipe is chosen
+            # by the LTX23_PROFILE env (quality|speed), which factory.load_model
+            # reads -- the pool subprocess inherits it. enable_optimizations=True
+            # lets the SPEED profile apply NVFP4 (QUALITY stays bf16 regardless).
+            # Denoise steps come from the shapes file (8 quality / 5 speed).
+            # See ltx23/config.py + ltx23/PROFILES.md.
             enable_optimizations=True,
-            attention_backend="TORCH_SDPA",
+            attention_backend="FLASH_ATTN",
             model_factory_dotted="ltx23.factory:load_model",
             model_label="ltx2-3-distilled",
         )
