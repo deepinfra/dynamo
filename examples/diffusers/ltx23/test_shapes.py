@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """
-Unit tests for ltx2/shapes.json + the menu-hash algorithm.
+Unit tests for ltx23/shapes.json + the menu-hash algorithm.
 
 The hash is the load-bearing identifier across the whole pipeline:
 
@@ -32,13 +32,13 @@ import pytest
 HERE = os.path.dirname(os.path.abspath(__file__))
 SHAPES_JSON = os.path.join(HERE, "shapes.json")
 
-# Pinned hash for the current 10-shape soft-launch menu. This is the
+# Pinned hash for the current 2-shape LTX-2.3 v1 menu. This is the
 # value that ends up in the runtime image tag (e.g. fastvideo-runtime:
-# 2.1.3-ltx2-c3266d71). Updating warmup_shapes.json -- adding, removing,
+# 2.1.3-ltx23-0a9a3bfe). Updating shapes.json -- adding, removing,
 # or renaming a shape -- changes this value, requires a new image bake,
 # and requires updating this fixture.
-EXPECTED_HASH = "c3266d71"
-EXPECTED_SHAPE_COUNT = 10
+EXPECTED_HASH = "0a9a3bfe"
+EXPECTED_SHAPE_COUNT = 2
 
 # Per-shape activation budget. The 1080p@241f shape is excluded from the
 # menu because the VAE decoder's intermediate tensor exceeds 2^31
@@ -53,7 +53,7 @@ def _canonical_menu_hash(shapes_json_path: str) -> tuple[str, int]:
     file has no FastVideo / torch dependency. Must stay byte-identical to:
       - examples/diffusers/lib/menu.py::compute_menu_hash
       - backend/tests/test_ltx_shape_menu.py
-      - the bake step documented in ltx2/RUNBOOK.md
+      - the bake step documented in ltx23/RUNBOOK.md
     """
     with open(shapes_json_path, "r", encoding="utf-8") as f:
         cfg = json.load(f)
@@ -71,7 +71,7 @@ def _load_shapes() -> dict:
 
 def test_warmup_shapes_parses() -> None:
     cfg = _load_shapes()
-    assert cfg["model"] == "FastVideo/LTX2-Distilled-Diffusers"
+    assert cfg["model"] == "/data/default"
     assert "shapes" in cfg
     assert isinstance(cfg["shapes"], list)
 
@@ -86,7 +86,7 @@ def test_warmup_shapes_required_keys() -> None:
 
 
 def test_warmup_shapes_dimensions_multiple_of_32() -> None:
-    """LTX-2 VAE has spatial_compression_ratio=32; non-multiples crash decode."""
+    """LTX-2.3 VAE has spatial_compression_ratio=32; non-multiples crash decode."""
     cfg = _load_shapes()
     for shape in cfg["shapes"]:
         assert shape["width"] % 32 == 0, f"width not /32: {shape}"

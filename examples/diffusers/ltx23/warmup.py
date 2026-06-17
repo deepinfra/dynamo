@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """
-Pre-compile LTX-2 torch.compile / triton / inductor caches for every
+Pre-compile LTX-2.3 torch.compile / triton / inductor caches for every
 production shape so the first production request is fast.
 
 Routes each shape through the same ``lib.pool.SubprocessPool`` code path
@@ -22,7 +22,7 @@ request. See ~/backend/claude_plans/2026-05-14-ltx2-phase2-subprocess-pool.md
 "What we tried that was wrong" for the Phase 3A regression and fix.
 
 Usage:
-  python ltx2/warmup.py --shapes ltx2/shapes.json \\
+  python ltx23/warmup.py --shapes ltx23/shapes.json \\
       --output-dir /tmp/warmup --model /data/default
 """
 
@@ -279,7 +279,7 @@ def _run_driver(args: argparse.Namespace) -> int:
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="LTX-2 warmup / compile-cache populator. Routes each "
+        description="LTX-2.3 warmup / compile-cache populator. Routes each "
         "shape through lib.pool.SubprocessPool so the cache-building "
         "subprocess matches the runtime serving subprocess in code path. "
         "Cache keys produced here match what the runtime asks for at "
@@ -289,7 +289,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--shapes",
         default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "shapes.json"),
-        help="path to shapes JSON (default: ltx2/shapes.json next to this script)",
+        help="path to shapes JSON (default: ltx23/shapes.json next to this script)",
     )
     p.add_argument(
         "--output-dir", default="/tmp/warmup", help="where to save rendered MP4s"

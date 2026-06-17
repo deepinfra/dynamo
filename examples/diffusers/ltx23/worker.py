@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """
-LTX-2 worker entry point for Dynamo (non-streaming).
+LTX-2.3 worker entry point for Dynamo (non-streaming).
 
 Registers a FastVideo VideoGenerator as a Dynamo backend endpoint
 compatible with the ``/v1/videos`` frontend endpoint. The endpoint
@@ -21,7 +21,7 @@ Usage:
   python worker.py [--model MODEL] [--num-gpus N] [--enable-optimizations]
                    [--attention-backend ATTENTION_BACKEND]
 
-This module is the LTX-2-specific entry. The top-level
+This module is the LTX-2.3-specific entry. The top-level
 ``examples/diffusers/worker.py`` shim is what the production
 deployment / pool-subprocess invocations actually execute; the shim
 dispatches pool-worker invocations to ``lib.pool`` directly (to skip
@@ -189,7 +189,7 @@ async def _main(args: argparse.Namespace) -> None:
             "DYN_SYSTEM_PORT is not set (or is %r); pool metrics will NOT "
             "be exposed. Set DYN_SYSTEM_PORT to a port (e.g. 9090) and "
             "DYN_SYSTEM_HOST=0.0.0.0 to enable the /metrics endpoint. "
-            "See examples/diffusers/ltx2/RUNBOOK.md § Metrics.",
+            "See examples/diffusers/ltx23/RUNBOOK.md § Metrics.",
             _system_port,
         )
     else:
@@ -211,7 +211,7 @@ async def _main(args: argparse.Namespace) -> None:
 
 def main_cli() -> None:
     """
-    LTX-2 worker entry. Called by the top-level ``worker.py`` shim
+    LTX-2.3 worker entry. Called by the top-level ``worker.py`` shim
     when the invocation is NOT a pool-worker subprocess (pool-worker
     dispatch happens in the shim itself, before any of these heavy
     imports run).
@@ -245,12 +245,12 @@ def main_cli() -> None:
 
 
 if __name__ == "__main__":
-    # If invoked directly (e.g. `python3 -m ltx2.worker`), guard the
+    # If invoked directly (e.g. `python3 -m ltx23.worker`), guard the
     # entry: pool-worker dispatch lives in the top-level shim. Direct
     # invocation with --pool-worker would skip that dispatch path.
     if "--pool-worker" in sys.argv:
         raise SystemExit(
-            "ltx2.worker invoked directly with --pool-worker; "
+            "ltx23.worker invoked directly with --pool-worker; "
             "use the top-level worker.py shim, which dispatches "
             "to lib.pool._pool_worker_dispatch_if_requested first."
         )

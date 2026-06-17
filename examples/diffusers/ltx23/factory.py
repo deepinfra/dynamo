@@ -1,16 +1,16 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""LTX-2 model factory.
+"""LTX-2.3 model factory.
 
-``load_model`` is the SINGLE source of truth for how an LTX-2
+``load_model`` is the SINGLE source of truth for how an LTX-2.3
 VideoGenerator is constructed. It is used by both the legacy
 in-process path (``lib.backend.GenericVideoBackend.initialize_model``)
 and the pool path (``lib.pool._pool_worker_main`` resolves it
-dynamically via the ``--model-factory ltx2.factory:load_model`` arg).
+dynamically via the ``--model-factory ltx23.factory:load_model`` arg).
 Sharing the factory across both paths is what keeps torch.compile
 cache keys byte-identical between warmup and serving.
 
-Heavy imports (torch, fastvideo, the LTX2 config kwargs) live inside
+Heavy imports (torch, fastvideo, the LTX-2.3 config kwargs) live inside
 the function body so the dispatcher's argv-parse + dynamic-import
 path stays cheap for pool subprocesses.
 """
@@ -28,13 +28,13 @@ def load_model(
     enable_optimizations: bool,
 ) -> Any:
     """
-    Build an LTX-2 ``VideoGenerator`` for ``model_path``.
+    Build an LTX-2.3 ``VideoGenerator`` for ``model_path``.
 
     Returns an object that exposes ``generate_video(**kwargs)`` with the
     FastVideo keyword-args contract (prompt, save_video, return_frames,
     output_path, width, height, num_frames, fps, num_inference_steps,
     guidance_scale, seed, negative_prompt). Generic pool/backend code
-    invokes ``.generate_video(...)`` and doesn't know about LTX-2
+    invokes ``.generate_video(...)`` and doesn't know about LTX-2.3
     internals.
     """
     import torch

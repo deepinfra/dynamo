@@ -1,6 +1,6 @@
-# LTX-2 Worker Architecture
+# LTX-2.3 Worker Architecture
 
-This document explains *why* the LTX-2 video-generation worker is shaped the
+This document explains *why* the LTX-2.3 video-generation worker is shaped the
 way it is. For operational procedures (adding a shape, baking an image,
 rollback, diagnosing failures) see [`RUNBOOK.md`](RUNBOOK.md). For the
 historical journey that produced this design, see the dated plan documents
@@ -9,12 +9,12 @@ under `deepinfra/backend/claude_plans/` referenced at the end of this file.
 **Code layout.** Generic video-pipeline infrastructure (subprocess pool,
 Connection-based IPC, Pydantic request/response models, Prometheus metrics,
 menu-hash check, Dynamo registration helpers) lives in the sibling
-[`../lib/`](../lib/) package. This document covers LTX-2-specific decisions
+[`../lib/`](../lib/) package. This document covers LTX-2.3-specific decisions
 and operational characteristics; the patterns described here apply to any
 future video model that plugs a factory function into the same
 infrastructure.
 
-If you are reading the worker code (the LTX-2 entry in
+If you are reading the worker code (the LTX-2.3 entry in
 [`worker.py`](worker.py), the pool / IPC in
 [`../lib/pool.py`](../lib/pool.py), or the backend / endpoint in
 [`../lib/backend.py`](../lib/backend.py)) and wondering why the IPC plumbing
@@ -24,10 +24,11 @@ cold and understand the constraints before changing anything.
 
 ## What this code serves
 
-LTX-2 is a FastVideo-backed text-to-video model (~19B parameters) served
+LTX-2.3 is a FastVideo-backed text-to-video model (~19B parameters) served
 through the Dynamo runtime's `/v1/videos` endpoint. The pipeline accepts a
-fixed menu of ~10 supported `(width, height, num_frames)` shapes
-(`shapes.json`), runs ~5 diffusion inference steps per request, and
+fixed menu of supported `(width, height, num_frames)` shapes (the LTX-2.3 v1
+menu is 2 landscape shapes; see `shapes.json`), runs ~8 diffusion inference
+steps per request, and
 returns an MP4 as base64. Production hardware is B200 (178 GiB GPU memory).
 A request takes 5-50 seconds of steady-state inference and produces a
 0.3-2 MB MP4.
@@ -104,7 +105,7 @@ Per-shape memory cost is dominated by FastVideo's internal multiprocess
 architecture, not by our pool. FastVideo's `multiproc_executor` forks a
 **Worker child** during model load that holds the actual model on GPU
 (weights + workspace + compiled kernels). The Worker child is ~70 GiB
-resident for LTX-2. The outer pool subprocess that owns the Worker child
+resident for LTX-2.3. The outer pool subprocess that owns the Worker child
 is only ~600 MiB — it is essentially a shepherd, not a holder.
 
 This means **each pool slot costs ~71 GiB of GPU memory**, not the
@@ -116,14 +117,14 @@ because there is only a few MiB of GPU memory left.
 
 `VIDEO_POOL_MAX_SIZE` is env-overridable for larger hardware. H100
 (80 GiB) cannot run pool mode for this model at all — K=1 leaves no
-headroom for activations. If LTX-2 is ever scheduled onto non-B200 GPUs,
+headroom for activations. If LTX-2.3 is ever scheduled onto non-B200 GPUs,
 operationally either lower `VIDEO_POOL_MAX_SIZE` to match the actual
 per-slot fit or disable pool mode entirely.
 
 ## Why LRU eviction
 
-A pod can see all menu shapes over its lifetime (typically 10 shapes for
-the LTX-2 menu) but the pool is bounded at K=2 by memory. Some eviction
+A pod can see all menu shapes over its lifetime (the LTX-2.3 v1 menu is
+2 shapes) but the pool is bounded at K=2 by memory. Some eviction
 policy is needed. LRU is a natural choice for shape-routing because
 real-world customer traffic has temporal locality (a customer typically
 generates several videos in the same shape in a session). The least
@@ -189,7 +190,7 @@ Until that follow-up lands, both paths remain in
 [`factory.load_model(model_name, num_gpus, enable_optimizations)`](factory.py)
 factory is used by both (legacy path: called directly from
 ``GenericVideoBackend.initialize_model``; pool path: imported in pool
-subprocesses via the ``--model-factory ltx2.factory:load_model`` dotted
+subprocesses via the ``--model-factory ltx23.factory:load_model`` dotted
 reference), so compile-cache keys match byte-for-byte across the two paths
 (do not split this factory; if you do, one path will produce caches the
 other cannot hit).
@@ -291,8 +292,8 @@ Operational procedures:
 - [`RUNBOOK.md`](RUNBOOK.md) — adding shapes, baking images, rollback,
   CI drift, diagnosing failures, updating FastVideo.
 
-Code (LTX-2-specific, this directory):
-- [`worker.py`](worker.py) — LTX-2 worker entry; CLI parse, namespace
+Code (LTX-2.3-specific, this directory):
+- [`worker.py`](worker.py) — LTX-2.3 worker entry; CLI parse, namespace
   resolution, endpoint registration, factory wiring.
 - [`factory.py`](factory.py) — `load_model()`: the shared
   ``VideoGenerator.from_pretrained`` factory used by both the legacy
@@ -323,7 +324,7 @@ Code (generic infrastructure, in sibling `../lib/`):
   ``get_worker_namespace`` and ``register_model`` helpers.
 - [`../worker.py`](../worker.py) — top-level shim; dispatches
   `--pool-worker` subprocesses into `lib.pool` BEFORE importing
-  `ltx2.worker`, so pool cold-start skips the parent-side import tree.
+  `ltx23.worker`, so pool cold-start skips the parent-side import tree.
 
 Historical narrative (in `deepinfra/backend`):
 - `claude_plans/2026-05-13-ltx2-cache-order-dependence.md` — the

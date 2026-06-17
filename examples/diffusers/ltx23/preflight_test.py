@@ -7,7 +7,7 @@ up the Dynamo distributed runtime. Loads the model, runs the preflight
 loop, exits. Logs per-shape timings and total wall time.
 
 Used to verify that a candidate ship image's preflight will:
-  - Find ltx2/shapes.json
+  - Find ltx23/shapes.json
   - Successfully warm every shape's in-memory cache
   - Complete in a reasonable wall-clock budget for pod startup
 """
@@ -21,8 +21,8 @@ import os
 import sys
 import time
 
-# Put examples/diffusers/ on sys.path so the lib / ltx2 packages
-# resolve. This script lives at examples/diffusers/ltx2/preflight_test.py;
+# Put examples/diffusers/ on sys.path so the lib / ltx23 packages
+# resolve. This script lives at examples/diffusers/ltx23/preflight_test.py;
 # parent dir = examples/diffusers/.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -31,7 +31,7 @@ def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument(
         "--model",
-        default="FastVideo/LTX2-Distilled-Diffusers",
+        default="FastVideo/LTX-2.3-Distilled-Diffusers",
         help="HuggingFace model identifier",
     )
     p.add_argument(
@@ -44,7 +44,7 @@ def _parse_args() -> argparse.Namespace:
 
 async def _amain(model: str) -> int:
     from lib.backend import GenericVideoBackend
-    from ltx2.factory import load_model
+    from ltx23.factory import load_model
 
     backend_args = argparse.Namespace(
         model=model,
@@ -57,8 +57,8 @@ async def _amain(model: str) -> int:
     backend = GenericVideoBackend(
         args=backend_args,
         model_factory_callable=load_model,
-        model_factory_dotted="ltx2.factory:load_model",
-        model_label="ltx2-distilled",
+        model_factory_dotted="ltx23.factory:load_model",
+        model_label="ltx2-3-distilled",
     )
 
     # Match production: default the shapes-JSON path so preflight can

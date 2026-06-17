@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """
-Unit tests for ltx2_config: the canonical kwargs we pass to
+Unit tests for ltx23.config: the canonical kwargs we pass to
 VideoGenerator.from_pretrained.
 
 These flags determine the torch.compile cache key. If they drift, the
@@ -17,13 +17,13 @@ import sys
 
 import pytest
 
-# Put examples/diffusers/ on sys.path so ``ltx2.config`` resolves
+# Put examples/diffusers/ on sys.path so ``ltx23.config`` resolves
 # regardless of how pytest is invoked.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from ltx2.config import (  # noqa: E402
-    LTX2_FP4_KWARGS,
-    LTX2_STANDARD_KWARGS,
+from ltx23.config import (  # noqa: E402
+    LTX23_FP4_KWARGS,
+    LTX23_STANDARD_KWARGS,
     fp4_kwargs,
     standard_kwargs,
 )
@@ -87,9 +87,9 @@ def test_module_constants_not_mutated_by_calls() -> None:
         d.clear()
         d2 = fp4_kwargs()
         d2.clear()
-    assert LTX2_STANDARD_KWARGS["torch_compile_kwargs"]["mode"] == "default"
-    assert LTX2_STANDARD_KWARGS["ltx2_vae_tiling"] is True
-    assert LTX2_FP4_KWARGS["torch_compile_kwargs"]["fullgraph"] is True
+    assert LTX23_STANDARD_KWARGS["torch_compile_kwargs"]["mode"] == "default"
+    assert LTX23_STANDARD_KWARGS["ltx2_vae_tiling"] is True
+    assert LTX23_FP4_KWARGS["torch_compile_kwargs"]["fullgraph"] is True
 
 
 if __name__ == "__main__":

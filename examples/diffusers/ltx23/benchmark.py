@@ -17,13 +17,13 @@ requests).
 
 The script itself is model-agnostic; it loads whatever HF model id you
 pass via --model and uses the shapes file you pass via --shapes. The
-optimization_kwargs in _load_generator() are tuned for LTX-2-style
+optimization_kwargs in _load_generator() are tuned for LTX-2.3-style
 distilled models (refine + tiling + compile); a different model family
 may want to edit those defaults.
 
 Usage (inside the container):
-  python3 ltx2/benchmark.py \\
-    --shapes ltx2/shapes.json \\
+  python3 ltx23/benchmark.py \\
+    --shapes ltx23/shapes.json \\
     --output-dir /tmp/benchmark-outputs \\
     --csv /tmp/benchmark-outputs/timings.csv \\
     --gpu-uuid GPU-xxxx-yyyy-zzzz
@@ -123,7 +123,7 @@ def _load_generator(model: str):
     # Put examples/diffusers/ on sys.path so the package import resolves
     # regardless of where the script is invoked from.
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    from ltx2.config import standard_kwargs
+    from ltx23.config import standard_kwargs
 
     print(f"[benchmark] loading VideoGenerator model={model}", flush=True)
     t0 = time.perf_counter()
@@ -164,7 +164,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--model",
-        default="FastVideo/LTX2-Distilled-Diffusers",
+        default="FastVideo/LTX-2.3-Distilled-Diffusers",
         help="HuggingFace model identifier to load",
     )
     parser.add_argument(
