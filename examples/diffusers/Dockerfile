@@ -11,18 +11,22 @@ RUN apt-get update \
 COPY --from=ghcr.io/astral-sh/uv:0.10.11 /uv /uvx /bin/
 ENV UV_LINK_MODE=copy
 
-# Pin torch/torchvision to the CUDA-13.0 build across EVERY uv resolution in
+# Pin the torch family to the CUDA-13.0 build across EVERY uv resolution in
 # this image. The base is CUDA 13.1, and flash-attention's cpp_extension build
 # rejects a torch whose compiled CUDA major differs. A later unpinned install
 # (flashinfer-python, ai-dynamo, FastVideo) otherwise re-resolves torch from
 # PyPI and silently swaps in the cu128 (CUDA 12.8) wheel -> flash-attn fails
-# with "detected CUDA version (13.1) mismatches ... (12.8)". The constraint
-# forbids any non-+cu130 torch; UV_EXTRA_INDEX_URL keeps the +cu130 wheel
-# reachable from installs whose primary index is PyPI; unsafe-first-match lets
-# uv fall through to that index for torch when PyPI's wheel violates the
-# constraint, while every other package still resolves from PyPI first (as
-# prod's frozen LTX-2 image does). 2.11.0+cu130 is exactly what prod runs.
-RUN printf 'torch==2.11.0+cu130\ntorchvision==0.26.0+cu130\n' > /opt/torch-constraint.txt
+# with "detected CUDA version (13.1) mismatches ... (12.8)". torchaudio is the
+# same trap one layer deeper: FastVideo's transformers 5.x imports torchaudio
+# at module load, and the PyPI torchaudio wheel is cu128-linked (dlopen of
+# libcudart.so.12, absent here) -> `import fastvideo` dies. Pin torch +
+# torchvision + torchaudio to +cu130 (torchcodec/torchdata already resolve
+# correctly). The constraint forbids any non-+cu130 build; UV_EXTRA_INDEX_URL
+# keeps the +cu130 wheels reachable from installs whose primary index is PyPI;
+# unsafe-first-match lets uv fall through to that index when PyPI's wheel
+# violates the constraint, while every other package still resolves from PyPI
+# first (as prod's frozen LTX-2 image does). These versions match prod exactly.
+RUN printf 'torch==2.11.0+cu130\ntorchvision==0.26.0+cu130\ntorchaudio==2.11.0+cu130\n' > /opt/torch-constraint.txt
 ENV UV_CONSTRAINT=/opt/torch-constraint.txt
 ENV UV_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu130
 ENV UV_INDEX_STRATEGY=unsafe-first-match
