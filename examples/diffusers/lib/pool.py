@@ -739,6 +739,11 @@ def _pool_worker_main(
                     kwargs["seed"] = req["seed"]
                 if req.get("negative_prompt") is not None:
                     kwargs["negative_prompt"] = req["negative_prompt"]
+                if req.get("ltx2_images"):
+                    # i2v: forward conditioning image(s) to the per-shape worker.
+                    # Same compiled shape as t2v (per-token mask, not a shape change).
+                    kwargs["ltx2_images"] = req["ltx2_images"]
+                    kwargs["ltx2_image_crf"] = req.get("ltx2_image_crf", 0.0)
 
                 t0 = time.perf_counter()
                 generator.generate_video(**kwargs)

@@ -1,0 +1,20 @@
+{
+  "_comment": "LTX-2.3 v1 shape menu (deepinfra). Two landscape shapes at 5s; each serves BOTH t2v and i2v (i2v rides the same compiled shape -- image conditioning is a per-token denoise mask, not a token-count change). Eager warm-on-boot warms exactly these. Adding/removing entries changes IMAGE_SHAPE_HASH and requires a new image tag + a matching per-model SUPPORTED_SHAPES in backend ltx.py (CI-checked). 'Nominal 720p' is 1280x736 because the LTX-2 VAE spatial_compression_ratio=32 requires dims that are multiples of 32 (ltx.py rounds 720->736). 10s (241f) and portrait deferred to a later menu.",
+  "model": "/data/default",
+  "fps": 24,
+  "num_inference_steps": 5,
+  "guidance_scale": 1.0,
+  "seed": 42,
+  "shapes": [
+    {
+      "width": 1920,
+      "height": 1088,
+      "num_frames": 121
+    },
+    {
+      "width": 1280,
+      "height": 736,
+      "num_frames": 121
+    }
+  ]
+}

@@ -42,6 +42,12 @@ if __name__ == "__main__":
 
         _pool_worker_dispatch_if_requested()  # never returns; calls sys.exit
     else:
-        from ltx2.worker import main_cli
+        # Family dispatcher (per this shim's design note). The LTX-2.3 image
+        # sets VIDEO_MODEL_FAMILY=ltx23 (via the model config's extra_env);
+        # default stays ltx2 so the existing LTX-2 image is unaffected.
+        import importlib
+        import os
 
+        family = os.environ.get("VIDEO_MODEL_FAMILY", "ltx2")
+        main_cli = importlib.import_module(f"{family}.worker").main_cli
         main_cli()

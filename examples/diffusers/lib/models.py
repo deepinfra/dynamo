@@ -22,6 +22,30 @@ class NvExtVideoCreateRequest(BaseModel):
     negative_prompt: str | None = Field(
         default=None, description="Text to avoid in generation"
     )
+    # i2v conditioning (LTX-2.3): omit image_url for text-to-video. The image
+    # rides the SAME compiled shape as t2v (image conditioning is a per-token
+    # denoise mask, not a token-count change), so it adds no new pool entry and
+    # no extra compile-cache bake.
+    image_url: str | None = Field(
+        default=None,
+        description=(
+            "i2v conditioning image: HTTP(S) URL, data: URI, or raw base64. "
+            "Omit for text-to-video."
+        ),
+    )
+    image_frame_index: int = Field(
+        default=0, description="Frame to anchor the conditioning image at (i2v)."
+    )
+    image_strength: float = Field(
+        default=1.0, ge=0.0, le=1.0, description="Conditioning strength (i2v)."
+    )
+    image_crf: float = Field(
+        default=0.0,
+        description=(
+            "JPEG re-encode quality for the conditioning image; 0 skips "
+            "re-encoding already-compressed input (FastVideo default is 33)."
+        ),
+    )
 
 
 class VideoCreateRequest(BaseModel):

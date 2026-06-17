@@ -55,7 +55,12 @@ RUN uv pip install ai-dynamo==1.1.1
 # (kwargs to from_pretrained, generate_video signature). Bumping this SHA
 # requires re-baking the cache and re-tagging the image. Procedure in
 # RUNBOOK § "Updating FastVideo".
-ARG FASTVIDEO_SHA=70ee5d230cda9651b88ada04be97ed94179bc482
+# LTX-2.3 build: bumped from 70ee5d23 (#1239, 2026-04-23, pre-LTX-2.3) to
+# 633d3935 (main, 2026-06-12) which has LTX-2.3 + NVFP4(renamed) + i2v + audio.
+# The LTX-2 image is FROZEN on the old SHA (retiring); only LTX-2.3 builds from
+# this branch. (One shared Dockerfile can't build both families -- different
+# FastVideo versions -- which is fine since LTX-2 is never rebuilt.)
+ARG FASTVIDEO_SHA=633d39356804e63478d242611e992dc8e1af3caa
 
 # Stamp the SHA into the runtime env so a running container can self-id:
 #   docker exec <container> printenv FASTVIDEO_SHA
