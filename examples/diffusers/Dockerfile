@@ -94,18 +94,17 @@ RUN echo "Building FastVideo @ ${FASTVIDEO_SHA} for TORCH_CUDA_ARCH_LIST=${TORCH
  && cd /tmp/FastVideo \
  && git checkout ${FASTVIDEO_SHA} \
  && git submodule update --init --recursive \
+ # FastVideo's [tool.uv.sources] pins the torch family (torch/torchvision/
+ # torchaudio) to the "pytorch-cu128" index (download.pytorch.org/whl/cu128) --
+ # uv honors that project-level source over any --index-url we pass. But this
+ # image is CUDA 13.1 with cu130 torch: flash-attn is already compiled against
+ # cu130 (matching prod's proven B200 stack), and a cu128 torchaudio dlopens
+ # libcudart.so.12 (absent here). torch 2.11.0 is the same code either way --
+ # +cuXXX only selects the bundled CUDA runtime -- so retarget FastVideo's torch
+ # index to cu130 to match this base instead of letting it downgrade the stack.
+ && sed -i 's|download.pytorch.org/whl/cu128|download.pytorch.org/whl/cu130|g' /tmp/FastVideo/pyproject.toml \
  && cd / \
- # FastVideo's pyproject pins torchaudio==2.11.0+cu130 (and depends on the rest
- # of the torch family). That +cu130 wheel only lives on the pytorch cu130
- # index, not PyPI. With PyPI as the primary index, unsafe-first-match binds
- # torchaudio to PyPI, finds no +cu130 there, and fails resolution ("no version
- # of torchaudio==2.11.0+cu130") instead of falling through. Make cu130 the
- # PRIMARY index for this resolution (PyPI as extra for the non-torch deps like
- # transformers) so the torch-family wheels resolve from cu130, mirroring the
- # torch install line above.
- && uv pip install --no-build-isolation /tmp/FastVideo \
-      --index-url https://download.pytorch.org/whl/cu130 \
-      --extra-index-url https://pypi.org/simple
+ && uv pip install --no-build-isolation /tmp/FastVideo
 
 ENV FASTVIDEO_VIDEO_CODEC=libx264
 ENV FASTVIDEO_X264_PRESET=ultrafast
