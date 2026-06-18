@@ -26,6 +26,8 @@
 pub mod indexer;
 pub mod listener;
 pub mod metrics;
+#[cfg(feature = "kube-discovery")]
+pub mod pod_watcher;
 pub mod recovery;
 pub mod registry;
 pub mod server;
@@ -62,6 +64,30 @@ pub(crate) fn merge_shards() -> bool {
     *MERGE_SHARDS.get().unwrap_or(&false)
 }
 
+/// Configuration for Kubernetes pod auto-discovery.
+///
+/// Plain data (no `kube` types) so it can live in the always-compiled config
+/// even when the `kube-discovery` feature is off; it is only *consumed* by the
+/// feature-gated [`pod_watcher`] module.
+#[derive(Debug, Clone)]
+pub struct KubeDiscoveryConfig {
+    /// Namespace to watch for engine pods.
+    pub namespace: String,
+    /// Label selector that picks out this model's engine pods,
+    /// e.g. `engine_hash=d4b7a85131172ca6`.
+    pub label_selector: String,
+    /// ZMQ KV-event port the engines publish on (e.g. 5557).
+    pub zmq_port: u16,
+    /// Optional ZMQ replay (ROUTER) port for gap recovery.
+    pub replay_port: Option<u16>,
+    /// Model name discovered pods are registered under.
+    pub model_name: String,
+    /// Tenant id discovered pods are registered under.
+    pub tenant_id: String,
+    /// KV cache block size for discovered engines.
+    pub block_size: u32,
+}
+
 pub struct IndexerConfig {
     pub block_size: Option<u32>,
     pub port: u16,
@@ -70,6 +96,8 @@ pub struct IndexerConfig {
     pub model_name: String,
     pub tenant_id: String,
     pub peers: Option<String>,
+    /// When set, watch Kubernetes and auto-register/deregister engine pods.
+    pub kube_discovery: Option<KubeDiscoveryConfig>,
     /// Drop `Removed` and `Cleared` events before applying to the tree.
     /// Simulates infinite memory (evictions never happen). Useful for the
     /// "ideal ceiling" and "∞ memory + sharded" measurement modes.
@@ -279,6 +307,21 @@ async fn run_common(
 
     wait_for_min_initial_workers(registry, &cancel_token).await?;
     registry.signal_ready();
+
+    // Optional Kubernetes pod auto-discovery. Runs on its own background task so
+    // it never blocks the HTTP server; stops when `cancel_token` fires.
+    if let Some(kube_config) = config.kube_discovery.clone() {
+        #[cfg(feature = "kube-discovery")]
+        pod_watcher::spawn_pod_watcher(kube_config, registry.clone(), cancel_token.clone());
+        #[cfg(not(feature = "kube-discovery"))]
+        {
+            let _ = kube_config;
+            tracing::warn!(
+                "kube_discovery is configured but this binary was built without the \
+                 `kube-discovery` feature; pod auto-discovery is disabled"
+            );
+        }
+    }
 
     #[cfg(feature = "metrics")]
     let prom_registry = {

@@ -21,6 +21,8 @@ profile = []
 shard-metrics = []
 standalone-indexer = ["dep:axum", "dep:serde_json", "dep:reqwest", "dep:zmq"]
 indexer-runtime = ["metrics", "runtime-protocols", "standalone-indexer"]
+# Kubernetes pod auto-discovery for the standalone indexer (pulls in the kube client).
+kube-discovery = ["standalone-indexer", "dep:kube", "dep:k8s-openapi", "dep:futures"]
 
 [dependencies]
 # repo
@@ -56,6 +58,11 @@ rustc-hash = "2.1.1"
 # standalone-indexer (optional)
 axum = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
+
+# kube-discovery (optional) — versions mirror lib/runtime
+kube = { version = "2.0.1", default-features = false, features = ["runtime", "client", "rustls-tls", "aws-lc-rs"], optional = true }
+k8s-openapi = { version = "0.26.0", features = ["v1_32"], optional = true }
+futures = { workspace = true, optional = true }
 
 [dev-dependencies]
 rstest = "0.18.2"

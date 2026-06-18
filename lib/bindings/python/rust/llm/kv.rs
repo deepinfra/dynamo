@@ -18,7 +18,7 @@ use dynamo_kv_router::config::{KvRouterConfig, RouterConfigOverride};
 use dynamo_kv_router::protocols::compute_block_hash_for_seq;
 use dynamo_kv_router::protocols::*;
 #[cfg(feature = "kv-indexer")]
-use dynamo_kv_router::standalone_indexer::{self, IndexerConfig};
+use dynamo_kv_router::standalone_indexer::{self, IndexerConfig, KubeDiscoveryConfig};
 use rs::pipeline::{AsyncEngine, SingleIn};
 use rs::protocols::annotated::Annotated as RsAnnotated;
 use tracing;
@@ -82,6 +82,29 @@ struct KvIndexerCli {
     /// Combine with --ignore-evictions for the "ideal ceiling" mode.
     #[arg(long, default_value_t = false)]
     merge_shards: bool,
+
+    /// Kubernetes namespace to watch for engine pods. Providing this together
+    /// with --watch-label enables pod auto-discovery (subscribe on Ready,
+    /// unsubscribe on delete).
+    #[arg(long)]
+    watch_namespace: Option<String>,
+
+    /// Label selector picking out this model's engine pods,
+    /// e.g. "engine_hash=d4b7a85131172ca6". Required with --watch-namespace.
+    #[arg(long)]
+    watch_label: Option<String>,
+
+    /// ZMQ KV-event port the discovered engines publish on.
+    #[arg(long, default_value_t = 5557)]
+    watch_zmq_port: u16,
+
+    /// Optional ZMQ replay (ROUTER) port on the engines for gap recovery.
+    #[arg(long)]
+    watch_replay_port: Option<u16>,
+
+    /// Model name to register discovered pods under. Defaults to --model-name.
+    #[arg(long)]
+    watch_model_name: Option<String>,
 }
 
 pub fn run_kv_indexer_cli<I, T>(args: I) -> anyhow::Result<()>
@@ -98,6 +121,30 @@ where
 
         init_standalone_logging();
 
+        // Build the optional Kubernetes discovery config. --watch-namespace and
+        // --watch-label must be supplied together; --block-size is then required
+        // because discovered engines are registered with it.
+        let kube_discovery = match (cli.watch_namespace, cli.watch_label) {
+            (Some(namespace), Some(label_selector)) => {
+                let block_size = cli.block_size.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "--block-size is required when --watch-namespace/--watch-label are set"
+                    )
+                })?;
+                Some(KubeDiscoveryConfig {
+                    namespace,
+                    label_selector,
+                    zmq_port: cli.watch_zmq_port,
+                    replay_port: cli.watch_replay_port,
+                    model_name: cli.watch_model_name.unwrap_or_else(|| cli.model_name.clone()),
+                    tenant_id: cli.tenant_id.clone(),
+                    block_size,
+                })
+            }
+            (None, None) => None,
+            _ => anyhow::bail!("--watch-namespace and --watch-label must be provided together"),
+        };
+
         let rt = tokio::runtime::Runtime::new()?;
         rt.block_on(standalone_indexer::run_server(IndexerConfig {
             block_size: cli.block_size,
@@ -109,6 +156,7 @@ where
             peers: cli.peers,
             ignore_evictions: cli.ignore_evictions,
             merge_shards: cli.merge_shards,
+            kube_discovery,
         }))
     }
 
