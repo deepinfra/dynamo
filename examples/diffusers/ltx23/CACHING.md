@@ -27,6 +27,11 @@ One resident process, both per-mode blobs loaded (glob-load), sequence t2v→i2v
 - **Peak VRAM ≈ 119 GB** for ONE process holding both modes (16 graphs) + model. Fits a 180 GB B200 with
   headroom. **But two resolutions = two resident pool processes ≈ 238 GB → OOMs a single B200.** So
   1080p-only is required to fit memory, not just to keep boot-warm short.
+- **Correctness: blob-served output is as correct as cold.** Frame-level PSNR cold-vs-blob = 22.95 dB and
+  cold-vs-cold (two independent compiles) = 22.82 dB — identical, so the blob adds ZERO error beyond the
+  inherent run-to-run nondeterminism of compiled diffusion (each compile picks slightly different kernels →
+  equally-valid variants). Frames are valid, artifact-free golden-retriever clips either way. No "fast but
+  wrong" risk from the cache.
 
 ## What's wired (code)
 - **Mega-Cache** — `lib/pool.py` exports `LTX_MEGACACHE_BLOB=<dir>/<shape_key>.megacache.bin` (from
