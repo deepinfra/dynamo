@@ -15,6 +15,19 @@ bake the caches into the serving image. Full investigation + measurements:
 - **Production model: Mega-Cache + resident pool + boot-warm.** A pod pays ~560 s ONCE at boot behind a
   readiness gate, then serves warm (~24 s QUALITY / ~15 s SPEED per clip). No on-the-fly recompile.
 
+## Measured end-to-end, 1080p QUALITY, both modes (2026-06-19, B200)
+One resident process, both per-mode blobs loaded (glob-load), sequence t2v→i2v→t2v→i2v:
+| forward | with | time | fx |
+|---|---|---|---|
+| t2v first (boot-warm) | blob | 493 s | HIT 8 |
+| i2v first (boot-warm) | blob | 462 s | HIT 8 |
+| t2v warm | resident | **24.0 s** | reuse |
+| i2v warm | resident | **24.2 s** | reuse |
+- **Boot-warm both modes ≈ 16 min** (493+462) with blobs; ~32 min without. Warm per clip **~24 s** (i2v == t2v).
+- **Peak VRAM ≈ 119 GB** for ONE process holding both modes (16 graphs) + model. Fits a 180 GB B200 with
+  headroom. **But two resolutions = two resident pool processes ≈ 238 GB → OOMs a single B200.** So
+  1080p-only is required to fit memory, not just to keep boot-warm short.
+
 ## What's wired (code)
 - **Mega-Cache** — `lib/pool.py` exports `LTX_MEGACACHE_BLOB=<dir>/<shape_key>.megacache.bin` (from
   `LTX_MEGACACHE_DIR`) before building the generator; `fastvideo/worker/gpu_worker.py` (fork patch) LOADS
@@ -64,8 +77,13 @@ The blob is keyed by (profile + shape + torch version + GPU arch + code/image), 
   t2v+i2v at one resolution share ONE resident process that must compile BOTH (16 graphs). Consequences:
   (1) **boot-warm must route a t2v AND an i2v dummy per resolution** (real warm surface = resolutions ×
   {t2v, i2v}, ~4 for our 2-res menu, not 2); (2) Mega-Cache saves after the FIRST forward, so a blob made
-  from a t2v request covers only t2v → i2v recompiles on reload (and vice-versa). To cover both, bake a t2v
-  AND an i2v gen and save after both, or keep separate per-mode blobs.
+  from a t2v request covers only t2v.
+  **Validated design (2026-06-19): per-mode blobs + glob-load.** Bake one blob PER MODE (a t2v-only and an
+  i2v-only process each save their own blob; name them e.g. `<shape>.t2v.megacache.bin` /
+  `<shape>.i2v.megacache.bin`). The worker `_ltx_megacache_load` globs the dir and calls
+  `load_cache_artifacts` once per blob — confirmed ADDITIVE: a fresh process that loaded both blobs hit
+  BOTH modes (t2v HIT=8, i2v HIT=8, MISS=0; ~491 s + ~448 s first-forward each). Do NOT use a single
+  combined blob (the multi-shape combined blob failed — first item missed).
 
 ## Future (not now): kill the ~512 s front-end
 Only **AOTInductor** (export submodules to `.so`, no runtime dynamo) can remove the front-end. It's a
