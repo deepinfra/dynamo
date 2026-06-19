@@ -58,6 +58,14 @@ The blob is keyed by (profile + shape + torch version + GPU arch + code/image), 
 - **Implicit inductor cache (`TORCHINDUCTOR_CACHE_DIR`) does NOT port** across processes — don't ship/rely
   on it for cold-start (LTX-2's tar+ADD bake only "worked" because of the di-slc-35 host-pin).
 - **Profile-specific**: a QUALITY (`mode=default`) blob will not serve the SPEED (`max-autotune`) profile.
+- **i2v is a SEPARATE compile from t2v** (measured 2026-06-19: at the same 1920×1088, the i2v forward
+  compiled 8 brand-new graphs, reusing none of t2v's — `MISS` delta 8, total 16, HIT 0). i2v injects
+  conditioning latents → distinct DiT graph, ~1000 s cold, same as t2v. The pool keys on `WxH@frames`, so
+  t2v+i2v at one resolution share ONE resident process that must compile BOTH (16 graphs). Consequences:
+  (1) **boot-warm must route a t2v AND an i2v dummy per resolution** (real warm surface = resolutions ×
+  {t2v, i2v}, ~4 for our 2-res menu, not 2); (2) Mega-Cache saves after the FIRST forward, so a blob made
+  from a t2v request covers only t2v → i2v recompiles on reload (and vice-versa). To cover both, bake a t2v
+  AND an i2v gen and save after both, or keep separate per-mode blobs.
 
 ## Future (not now): kill the ~512 s front-end
 Only **AOTInductor** (export submodules to `.so`, no runtime dynamo) can remove the front-end. It's a
