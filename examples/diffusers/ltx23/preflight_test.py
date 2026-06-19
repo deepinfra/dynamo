@@ -51,7 +51,7 @@ async def _amain(model: str) -> int:
         served_model_name=None,
         num_gpus=1,
         enable_optimizations=False,
-        attention_backend="TORCH_SDPA",
+        attention_backend="FLASH_ATTN",
     )
 
     backend = GenericVideoBackend(

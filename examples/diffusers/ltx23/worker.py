@@ -49,7 +49,11 @@ from .factory import load_model
 logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL = "FastVideo/LTX-2.3-Distilled-Diffusers"
-DEFAULT_ATTENTION_BACKEND = "TORCH_SDPA"
+# FastVideo's deployed LTX-2.3 1080p recipe uses FLASH_ATTN (their optimized
+# SM100/SM103 kernels); streaming_demo launch sets FASTVIDEO_ATTENTION_BACKEND=
+# FLASH_ATTN. TORCH_SDPA (the prior default, inherited from LTX-2) is the slow
+# generic fallback and does NOT reproduce the ~4.5s/1080p result.
+DEFAULT_ATTENTION_BACKEND = "FLASH_ATTN"
 DEFAULT_MODEL_LABEL = "ltx2-3-distilled"
 
 # Where the LTX-2.3 shapes JSON lives in the production image. Production
