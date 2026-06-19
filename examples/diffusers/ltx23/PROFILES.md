@@ -5,6 +5,9 @@ the `LTX23_PROFILE` env var (`quality` is the default). Source of truth:
 `ltx23/config.py` (load-time kwargs) + `ltx23/factory.py` (quant + Inductor knobs).
 CI: `ltx23/test_config.py` pins both profiles.
 
+> Cold-start / compile-cache strategy (Mega-Cache, the per-pod bake, the ~512 s
+> front-end residual, and limits): see **`ltx23/CACHING.md`**.
+
 Both profiles share: model `FastVideo/LTX-2.3-Distilled-Diffusers` (`fast-ltx23`),
 **1920×1088 landscape**, 121 frames @ 24fps, guidance 1.0, negative `""`, refine
 upsampler = `<model>/spatial_upscaler`, `FLASH_ATTN`, `vae_tiling=False`, the

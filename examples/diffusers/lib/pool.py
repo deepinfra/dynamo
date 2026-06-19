@@ -603,6 +603,45 @@ def _set_parent_death_signal(sig: int = signal.SIGTERM) -> None:
         )
 
 
+def _megacache_blob_path(shape_key: str) -> str | None:
+    """Per-shape Mega-Cache blob path, or None if the feature is off.
+
+    Opt-in via ``LTX_MEGACACHE_DIR``. When set, the dir holds one
+    ``<shape_key>.megacache.bin`` per shape: a portable ``torch.compiler``
+    artifact bundle (FX graphs + Triton + autotune best_configs). At bake
+    time the dir is writable and starts empty (worker compiles cold, then
+    saves the blob); the blobs are then COPYd into the image, and at serve
+    time the worker LOADs them so a fresh pod skips the autotune recompile.
+    Unset => no-op (legacy behavior: compile cold per process).
+    """
+    base = os.environ.get("LTX_MEGACACHE_DIR")
+    if not base:
+        return None
+    return os.path.join(base, f"{shape_key}.megacache.bin")
+
+
+def _export_megacache_env(shape_key: str) -> None:
+    """Export the per-shape Mega-Cache blob path for the FastVideo worker child.
+
+    The actual ``torch.compiler.save/load_cache_artifacts`` calls MUST run in
+    the process that compiles -- and FastVideo's MultiprocExecutor compiles in a
+    spawned worker child, NOT here. So this pool-worker only resolves the
+    per-shape path and exports it as ``LTX_MEGACACHE_BLOB`` BEFORE the factory
+    builds the generator (which spawns that child). The child inherits the env
+    and does the load (before first forward) / save (after first forward). See
+    fastvideo/worker/gpu_worker.py. No-op when ``LTX_MEGACACHE_DIR`` is unset.
+    """
+    path = _megacache_blob_path(shape_key)
+    if path:
+        os.environ["LTX_MEGACACHE_BLOB"] = path
+        print(
+            f"[pool-worker/{shape_key}] megacache blob path -> {path} "
+            f"(load/save happen in the fastvideo worker child)",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
 def _pool_worker_main(
     factory_func: Callable[[str, int, bool], Any],
     shape_key: str,
@@ -666,6 +705,31 @@ def _pool_worker_main(
     os.environ.setdefault("FASTVIDEO_ATTENTION_BACKEND", attention_backend)
     os.environ.setdefault("FASTVIDEO_STAGE_LOGGING", "1")
     os.environ.setdefault("FASTVIDEO_ENABLE_RMSNORM_FP4_PREQUANT", "0")
+    # Persist the CuTe DSL on-disk cache (the ~270 FlashAttention-4 + QuACK
+    # @cute.jit kernels) and the CUDA PTX JIT cache to a stable location, so a
+    # fresh process reuses them instead of recompiling every boot. These are NOT
+    # covered by torch Mega-Cache (which only handles inductor/autotune/aot/pgo).
+    # CuTe defaults to an ephemeral /tmp dir if unset -> recompile every process.
+    # Path under /cache so the bake populates it and it can be carried into the
+    # image; override via env. See ltx23_cache_investigation_report.md.
+    os.environ.setdefault("CUTE_DSL_CACHE_DIR", "/cache/cutedsl")
+    os.environ.setdefault("CUDA_CACHE_PATH", "/cache/cuda")
+    # QuACK (RMSNorm/softmax CuTe kernels) has its own persistent .o cache plus
+    # an autotuning-results cache. Both default to ephemeral/off: QUACK_CACHE_DIR
+    # falls back to $HOME (wiped per container) and QUACK_CACHE_AUTOTUNING is off.
+    # Pin the dir under /cache and persist autotuning so a fresh process reuses
+    # both instead of recompiling + re-autotuning QuACK kernels.
+    os.environ.setdefault("QUACK_CACHE_DIR", "/cache/quack")
+    os.environ.setdefault("QUACK_CACHE_AUTOTUNING", "1")
+    for _cache_dir in (
+        os.environ["CUTE_DSL_CACHE_DIR"],
+        os.environ["CUDA_CACHE_PATH"],
+        os.environ["QUACK_CACHE_DIR"],
+    ):
+        try:
+            os.makedirs(_cache_dir, exist_ok=True)
+        except OSError:
+            pass
 
     conn = Connection(protocol_fd)
 
@@ -682,6 +746,11 @@ def _pool_worker_main(
         sys.exit(0)
 
     signal.signal(signal.SIGTERM, _on_sigterm)
+
+    # Export the per-shape Mega-Cache blob path BEFORE building the generator:
+    # factory_func spawns the FastVideo worker child that actually compiles, and
+    # the child inherits this env to load/save the compile-artifact blob.
+    _export_megacache_env(shape_key)
 
     print(
         f"[pool-worker/{shape_key}] loading model={model_path} "
@@ -854,7 +923,7 @@ def _pool_worker_dispatch_if_requested() -> None:
     sub_parser.add_argument("--model", required=True)
     sub_parser.add_argument("--num-gpus", type=int, default=1)
     sub_parser.add_argument("--enable-optimizations", action="store_true")
-    sub_parser.add_argument("--attention-backend", default="TORCH_SDPA")
+    sub_parser.add_argument("--attention-backend", default="FLASH_ATTN")
     sub_parser.add_argument("--model-factory", required=True)
     sub_parser.add_argument("--protocol-fd", required=True, type=int)
     sub_args, _ = sub_parser.parse_known_args()

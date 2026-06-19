@@ -12,14 +12,20 @@ in code path to the runtime serving subprocess. Per-shape
 on the child env (/cache/per-shape/<shape_key>/{torchinductor,triton}),
 matching what production reads at serve time.
 
-This is the load-bearing property: torch.compile / inductor fxgraph cache
-keys are sensitive to invocation context in ways we have not fully
-characterized (Phase 3A.2 followup; PYTHONHASHSEED / sys.argv / sys.modules /
-__main__ ruled out by torch source review). Validated 2026-05-16 di-slc-39:
-per-shape caches built via this driver produce byte-identical fxgraph keys
-to what the runtime serving worker asks for, so cache lookups hit at first
-request. See ~/backend/claude_plans/2026-05-14-ltx2-phase2-subprocess-pool.md
-"What we tried that was wrong" for the Phase 3A regression and fix.
+CROSS-PROCESS CACHE PORTABILITY (LTX-2.3, instrumented 2026-06-18, fxgraph
+hit/miss counters): the implicit on-disk per-shape cache (these dirs) does NOT
+port to a fresh process for EITHER profile -- a fresh worker recomputes a
+different fxgraph key and RECOMPILES (MISS=8), confirmed on mode=default AND
+max-autotune. (This refutes an earlier "mode=default ports" note.) The per-shape
+dirs here are only the in-process compile scratch for THIS bake run.
+
+To actually make a fresh pod warm, use torch **Mega-Cache**
+(save/load_cache_artifacts -- wired in fastvideo gpu_worker + lib/pool.py): it
+DOES port and halves cold-start (~1103s -> ~560s). The remaining residual is the
+torch.compile FRONT-END (dynamo + AOTAutograd re-traces every process to produce
+the cache key) -- not cacheable short of AOTInductor. Full strategy, bake steps,
+and measurements: **ltx23/CACHING.md** + ~/ltx23_cache_investigation_report.md.
+Do NOT relitigate -- this is settled.
 
 Usage:
   python ltx23/warmup.py --shapes ltx23/shapes.json \\
