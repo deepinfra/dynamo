@@ -1,19 +1,15 @@
 {
-  "_comment": "LTX-2.3 v1 shape menu (deepinfra). Two landscape shapes at 5s; each serves BOTH t2v and i2v (i2v rides the same compiled shape -- image conditioning is a per-token denoise mask, not a token-count change). Eager warm-on-boot warms exactly these. Adding/removing entries changes IMAGE_SHAPE_HASH and requires a new image tag + a matching per-model SUPPORTED_SHAPES in backend ltx.py (CI-checked). Dims MUST be multiples of 64: the LTX-2.3 two-stage refine stage requires height/width divisible by 64 (stricter than the VAE's 32) or it raises 'LTX-2 refinement requires height/width divisible by 64'. We round UP to the next 64-multiple so we never deliver fewer lines than the advertised resolution: 1080p -> 1920x1088 (1088=17*64, >=1080) and 720p -> 1280x768 (768=12*64, >=720). NOTE 1280x768 is 5:3, slightly taller than 16:9 (1080p is ~16:9); switch to 1344x768 if exact 16:9 is wanted. 10s (241f) and portrait deferred to a later menu.",
+  "_comment": "LTX-2.3 v1 shape menu (deepinfra). ONE landscape shape at 1080p/5s. CORRECTION (2026-06-19, measured): i2v is a SEPARATE compiled graph from t2v (it adds its own ~8 fx graphs; an earlier comment wrongly claimed i2v 'rides the same compiled shape' -- it does NOT). Both modes share the same shape_key (same WxH@frames -> same resident pool process), but each compiles its own graph, so 'warm_i2v': true makes eager warm-on-boot warm BOTH t2v and i2v per shape (otherwise the readiness gate lies and the first i2v request eats a cold recompile). 1080p-only is also required for VRAM: one resident process with both modes peaks ~119GB; a second resolution = a second resident process ~238GB > 180GB B200 -> OOM. Adding/removing shapes changes IMAGE_SHAPE_HASH and requires a new image tag + a matching per-model menu in backend ttv.py (CI-checked). Dims MUST be multiples of 64 (the LTX-2.3 two-stage refine requires h/w divisible by 64); we round UP so we never deliver fewer lines than advertised: 1080p -> 1920x1088 (1088=17*64, >=1080). 720p, 10s, and portrait deferred to a later menu. Compile-cache / boot-warm strategy: ltx23/CACHING.md.",
   "model": "/data/default",
   "fps": 24,
   "num_inference_steps": 8,
   "guidance_scale": 1.0,
   "seed": 42,
+  "warm_i2v": true,
   "shapes": [
     {
       "width": 1920,
       "height": 1088,
-      "num_frames": 121
-    },
-    {
-      "width": 1280,
-      "height": 768,
       "num_frames": 121
     }
   ]

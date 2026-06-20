@@ -229,6 +229,14 @@ class GenericVideoBackend:
             shapes = cfg.get("shapes", [])
             fps = int(cfg.get("fps", 24))
             guidance_scale = float(cfg.get("guidance_scale", 1.0))
+            # i2v is a SEPARATE compiled graph from t2v (measured 2026-06-19: it
+            # adds its own ~8 fx graphs; it does NOT "ride the same compiled
+            # shape" as an earlier comment wrongly claimed). So when the model
+            # serves i2v we MUST warm it too, or the readiness gate lies and the
+            # first i2v request eats a cold ~9-18min recompile. Opt in via
+            # shapes.json "warm_i2v": true. Both modes warm into the SAME
+            # resident per-shape process (same shape_key), so no extra pool slot.
+            warm_i2v = bool(cfg.get("warm_i2v", False))
             if len(shapes) > VIDEO_POOL_MAX_SIZE:
                 raise RuntimeError(
                     "eager warm-on-boot needs VIDEO_POOL_MAX_SIZE (%d) >= number of "
@@ -238,56 +246,80 @@ class GenericVideoBackend:
                     % (VIDEO_POOL_MAX_SIZE, len(shapes))
                 )
             logger.info(
-                "preflight(pool): eager-warming %d shapes from %s",
-                len(shapes), shapes_path,
+                "preflight(pool): eager-warming %d shapes (i2v=%s) from %s",
+                len(shapes), warm_i2v, shapes_path,
             )
             t_total = time.perf_counter()
+
+            def _warm_req(label, w, h, nf, tmpdir):
+                return {
+                    "request_id": "preflight_%s_%dx%d@%df" % (label, w, h, nf),
+                    "prompt": "warmup",
+                    "width": w, "height": h, "num_frames": nf, "fps": fps,
+                    "num_inference_steps": 1, "guidance_scale": guidance_scale,
+                    "seed": 42, "negative_prompt": None,
+                    "output_path": os.path.join(
+                        tmpdir, "preflight_%s_%dx%d@%df.mp4" % (label, w, h, nf)
+                    ),
+                }
+
+            def _check(shape_key, label, result, out_path):
+                # route() DONE is necessary but not sufficient: a broken bake can
+                # report DONE yet write a missing/empty file. Fail boot loudly.
+                if result.get("status") != "DONE":
+                    raise RuntimeError(
+                        "preflight %s failed for shape %s: %s; refusing to start. "
+                        "Likely a baked-cache miss or a FastVideo version "
+                        "mismatch. See ltx23/RUNBOOK.md."
+                        % (label, shape_key, result.get("error", result.get("status")))
+                    )
+                if not os.path.isfile(out_path) or os.path.getsize(out_path) == 0:
+                    raise RuntimeError(
+                        "preflight %s: shape %s reported DONE but produced a "
+                        "missing/empty output file (%s); refusing to start "
+                        "(broken bake)." % (label, shape_key, out_path)
+                    )
+
             with tempfile.TemporaryDirectory() as tmpdir:
+                # Synthetic conditioning image for the i2v warm: content is
+                # irrelevant (it only needs to be a valid image so the i2v code
+                # path compiles); the pipeline resizes it to the target shape.
+                i2v_cond_path = None
+                if warm_i2v:
+                    i2v_cond_path = os.path.join(tmpdir, "preflight_i2v_cond.png")
+                    try:
+                        from PIL import Image
+                        Image.new("RGB", (512, 512), (128, 128, 128)).save(i2v_cond_path)
+                    except Exception as exc:
+                        raise RuntimeError(
+                            "preflight: could not create i2v warm conditioning "
+                            "image (%r); refusing to start." % exc
+                        )
                 for idx, shape in enumerate(shapes, 1):
                     w = int(shape["width"])
                     h = int(shape["height"])
                     nf = int(shape["num_frames"])
                     shape_key = "%dx%d@%df" % (w, h, nf)
-                    warm_request = {
-                        "request_id": "preflight_%s" % shape_key,
-                        "prompt": "warmup",
-                        "width": w,
-                        "height": h,
-                        "num_frames": nf,
-                        "fps": fps,
-                        "num_inference_steps": 1,
-                        "guidance_scale": guidance_scale,
-                        "seed": 42,
-                        "negative_prompt": None,
-                        "output_path": os.path.join(
-                            tmpdir, "preflight_%s.mp4" % shape_key
-                        ),
-                    }
                     t_shape = time.perf_counter()
-                    # route() expects the caller to hold the global lock; it
-                    # also serializes spawns (GPU is single-tenant).
+                    # t2v warm. route() expects the caller to hold the global
+                    # lock; it also serializes spawns (GPU is single-tenant).
+                    t2v_req = _warm_req("t2v", w, h, nf, tmpdir)
                     async with self._generate_lock:
-                        result = await self.pool.route(shape_key, warm_request)
-                    if result.get("status") != "DONE":
-                        raise RuntimeError(
-                            "preflight failed for shape %s: %s; refusing to "
-                            "start. Likely a baked-cache miss or a FastVideo "
-                            "version mismatch. See ltx23/RUNBOOK.md."
-                            % (shape_key, result.get("error", result.get("status")))
-                        )
-                    # DONE is necessary but not sufficient: a broken bake can
-                    # report DONE yet write a missing/empty file (same guard the
-                    # serve path applies). Fail boot loudly here too.
-                    out_path = warm_request["output_path"]
-                    if not os.path.isfile(out_path) or os.path.getsize(out_path) == 0:
-                        raise RuntimeError(
-                            "preflight: shape %s reported DONE but produced a "
-                            "missing/empty output file (%s); refusing to start "
-                            "(broken bake)." % (shape_key, out_path)
-                        )
+                        result = await self.pool.route(shape_key, t2v_req)
+                    _check(shape_key, "t2v", result, t2v_req["output_path"])
+                    # i2v warm: same shape_key (same resident process) but a
+                    # distinct compiled graph, so it must be warmed explicitly.
+                    if warm_i2v:
+                        i2v_req = _warm_req("i2v", w, h, nf, tmpdir)
+                        i2v_req["ltx2_images"] = [(i2v_cond_path, 0, 1.0)]
+                        i2v_req["ltx2_image_crf"] = 0.0
+                        async with self._generate_lock:
+                            result = await self.pool.route(shape_key, i2v_req)
+                        _check(shape_key, "i2v", result, i2v_req["output_path"])
                     logger.info(
-                        "preflight(pool): %s warmed in %.1fs (%d/%d)",
+                        "preflight(pool): %s warmed in %.1fs (%d/%d)%s",
                         shape_key, time.perf_counter() - t_shape, idx, len(shapes),
+                        " [t2v+i2v]" if warm_i2v else "",
                     )
             logger.info(
                 "preflight(pool): complete in %.1fs", time.perf_counter() - t_total
