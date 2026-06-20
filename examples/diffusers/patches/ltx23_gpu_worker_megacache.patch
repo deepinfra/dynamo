@@ -1,0 +1,80 @@
+--- a/fastvideo/worker/gpu_worker.py
++++ b/fastvideo/worker/gpu_worker.py
+@@ -71,10 +71,77 @@
+ 
+         self.pipeline = build_pipeline(self.fastvideo_args)
+ 
++        # deepinfra: load baked torch.compile artifacts (Mega-Cache) BEFORE the
++        # first forward triggers lazy compilation, so a fresh pod reuses them
++        # instead of recompiling (~halves cold start). Per-mode blobs (t2v/i2v)
++        # are glob-loaded from the dir of LTX_MEGACACHE_BLOB. Best-effort: a
++        # missing/incompatible blob just falls back to a cold compile and never
++        # wedges boot. This MUST live here (the worker child is the process that
++        # compiles). See examples/diffusers/ltx23/CACHING.md.
++        self._megacache_saved = False
++        self._megacache_loaded = self._ltx_megacache_load()
++
+     def execute_forward(self, forward_batch: ForwardBatch, fastvideo_args: FastVideoArgs) -> ForwardBatch:
+         output_batch = self.pipeline.forward(forward_batch, self.fastvideo_args)
++        # deepinfra: after the first (cold) forward compiled all graphs, persist
++        # them once so a future fresh process can skip the recompile (bake path).
++        self._ltx_megacache_save()
+         return cast(ForwardBatch, output_batch)
+ 
++    # ---- deepinfra Mega-Cache helpers (torch.compiler save/load_cache_artifacts) ----
++    @staticmethod
++    def _ltx_megacache_path() -> str | None:
++        return os.environ.get("LTX_MEGACACHE_BLOB")
++
++    def _ltx_megacache_load(self) -> bool:
++        """Load every ``*.megacache.bin`` in the blob's directory (one per
++        shape*mode, e.g. t2v + i2v) before the first compile. Repeated
++        ``load_cache_artifacts`` calls are additive (validated). Best-effort."""
++        path = self._ltx_megacache_path()
++        if not path:
++            return False
++        import glob
++        blobs = sorted(glob.glob(os.path.join(os.path.dirname(path), "*.megacache.bin")))
++        if not blobs:
++            return False
++        loaded_any = False
++        for bp in blobs:
++            try:
++                with open(bp, "rb") as fh:
++                    blob = fh.read()
++                info = torch.compiler.load_cache_artifacts(blob)
++                logger.info("[megacache] LOADED %d bytes from %s: %s", len(blob), bp, info)
++                loaded_any = True
++            except Exception as exc:  # noqa: BLE001 -- never wedge boot on a bad blob
++                logger.warning("[megacache] load failed for %s (%r)", bp, exc)
++        return loaded_any
++
++    def _ltx_megacache_save(self) -> None:
++        """Persist compile artifacts after the first (cold) compile. No-op when
++        disabled, when we booted from a blob, or already saved. With
++        LTX_MEGACACHE_SAVE_EVERY set, re-save after every forward (bake helper)."""
++        path = self._ltx_megacache_path()
++        if not path or getattr(self, "_megacache_loaded", False):
++            return
++        if getattr(self, "_megacache_saved", False) and not os.environ.get("LTX_MEGACACHE_SAVE_EVERY"):
++            return
++        try:
++            os.makedirs(os.path.dirname(path), exist_ok=True)
++            art = torch.compiler.save_cache_artifacts()
++            if not art:
++                logger.info("[megacache] save: nothing to serialize")
++                self._megacache_saved = True
++                return
++            blob = art[0] if isinstance(art, tuple) else art
++            tmp = "%s.tmp.%d" % (path, os.getpid())
++            with open(tmp, "wb") as fh:
++                fh.write(blob)
++            os.replace(tmp, path)
++            logger.info("[megacache] SAVED %d bytes -> %s", len(blob), path)
++            self._megacache_saved = True
++        except Exception as exc:  # noqa: BLE001 -- bake-time best-effort
++            logger.warning("[megacache] save failed: %r", exc)
++
+     def shutdown(self) -> dict[str, Any]:
+         """Gracefully shut down the worker process"""
+         logger.info("Worker %d shutting down...", self.rank, local_main_process_only=False)

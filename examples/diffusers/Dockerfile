@@ -80,6 +80,13 @@ RUN uv pip install ai-dynamo==1.1.1
 ARG FASTVIDEO_SHA=633d39356804e63478d242611e992dc8e1af3caa
 ENV FASTVIDEO_SHA=${FASTVIDEO_SHA}
 
+# deepinfra Mega-Cache patch for FastVideo's worker child (the process that
+# compiles): adds torch.compiler save/load_cache_artifacts so a fresh pod
+# reuses baked compile artifacts instead of recompiling. COPY'd here (before
+# the FastVideo build) so `git apply` below picks it up; the full app tree is
+# only COPYd to /opt/app later. See examples/diffusers/ltx23/CACHING.md.
+COPY patches/ltx23_gpu_worker_megacache.patch /tmp/megacache.patch
+
 # Install FastVideo at the pinned SHA. No pyproject sed needed: the base is now
 # cu128, which is exactly what FastVideo's [tool.uv.sources] targets, so the
 # torch family resolves natively without any index gymnastics.
@@ -90,6 +97,7 @@ RUN echo "Building FastVideo @ ${FASTVIDEO_SHA} for TORCH_CUDA_ARCH_LIST=${TORCH
  && cd /tmp/FastVideo \
  && git checkout ${FASTVIDEO_SHA} \
  && git submodule update --init --recursive \
+ && git apply --verbose /tmp/megacache.patch \
  && cd / \
  && uv pip install --no-build-isolation /tmp/FastVideo
 
