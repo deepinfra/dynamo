@@ -544,8 +544,9 @@ class SubprocessPool:
                     proc.kill()
                 with suppress(asyncio.TimeoutError):
                     await asyncio.wait_for(proc.wait(), timeout=5)
-        drainers = [d for d in (handle.stdout_drainer, handle.stderr_drainer)
-                    if d is not None]
+        drainers = [
+            d for d in (handle.stdout_drainer, handle.stderr_drainer) if d is not None
+        ]
         for d in drainers:
             d.cancel()
         if drainers:

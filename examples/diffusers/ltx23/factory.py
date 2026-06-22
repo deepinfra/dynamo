@@ -75,14 +75,24 @@ def load_model(
         if major < 10:
             logger.warning(
                 "NVFP4 (speed profile) needs Blackwell (cc>=10.0); detected %d.%d. "
-                "Falling back to bf16.", major, minor,
+                "Falling back to bf16.",
+                major,
+                minor,
             )
         else:
             from fastvideo.layers.quantization.nvfp4_config import NVFP4Config
+
             pipeline_config.dit_config.quant_config = NVFP4Config()
-            logger.info("LTX-2.3 profile=speed: NVFP4 + %s", optimization_kwargs["torch_compile_kwargs"]["mode"])
+            logger.info(
+                "LTX-2.3 profile=speed: NVFP4 + %s",
+                optimization_kwargs["torch_compile_kwargs"]["mode"],
+            )
     if pipeline_config.dit_config.quant_config is None:
-        logger.info("LTX-2.3 profile=%s: bf16 + %s", profile, optimization_kwargs["torch_compile_kwargs"]["mode"])
+        logger.info(
+            "LTX-2.3 profile=%s: bf16 + %s",
+            profile,
+            optimization_kwargs["torch_compile_kwargs"]["mode"],
+        )
 
     # LTX-2.3 distilled is a two-stage pipeline: a fast low-res denoise pass
     # followed by a latent-upsample + refine pass (this is what buys the 1080p

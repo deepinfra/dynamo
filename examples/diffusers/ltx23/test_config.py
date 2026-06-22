@@ -51,7 +51,9 @@ def test_speed_profile_mirrors_streaming_demo() -> None:
     assert k["ltx2_refine_num_inference_steps"] == 2
     assert k["enable_torch_compile"] is True
     assert k["enable_torch_compile_text_encoder"] is True
-    assert k["enable_torch_compile_vae"] is False          # streaming compiles only DiT+text_encoder
+    assert (
+        k["enable_torch_compile_vae"] is False
+    )  # streaming compiles only DiT+text_encoder
     assert k["torch_compile_kwargs"]["mode"] == "max-autotune-no-cudagraphs"
     assert k["torch_compile_kwargs"]["fullgraph"] is True
     assert k["torch_compile_kwargs"]["dynamic"] is False

@@ -248,11 +248,7 @@ def _run_driver(args: argparse.Namespace) -> int:
 
         elapsed = time.perf_counter() - t0
         status = result.get("status")
-        if (
-            status == "DONE"
-            and out_path.exists()
-            and out_path.stat().st_size > 0
-        ):
+        if status == "DONE" and out_path.exists() and out_path.stat().st_size > 0:
             size_mb = out_path.stat().st_size / 1_048_576
             print(
                 f"[warmup] OK   {tag} in {elapsed:.1f}s ({size_mb:.1f}MB)",

@@ -129,7 +129,10 @@ def _load_generator(model: str):
     # set here). For the SPEED profile, set LTX23_PROFILE=speed and go through
     # factory.load_model instead (which applies NVFP4).
     profile = os.environ.get("LTX23_PROFILE", "quality")
-    print(f"[benchmark] loading VideoGenerator model={model} profile={profile}", flush=True)
+    print(
+        f"[benchmark] loading VideoGenerator model={model} profile={profile}",
+        flush=True,
+    )
     t0 = time.perf_counter()
     pipeline_config = PipelineConfig.from_pretrained(model)
     generator = VideoGenerator.from_pretrained(

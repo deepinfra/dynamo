@@ -247,7 +247,9 @@ class GenericVideoBackend:
                 )
             logger.info(
                 "preflight(pool): eager-warming %d shapes (i2v=%s) from %s",
-                len(shapes), warm_i2v, shapes_path,
+                len(shapes),
+                warm_i2v,
+                shapes_path,
             )
             t_total = time.perf_counter()
 
@@ -255,9 +257,14 @@ class GenericVideoBackend:
                 return {
                     "request_id": "preflight_%s_%dx%d@%df" % (label, w, h, nf),
                     "prompt": "warmup",
-                    "width": w, "height": h, "num_frames": nf, "fps": fps,
-                    "num_inference_steps": 1, "guidance_scale": guidance_scale,
-                    "seed": 42, "negative_prompt": None,
+                    "width": w,
+                    "height": h,
+                    "num_frames": nf,
+                    "fps": fps,
+                    "num_inference_steps": 1,
+                    "guidance_scale": guidance_scale,
+                    "seed": 42,
+                    "negative_prompt": None,
                     "output_path": os.path.join(
                         tmpdir, "preflight_%s_%dx%d@%df.mp4" % (label, w, h, nf)
                     ),
@@ -289,7 +296,10 @@ class GenericVideoBackend:
                     i2v_cond_path = os.path.join(tmpdir, "preflight_i2v_cond.png")
                     try:
                         from PIL import Image
-                        Image.new("RGB", (512, 512), (128, 128, 128)).save(i2v_cond_path)
+
+                        Image.new("RGB", (512, 512), (128, 128, 128)).save(
+                            i2v_cond_path
+                        )
                     except Exception as exc:
                         raise RuntimeError(
                             "preflight: could not create i2v warm conditioning "
@@ -318,7 +328,10 @@ class GenericVideoBackend:
                         _check(shape_key, "i2v", result, i2v_req["output_path"])
                     logger.info(
                         "preflight(pool): %s warmed in %.1fs (%d/%d)%s",
-                        shape_key, time.perf_counter() - t_shape, idx, len(shapes),
+                        shape_key,
+                        time.perf_counter() - t_shape,
+                        idx,
+                        len(shapes),
                         " [t2v+i2v]" if warm_i2v else "",
                     )
             logger.info(
@@ -585,11 +598,13 @@ class GenericVideoBackend:
             )
             with os.fdopen(fd, "wb") as f:
                 f.write(img_bytes)
-            ltx2_images = [(
-                i2v_temp_path,
-                int(nvext.image_frame_index),
-                float(nvext.image_strength),
-            )]
+            ltx2_images = [
+                (
+                    i2v_temp_path,
+                    int(nvext.image_frame_index),
+                    float(nvext.image_strength),
+                )
+            ]
         ltx2_image_crf = float(nvext.image_crf)
 
         try:
@@ -660,5 +675,7 @@ class GenericVideoBackend:
                 except OSError as exc:
                     logger.warning(
                         "[%s] failed to delete i2v temp %s: %s",
-                        video_id, i2v_temp_path, exc,
+                        video_id,
+                        i2v_temp_path,
+                        exc,
                     )

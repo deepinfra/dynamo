@@ -37,8 +37,8 @@ from typing import Any
 
 # Canonical denoise step counts (these live in shapes.json / per-request, NOT in
 # the kwargs below -- documented here so the profile is fully specified in one place).
-QUALITY_DENOISE_STEPS = 8   # basic_ltx2_3_distilled example: num_inference_steps=8
-SPEED_DENOISE_STEPS = 5     # streaming_demo.yaml default_request: num_inference_steps=5
+QUALITY_DENOISE_STEPS = 8  # basic_ltx2_3_distilled example: num_inference_steps=8
+SPEED_DENOISE_STEPS = 5  # streaming_demo.yaml default_request: num_inference_steps=5
 
 
 # ── QUALITY ── mirrors basic_ltx2_3_distilled_i2v_typed.py ────────────────────
