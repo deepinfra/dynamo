@@ -317,16 +317,29 @@ class PrometheusAPIClient:
             logger.error(f"Error getting avg request count: {e}")
             return 0
 
+    # DEEPINFRA: ISL and OSL have heavy right tails (median ~500 tokens,
+    # p99 ~8k-30k). The mean over the caller's throughput-adjustment window
+    # (30s) is genuinely correct for Little's-law capacity sizing, but is
+    # statistically unstable at that sample size — one window catches the
+    # densest moment of a long-completion cluster and the mean spikes
+    # (observed: 30s mean jumped from ~900 to 2046 in a single tick, while
+    # the 5m mean rose only to 1101). Override these specific queries to a
+    # 5m window so the planner sees a stable mean that still includes long
+    # sequences' full contribution to total decode work. Reaction lag to
+    # genuine distribution shifts becomes ~5min — acceptable because OSL
+    # distribution character changes over hours, not seconds.
+    _ISL_OSL_AVG_INTERVAL: str = "5m"
+
     def get_avg_input_sequence_tokens(self, interval: str, model_name: str):
         if self.metrics_source == "router":
             return self._get_average_metric(
                 f"{prometheus_names.name_prefix.COMPONENT}_{prometheus_names.router.INPUT_SEQUENCE_TOKENS}",
-                interval,
+                self._ISL_OSL_AVG_INTERVAL,
                 "avg input sequence tokens",
             )
         return self._get_average_metric(
             prometheus_names.frontend_service.INPUT_SEQUENCE_TOKENS,
-            interval,
+            self._ISL_OSL_AVG_INTERVAL,
             "avg input sequence tokens",
             model_name,
         )
@@ -335,12 +348,12 @@ class PrometheusAPIClient:
         if self.metrics_source == "router":
             return self._get_average_metric(
                 f"{prometheus_names.name_prefix.COMPONENT}_{prometheus_names.router.OUTPUT_SEQUENCE_TOKENS}",
-                interval,
+                self._ISL_OSL_AVG_INTERVAL,
                 "avg output sequence tokens",
             )
         return self._get_average_metric(
             prometheus_names.frontend_service.OUTPUT_SEQUENCE_TOKENS,
-            interval,
+            self._ISL_OSL_AVG_INTERVAL,
             "avg output sequence tokens",
             model_name,
         )
