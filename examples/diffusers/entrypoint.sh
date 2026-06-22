@@ -53,5 +53,16 @@ wait
 T_END=$(date +%s)
 echo "[entrypoint] page-cache warming done in $((T_END - T_START))s; launching: $*"
 
+# Blackwell (B200/GB200): unset LD_LIBRARY_PATH before launching the worker so
+# torch loads its own bundled cuBLAS (cu130) instead of the system CUDA libs on
+# the LD path (/usr/local/cuda/lib64 from the CUDA base image). FastVideo's
+# LTX-2.3 reference flags this as mandatory -- the system-vs-torch cuBLAS
+# mismatch otherwise fails every GEMM, and the refine path in particular crashes
+# (pad_mm INVALID_VALUE). The cache bake runs with this unset too; serving must
+# match or the baked cache's first refine GEMM dies. CUDA driver libs still
+# resolve via the nvidia container runtime's ldconfig (verified: the bake loads
+# FlashAttention-4 and compiles with LD_LIBRARY_PATH unset).
+unset LD_LIBRARY_PATH
+
 # exec preserves PID 1 semantics so docker stop / k8s SIGTERM go to the worker.
 exec "$@"

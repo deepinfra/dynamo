@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """
-Pre-compile LTX-2 torch.compile / triton / inductor caches for every
+Pre-compile LTX-2.3 torch.compile / triton / inductor caches for every
 production shape so the first production request is fast.
 
 Routes each shape through the same ``lib.pool.SubprocessPool`` code path
@@ -12,17 +12,23 @@ in code path to the runtime serving subprocess. Per-shape
 on the child env (/cache/per-shape/<shape_key>/{torchinductor,triton}),
 matching what production reads at serve time.
 
-This is the load-bearing property: torch.compile / inductor fxgraph cache
-keys are sensitive to invocation context in ways we have not fully
-characterized (Phase 3A.2 followup; PYTHONHASHSEED / sys.argv / sys.modules /
-__main__ ruled out by torch source review). Validated 2026-05-16 di-slc-39:
-per-shape caches built via this driver produce byte-identical fxgraph keys
-to what the runtime serving worker asks for, so cache lookups hit at first
-request. See ~/backend/claude_plans/2026-05-14-ltx2-phase2-subprocess-pool.md
-"What we tried that was wrong" for the Phase 3A regression and fix.
+CROSS-PROCESS CACHE PORTABILITY (LTX-2.3, instrumented 2026-06-18, fxgraph
+hit/miss counters): the implicit on-disk per-shape cache (these dirs) does NOT
+port to a fresh process for EITHER profile -- a fresh worker recomputes a
+different fxgraph key and RECOMPILES (MISS=8), confirmed on mode=default AND
+max-autotune. (This refutes an earlier "mode=default ports" note.) The per-shape
+dirs here are only the in-process compile scratch for THIS bake run.
+
+To actually make a fresh pod warm, use torch **Mega-Cache**
+(save/load_cache_artifacts -- wired in fastvideo gpu_worker + lib/pool.py): it
+DOES port and halves cold-start (~1103s -> ~560s). The remaining residual is the
+torch.compile FRONT-END (dynamo + AOTAutograd re-traces every process to produce
+the cache key) -- not cacheable short of AOTInductor. Full strategy, bake steps,
+and measurements: **ltx23/CACHING.md** + ~/ltx23_cache_investigation_report.md.
+Do NOT relitigate -- this is settled.
 
 Usage:
-  python ltx2/warmup.py --shapes ltx2/shapes.json \\
+  python ltx23/warmup.py --shapes ltx23/shapes.json \\
       --output-dir /tmp/warmup --model /data/default
 """
 
@@ -161,10 +167,16 @@ def _run_driver(args: argparse.Namespace) -> int:
         pool = SubprocessPool(
             model_path=model,
             num_gpus=1,
-            enable_optimizations=False,
-            attention_backend="TORCH_SDPA",
-            model_factory_dotted="ltx2.factory:load_model",
-            model_label="ltx2-distilled",
+            # Bake the cache so it MATCHES the serving path. The recipe is chosen
+            # by the LTX23_PROFILE env (quality|speed), which factory.load_model
+            # reads -- the pool subprocess inherits it. enable_optimizations=True
+            # lets the SPEED profile apply NVFP4 (QUALITY stays bf16 regardless).
+            # Denoise steps come from the shapes file (8 quality / 5 speed).
+            # See ltx23/config.py + ltx23/PROFILES.md.
+            enable_optimizations=True,
+            attention_backend="FLASH_ATTN",
+            model_factory_dotted="ltx23.factory:load_model",
+            model_label="ltx2-3-distilled",
         )
         try:
             return await asyncio.wait_for(pool.route(tag, request), timeout=timeout)
@@ -271,7 +283,7 @@ def _run_driver(args: argparse.Namespace) -> int:
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="LTX-2 warmup / compile-cache populator. Routes each "
+        description="LTX-2.3 warmup / compile-cache populator. Routes each "
         "shape through lib.pool.SubprocessPool so the cache-building "
         "subprocess matches the runtime serving subprocess in code path. "
         "Cache keys produced here match what the runtime asks for at "
@@ -281,7 +293,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--shapes",
         default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "shapes.json"),
-        help="path to shapes JSON (default: ltx2/shapes.json next to this script)",
+        help="path to shapes JSON (default: ltx23/shapes.json next to this script)",
     )
     p.add_argument(
         "--output-dir", default="/tmp/warmup", help="where to save rendered MP4s"
