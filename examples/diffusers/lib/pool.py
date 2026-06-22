@@ -544,11 +544,15 @@ class SubprocessPool:
                     proc.kill()
                 with suppress(asyncio.TimeoutError):
                     await asyncio.wait_for(proc.wait(), timeout=5)
-        for drainer in (handle.stdout_drainer, handle.stderr_drainer):
-            if drainer is not None:
-                drainer.cancel()
-                with suppress(asyncio.CancelledError, Exception):
-                    await drainer
+        drainers = [d for d in (handle.stdout_drainer, handle.stderr_drainer)
+                    if d is not None]
+        for d in drainers:
+            d.cancel()
+        if drainers:
+            # Await the cancellations so the drain tasks finish unwinding before
+            # we return; return_exceptions swallows the expected CancelledError
+            # (and any late drain error) instead of failing the kill path.
+            await asyncio.gather(*drainers, return_exceptions=True)
 
     async def _discard(self, shape_key: str, handle: _SubprocessHandle) -> None:
         """Remove from pool and kill. Used for unrecoverable subprocess errors."""
@@ -729,6 +733,9 @@ def _pool_worker_main(
         try:
             os.makedirs(_cache_dir, exist_ok=True)
         except OSError:
+            # Best-effort: these are optional compile/autotune caches. If the
+            # dir can't be created the libraries fall back to ephemeral/off, so
+            # a failure here must not block worker startup.
             pass
 
     conn = Connection(protocol_fd)
