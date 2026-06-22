@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import math
+from collections import deque
 from typing import TYPE_CHECKING, Optional
 
 from dynamo.planner.config.planner_config import PlannerConfig
@@ -101,6 +102,23 @@ class PlannerScalingState(LoadScalingMixin, ThroughputScalingMixin):
 
         self._throughput_lower_bound_p: int = 1
         self._throughput_lower_bound_d: int = 1
+
+        # DEEPINFRA: N-tick proposal-confirmation buffer (re-added; dropped in
+        # the v2 rebase). Store the last N *proposed* replica counts per
+        # component and only emit a new suggestion when every entry in a full
+        # buffer is unanimously higher or unanimously lower than the planner's
+        # current commitment (`_last_suggested_*`, latched to observed on the
+        # first tick) — debounces noisy single-tick TTFT/ITL estimates and
+        # transient FPM-staleness flaps. Set to 1 to disable.
+        self._scaling_confirmation_ticks: int = 6
+        self._proposed_buffer_p: deque[int] = deque(
+            maxlen=self._scaling_confirmation_ticks
+        )
+        self._proposed_buffer_d: deque[int] = deque(
+            maxlen=self._scaling_confirmation_ticks
+        )
+        self._last_suggested_p: int = 0
+        self._last_suggested_d: int = 0
 
         # Most recent observed KV hit rate from the router. Runtime metadata like
         # this is intentionally last-value only, not fed through the traffic load
