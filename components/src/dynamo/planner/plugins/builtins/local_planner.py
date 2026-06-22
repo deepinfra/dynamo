@@ -244,11 +244,52 @@ class BuiltinThroughputPropose:
     def __init__(self, config: PlannerConfig, state: PlannerScalingState) -> None:
         self._config = config
         self._state = state
+        # DEEPINFRA: tick counter for periodic Rust-shim diagnostics dump.
+        self._diag_tick: int = 0
+
+    def _log_rust_diagnostics(self) -> None:
+        """DEEPINFRA: emit each perf model's Rust shim diagnostics.
+
+        Surfaces what the opaque Rust regression thinks its readiness,
+        coefficients, and sample counts are. Called every N ticks to keep
+        log volume modest. Safe no-op when the shim is unavailable or the
+        model handle hasn't been built.
+        """
+        import json as _json
+        for name, attr in (
+            ("prefill", "_prefill_regression"),
+            ("decode",  "_decode_regression"),
+            ("agg",     "_agg_regression"),
+        ):
+            model = getattr(self._state, attr, None)
+            if model is None:
+                continue
+            try:
+                diag = model._rust_diagnostics()
+            except Exception as e:  # noqa: BLE001 - diagnostics is best-effort
+                logger.warning("RUST_DIAG[%s]: collection failed: %s", name, e)
+                continue
+            if not diag:
+                continue
+            try:
+                logger.info(
+                    "RUST_DIAG[%s]: %s",
+                    name, _json.dumps(diag, default=str, sort_keys=True),
+                )
+            except (TypeError, ValueError) as e:
+                logger.warning("RUST_DIAG[%s]: serialize failed: %s", name, e)
 
     async def Propose(self, req: ProposeStageRequest) -> ProposeStageResponse:
         # See BuiltinLoadPredict.Predict for why builtin methods are async.
         if not self._config.enable_throughput_scaling:
             return ProposeStageResponse(accept=AcceptResult())
+
+        # DEEPINFRA: every 6th tick (~30s at default 5s tick), dump Rust
+        # shim diagnostics for all three perf models. Lets us see fit
+        # readiness, coefficients, and sample counts without rebuilding.
+        self._diag_tick = (self._diag_tick + 1) % 6
+        if self._diag_tick == 0:
+            self._log_rust_diagnostics()
 
         ctx = req.context
         obs = ctx.observations if ctx is not None else None

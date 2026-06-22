@@ -615,7 +615,22 @@ class PlannerEnginePerfModel:
             logger.warning("Rust capacity query failed: %s", e)
             return None
         if result is None:
+            # DEEPINFRA: log every None-result so we can see when the shim
+            # silently refuses to answer; debugging the 1e9 prefill sentinel.
+            logger.info(
+                "RUST_CAPACITY[%s]: req=%s -> None",
+                self._worker_type, request_kwargs,
+            )
             return None
+        # DEEPINFRA: per-query I/O log for the Rust shim. Surfaces the exact
+        # (isl, osl, sla, hit_rate) → (rps, ttft_ms, itl_ms, eligible) shape
+        # so we can map where the 1e9 sentinel kicks in.
+        logger.info(
+            "RUST_CAPACITY[%s]: req=%s -> rps=%s ttft_ms=%s itl_ms=%s e2e_ms=%s eligible=%s",
+            self._worker_type, request_kwargs,
+            result.rps, result.ttft_ms, result.itl_ms,
+            result.e2e_latency_ms, result.eligible,
+        )
         rps = result.rps
         itl_ms = result.itl_ms
         return PlannerEngineCapacity(
