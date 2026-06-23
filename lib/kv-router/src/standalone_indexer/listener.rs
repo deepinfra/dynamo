@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
-use crate::protocols::{KvCacheEventData, WorkerId, WorkerWithDpRank};
+use crate::protocols::{KvCacheEventData, RouterEvent, WorkerId, WorkerWithDpRank};
 use crate::recovery::{CursorObservation, CursorState};
 use crate::zmq_wire::{ZmqEventNormalizer, decode_event_batch};
 
@@ -144,6 +144,83 @@ impl ReplayRecoveryProgress {
     }
 }
 
+/// Emit a `kv_audit` line for a single KV event ingested from the engine,
+/// before the `ignore_evictions` measurement filter is applied, so the log
+/// reflects what the engine actually published. `source`
+/// distinguishes the live SUB stream (`"live"`) from replayed batches
+/// (`"replay"`). No-op unless audit logging is enabled.
+fn audit_log_event(router_event: &RouterEvent, seq: u64, source: &'static str) {
+    if !super::logging_enabled() {
+        return;
+    }
+    let ts_ms = super::now_unix_millis();
+    let worker_id = router_event.worker_id;
+    let dp_rank = router_event.event.dp_rank;
+    let storage_tier = router_event.storage_tier;
+    let event_id = router_event.event.event_id;
+    match &router_event.event.data {
+        KvCacheEventData::Stored(data) => {
+            // `tokens_hash` is the local block hash (matches what `/query`
+            // computes from token_ids); `block_hash` is the sequence hash that
+            // chains blocks together. Log both so queries and events correlate.
+            let token_block_hashes: Vec<u64> =
+                data.blocks.iter().map(|b| b.tokens_hash.0).collect();
+            let sequence_block_hashes: Vec<u64> =
+                data.blocks.iter().map(|b| b.block_hash.0).collect();
+            let parent_hash = data.parent_hash.map(|h| h.0);
+            tracing::info!(
+                target: "kv_audit",
+                kind = "STORE",
+                ts_ms,
+                source,
+                seq,
+                worker_id,
+                dp_rank,
+                storage_tier = ?storage_tier,
+                event_id,
+                parent_hash = ?parent_hash,
+                num_blocks = token_block_hashes.len(),
+                token_block_hashes = ?token_block_hashes,
+                sequence_block_hashes = ?sequence_block_hashes,
+                "kv_audit STORE"
+            );
+        }
+        KvCacheEventData::Removed(data) => {
+            // Removal events carry only sequence (external) block hashes.
+            let sequence_block_hashes: Vec<u64> =
+                data.block_hashes.iter().map(|h| h.0).collect();
+            tracing::info!(
+                target: "kv_audit",
+                kind = "EVICT",
+                ts_ms,
+                source,
+                seq,
+                worker_id,
+                dp_rank,
+                storage_tier = ?storage_tier,
+                event_id,
+                num_blocks = sequence_block_hashes.len(),
+                sequence_block_hashes = ?sequence_block_hashes,
+                "kv_audit EVICT"
+            );
+        }
+        KvCacheEventData::Cleared => {
+            tracing::info!(
+                target: "kv_audit",
+                kind = "CLEAR",
+                ts_ms,
+                source,
+                seq,
+                worker_id,
+                dp_rank,
+                storage_tier = ?storage_tier,
+                event_id,
+                "kv_audit CLEAR"
+            );
+        }
+    }
+}
+
 struct ListenerLoop {
     worker_id: WorkerId,
     dp_rank: u32,
@@ -272,10 +349,12 @@ impl ListenerLoop {
                 ) else {
                     continue;
                 };
-                let mut router_event = placement_event
+                let router_event = placement_event
                     .into_router_event()
                     .expect("local worker placement must convert to router event");
-                // Feed-layer measurement filters (same as apply_live_batch).
+                // Audit-log the replayed event before the measurement filter.
+                audit_log_event(&router_event, seq, "replay");
+                // Feed-layer measurement filter (same as apply_live_batch).
                 if super::ignore_evictions()
                     && matches!(
                         router_event.event.data,
@@ -283,10 +362,6 @@ impl ListenerLoop {
                     )
                 {
                     continue;
-                }
-                if super::merge_shards() {
-                    router_event.worker_id = 0;
-                    router_event.event.dp_rank = 0;
                 }
                 indexer.apply_event_routed(router_event).await;
             }
@@ -354,10 +429,13 @@ impl ListenerLoop {
             ) else {
                 continue;
             };
-            let mut router_event = placement_event
+            let router_event = placement_event
                 .into_router_event()
                 .expect("local worker placement must convert to router event");
-            // Feed-layer measurement filters.
+            // Audit-log the event as published by the engine, before the
+            // measurement filter below can drop it.
+            audit_log_event(&router_event, seq, "live");
+            // Feed-layer measurement filter.
             if super::ignore_evictions()
                 && matches!(
                     router_event.event.data,
@@ -365,10 +443,6 @@ impl ListenerLoop {
                 )
             {
                 continue;
-            }
-            if super::merge_shards() {
-                router_event.worker_id = 0;
-                router_event.event.dp_rank = 0;
             }
             self.indexer.apply_event_routed(router_event).await;
             self.messages_processed += 1;

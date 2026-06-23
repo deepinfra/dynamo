@@ -300,23 +300,59 @@ fn build_score_response(tiered: &TieredMatchDetails, block_size: u32) -> ScoreRe
     }
 }
 
+/// Context carried through [`run_tiered_query`] solely for audit logging.
+/// Holds borrows of the request's model/tenant so the `kv_audit` line can
+/// identify which indexer served the query.
+struct QueryAudit<'a> {
+    model_name: &'a str,
+    tenant_id: &'a str,
+}
+
 /// Run a tiered query and serialize the result, returning the appropriate
 /// HTTP status. Shared between `/query` and `/query_by_hash`.
+///
+/// When `kv_audit` logging is enabled (see [`super::logging_enabled`]), emits a
+/// single `QUERY` line per request, before returning to the client, carrying a
+/// timestamp, the queried block hashes, and the full JSON response (including
+/// `longest_matched` and the per-tier `instances` breakdown).
 async fn run_tiered_query(
     indexer: &Indexer,
     block_hashes: Vec<LocalBlockHash>,
     block_size: u32,
+    audit: QueryAudit<'_>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    match indexer.find_tiered_matches(block_hashes).await {
+    // Snapshot the raw hashes for logging up front (find_tiered_matches takes
+    // ownership). Skip the allocation entirely when logging is off.
+    let logged_hashes: Option<Vec<u64>> = super::logging_enabled()
+        .then(|| block_hashes.iter().map(|h| h.0).collect());
+
+    let (status, body) = match indexer.find_tiered_matches(block_hashes).await {
         Ok(tiered) => (
             StatusCode::OK,
-            Json(serde_json::json!(build_score_response(&tiered, block_size))),
+            serde_json::json!(build_score_response(&tiered, block_size)),
         ),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
+            serde_json::json!({"error": e.to_string()}),
         ),
+    };
+
+    if let Some(block_hashes) = logged_hashes {
+        tracing::info!(
+            target: "kv_audit",
+            kind = "QUERY",
+            ts_ms = super::now_unix_millis(),
+            model_name = audit.model_name,
+            tenant_id = audit.tenant_id,
+            status = status.as_u16(),
+            num_blocks = block_hashes.len(),
+            block_hashes = ?block_hashes,
+            response = %body,
+            "kv_audit QUERY"
+        );
     }
+
+    (status, Json(body))
 }
 
 async fn query(
@@ -347,7 +383,16 @@ async fn query(
             ..Default::default()
         },
     );
-    run_tiered_query(&indexer, block_hashes, block_size).await
+    run_tiered_query(
+        &indexer,
+        block_hashes,
+        block_size,
+        QueryAudit {
+            model_name: &key.model_name,
+            tenant_id: &key.tenant_id,
+        },
+    )
+    .await
 }
 
 async fn query_by_hash(
@@ -375,7 +420,16 @@ async fn query_by_hash(
         .iter()
         .map(|h| LocalBlockHash(*h as u64))
         .collect();
-    run_tiered_query(&indexer, block_hashes, block_size).await
+    run_tiered_query(
+        &indexer,
+        block_hashes,
+        block_size,
+        QueryAudit {
+            model_name: &key.model_name,
+            tenant_id: &key.tenant_id,
+        },
+    )
+    .await
 }
 
 #[derive(Deserialize)]

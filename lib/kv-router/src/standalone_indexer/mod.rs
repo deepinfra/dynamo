@@ -50,7 +50,7 @@ use server::{AppState, create_router};
 // (it is a thin wrapper around `Option`) and suits flags that are written
 // exactly once and read many times.
 static IGNORE_EVICTIONS: OnceLock<bool> = OnceLock::new();
-static MERGE_SHARDS: OnceLock<bool> = OnceLock::new();
+static ENABLE_LOGGING: OnceLock<bool> = OnceLock::new();
 
 /// Returns `true` when this indexer instance should drop `Removed` and
 /// `Cleared` events, simulating a tree with infinite memory capacity.
@@ -58,10 +58,22 @@ pub(crate) fn ignore_evictions() -> bool {
     *IGNORE_EVICTIONS.get().unwrap_or(&false)
 }
 
-/// Returns `true` when this indexer instance should rewrite every event's
-/// `worker_id` and `dp_rank` to 0, simulating a single global shard.
-pub(crate) fn merge_shards() -> bool {
-    *MERGE_SHARDS.get().unwrap_or(&false)
+/// Returns `true` when verbose audit logging is enabled. When on, the query
+/// endpoint logs each query (block hashes + full indexer response) and the
+/// listener logs every store/evict/clear event ingested from the engine.
+/// All audit lines use the `kv_audit` tracing target so they can be filtered.
+pub(crate) fn logging_enabled() -> bool {
+    *ENABLE_LOGGING.get().unwrap_or(&false)
+}
+
+/// Wall-clock timestamp in milliseconds since the Unix epoch, for audit logs.
+/// Returns 0 if the clock is before the epoch (should never happen).
+pub(crate) fn now_unix_millis() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Configuration for Kubernetes pod auto-discovery.
@@ -100,12 +112,11 @@ pub struct IndexerConfig {
     pub kube_discovery: Option<KubeDiscoveryConfig>,
     /// Drop `Removed` and `Cleared` events before applying to the tree.
     /// Simulates infinite memory (evictions never happen). Useful for the
-    /// "ideal ceiling" and "∞ memory + sharded" measurement modes.
+    /// "ideal ceiling" measurement mode.
     pub ignore_evictions: bool,
-    /// Rewrite every event's `worker_id` and `dp_rank` to 0 before applying
-    /// to the tree.  Simulates all engine shards as one global worker.
-    /// Combine with `ignore_evictions` for the "ideal ceiling" mode.
-    pub merge_shards: bool,
+    /// Emit verbose per-query and per-event audit logs on the `kv_audit`
+    /// tracing target. See [`logging_enabled`].
+    pub enable_logging: bool,
 }
 
 pub(super) fn validate_zmq_endpoint(endpoint: &str) -> anyhow::Result<()> {
@@ -196,7 +207,13 @@ pub async fn run_server(config: IndexerConfig) -> anyhow::Result<()> {
     // `set` returns Err if already set; that should never happen since
     // run_server is called once, so we discard the result.
     let _ = IGNORE_EVICTIONS.set(config.ignore_evictions);
-    let _ = MERGE_SHARDS.set(config.merge_shards);
+    let _ = ENABLE_LOGGING.set(config.enable_logging);
+    if config.enable_logging {
+        tracing::info!(
+            target: "kv_audit",
+            "kv_audit logging enabled: queries and store/evict/clear events will be logged"
+        );
+    }
 
     let cancel_token = CancellationToken::new();
     let shutdown_token = cancel_token.clone();

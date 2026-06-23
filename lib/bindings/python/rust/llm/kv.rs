@@ -77,11 +77,12 @@ struct KvIndexerCli {
     #[arg(long, default_value_t = false)]
     ignore_evictions: bool,
 
-    /// Rewrite every event's worker_id and dp_rank to 0 before applying to the tree.
-    /// Simulates all engine shards as a single global worker.
-    /// Combine with --ignore-evictions for the "ideal ceiling" mode.
+    /// Emit verbose audit logs on the `kv_audit` tracing target: one line per
+    /// query (block hashes + full indexer response) and one line per
+    /// store/evict/clear event ingested from the engine. Filter with
+    /// RUST_LOG=kv_audit=info.
     #[arg(long, default_value_t = false)]
-    merge_shards: bool,
+    enable_logging: bool,
 
     /// Kubernetes namespace to watch for engine pods. Providing this together
     /// with --watch-label enables pod auto-discovery (subscribe on Ready,
@@ -155,7 +156,7 @@ where
             tenant_id: cli.tenant_id,
             peers: cli.peers,
             ignore_evictions: cli.ignore_evictions,
-            merge_shards: cli.merge_shards,
+            enable_logging: cli.enable_logging,
             kube_discovery,
         }))
     }
