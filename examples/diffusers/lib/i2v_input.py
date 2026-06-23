@@ -15,8 +15,11 @@ from __future__ import annotations
 
 import base64
 import binascii
+import io
 import logging
 import urllib.request
+
+from PIL import Image
 
 logger = logging.getLogger(__name__)
 
@@ -43,12 +46,37 @@ def _fetch_url(url: str) -> bytes:
     return data
 
 
+def _validate_decodable_image(data: bytes) -> None:
+    """Confirm ``data`` is a decodable image BEFORE it reaches the GPU subprocess.
+
+    A non-image URL (HTML / redirect / 404 body) or a corrupt payload would
+    otherwise raise ``PIL.UnidentifiedImageError`` *inside* the resident pool
+    worker, killing that subprocess and forcing an ~8.5min cold recompile on the
+    next request -- i.e. a user could trigger a recompile with bad input.
+    Validating here (the main process, before the GPU subprocess and the generate
+    lock) turns that into a fast, clean ``ValueError`` instead.
+    """
+    if not data:
+        raise ValueError("conditioning image is empty")
+    try:
+        with Image.open(io.BytesIO(data)) as im:
+            im.verify()
+    except Exception as exc:  # UnidentifiedImageError, OSError, ...
+        raise ValueError("conditioning image is not a decodable image") from exc
+
+
 def resolve_image_bytes(image: str) -> bytes:
     """Resolve an image reference (URL | data-URI | raw base64) to raw bytes.
 
     Blocking (network for URLs) -- callers run it via ``asyncio.to_thread`` so it
-    never stalls the event loop. Enforces a size cap and a download timeout.
+    never stalls the event loop. Enforces a size cap and a download timeout, and
+    validates the result is a decodable image so malformed input fails fast in the
+    main process instead of crashing the GPU subprocess (which would force a
+    recompile).
     """
     if image.startswith(("http://", "https://")):
-        return _fetch_url(image)
-    return _decode_data_uri_or_b64(image)
+        data = _fetch_url(image)
+    else:
+        data = _decode_data_uri_or_b64(image)
+    _validate_decodable_image(data)
+    return data
