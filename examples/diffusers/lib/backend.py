@@ -569,9 +569,8 @@ class GenericVideoBackend:
         created_ts = int(time.time())
 
         logger.info(
-            "[%s] create_video: prompt='%s...' size=%s frames=%d steps=%d pool_mode=%s",
+            "[%s] create_video: size=%s frames=%d steps=%d pool_mode=%s",
             video_id,
-            request.prompt[:60],
             request.size,
             num_frames,
             nvext.num_inference_steps,
