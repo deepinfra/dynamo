@@ -17,8 +17,11 @@ from __future__ import annotations
 import base64
 import binascii
 import io
+import ipaddress
 import logging
+import socket
 import urllib.request
+from urllib.parse import urlparse
 
 from PIL import Image
 
@@ -38,9 +41,48 @@ def _decode_data_uri_or_b64(value: str) -> bytes:
         raise ValueError("conditioning image is not valid base64 / data-URI") from exc
 
 
+def _assert_public_host(url: str) -> None:
+    """SSRF guard: reject URLs that resolve to a non-public address.
+
+    The conditioning-image URL is customer-supplied and fetched server-side, so
+    without this an attacker could point it at cloud metadata (169.254.169.254),
+    localhost, or internal/private ranges. Resolve the host and require every
+    resolved address to be globally routable. (Residual: DNS-rebinding TOCTOU
+    between resolve and connect is not covered by this check.)
+    """
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError("conditioning image URL must be http or https")
+    host = parsed.hostname
+    if not host:
+        raise ValueError("conditioning image URL has no host")
+    try:
+        infos = socket.getaddrinfo(
+            host, parsed.port or (443 if parsed.scheme == "https" else 80)
+        )
+    except socket.gaierror as exc:
+        raise ValueError("conditioning image URL host does not resolve") from exc
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if not ip.is_global or ip.is_multicast:
+            raise ValueError("conditioning image URL resolves to a non-public address")
+
+
+class _SsrfSafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Re-validate the target host on every redirect hop (blocks redirect-to-internal)."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[no-untyped-def]
+        _assert_public_host(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_SSRF_SAFE_OPENER = urllib.request.build_opener(_SsrfSafeRedirectHandler())
+
+
 def _fetch_url(url: str) -> bytes:
+    _assert_public_host(url)  # validate before connecting; redirects re-validated by the opener
     req = urllib.request.Request(url, headers={"User-Agent": "deepinfra-ltx2"})
-    with urllib.request.urlopen(req, timeout=_DOWNLOAD_TIMEOUT_S) as resp:  # noqa: S310
+    with _SSRF_SAFE_OPENER.open(req, timeout=_DOWNLOAD_TIMEOUT_S) as resp:
         data = resp.read(_MAX_IMAGE_BYTES + 1)
     if len(data) > _MAX_IMAGE_BYTES:
         raise ValueError("conditioning image exceeds %d bytes" % _MAX_IMAGE_BYTES)
