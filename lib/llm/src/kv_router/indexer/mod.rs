@@ -78,9 +78,47 @@ pub enum Indexer {
 /// (observed: frontend → ~500GB). This mirrors the NATS purge: list live
 /// instances and drop tree workers no longer present. It only removes workers
 /// that no longer exist in discovery, so it never evicts live cache state.
-fn spawn_zmq_worker_reconciliation(
+/// Indexers that support periodic discovery reconciliation. Both the
+/// single-threaded `KvIndexer` (kv-events, `router_event_threads == 1`) and the
+/// multi-threaded `ThreadPoolIndexer` (`router_event_threads > 1`) take a
+/// kv-events code path with NO prune TTL, so both leak departed-worker block
+/// sets without this reconciliation. The trait lets one loop drive either.
+trait ReconcilableIndexer: Send + Sync + 'static {
+    fn reconcile_workers(&self) -> impl std::future::Future<Output = Vec<WorkerId>> + Send;
+    fn reconcile_total_blocks(&self) -> impl std::future::Future<Output = usize> + Send;
+    fn reconcile_remove_worker(
+        &self,
+        worker: WorkerId,
+    ) -> impl std::future::Future<Output = ()> + Send;
+}
+
+impl ReconcilableIndexer for ThreadPoolIndexer<ConcurrentRadixTreeCompressed> {
+    async fn reconcile_workers(&self) -> Vec<WorkerId> {
+        self.get_workers().await
+    }
+    async fn reconcile_total_blocks(&self) -> usize {
+        self.total_blocks().await
+    }
+    async fn reconcile_remove_worker(&self, worker: WorkerId) {
+        KvIndexerInterface::remove_worker(self, worker).await
+    }
+}
+
+impl ReconcilableIndexer for KvIndexer {
+    async fn reconcile_workers(&self) -> Vec<WorkerId> {
+        self.get_workers().await
+    }
+    async fn reconcile_total_blocks(&self) -> usize {
+        self.total_blocks().await
+    }
+    async fn reconcile_remove_worker(&self, worker: WorkerId) {
+        KvIndexerInterface::remove_worker(self, worker).await
+    }
+}
+
+fn spawn_zmq_worker_reconciliation<I: ReconcilableIndexer>(
     component: Component,
-    indexer: Arc<ThreadPoolIndexer<ConcurrentRadixTreeCompressed>>,
+    indexer: Arc<I>,
 ) {
     const RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
     let token = component.drt().primary_token();
@@ -105,7 +143,7 @@ fn spawn_zmq_worker_reconciliation(
                 _ = token.cancelled() => break,
                 _ = ticker.tick() => {
                     if let Some(gauge) = &block_gauge {
-                        gauge.set(indexer.total_blocks().await as i64);
+                        gauge.set(indexer.reconcile_total_blocks().await as i64);
                     }
                     let live: HashSet<WorkerId> = match component.list_instances().await {
                         Ok(instances) => instances.iter().map(|i| i.instance_id).collect(),
@@ -114,12 +152,12 @@ fn spawn_zmq_worker_reconciliation(
                             continue;
                         }
                     };
-                    for worker_id in workers_to_purge(&live, &indexer.get_workers().await) {
+                    for worker_id in workers_to_purge(&live, &indexer.reconcile_workers().await) {
                         tracing::info!(
                             worker_id,
                             "kv-indexer reconciliation: purging blocks for departed worker"
                         );
-                        KvIndexerInterface::remove_worker(indexer.as_ref(), worker_id).await;
+                        indexer.reconcile_remove_worker(worker_id).await;
                     }
                 }
             }
@@ -280,13 +318,15 @@ impl Indexer {
         let kv_indexer_metrics = KvIndexerMetrics::from_component(component);
         let cancellation_token = component.drt().primary_token();
 
+        let primary =
+            KvIndexer::new_with_pruning(cancellation_token, block_size, kv_indexer_metrics, None);
+        // DEEPINFRA: same leak as the threads>1 branch — kv-events mode has no
+        // prune TTL and the ZMQ plane has no worker-departure purge, so churned
+        // workers leak their block sets forever. (KvIndexer is cheap to clone —
+        // it's just channel senders.)
+        spawn_zmq_worker_reconciliation(component.clone(), Arc::new(primary.clone()));
         Ok(Self::KvIndexer {
-            primary: KvIndexer::new_with_pruning(
-                cancellation_token,
-                block_size,
-                kv_indexer_metrics,
-                None,
-            ),
+            primary,
             lower_tier: LowerTierIndexers::new(1, block_size),
             approx,
             primary_records_routing_decisions: false,

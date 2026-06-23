@@ -182,6 +182,8 @@ pub struct KvIndexer {
     remove_worker_dp_rank_tx: mpsc::Sender<(WorkerId, DpRank)>,
     /// A sender for get workers requests.
     get_workers_tx: mpsc::Sender<GetWorkersRequest>,
+    /// A sender for tracked-block-count requests (reconciliation gauge).
+    total_blocks_tx: mpsc::Sender<oneshot::Sender<usize>>,
     /// A sender for dump requests.
     dump_tx: mpsc::Sender<DumpRequest>,
     /// A sender for flush requests.
@@ -221,6 +223,7 @@ impl KvIndexer {
         let (remove_worker_dp_rank_tx, remove_worker_dp_rank_rx) =
             mpsc::channel::<(WorkerId, DpRank)>(16);
         let (get_workers_tx, get_workers_rx) = mpsc::channel::<GetWorkersRequest>(16);
+        let (total_blocks_tx, total_blocks_rx) = mpsc::channel::<oneshot::Sender<usize>>(16);
         let (dump_tx, dump_rx) = mpsc::channel::<DumpRequest>(16);
         let (flush_tx, flush_rx) = mpsc::channel::<FlushRequest>(16);
         let (routing_tx, mut routing_rx) = mpsc::channel::<RoutingDecisionRequest>(2048);
@@ -242,6 +245,7 @@ impl KvIndexer {
                     let mut remove_worker_rx = remove_worker_rx;
                     let mut remove_worker_dp_rank_rx = remove_worker_dp_rank_rx;
                     let mut get_workers_rx = get_workers_rx;
+                    let mut total_blocks_rx = total_blocks_rx;
                     let mut dump_rx = dump_rx;
                     let mut flush_rx = flush_rx;
                     let mut trie = RadixTree::new();
@@ -281,6 +285,10 @@ impl KvIndexer {
                             Some(get_workers_req) = get_workers_rx.recv() => {
                                 let workers = trie.get_workers();
                                 let _ = get_workers_req.resp.send(workers);
+                            }
+
+                            Some(resp) = total_blocks_rx.recv() => {
+                                let _ = resp.send(trie.block_count());
                             }
 
                             Some(dump_req) = dump_rx.recv() => {
@@ -400,6 +408,7 @@ impl KvIndexer {
             remove_worker_tx,
             remove_worker_dp_rank_tx,
             get_workers_tx,
+            total_blocks_tx,
             dump_tx,
             flush_tx,
             routing_tx,
@@ -465,6 +474,32 @@ impl KvIndexer {
     /// A `mpsc::Sender` for `GetWorkersRequest`s.
     pub fn get_workers_sender(&self) -> mpsc::Sender<GetWorkersRequest> {
         self.get_workers_tx.clone()
+    }
+
+    /// List the workers currently tracked in the trie. Returns empty if the
+    /// indexer thread is gone. Used by the ZMQ discovery reconciliation loop.
+    pub async fn get_workers(&self) -> Vec<WorkerId> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        if self
+            .get_workers_tx
+            .send(GetWorkersRequest { resp: resp_tx })
+            .await
+            .is_err()
+        {
+            return Vec::new();
+        }
+        resp_rx.await.unwrap_or_default()
+    }
+
+    /// Total (worker, block) entries currently tracked in the trie. Returns 0
+    /// if the indexer thread is gone. Backs the `kv_indexer_tracked_blocks`
+    /// gauge on the single-threaded kv-events path (no prune TTL).
+    pub async fn total_blocks(&self) -> usize {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        if self.total_blocks_tx.send(resp_tx).await.is_err() {
+            return 0;
+        }
+        resp_rx.await.unwrap_or(0)
     }
 }
 
