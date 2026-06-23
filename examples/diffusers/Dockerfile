@@ -99,7 +99,8 @@ RUN echo "Building FastVideo @ ${FASTVIDEO_SHA} for TORCH_CUDA_ARCH_LIST=${TORCH
  && git submodule update --init --recursive \
  && git apply --verbose /tmp/megacache.patch \
  && cd / \
- && uv pip install --no-build-isolation /tmp/FastVideo
+ && uv pip install --no-build-isolation /tmp/FastVideo \
+ && rm -rf /tmp/FastVideo
 
 ENV FASTVIDEO_VIDEO_CODEC=libx264
 ENV FASTVIDEO_X264_PRESET=ultrafast

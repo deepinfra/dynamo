@@ -569,9 +569,8 @@ class GenericVideoBackend:
         created_ts = int(time.time())
 
         logger.info(
-            "[%s] create_video: prompt='%s...' size=%s frames=%d steps=%d pool_mode=%s",
+            "[%s] create_video: size=%s frames=%d steps=%d pool_mode=%s",
             video_id,
-            request.prompt[:60],
             request.size,
             num_frames,
             nvext.num_inference_steps,
@@ -588,7 +587,12 @@ class GenericVideoBackend:
         # the lock. Empty list -> t2v. Temp file cleaned up in `finally`.
         ltx2_images: list[tuple[str, int, float]] = []
         i2v_temp_path: str | None = None
-        image_ref = nvext.image_url
+        # The Dynamo frontend forwards an i2v image ONLY via the top-level
+        # `input_reference` field (its `nvext` is a typed struct without an image
+        # field, so nvext.image_url never survives the frontend hop). Prefer
+        # input_reference; fall back to nvext.image_url for direct-to-worker
+        # calls that bypass the frontend.
+        image_ref = request.input_reference or nvext.image_url
         if image_ref:
             from .i2v_input import resolve_image_bytes
 
