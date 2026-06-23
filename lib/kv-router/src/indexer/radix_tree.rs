@@ -715,6 +715,14 @@ impl RadixTree {
         workers
     }
 
+    /// Total number of (worker, block) entries tracked across all per-worker
+    /// lookup tables. In kv-events ("exact") mode the tree has no prune TTL, so
+    /// this is the primary signal for unbounded growth; exposed for the
+    /// `kv_indexer_tracked_blocks` gauge.
+    pub fn block_count(&self) -> usize {
+        self.lookup.values().map(|lookup| lookup.len()).sum()
+    }
+
     pub fn dump_tree_as_events(&self) -> Vec<RouterEvent> {
         let mut events = Vec::new();
         let mut event_id = 0u64;
