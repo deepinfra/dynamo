@@ -58,6 +58,14 @@ class VideoCreateRequest(BaseModel):
         default=5, description="Clip duration; used when nvext.num_frames is unset"
     )
     user: str | None = Field(default=None)
+    # i2v conditioning image, TOP-LEVEL. This mirrors the Dynamo HTTP frontend's
+    # NvCreateVideoRequest.input_reference -- the ONLY channel the frontend
+    # forwards an i2v image through. The frontend's `nvext` is a typed struct
+    # (VideoNvExt) that has no image field, so `nvext.image_url` is silently
+    # dropped at the frontend; the image MUST arrive here. The frontend passes
+    # this through opaquely (no fetch/decode), so create_video resolves it via
+    # i2v_input.resolve_image_bytes (URL / data: URI / raw base64).
+    input_reference: str | None = Field(default=None)
     nvext: NvExtVideoCreateRequest = Field(default_factory=NvExtVideoCreateRequest)
 
 
