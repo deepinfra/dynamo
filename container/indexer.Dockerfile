@@ -57,15 +57,16 @@ ENV CARGO_TARGET_DIR=/cargo-target
 # file-descriptor limit (hundreds of parallel rustc -> "too many open files").
 # 16 jobs is plenty and well-behaved; build-indexer-image.sh also raises nofile.
 ENV CARGO_BUILD_JOBS=16
-# Debug build: fast to compile and correct for measurement/validation. Switch to
-# `--release` only when you need real indexer throughput. kv-indexer-metrics adds
-# the `dynamo.indexer` binary + Prometheus /metrics. nixl-sys' build script runs
-# bindgen, so point it at libclang (resolved dynamically to survive llvm bumps).
-# Cache mounts keep the crate registry + compiled artifacts warm across rebuilds.
+# Release build: optimized for real indexer throughput (slower to compile than a
+# debug build, but the radix-tree query/apply hot paths need the optimizations).
+# kv-indexer-metrics adds the `dynamo.indexer` binary + Prometheus /metrics.
+# nixl-sys' build script runs bindgen, so point it at libclang (resolved
+# dynamically to survive llvm bumps). Cache mounts keep the crate registry +
+# compiled artifacts warm across rebuilds.
 RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/cargo-target \
     export LIBCLANG_PATH="$(dirname "$(find /usr/lib/llvm-* -name 'libclang.so*' 2>/dev/null | head -1)")" \
- && maturin build --features kv-indexer-metrics --out /wheels
+ && maturin build --release --features kv-indexer-metrics --out /wheels
 
 # ---------- runtime: install just the wheel --------------------------------
 FROM ubuntu:24.04 AS runtime
