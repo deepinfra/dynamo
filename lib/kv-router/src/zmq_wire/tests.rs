@@ -8,7 +8,7 @@ use rmp_serde::{from_slice, to_vec};
 
 use crate::protocols::{
     BlockExtraInfo, BlockHashOptions, BlockMmObjectInfo, ExternalSequenceBlockHash,
-    KvCacheEventData, WorkerWithDpRank, compute_block_hash_for_seq,
+    KvCacheEventData, StorageTier, WorkerWithDpRank, compute_block_hash_for_seq,
 };
 
 use super::filter::KvCacheSpecKind;
@@ -639,5 +639,31 @@ fn test_convert_event_short_token_ids_keeps_parsed_blocks() {
             );
         }
         other => panic!("expected Stored event, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_convert_event_cpu_medium_lands_on_host_tier() {
+    // vLLM's SimpleCPUOffloadConnector tags its events medium="CPU". Before
+    // #10368 this string was unknown and fell back to the Device tier, so a
+    // CPU-tier eviction removed a block the GPU still held.
+    for (medium, expected) in [
+        (Some("CPU"), StorageTier::HostPinned),
+        (Some("CPU_PINNED"), StorageTier::HostPinned),
+        (Some("GPU"), StorageTier::Device),
+        (None, StorageTier::Device),
+    ] {
+        let raw_event = RawKvEvent::BlockRemoved {
+            block_hashes: vec![BlockHashValue::Unsigned(201)],
+            medium: medium.map(str::to_string),
+            group_idx: None,
+            kv_cache_spec_kind: None,
+            kv_cache_spec_sliding_window: None,
+        };
+        let warning_count = Arc::new(AtomicU32::new(0));
+        let placement = convert_event(raw_event, 7, 4, WorkerWithDpRank::new(3, 0), &warning_count)
+            .expect("remove event converts")
+            .expect("remove event is kept");
+        assert_eq!(placement.placement.tier, expected, "medium {medium:?}");
     }
 }
