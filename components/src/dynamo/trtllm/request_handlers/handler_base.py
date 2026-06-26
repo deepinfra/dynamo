@@ -329,13 +329,28 @@ class HandlerBase(BaseGenerativeHandler):
         return needs_recovery if isinstance(needs_recovery, bool) else False
 
     # ------------------------------------------------------------------
+    # Deferred engine quiesce (drain v7)
+    # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
     # Sleep / wake public API (delegates to TRTLLMEnginePauseController)
     # ------------------------------------------------------------------
 
     async def release_memory_occupation(self, body: dict) -> dict:
-        """Release GPU memory: unregister endpoint, drain requests, pause engine."""
+        """Drain for scale-down: pure registration toggle, never touches the engine.
+
+        DEEPINFRA (drain v8): the synchronous work is reject-new + unregister +
+        pause-FPM. That alone makes the worker stop taking traffic. Earlier
+        versions (v6/v7) eventually called engine.sleep() to free GPU memory
+        after a grace window; the matching engine.wake_up() RPC was a known
+        wedge surface (observed: decode-6sgj 2026-06-26 — drain ran, FPM
+        resumed under a new instance_id, but no further engine activity for 2h
+        while the readiness probe timed out). We dropped the engine pause
+        entirely. Scale-down terminates the pod (Kubernetes releases the
+        memory); idle drained pods cost what the operator was already paying
+        for. The wake-up wedge class is gone.
+        """
         body = body or {}
-        tags = body.get("tags")
 
         async with self._pause_lock:
             if self._pause_controller.is_paused:
@@ -348,65 +363,55 @@ class HandlerBase(BaseGenerativeHandler):
                     "message": "resume_memory_occupation required before retrying release",
                 }
 
+            # DEEPINFRA (drain v2): commit the drain — reject new requests and
+            # unregister from frontend discovery. This is the ONLY step we roll
+            # back, and only if it fails before the pod actually leaves rotation.
             try:
                 await self._set_reject_new_requests(True)
-
                 if self.generate_endpoint is not None:
                     await self.generate_endpoint.unregister_endpoint_instance()
-
-                timeout_s = float(body.get("timeout_s", 30.0))
-                await self._wait_for_inflight_requests(timeout_s)
-                await self._pause_controller.pause(tags)
-
-                return {"status": "ok", "message": "Memory released"}
             except Exception as exc:
-                logger.error("release_memory_occupation failed: %s", exc)
-                # Rollback: TRT-LLM has no pause_generation(), so we
-                # manually unregistered the endpoint and set reject flag
-                # above. Restore both on failure. If pause partially
-                # succeeded, resume the completed domains first.
-                if self._controller_needs_resume_recovery(self._pause_controller):
-                    try:
-                        await self._pause_controller.resume(tags)
-                        self._pause_controller.mark_resumed()
-                    except Exception as resume_exc:
-                        logger.error(
-                            "release_memory_occupation rollback resume failed: %s",
-                            resume_exc,
-                        )
-                        return {
-                            "status": "error",
-                            "message": (f"{exc}; rollback resume failed: {resume_exc}"),
-                        }
+                logger.error("release_memory_occupation: drain-commit failed: %s", exc)
                 if self.generate_endpoint is not None:
-                    await self.generate_endpoint.register_endpoint_instance()
+                    try:
+                        await self.generate_endpoint.register_endpoint_instance()
+                    except Exception as reg_exc:
+                        logger.error(
+                            "release_memory_occupation rollback re-register failed: %s",
+                            reg_exc,
+                        )
                 await self._set_reject_new_requests(False)
                 return {"status": "error", "message": str(exc)}
+
+            # The pod is now unregistered. DEEPINFRA (drain v5): stop emitting FPM
+            # so a drained worker doesn't inflate the planner's engine count.
+            if self.publisher is not None:
+                self.publisher.pause_fpm()
+
+        return {"status": "draining", "unregistered": True}
 
     async def resume_memory_occupation(self, body: dict) -> dict:
-        """Restore GPU memory: resume engine, re-register endpoint."""
-        body = body or {}
-        tags = body.get("tags")
+        """Undrain: re-register, clear reject, resume FPM.
+
+        DEEPINFRA (drain v8): mirror of ``release_memory_occupation`` — the
+        engine was never paused, so resume is a pure registration toggle
+        with no engine RPC. The body argument is accepted for compatibility
+        with MM's existing /engine/wake_up callers but is unused.
+        """
+        _ = body  # historical compat — earlier versions read tags from here
 
         async with self._pause_lock:
-            needs_recovery = self._controller_needs_resume_recovery(
-                self._pause_controller
-            )
-            if not self._pause_controller.is_paused and not needs_recovery:
-                return {"status": "ok", "message": "Memory already resumed"}
-
             try:
-                await self._pause_controller.resume(tags)
-
+                if self.publisher is not None:
+                    self.publisher.resume_fpm()
                 if self.generate_endpoint is not None:
                     await self.generate_endpoint.register_endpoint_instance()
-
                 await self._set_reject_new_requests(False)
-                self._pause_controller.mark_resumed()
-                return {"status": "ok", "message": "Memory resumed"}
             except Exception as exc:
-                logger.error("resume_memory_occupation failed: %s", exc)
+                logger.error("resume_memory_occupation: re-register failed: %s", exc)
                 return {"status": "error", "message": str(exc)}
+
+            return {"status": "ok", "message": "Re-registered (no engine RPC)"}
 
     @staticmethod
     def _extract_logprobs(
