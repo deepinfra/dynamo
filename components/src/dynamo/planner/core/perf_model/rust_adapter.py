@@ -15,6 +15,8 @@ import json
 import logging
 import math
 from dataclasses import dataclass
+import statistics
+from collections import deque
 from typing import Any, Optional
 
 from dynamo.common.forward_pass_metrics import (
@@ -29,6 +31,19 @@ from dynamo.planner.core.perf_model.base import _clamp_kv_hit_rate
 from dynamo.planner.core.types import EngineCapabilities
 
 logger = logging.getLogger(__name__)
+
+# DEEPINFRA: prefill_tokens threshold above which an iter is considered
+# "compute-dominated" (overhead is negligible). Used by the simple-stats
+# fallback for the prefill perf model. Tuned from production FPM scatter:
+# below ~5000 tokens wall_time clusters at ~30-50ms regardless of token
+# count (overhead-dominated), above ~6000 wall_time scales linearly with
+# tokens. 8000 is a safe margin into the compute-dominated regime.
+_FALLBACK_HEAVY_PT_THRESHOLD: int = 8000
+
+# DEEPINFRA: rps threshold above which we treat the shim's prediction as
+# unphysical. Any modern prefill engine processes at most ~1000 rps even
+# with tiny prompts; anything above is the 1-nanosecond floor artifact.
+_FALLBACK_UNPHYSICAL_RPS: float = 1e5
 
 AicEngineConfig: Any = None
 EngineCapacityRequest: Any = None
@@ -123,6 +138,21 @@ class PlannerEnginePerfModel:
         self._retained_iterations: list[list[ForwardPassMetrics]] = []
         self._avg_isl = _MovingAverage(config.max_num_fpm_samples)
         self._avg_decode_length = _MovingAverage(config.max_num_fpm_samples)
+
+        # DEEPINFRA: simple-stats fallback for when the AIC regression returns
+        # unphysical predictions (the 1e-6 ms floor that produces rps ~ 1e9).
+        # The AIC fit is a single affine regression which can't represent the
+        # two-regime shape of real prefill data (~30ms constant overhead for
+        # small batches + ~0.015ms/token linear above), so it ends up with a
+        # negative intercept and clamps at the floor for any small-token query.
+        # We track running min wall_time (≈ system overhead) and per-token
+        # compute slope from heavy iters, then substitute an analytical
+        # estimate `wt = max(min_observed, slope * isl)` when the shim's
+        # output is below physical possibility.
+        self._fallback_min_wt_s: Optional[float] = None
+        self._fallback_heavy_window: deque[tuple[int, float]] = deque(
+            maxlen=config.max_num_fpm_samples
+        )
 
         self._init_rust_model()
 
@@ -390,6 +420,21 @@ class PlannerEnginePerfModel:
             self._avg_decode_length.add_after_first_nonzero(
                 scheduled.sum_decode_kv_tokens / scheduled.num_decode_requests
             )
+        # DEEPINFRA: feed the simple-stats fallback (see __init__ note). Track
+        # min observed wall_time (≈ system overhead) and append heavy-iter
+        # samples for per-token slope computation. Skip wall_time==0 (TRT-LLM's
+        # polling iter) — same filter as the regression's add_observation.
+        wt = fpm.wall_time
+        if wt > 0.0:
+            if self._fallback_min_wt_s is None or wt < self._fallback_min_wt_s:
+                self._fallback_min_wt_s = wt
+            if self._worker_type == "prefill":
+                pt = scheduled.sum_prefill_tokens
+                # "Heavy" = compute-dominated (above the overhead-saturated
+                # cluster we plotted). For workloads where wall_time grows
+                # roughly linearly with tokens we get a clean per-token slope.
+                if pt >= _FALLBACK_HEAVY_PT_THRESHOLD:
+                    self._fallback_heavy_window.append((pt, wt))
 
     def _tune(self, iterations: list[list[ForwardPassMetrics]]) -> None:
         if not iterations:
@@ -633,12 +678,98 @@ class PlannerEnginePerfModel:
         )
         rps = result.rps
         itl_ms = result.itl_ms
+        # DEEPINFRA: substitute the analytical fallback when the shim returned
+        # the 1-ns floor (rps > _FALLBACK_UNPHYSICAL_RPS or ttft below the
+        # observed system overhead). See _fallback_capacity for the model.
+        if self._worker_type == "prefill":
+            fallback = self._fallback_capacity(
+                isl=isl,
+                shim_rps=rps,
+                shim_ttft_ms=result.ttft_ms,
+            )
+            if fallback is not None:
+                logger.info(
+                    "RUST_CAPACITY[%s]: FALLBACK_OVERRIDE shim_rps=%s -> "
+                    "rps=%.2f ttft_ms=%.2f (min_wt_s=%s slope=%s)",
+                    self._worker_type, rps,
+                    fallback.rps, fallback.ttft_ms or 0,
+                    self._fallback_min_wt_s,
+                    self._fallback_per_token_slope_s(),
+                )
+                return fallback
         return PlannerEngineCapacity(
             rps=rps,
             ttft_ms=result.ttft_ms,
             itl_ms=itl_ms,
             e2e_latency_ms=result.e2e_latency_ms,
             eligible=result.eligible,
+        )
+
+    def _fallback_per_token_slope_s(self) -> Optional[float]:
+        """Median per-token compute time (s) from heavy iters, or None."""
+        if not self._fallback_heavy_window:
+            return None
+        ratios = [wt / pt for pt, wt in self._fallback_heavy_window if pt > 0]
+        if not ratios:
+            return None
+        return statistics.median(ratios)
+
+    def _fallback_capacity(
+        self,
+        *,
+        isl: float,
+        shim_rps: Optional[float],
+        shim_ttft_ms: Optional[float],
+    ) -> Optional[PlannerEngineCapacity]:
+        """Analytical replacement when the shim returns unphysical predictions.
+
+        Model: wall_time(isl) = max(min_observed_wt, slope * isl).
+
+        - ``min_observed_wt`` ≈ irreducible per-iter overhead (≈ smallest
+          observed FPM wall_time)
+        - ``slope`` ≈ per-token compute time (median of wt/pt over
+          compute-dominated FPMs)
+
+        Single-engine capacity ≈ 1 / wall_time(isl). This is conservative —
+        ignores batching headroom — but always physical, in contrast to the
+        shim's 1e9-rps sentinel.
+
+        Returns None if the shim's result is plausible (let the caller pass
+        it through unchanged) OR if we lack the rolling stats to substitute.
+        """
+        if self._fallback_min_wt_s is None:
+            return None
+        # Only override when shim is clearly unphysical: rps > 1e5 OR
+        # ttft below the observed system overhead floor.
+        min_wt_ms = self._fallback_min_wt_s * 1000.0
+        shim_is_unphysical = False
+        if shim_rps is not None and shim_rps > _FALLBACK_UNPHYSICAL_RPS:
+            shim_is_unphysical = True
+        if shim_ttft_ms is not None and shim_ttft_ms < min_wt_ms * 0.5:
+            # Significantly below the irreducible overhead — also a tell that
+            # the regression has hit its 1e-6 ms floor.
+            shim_is_unphysical = True
+        if not shim_is_unphysical:
+            return None
+        slope_s = self._fallback_per_token_slope_s()
+        if slope_s is None:
+            return None
+        wt_s = max(self._fallback_min_wt_s, slope_s * isl)
+        if wt_s <= 0:
+            return None
+        wt_ms = wt_s * 1000.0
+        # Single-request throughput: 1 / wt. The shim's batched throughput
+        # could be higher, but the planner uses rps as "sustainable per-engine
+        # request rate at this ISL" which is bounded by 1/wt_per_request when
+        # batching helps but doesn't change per-request residency. Acceptable
+        # conservative estimate.
+        rps = 1.0 / wt_s
+        return PlannerEngineCapacity(
+            rps=rps,
+            ttft_ms=wt_ms,
+            itl_ms=None,
+            e2e_latency_ms=wt_ms,
+            eligible=True,
         )
 
     # ------------------------------------------------------------------
