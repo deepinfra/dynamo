@@ -151,7 +151,7 @@ struct ListenerRuntime {
 
 pub struct ListenerRecord {
     endpoint: String,
-    replay_endpoint: Option<String>,
+    recover_endpoint: Option<String>,
     block_size: u32,
     indexer: Indexer,
     watermark: Arc<AtomicU64>,
@@ -161,14 +161,14 @@ pub struct ListenerRecord {
 impl ListenerRecord {
     fn new(
         endpoint: String,
-        replay_endpoint: Option<String>,
+        recover_endpoint: Option<String>,
         block_size: u32,
         indexer: Indexer,
         watermark: Arc<AtomicU64>,
     ) -> Self {
         Self {
             endpoint,
-            replay_endpoint,
+            recover_endpoint,
             block_size,
             indexer,
             watermark,
@@ -185,8 +185,8 @@ impl ListenerRecord {
         &self.endpoint
     }
 
-    pub(super) fn replay_endpoint(&self) -> Option<&str> {
-        self.replay_endpoint.as_deref()
+    pub(super) fn recover_endpoint(&self) -> Option<&str> {
+        self.recover_endpoint.as_deref()
     }
 
     pub(super) fn block_size(&self) -> u32 {
@@ -380,7 +380,7 @@ impl WorkerRegistry {
         model_name: String,
         tenant_id: String,
         block_size: u32,
-        replay_endpoint: Option<String>,
+        recover_endpoint: Option<String>,
     ) -> Result<()> {
         let key = IndexerKey {
             model_name,
@@ -436,7 +436,7 @@ impl WorkerRegistry {
 
         let record = Arc::new(ListenerRecord::new(
             endpoint,
-            replay_endpoint,
+            recover_endpoint,
             bs,
             indexer,
             watermark,

@@ -99,9 +99,10 @@ struct KvIndexerCli {
     #[arg(long, default_value_t = 5557)]
     watch_zmq_port: u16,
 
-    /// Optional ZMQ replay (ROUTER) port on the engines for gap recovery.
+    /// Optional HTTP port serving `GET /kv_recover` on the engines, used for
+    /// per-worker gap recovery (queried at `http://<pod-ip>:<port>/kv_recover`).
     #[arg(long)]
-    watch_replay_port: Option<u16>,
+    watch_recover_port: Option<u16>,
 
     /// Model name to register discovered pods under. Defaults to --model-name.
     #[arg(long)]
@@ -136,7 +137,7 @@ where
                     namespace,
                     label_selector,
                     zmq_port: cli.watch_zmq_port,
-                    replay_port: cli.watch_replay_port,
+                    recover_port: cli.watch_recover_port,
                     model_name: cli.watch_model_name.unwrap_or_else(|| cli.model_name.clone()),
                     tenant_id: cli.tenant_id.clone(),
                     block_size,

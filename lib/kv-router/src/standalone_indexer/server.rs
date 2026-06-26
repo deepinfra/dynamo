@@ -44,8 +44,12 @@ pub struct RegisterRequest {
     pub block_size: u32,
     #[serde(default)]
     pub dp_rank: Option<u32>,
-    #[serde(default)]
-    pub replay_endpoint: Option<String>,
+    /// Base URL of the worker's `GET /kv_recover` endpoint used for per-worker
+    /// gap recovery, e.g. `http://10.0.0.1:8081`. Accepts the legacy
+    /// `replay_endpoint` key for back-compat, but the value must now be an
+    /// HTTP(S) URL, not a ZMQ endpoint.
+    #[serde(default, alias = "replay_endpoint")]
+    pub recover_endpoint: Option<String>,
     /// Optional per-tenant salt (Mooncake RFC #1403 `additionalsalt`).
     /// Currently accepted but not yet mixed into hashes — engines apply
     /// their own salt internally. Plumbed for forward compatibility.
@@ -128,7 +132,7 @@ async fn register(
     Json(req): Json<RegisterRequest>,
 ) -> impl IntoResponse {
     if let Err(error) =
-        super::validate_listener_endpoints(&req.endpoint, req.replay_endpoint.as_deref())
+        super::validate_listener_endpoints(&req.endpoint, req.recover_endpoint.as_deref())
     {
         return (
             StatusCode::BAD_REQUEST,
@@ -145,7 +149,7 @@ async fn register(
             req.model_name,
             req.tenant_id,
             req.block_size,
-            req.replay_endpoint,
+            req.recover_endpoint,
         )
         .await
     {

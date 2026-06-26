@@ -196,9 +196,9 @@ async fn reconcile(
 
         let instance_id = instance_id_for(name);
         let endpoint = format!("tcp://{ip}:{}", config.zmq_port);
-        let replay_endpoint = config
-            .replay_port
-            .map(|port| format!("tcp://{ip}:{port}"));
+        let recover_endpoint = config
+            .recover_port
+            .map(|port| format!("http://{ip}:{port}"));
 
         match registry
             .register(
@@ -208,7 +208,7 @@ async fn reconcile(
                 config.model_name.clone(),
                 config.tenant_id.clone(),
                 config.block_size,
-                replay_endpoint,
+                recover_endpoint,
             )
             .await
         {

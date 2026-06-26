@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+#[cfg(test)]
 use std::collections::VecDeque;
 use std::future::poll_fn;
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -14,6 +15,7 @@ pub(super) type MultipartMessage = Vec<Vec<u8>>;
 pub(super) type SharedSocket = Arc<Mutex<ZmqSocket>>;
 
 const ZMQ_RCVTIMEOUT_MS: i32 = 100;
+#[cfg(test)]
 const ZMQ_SNDTIMEOUT_MS: i32 = 0;
 const ZMQ_RECONNECT_IVL_MS: i32 = 100;
 const ZMQ_RECONNECT_IVL_MAX_MS: i32 = 5000;
@@ -104,6 +106,7 @@ impl ZmqSocket {
         }
     }
 
+    #[cfg(test)]
     fn poll_send_multipart(
         &mut self,
         cx: &mut Context<'_>,
@@ -151,12 +154,6 @@ fn configure_receive_socket(socket: &zmq::Socket) -> Result<()> {
     Ok(())
 }
 
-fn configure_bidirectional_socket(socket: &zmq::Socket) -> Result<()> {
-    configure_receive_socket(socket)?;
-    socket.set_sndtimeo(ZMQ_SNDTIMEOUT_MS)?;
-    Ok(())
-}
-
 #[cfg(test)]
 fn configure_send_socket(socket: &zmq::Socket) -> Result<()> {
     configure_common_socket(socket)?;
@@ -183,14 +180,6 @@ pub(super) fn connect_sub_socket(endpoint: &str) -> Result<SharedSocket> {
     })?)))
 }
 
-pub(super) fn connect_dealer_socket(endpoint: &str) -> Result<SharedSocket> {
-    Ok(Arc::new(Mutex::new(build_socket(zmq::DEALER, |socket| {
-        configure_bidirectional_socket(socket)?;
-        socket.connect(endpoint)?;
-        Ok(())
-    })?)))
-}
-
 #[cfg(test)]
 pub(super) fn bind_pub_socket(endpoint: &str) -> Result<SharedSocket> {
     Ok(Arc::new(Mutex::new(build_socket(zmq::PUB, |socket| {
@@ -205,6 +194,7 @@ pub(super) async fn recv_multipart(socket: &SharedSocket) -> Result<MultipartMes
     poll_fn(|cx| socket.poll_recv_multipart(cx)).await
 }
 
+#[cfg(test)]
 pub(super) async fn send_multipart(socket: &SharedSocket, frames: MultipartMessage) -> Result<()> {
     let mut socket = socket.lock().await;
     let mut buffer = frames

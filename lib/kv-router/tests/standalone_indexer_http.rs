@@ -534,3 +534,135 @@ async fn zmq_published_tiered_events_appear_in_http_query() {
     server_task.await.expect("server task join");
     drop(pub_socket);
 }
+
+// =============================================================================
+// HTTP /kv_recover gap recovery — drive ZMQ → listener → /kv_recover → indexer
+// =============================================================================
+
+/// Spawn a mock worker that serves `GET /kv_recover` and always returns the
+/// given [`WorkerKvQueryResponse`] (query params ignored). Returns the base
+/// URL the indexer registers as the worker's `recover_endpoint`.
+async fn spawn_mock_recover(
+    response: dynamo_kv_router::indexer::WorkerKvQueryResponse,
+) -> (String, CancellationToken, tokio::task::JoinHandle<()>) {
+    let (listener, addr) = bind_localhost().await;
+    let shared = Arc::new(response);
+    let app = axum::Router::new().route(
+        "/kv_recover",
+        axum::routing::get(move || {
+            let shared = shared.clone();
+            async move { axum::Json((*shared).clone()) }
+        }),
+    );
+    let cancel = CancellationToken::new();
+    let cancel_for_serve = cancel.clone();
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move { cancel_for_serve.cancelled().await })
+            .await
+            .expect("axum::serve mock recover");
+    });
+    (format!("http://{addr}"), cancel, task)
+}
+
+/// Full gap-recovery round trip: a live ZMQ message at seq 5 with no prior
+/// events is an initial gap, so the listener issues `GET /kv_recover` to the
+/// registered recover endpoint. The mock returns two chained device blocks
+/// under a *foreign* identity (999/3) with `last_event_id = 5`; the consumer
+/// must apply them under the registered `(7, 0)` and surface them via
+/// `/query_by_hash`. Exercises URL construction, query params, HTTP transport,
+/// JSON deserialization, the identity rewrite, and watermark resume together.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gap_triggers_http_kv_recover_and_applies_events() {
+    const BLOCK_SIZE: u32 = 4;
+    const MODEL: &str = "test-model";
+    const TENANT: &str = "default";
+    const INSTANCE_ID: u64 = 7;
+
+    let recover_response = dynamo_kv_router::indexer::WorkerKvQueryResponse::Events {
+        events: vec![
+            store_event(999, 3, 0, &[], &[11], StorageTier::Device),
+            store_event(999, 3, 1, &[11], &[12], StorageTier::Device),
+        ],
+        last_event_id: 5,
+    };
+    let (recover_url, recover_cancel, recover_task) = spawn_mock_recover(recover_response).await;
+
+    let registry = Arc::new(WorkerRegistry::new(1));
+    registry.signal_ready();
+    let state = make_app_state(registry);
+    let (base_url, server_cancel, server_task) = spawn_indexer_http(state).await;
+    let client = reqwest::Client::new();
+
+    let zmq_endpoint = reserve_zmq_endpoint();
+    let zmq_ctx = zmq::Context::new();
+    let pub_socket = zmq_ctx.socket(zmq::PUB).expect("create PUB socket");
+    pub_socket.set_linger(0).expect("set_linger");
+    pub_socket.bind(&zmq_endpoint).expect("bind PUB socket");
+
+    // Register with both the ZMQ event endpoint and the HTTP recover endpoint.
+    let resp = client
+        .post(format!("{base_url}/register"))
+        .json(&json!({
+            "instance_id": INSTANCE_ID,
+            "endpoint": zmq_endpoint,
+            "recover_endpoint": recover_url,
+            "model_name": MODEL,
+            "tenant_id": TENANT,
+            "block_size": BLOCK_SIZE,
+            "dp_rank": 0,
+        }))
+        .send()
+        .await
+        .expect("POST /register");
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // Payload is irrelevant: post-recovery the watermark is 5, so the seq-5
+    // live message is deduped as stale.
+    let trigger = encode_batch(
+        raw_block_stored(0xAB, None, vec![1, 2, 3, 4], BLOCK_SIZE as usize, "GPU"),
+        0,
+    );
+
+    // Re-publish on each poll iteration to ride over the ZMQ slow-joiner: the
+    // first message that lands after the SUB connects triggers recovery; the
+    // rest are stale no-ops.
+    let query_url = format!("{base_url}/query_by_hash");
+    let body = json!({"block_hashes": [11_i64, 12], "model_name": MODEL, "tenant_id": TENANT});
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let recovered = loop {
+        send_live_message(&pub_socket, 5, &trigger);
+        let resp = client
+            .post(&query_url)
+            .json(&body)
+            .send()
+            .await
+            .expect("POST /query_by_hash");
+        if resp.status() == reqwest::StatusCode::OK {
+            let value: serde_json::Value = resp.json().await.expect("parse query body");
+            if value["scores"]["7"]["0"].as_u64() == Some((2 * BLOCK_SIZE) as u64) {
+                break value;
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("timed out waiting for /kv_recover-applied blocks to appear under (7, 0)");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+
+    // Identity rewrite: recovered blocks land under the registered (7, 0),
+    // never under the worker's self-reported (999, 3).
+    assert_eq!(recovered["scores"]["7"]["0"], (2 * BLOCK_SIZE) as u64);
+    assert!(
+        recovered["scores"].get("999").is_none(),
+        "worker's self-reported identity 999 must not appear: {recovered}"
+    );
+
+    server_cancel.cancel();
+    recover_cancel.cancel();
+    server_task.await.expect("server task join");
+    recover_task.await.expect("recover task join");
+    drop(pub_socket);
+}

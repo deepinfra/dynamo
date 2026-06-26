@@ -90,8 +90,10 @@ pub struct KubeDiscoveryConfig {
     pub label_selector: String,
     /// ZMQ KV-event port the engines publish on (e.g. 5557).
     pub zmq_port: u16,
-    /// Optional ZMQ replay (ROUTER) port for gap recovery.
-    pub replay_port: Option<u16>,
+    /// Optional HTTP port serving `GET /kv_recover` on the engines, used for
+    /// per-worker gap recovery. `http://<pod-ip>:<recover_port>` is the base
+    /// URL the indexer queries on a detected gap.
+    pub recover_port: Option<u16>,
     /// Model name discovered pods are registered under.
     pub model_name: String,
     /// Tenant id discovered pods are registered under.
@@ -155,15 +157,31 @@ pub(super) fn validate_zmq_endpoint(endpoint: &str) -> anyhow::Result<()> {
     }
 }
 
+/// Validate a per-worker recovery endpoint: the base URL the indexer queries
+/// at `<recover_endpoint>/kv_recover` on a detected gap. Must be an absolute
+/// `http`/`https` URL with a host.
+pub(super) fn validate_recover_endpoint(endpoint: &str) -> anyhow::Result<()> {
+    let url = reqwest::Url::parse(endpoint)
+        .map_err(|error| anyhow::anyhow!("invalid recover endpoint `{endpoint}`: {error}"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        anyhow::bail!(
+            "invalid recover endpoint `{endpoint}`: scheme must be http or https, got `{}`",
+            url.scheme()
+        );
+    }
+    if url.host().is_none() {
+        anyhow::bail!("invalid recover endpoint `{endpoint}`: missing host");
+    }
+    Ok(())
+}
+
 pub(super) fn validate_listener_endpoints(
     endpoint: &str,
-    replay_endpoint: Option<&str>,
+    recover_endpoint: Option<&str>,
 ) -> anyhow::Result<()> {
     validate_zmq_endpoint(endpoint)?;
-    if let Some(replay_endpoint) = replay_endpoint {
-        validate_zmq_endpoint(replay_endpoint).map_err(|error| {
-            anyhow::anyhow!("invalid replay endpoint `{replay_endpoint}`: {error}")
-        })?;
+    if let Some(recover_endpoint) = recover_endpoint {
+        validate_recover_endpoint(recover_endpoint)?;
     }
     Ok(())
 }
