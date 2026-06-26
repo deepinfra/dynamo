@@ -154,3 +154,42 @@ class TestEncodeToVideoBytes:
 
             assert writer.append_data.call_count == 4
             writer.close.assert_called_once()
+
+    def test_caps_encoder_threads_default(self):
+        """encode passes a default -threads cap to ffmpeg (no env override)."""
+        from dynamo.common.utils.video_utils import encode_to_video_bytes
+
+        iio = self._mock_iio_v3()
+        with patch("dynamo.common.utils.video_utils.io") as mock_io, patch(
+            "imageio.v3", iio, create=True
+        ), patch.dict("sys.modules", {"imageio.v3": iio}), patch.dict(
+            "os.environ", {}, clear=False
+        ):
+            import os
+
+            os.environ.pop("DI_VIDEO_ENCODE_THREADS", None)
+            buf = MagicMock()
+            mock_io.BytesIO.return_value = buf
+
+            encode_to_video_bytes(make_frames(), output_format="mp4")
+
+            _, kwargs = iio.imwrite.call_args
+            assert kwargs.get("output_params") == ["-threads", "32"]
+
+    def test_encoder_threads_env_override(self):
+        """DI_VIDEO_ENCODE_THREADS overrides the -threads cap."""
+        from dynamo.common.utils.video_utils import encode_to_video_bytes
+
+        iio = self._mock_iio_v3()
+        with patch("dynamo.common.utils.video_utils.io") as mock_io, patch(
+            "imageio.v3", iio, create=True
+        ), patch.dict("sys.modules", {"imageio.v3": iio}), patch.dict(
+            "os.environ", {"DI_VIDEO_ENCODE_THREADS": "8"}
+        ):
+            buf = MagicMock()
+            mock_io.BytesIO.return_value = buf
+
+            encode_to_video_bytes(make_frames(), output_format="webm")
+
+            _, kwargs = iio.imwrite.call_args
+            assert kwargs.get("output_params") == ["-threads", "8"]

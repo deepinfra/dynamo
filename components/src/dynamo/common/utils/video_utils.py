@@ -21,6 +21,19 @@ DEFAULT_VIDEO_WIDTH = 832
 DEFAULT_VIDEO_HEIGHT = 480
 DEFAULT_VIDEO_FPS = 16
 DEFAULT_VIDEO_NUM_FRAMES = 97
+DEFAULT_ENCODE_THREADS = "32"
+
+
+def _encode_thread_params() -> list[str]:
+    """ffmpeg output args that cap the CPU video-encoder thread count.
+
+    Video diffusion runs on shared multi-GPU nodes (e.g. 8 GPUs and 224+ CPU
+    cores). imageio's libx264/libvpx encode is CPU-only; with no ``-threads``
+    ffmpeg auto-detects every core and oversubscribes, contending with the
+    neighbouring GPU pods and making encode latency drift with node load. Cap
+    to roughly a per-GPU share. Override with ``DI_VIDEO_ENCODE_THREADS``.
+    """
+    return ["-threads", os.getenv("DI_VIDEO_ENCODE_THREADS", DEFAULT_ENCODE_THREADS)]
 
 
 def parse_size(
@@ -157,10 +170,21 @@ def encode_to_mp4(
         # Use imageio to write MP4
         # imageio.v3 API
         if hasattr(iio, "imwrite"):
-            iio.imwrite(output_path, frames, fps=fps, codec="libx264")
+            iio.imwrite(
+                output_path,
+                frames,
+                fps=fps,
+                codec="libx264",
+                output_params=_encode_thread_params(),
+            )
         else:
             # Fall back to v2 API
-            writer = iio.get_writer(output_path, fps=fps, codec="libx264")  # type: ignore[attr-defined]
+            writer = iio.get_writer(  # type: ignore[attr-defined]
+                output_path,
+                fps=fps,
+                codec="libx264",
+                output_params=_encode_thread_params(),
+            )
             try:
                 for frame in frames:
                     writer.append_data(frame)
@@ -218,6 +242,10 @@ def encode_to_video_bytes(
             kwargs["codec"] = "libx264"
         else:
             raise ValueError(f"No codec specified for response format: {output_format}")
+
+        # Cap CPU encoder threads (see _encode_thread_params). Applies to both
+        # the libx264 (mp4) and libvpx-vp9 (webm) encoders.
+        kwargs["output_params"] = _encode_thread_params()
 
         if hasattr(iio, "imwrite"):
             # v3 API
