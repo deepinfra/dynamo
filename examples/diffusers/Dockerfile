@@ -87,6 +87,11 @@ ENV FASTVIDEO_SHA=${FASTVIDEO_SHA}
 # only COPYd to /opt/app later. See examples/diffusers/ltx23/CACHING.md.
 COPY patches/ltx23_gpu_worker_megacache.patch /tmp/megacache.patch
 
+# deepinfra encode patch: cap libx264 -threads so the CPU mp4 encode can't grab
+# the whole shared node (no NVENC on B200 -> CPU libx264). git apply'd below;
+# default 32, env-overridable via FASTVIDEO_X264_THREADS. See PR description.
+COPY patches/x264-threads-cap.patch /tmp/x264-threads-cap.patch
+
 # Install FastVideo at the pinned SHA. No pyproject sed needed: the base is now
 # cu128, which is exactly what FastVideo's [tool.uv.sources] targets, so the
 # torch family resolves natively without any index gymnastics.
@@ -98,6 +103,7 @@ RUN echo "Building FastVideo @ ${FASTVIDEO_SHA} for TORCH_CUDA_ARCH_LIST=${TORCH
  && git checkout ${FASTVIDEO_SHA} \
  && git submodule update --init --recursive \
  && git apply --verbose /tmp/megacache.patch \
+ && git apply --verbose /tmp/x264-threads-cap.patch \
  && cd / \
  && uv pip install --no-build-isolation /tmp/FastVideo \
  && rm -rf /tmp/FastVideo

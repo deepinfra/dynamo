@@ -1,0 +1,16 @@
+diff --git a/fastvideo/entrypoints/video_generator.py b/fastvideo/entrypoints/video_generator.py
+index bfc16335..d8aa4761 100644
+--- a/fastvideo/entrypoints/video_generator.py
++++ b/fastvideo/entrypoints/video_generator.py
+@@ -1143,6 +1143,11 @@ class VideoGenerator:
+                             cmd += [f"-{option_name}", option_value]
+                 else:
+                     cmd += ["-preset", os.getenv("FASTVIDEO_X264_PRESET", "ultrafast")]
++                    # Cap encoder threads: B200 has no NVENC so this is CPU libx264;
++                    # without a cap x264 auto-detects all node cores (e.g. 288) and
++                    # contends with neighbor GPU pods, making encode latency drift with
++                    # node load. ~32 = our per-GPU share; override via env, no rebuild.
++                    cmd += ["-threads", os.getenv("FASTVIDEO_X264_THREADS", "32")]
+ 
+                 cmd += [
+                     "-c:a",
