@@ -53,11 +53,17 @@ ARG TORCH_CUDA_ARCH_LIST="10.0a"
 # Lower MAX_JOBS if the build OOMs (machines with <96GB RAM and many CPU cores).
 ARG MAX_JOBS=4
 
-# Persist arch list; CMAKE_ARGS pins fastvideo-kernel to sm_100 (Blackwell;
-# CUDA 12.9 supports it) and disables the ThunderKittens kernel build (TK has
-# crashed at worker startup on B200 in earlier revisions).
+# Persist arch list; CMAKE_ARGS pins the fastvideo-kernel CUDA arch and disables
+# the ThunderKittens kernel build (TK has crashed at worker startup on B200 in
+# earlier revisions). CUDA_ARCH_CMAKE must match TORCH_CUDA_ARCH_LIST's target:
+#   - 100a (default) -> Blackwell B200/sm_100 (LTX-2.3 fleet)
+#   - 90a            -> Hopper H100/sm_90 (FastWan-QAD fleet; build with
+#                       --build-arg TORCH_CUDA_ARCH_LIST=9.0a --build-arg CUDA_ARCH_CMAKE=90a)
+# It's a separate arg (not derived) because the cmake form drops the dot ("9.0a"
+# -> "90a") and we keep that mapping explicit rather than sed-munging it.
+ARG CUDA_ARCH_CMAKE=100a
 ENV TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}
-ENV CMAKE_ARGS="-DCMAKE_CUDA_ARCHITECTURES=100a -DFASTVIDEO_KERNEL_BUILD_TK=OFF"
+ENV CMAKE_ARGS="-DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCH_CMAKE} -DFASTVIDEO_KERNEL_BUILD_TK=OFF"
 
 # flash-attention FA4 from FastVideo's exact fork (XOR-op/flash-attention@
 # fa4-compile -- the flash-attn-cute source in their pyproject). The cute
@@ -117,6 +123,22 @@ ENV FASTVIDEO_X264_PRESET=ultrafast
 
 WORKDIR /opt/app
 COPY . /opt/app/
+
+# FastWan decodes with the TAEHV tiny autoencoder (the ~2.4s path) instead of
+# the full Wan VAE (~5.8s). Bake the single-file taehv module + the Wan2.1
+# checkpoint into the fastwan family dir; fastwan.factory loads them. Gated so
+# LTX images (which use the full VAE) don't carry it. Build the FastWan image
+# with --build-arg INCLUDE_FASTWAN_TAEHV=1.
+ARG INCLUDE_FASTWAN_TAEHV=0
+RUN if [ "$INCLUDE_FASTWAN_TAEHV" = "1" ]; then \
+      . /opt/dynamo/venv/bin/activate && \
+      uv pip install imageio imageio-ffmpeg && \
+      curl -fsSL https://raw.githubusercontent.com/madebyollin/taehv/main/taehv.py \
+        -o /opt/app/fastwan/taehv.py && \
+      curl -fsSL https://github.com/madebyollin/taehv/raw/main/taew2_1.pth \
+        -o /opt/app/fastwan/taew2_1.pth && \
+      test -s /opt/app/fastwan/taew2_1.pth ; \
+    fi
 
 # Page-cache warming + LD_LIBRARY_PATH unset happen in entrypoint.sh.
 ENTRYPOINT ["/opt/app/entrypoint.sh"]
