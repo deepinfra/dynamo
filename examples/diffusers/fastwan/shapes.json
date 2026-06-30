@@ -1,5 +1,5 @@
 {
-  "_comment": "FastWan-QAD-FP8 v1 shape menu (deepinfra). ONE landscape shape at 480p/5s: 832x480 @ 81 frames, 3 denoise steps, guidance 1.0 (no CFG) -- the model's native QAD recipe (Wan2.1-T2V-1.3B distillation). Text-to-video ONLY (no i2v), so unlike ltx23 there is no 'warm_i2v' (the model has no image-conditioning graph to warm). Single shape keeps one resident pool process boot-warm so customers never hit cold-spawn churn (mirrors the ltx23 single-shape policy). Dims are multiples of 16 (Wan VAE spatial stride); 81 = 4*20+1 (Wan VAE temporal stride 4k+1). Adding/removing shapes changes IMAGE_SHAPE_HASH and requires a new image tag + a matching per-model menu in backend ttv.py _FASTWAN_SIZE_TABLE/FastWanQADFP8In (CI-checked). portrait (480x832) deferred to a later menu. Compile-cache / boot-warm strategy: reuses lib/ + warmup.py (same machinery as ltx23/CACHING.md).",
+  "_comment": "FastWan-QAD-FP8 v1 shape menu (deepinfra). TWO 480p/5s shapes: landscape 832x480 and portrait 480x832, both @ 81 frames, 3 denoise steps, guidance 1.0 (no CFG) -- the model's native QAD recipe (Wan2.1-T2V-1.3B distillation). Text-to-video ONLY (no i2v), so unlike ltx23 there is no 'warm_i2v' (the model has no image-conditioning graph to warm). Both shapes are kept boot-warm by the K=2 subprocess pool (VIDEO_POOL_MODE=1, VIDEO_POOL_MAX_SIZE=2) -- one resident shape-pinned process each with its own baked compile cache, so customers never hit cold-spawn churn switching orientation. Dims are multiples of 16 (Wan VAE spatial stride); 81 = 4*20+1 (Wan VAE temporal stride 4k+1). Adding/removing shapes changes IMAGE_SHAPE_HASH and requires a new image tag + a matching per-model menu in backend ttv.py _FASTWAN_SIZE_TABLE/FastWanQADFP8In (CI-checked). Compile-cache / boot-warm strategy: reuses lib/ + warmup.py (same machinery as ltx23/CACHING.md).",
   "model": "/data/default",
   "fps": 16,
   "num_inference_steps": 3,
@@ -9,6 +9,11 @@
     {
       "width": 832,
       "height": 480,
+      "num_frames": 81
+    },
+    {
+      "width": 480,
+      "height": 832,
       "num_frames": 81
     }
   ]
