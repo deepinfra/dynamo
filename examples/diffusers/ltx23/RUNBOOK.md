@@ -161,6 +161,54 @@ docker run --rm localhost:30500/fastvideo-runtime:<version>-ltx2-$HASH \
 
 Should report sizes matching the host's `/cache`.
 
+### Step 4b: profile selection (quality vs speed) — pin it into the IMAGE
+
+LTX-2.3 has two recipes, selected by the `LTX23_PROFILE` env var, which
+`ltx23/factory.py` reads at load time (`quality`=bf16/8-step default,
+`speed`=NVFP4/max-autotune/5-step — see `PROFILES.md`). The two recipes
+produce **different torch.compile cache keys**, so the warmup bake and the
+serving worker MUST agree on the profile, or the serving path misses the
+baked cache and cold-compiles 10-15 min per shape.
+
+**Ship rule: bake `LTX23_PROFILE` into the image ENV; never set it in the
+model/deploy config.** Making the image tag the single source of truth means
+the recipe travels with the image — a `-speed-` image always serves speed, a
+`-quality-` image always serves quality. A `LTX23_PROFILE` set in the redis
+model-config env would *override* the image ENV and can silently drift away
+from the baked cache (wrong recipe + cache miss, no error). Leave it out of
+the deploy config so the image wins.
+
+To bake the **SPEED** (fast / ~10s) image:
+
+1. Step 3 warmup — add `-e LTX23_PROFILE=speed` to the `docker run`, and use
+   the **`ltx23/`** driver and shapes (the snippet above still shows stale
+   `ltx2/` paths):
+   ```bash
+   ... -e HF_HUB_OFFLINE=1 -e LTX23_PROFILE=speed -w /opt/app \
+     localhost:30500/fastvideo-runtime:<version>-ltx23-warmupbase \
+     python3 ltx23/warmup.py --shapes ltx23/shapes.json \
+       --output-dir /tmp/warmup-outputs --model /data/default
+   ```
+   (`ltx23/warmup.py` already runs the pool with `enable_optimizations=True`,
+   so the SPEED profile applies NVFP4; QUALITY stays bf16 regardless.)
+2. Step 4 bake — add `ENV LTX23_PROFILE=speed` to the bake Dockerfile and use
+   a distinct tag so quality and speed images are never conflated
+   (`IMAGE_SHAPE_HASH` only encodes the shape menu, not the recipe):
+   ```bash
+   printf 'FROM localhost:30500/fastvideo-runtime:<version>-ltx23-warmupbase\nADD cache.tar /\nENV IMAGE_SHAPE_HASH=%s\nENV LTX23_PROFILE=speed\n' "$HASH" > Dockerfile
+   docker build -t localhost:30500/fastvideo-runtime:<version>-ltx23-speed-$HASH .
+   ```
+
+The QUALITY image is the default (no `LTX23_PROFILE` needed at warmup; omit the
+`ENV LTX23_PROFILE` line at bake, or set it to `quality` explicitly).
+
+The attention backend follows the profile automatically (`config.py`
+`profile_attention_backend`: `quality`→`FLASH_ATTN`, `speed`→`TORCH_SDPA`) in
+both the warmup bake and the serving worker, so you do **not** set
+`FASTVIDEO_ATTENTION_BACKEND` separately — the one `LTX23_PROFILE` env pins it.
+Note SPEED ships `TORCH_SDPA` (the config we validated, ~10s), not FastVideo's
+`FLASH_ATTN` speed path; override with `worker.py --attention-backend` to revisit.
+
 ### Step 5: validate with `benchmark.py`
 
 ```bash

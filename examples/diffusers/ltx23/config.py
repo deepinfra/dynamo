@@ -25,8 +25,15 @@ Each profile has THREE coupled parts. Keep them consistent per profile:
 
 Both profiles share: model FastVideo/LTX-2.3-Distilled-Diffusers, 1920x1088
 landscape, 121 frames @ 24fps, guidance 1.0, negative "", refine upsampler =
-<model>/spatial_upscaler, FLASH_ATTN, vae_tiling False, the Blackwell Inductor
+<model>/spatial_upscaler, vae_tiling False, the Blackwell Inductor
 knobs (factory.py: shape_padding=False etc.), LD_LIBRARY_PATH unset, cu128 env.
+
+Attention backend is per-profile (see profile_attention_backend): QUALITY uses
+FLASH_ATTN (FastVideo's SM100/SM103 fast kernels, what prod runs); SPEED uses
+TORCH_SDPA -- the config we validated end-to-end on B200 (~10s, quality OK'd by
+Johan). FastVideo's own streaming_demo speed path uses FLASH_ATTN (faster,
+~4.5s), but SPEED+FLASH_ATTN is NOT something we have validated, so we ship the
+attention we tested. Revisit with worker.py --attention-backend.
 
 Changing any of these requires a coordinated re-bake (the compile cache is keyed
 on the kwargs + shape). Do NOT hand-edit values away from the FastVideo source.
@@ -118,3 +125,29 @@ def profile_kwargs(profile: str) -> dict[str, Any]:
 def profile_uses_nvfp4(profile: str) -> bool:
     """SPEED uses NVFP4; QUALITY is bf16."""
     return (profile or "quality").strip().lower() == "speed"
+
+
+def profile_attention_backend(profile: str) -> str:
+    """Attention backend per profile.
+
+    QUALITY -> FLASH_ATTN (FastVideo's SM100/SM103 fast kernels; what prod runs).
+    SPEED   -> TORCH_SDPA: the config validated end-to-end on B200 (~10s,
+    quality OK'd). FastVideo's streaming_demo speed path actually uses FLASH_ATTN
+    (faster, ~4.5s), but we have NOT validated SPEED+FLASH_ATTN ourselves, so we
+    ship the attention we tested. Bake (warmup) and serve (worker) both derive
+    the default from here so the compile cache always matches; override with
+    worker.py --attention-backend to revisit FLASH_ATTN.
+    """
+    return "TORCH_SDPA" if (profile or "quality").strip().lower() == "speed" else "FLASH_ATTN"
+
+
+def profile_default_optimizations(profile: str) -> bool:
+    """Whether NVFP4 + torch.compile optimizations default ON for this profile.
+
+    SPEED needs them ON (NVFP4 is the whole point); QUALITY is bf16, OFF. Coupling
+    this to the profile means a SPEED ship image (LTX23_PROFILE=speed baked in)
+    serves NVFP4 with no extra launch arg -- the recipe lives in the image, not a
+    redis deploy-config flag. factory.load_model still hardware-gates NVFP4 to
+    Blackwell, so a non-Blackwell host safely falls back to bf16 regardless.
+    """
+    return profile_uses_nvfp4(profile)
