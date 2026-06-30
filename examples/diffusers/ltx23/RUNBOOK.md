@@ -180,27 +180,39 @@ the deploy config so the image wins.
 
 To bake the **SPEED** (fast / ~10s) image:
 
-1. Step 3 warmup — add `-e LTX23_PROFILE=speed` to the `docker run`, and use
-   the **`ltx23/`** driver and shapes (the snippet above still shows stale
-   `ltx2/` paths):
+1. Step 3 warmup — add `-e LTX23_PROFILE=speed` **and `-e LTX_MEGACACHE_DIR=/cache/megacache`**
+   to the `docker run`, and use the **`ltx23/`** driver and shapes (the snippet
+   above still shows stale `ltx2/` paths):
    ```bash
-   ... -e HF_HUB_OFFLINE=1 -e LTX23_PROFILE=speed -w /opt/app \
+   ... -e HF_HUB_OFFLINE=1 -e LTX23_PROFILE=speed -e LTX_MEGACACHE_DIR=/cache/megacache -w /opt/app \
      localhost:30500/fastvideo-runtime:<version>-ltx23-warmupbase \
      python3 ltx23/warmup.py --shapes ltx23/shapes.json \
-       --output-dir /tmp/warmup-outputs --model /data/default
+       --output-dir /tmp/warmup-outputs --model /data/default --per-shape-timeout 3600
    ```
-   (`ltx23/warmup.py` already runs the pool with `enable_optimizations=True`,
-   so the SPEED profile applies NVFP4; QUALITY stays bf16 regardless.)
-2. Step 4 bake — add `ENV LTX23_PROFILE=speed` to the bake Dockerfile and use
-   a distinct tag so quality and speed images are never conflated
-   (`IMAGE_SHAPE_HASH` only encodes the shape menu, not the recipe):
+   `ltx23/warmup.py` runs the pool with `enable_optimizations=True`, so the SPEED
+   profile applies NVFP4 (QUALITY stays bf16 regardless).
+
+   **`LTX_MEGACACHE_DIR` is NOT optional for a ship image.** Without it the bake
+   produces only the inductor `/cache`, not the per-shape `*.megacache.bin`
+   blobs — and a fresh pod then cold-compiles the torch.compile front-end (~33
+   min/shape SPEED) on *every* boot instead of the ~12 min Mega-Cache boot-warm.
+   `warmup.py` prints a loud WARNING if it's unset. Putting it **under `/cache`**
+   means the existing `cache.tar` step below captures the blobs automatically —
+   no separate `megacache.tar`. Full rationale: `ltx23/CACHING.md`.
+2. Step 4 bake — add `ENV LTX23_PROFILE=speed` **and `ENV LTX_MEGACACHE_DIR=/cache/megacache`**
+   to the bake Dockerfile and use a distinct tag so quality and speed images are
+   never conflated (`IMAGE_SHAPE_HASH` only encodes the shape menu, not the recipe):
    ```bash
-   printf 'FROM localhost:30500/fastvideo-runtime:<version>-ltx23-warmupbase\nADD cache.tar /\nENV IMAGE_SHAPE_HASH=%s\nENV LTX23_PROFILE=speed\n' "$HASH" > Dockerfile
+   printf 'FROM localhost:30500/fastvideo-runtime:<version>-ltx23-warmupbase\nADD cache.tar /\nENV IMAGE_SHAPE_HASH=%s\nENV LTX23_PROFILE=speed\nENV LTX_MEGACACHE_DIR=/cache/megacache\n' "$HASH" > Dockerfile
    docker build -t localhost:30500/fastvideo-runtime:<version>-ltx23-speed-$HASH .
    ```
+   Pinning `LTX_MEGACACHE_DIR` in the image ENV (rather than the model's redis
+   `extra_env`) keeps the serving side from depending on a deploy-config flag —
+   the image alone knows where its Mega-Cache lives.
 
 The QUALITY image is the default (no `LTX23_PROFILE` needed at warmup; omit the
-`ENV LTX23_PROFILE` line at bake, or set it to `quality` explicitly).
+`ENV LTX23_PROFILE` line at bake, or set it to `quality` explicitly). It still
+needs `LTX_MEGACACHE_DIR` at both bake and serve for the same boot-warm reason.
 
 The attention backend follows the profile automatically (`config.py`
 `profile_attention_backend`: `quality`→`FLASH_ATTN`, `speed`→`TORCH_SDPA`) in

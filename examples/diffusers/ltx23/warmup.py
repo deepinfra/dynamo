@@ -153,6 +153,23 @@ def _run_driver(args: argparse.Namespace) -> int:
     profile = os.environ.get("LTX23_PROFILE", "quality")
     attention_backend = profile_attention_backend(profile)
 
+    # LOUD GUARD: a ship image needs the Mega-Cache blobs, not just the inductor
+    # /cache. Without LTX_MEGACACHE_DIR set here, this bake produces NO
+    # .megacache.bin, and a fresh pod from the resulting image cold-compiles the
+    # torch.compile front-end (~33 min/shape for SPEED) on EVERY boot instead of
+    # the ~12 min Mega-Cache boot-warm. This is silent unless you look. See
+    # ltx23/CACHING.md "Production: bake the Mega-Cache blobs into the image".
+    if not os.environ.get("LTX_MEGACACHE_DIR"):
+        print(
+            "[warmup] *** WARNING: LTX_MEGACACHE_DIR is UNSET. This bake will NOT "
+            "produce Mega-Cache blobs -- a ship image from this cache cold-compiles "
+            "on every pod boot (no ~12 min boot-warm). For a ship image, set "
+            "LTX_MEGACACHE_DIR (e.g. -e LTX_MEGACACHE_DIR=/cache/megacache). "
+            "See ltx23/CACHING.md. ***",
+            file=sys.stderr,
+            flush=True,
+        )
+
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
