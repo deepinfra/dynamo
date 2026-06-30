@@ -120,6 +120,16 @@ nohup docker run --rm \
   > ~/warmup.log 2>&1 &
 ```
 
+**FP4 (fast / 10s) ship image:** add `--enable-optimizations` to the
+`warmup.py` invocation above. This bakes the FP4 + `max-autotune-no-cudagraphs`
++ `fullgraph` compile cache instead of the standard bf16 one. The flag MUST
+match the serving worker's `--enable-optimizations` — the two recipes produce
+different torch.compile keys, so a bf16-baked image serving FP4 (or vice versa)
+misses the cache and cold-compiles 10-15 min per shape. Keep the bf16 and FP4
+images on distinct tags (e.g. `<version>-ltx2-$HASH` vs `<version>-ltx2-fp4-$HASH`)
+so they're never conflated; `IMAGE_SHAPE_HASH` only encodes the shape menu, not
+the recipe.
+
 Monitor:
 ```bash
 tail -f ~/warmup.log | grep -aF '[warmup]'

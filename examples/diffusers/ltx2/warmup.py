@@ -161,8 +161,8 @@ def _run_driver(args: argparse.Namespace) -> int:
         pool = SubprocessPool(
             model_path=model,
             num_gpus=1,
-            enable_optimizations=False,
-            attention_backend="TORCH_SDPA",
+            enable_optimizations=args.enable_optimizations,
+            attention_backend=args.attention_backend,
             model_factory_dotted="ltx2.factory:load_model",
             model_label="ltx2-distilled",
         )
@@ -309,6 +309,29 @@ def _parse_args() -> argparse.Namespace:
     # flag is currently a no-op (kept as a forward-compat hook). The
     # production default is the local /data/default mount.
     p.add_argument("--model", default="/data/default")
+
+    # MUST match the serving worker's flags, or the baked compile cache
+    # won't be hit at serve time. fp4_kwargs() (FP4 + max-autotune-no-
+    # cudagraphs + fullgraph) produces different torch.compile keys than
+    # standard_kwargs(), so a bake without --enable-optimizations yields a
+    # bf16 cache that the FP4 serving path misses (10-15 min cold compile
+    # per shape). Bake the FP4 ship image with --enable-optimizations; bake
+    # the bf16 image without it. The attention backend likewise keys the
+    # cache, so it must match the worker's --attention-backend.
+    p.add_argument(
+        "--enable-optimizations",
+        action="store_true",
+        dest="enable_optimizations",
+        help="Bake the FP4 + torch.compile cache (matches worker.py "
+        "--enable-optimizations). Omit to bake the standard bf16 cache.",
+    )
+    p.add_argument(
+        "--attention-backend",
+        default="TORCH_SDPA",
+        dest="attention_backend",
+        help="Attention backend to bake for; MUST match the serving "
+        "worker's --attention-backend (default: TORCH_SDPA).",
+    )
 
     return p.parse_args()
 
