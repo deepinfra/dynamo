@@ -61,10 +61,10 @@ class _TaehvVideoGenerator:
     ``lib.backend``/``lib.pool`` call, but decoding via TAEHV. The underlying
     generator is built with ``output_type="latent"`` (VAE bypassed), so
     ``generate()`` returns latents in ``result.samples``; we TAEHV-decode them
-    and write the mp4 at the requested fps. The served shape is the single baked
-    832x480@81 (the model's native default), so width/height/num_frames are
-    accepted but not re-plumbed into the latent request -- the model defaults
-    already produce that shape (matches the warmup-baked compile graph)."""
+    and write the mp4 at the requested fps. width/height/num_frames ARE plumbed
+    into the latent request (via SamplingParam), so multi-shape serving renders
+    the requested dimensions -- e.g. portrait 480x832 vs landscape 832x480 --
+    rather than the model's default shape."""
 
     def __init__(self, gen: Any, taehv: Any) -> None:
         self._gen = gen
@@ -74,6 +74,8 @@ class _TaehvVideoGenerator:
                        fps: int = 16, num_inference_steps: int = 3,
                        guidance_scale: float = 1.0, seed: int | None = None,
                        negative_prompt: str | None = None,
+                       width: int | None = None, height: int | None = None,
+                       num_frames: int | None = None,
                        save_video: bool = True, return_frames: bool = False,
                        **_ignored: Any) -> Any:
         import imageio
@@ -81,6 +83,16 @@ class _TaehvVideoGenerator:
             "num_inference_steps": num_inference_steps,
             "guidance_scale": guidance_scale,
         }
+        # Plumb the requested shape onto SamplingParam.{width,height,num_frames}
+        # so each pool subprocess renders (and compiles for) its actual shape.
+        # Without this the generator falls back to the model default (832x480)
+        # and portrait 480x832 silently comes out landscape.
+        if width is not None:
+            sampling["width"] = width
+        if height is not None:
+            sampling["height"] = height
+        if num_frames is not None:
+            sampling["num_frames"] = num_frames
         if seed is not None:
             sampling["seed"] = seed
         request: dict[str, Any] = {
