@@ -38,22 +38,31 @@ TAEHV_CKPT = os.environ.get("FASTWAN_TAEHV_CKPT", "/opt/app/fastwan/taew2_1.pth"
 
 def _load_taehv():
     import torch
+
     repo_dir = os.path.dirname(TAEHV_CKPT)
     if repo_dir and repo_dir not in sys.path:
         sys.path.insert(0, repo_dir)
     from taehv import TAEHV
+
     return TAEHV(checkpoint_path=TAEHV_CKPT).to("cuda", torch.float16)
 
 
 def _decode_with_taehv(taehv_model, latents):
     import torch
+
     with torch.no_grad():
         latents = latents.permute(0, 2, 1, 3, 4)
-        latents = latents.to(device=next(taehv_model.parameters()).device,
-                             dtype=next(taehv_model.parameters()).dtype)
-        decoded = taehv_model.decode_video(latents, parallel=False, show_progress_bar=False)
-        return [(f.clamp(0, 1) * 255).byte().cpu().permute(1, 2, 0).numpy()
-                for f in decoded[0]]
+        latents = latents.to(
+            device=next(taehv_model.parameters()).device,
+            dtype=next(taehv_model.parameters()).dtype,
+        )
+        decoded = taehv_model.decode_video(
+            latents, parallel=False, show_progress_bar=False
+        )
+        return [
+            (f.clamp(0, 1) * 255).byte().cpu().permute(1, 2, 0).numpy()
+            for f in decoded[0]
+        ]
 
 
 class _TaehvVideoGenerator:
@@ -70,15 +79,24 @@ class _TaehvVideoGenerator:
         self._gen = gen
         self._taehv = taehv
 
-    def generate_video(self, prompt: str, output_path: str | None = None,
-                       fps: int = 16, num_inference_steps: int = 3,
-                       guidance_scale: float = 1.0, seed: int | None = None,
-                       negative_prompt: str | None = None,
-                       width: int | None = None, height: int | None = None,
-                       num_frames: int | None = None,
-                       save_video: bool = True, return_frames: bool = False,
-                       **_ignored: Any) -> Any:
+    def generate_video(
+        self,
+        prompt: str,
+        output_path: str | None = None,
+        fps: int = 16,
+        num_inference_steps: int = 3,
+        guidance_scale: float = 1.0,
+        seed: int | None = None,
+        negative_prompt: str | None = None,
+        width: int | None = None,
+        height: int | None = None,
+        num_frames: int | None = None,
+        save_video: bool = True,
+        return_frames: bool = False,
+        **_ignored: Any,
+    ) -> Any:
         import imageio
+
         sampling: dict[str, Any] = {
             "num_inference_steps": num_inference_steps,
             "guidance_scale": guidance_scale,
@@ -126,9 +144,11 @@ def load_model(
     quant_kwargs: dict[str, Any] = {
         "transformer_quant": get_quantization_config("FP8")(granularity="tensor"),
     }
-    logger.info("FastWan-QAD: FP8 e4m3 per-tensor linear quant (always on); "
-                "attention_backend=%s",
-                os.environ.get("FASTVIDEO_ATTENTION_BACKEND", "<default>"))
+    logger.info(
+        "FastWan-QAD: FP8 e4m3 per-tensor linear quant (always on); "
+        "attention_backend=%s",
+        os.environ.get("FASTVIDEO_ATTENTION_BACKEND", "<default>"),
+    )
 
     gen = VideoGenerator.from_pretrained(
         model_path,

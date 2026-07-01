@@ -43,8 +43,8 @@ def _parse_args() -> argparse.Namespace:
 
 
 async def _amain(model: str) -> int:
-    from lib.backend import GenericVideoBackend
     from fastwan.factory import load_model
+    from lib.backend import GenericVideoBackend
 
     backend_args = argparse.Namespace(
         model=model,
