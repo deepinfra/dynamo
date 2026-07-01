@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """
-LTX-2.3 worker entry point for Dynamo (non-streaming).
+FastWan-QAD-FP8 worker entry point for Dynamo (non-streaming).
 
 Registers a FastVideo VideoGenerator as a Dynamo backend endpoint
 compatible with the ``/v1/videos`` frontend endpoint. The endpoint
@@ -21,7 +21,7 @@ Usage:
   python worker.py [--model MODEL] [--num-gpus N] [--enable-optimizations]
                    [--attention-backend ATTENTION_BACKEND]
 
-This module is the LTX-2.3-specific entry. The top-level
+This module is the FastWan-QAD-FP8-specific entry. The top-level
 ``examples/diffusers/worker.py`` shim is what the production
 deployment / pool-subprocess invocations actually execute; the shim
 dispatches pool-worker invocations to ``lib.pool`` directly (to skip
@@ -152,15 +152,14 @@ async def _main(args: argparse.Namespace) -> None:
         model_label=model_label,
     )
     await backend.initialize_model()
-    # LTX-2.3: eager warm-on-boot is the DEFAULT. Unlike LTX-2's 10-shape menu
-    # (~25 min, hence opt-in there), the LTX-2.3 v1 menu is tiny (2 shapes), so
-    # warming every shape's pool subprocess at boot is cheap (~minutes). It runs
-    # BEFORE we register/serve below, so the first real request per shape is
+    # Eager warm-on-boot is the DEFAULT. The FastWan v1 menu is tiny (2 shapes),
+    # so warming every shape's pool subprocess at boot is cheap (~90s total). It
+    # runs BEFORE we register/serve below, so the first real request per shape is
     # steady-state and traffic routing (register_model) is gated on it; existing
     # warm pods cover traffic during a new pod's boot (min-instances >= 1). The
     # startup-probe budget in backend kubernetes_utils_async.py is sized to cover
-    # this. Opt out with LTX23_EAGER_WARM=0 for debugging only.
-    if os.environ.get("LTX23_EAGER_WARM", "1") != "0":
+    # this. Opt out with FASTWAN_EAGER_WARM=0 for debugging only.
+    if os.environ.get("FASTWAN_EAGER_WARM", "1") != "0":
         await backend.preflight()
 
     # Wire video_pool_* series into the Dynamo runtime's /metrics scrape.
@@ -215,7 +214,7 @@ async def _main(args: argparse.Namespace) -> None:
 
 def main_cli() -> None:
     """
-    LTX-2.3 worker entry. Called by the top-level ``worker.py`` shim
+    FastWan-QAD-FP8 worker entry. Called by the top-level ``worker.py`` shim
     when the invocation is NOT a pool-worker subprocess (pool-worker
     dispatch happens in the shim itself, before any of these heavy
     imports run).
@@ -249,12 +248,12 @@ def main_cli() -> None:
 
 
 if __name__ == "__main__":
-    # If invoked directly (e.g. `python3 -m ltx23.worker`), guard the
+    # If invoked directly (e.g. `python3 -m fastwan.worker`), guard the
     # entry: pool-worker dispatch lives in the top-level shim. Direct
     # invocation with --pool-worker would skip that dispatch path.
     if "--pool-worker" in sys.argv:
         raise SystemExit(
-            "ltx23.worker invoked directly with --pool-worker; "
+            "fastwan.worker invoked directly with --pool-worker; "
             "use the top-level worker.py shim, which dispatches "
             "to lib.pool._pool_worker_dispatch_if_requested first."
         )

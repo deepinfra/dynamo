@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """
-Unit tests for ltx23/shapes.json + the menu-hash algorithm.
+Unit tests for fastwan/shapes.json + the menu-hash algorithm.
 
 The hash is the load-bearing identifier across the whole pipeline:
 
@@ -11,8 +11,8 @@ The hash is the load-bearing identifier across the whole pipeline:
     doesn't match the vendored menu
 
 If the algorithm or the menu drifts, every layer downstream is wrong.
-A backend-side equivalent test lives in
-backend/tests/test_ltx_shape_menu.py; both must agree.
+The canonical algorithm lives in examples/diffusers/lib/menu.py; the
+backend's menu-hash admission check must agree with it.
 
 This module reimplements the canonical hash inline so it can run in CI
 without FastVideo / torch. A second cross-check test imports the live
@@ -32,28 +32,27 @@ import pytest
 HERE = os.path.dirname(os.path.abspath(__file__))
 SHAPES_JSON = os.path.join(HERE, "shapes.json")
 
-# Pinned hash for the current 2-shape LTX-2.3 v1 menu. This is the
-# value that ends up in the runtime image tag (e.g. fastvideo-runtime:
-# 2.1.3-ltx23-0a9a3bfe). Updating shapes.json -- adding, removing,
-# or renaming a shape -- changes this value, requires a new image bake,
-# and requires updating this fixture.
-EXPECTED_HASH = "f5c507d4"
+# Pinned hash for the current 2-shape FastWan-QAD-FP8 v1 menu
+# (landscape 832x480 + portrait 480x832, both @ 81 frames). Updating
+# shapes.json -- adding, removing, or renaming a shape -- changes this
+# value, requires a new image bake, and requires updating this fixture.
+EXPECTED_HASH = "8840f800"
 EXPECTED_SHAPE_COUNT = 2
 
-# Per-shape activation budget. The 1080p@241f shape is excluded from the
-# menu because the VAE decoder's intermediate tensor exceeds 2^31
-# elements and F.pad trips PyTorch's int32 indexing limit. Any shape we
-# add must stay below that bound.
+# Per-shape activation budget. A shape whose width*height*frames is too
+# large makes the decoder's intermediate tensor exceed 2^31 elements,
+# tripping PyTorch's int32 indexing limit in F.pad. Any shape we add must
+# stay below that bound (the current 480p shapes are far under it).
 INT32_LIMIT = 2**31
 ACTIVATION_BUDGET = INT32_LIMIT // 2
 
 
 def _canonical_menu_hash(shapes_json_path: str) -> tuple[str, int]:
     """Reimplements ``lib.menu.compute_menu_hash`` inline so this test
-    file has no FastVideo / torch dependency. Must stay byte-identical to:
-      - examples/diffusers/lib/menu.py::compute_menu_hash
-      - backend/tests/test_ltx_shape_menu.py
-      - the bake step documented in ltx23/RUNBOOK.md
+    file has no FastVideo / torch dependency. Must stay byte-identical to
+    the canonical algorithm in ``examples/diffusers/lib/menu.py::compute_menu_hash``
+    (the same algorithm the bake step and the backend menu-hash admission
+    check rely on).
     """
     with open(shapes_json_path, "r", encoding="utf-8") as f:
         cfg = json.load(f)
@@ -85,12 +84,13 @@ def test_warmup_shapes_required_keys() -> None:
             assert shape[key] > 0
 
 
-def test_warmup_shapes_dimensions_multiple_of_32() -> None:
-    """LTX-2.3 VAE has spatial_compression_ratio=32; non-multiples crash decode."""
+def test_warmup_shapes_dimensions_multiple_of_16() -> None:
+    """Wan2.1 needs dims that are multiples of 16 (8x VAE spatial stride x
+    2x2 DiT patch); non-multiples crash decode/patchify."""
     cfg = _load_shapes()
     for shape in cfg["shapes"]:
-        assert shape["width"] % 32 == 0, f"width not /32: {shape}"
-        assert shape["height"] % 32 == 0, f"height not /32: {shape}"
+        assert shape["width"] % 16 == 0, f"width not /16: {shape}"
+        assert shape["height"] % 16 == 0, f"height not /16: {shape}"
 
 
 def test_warmup_shapes_within_activation_budget() -> None:

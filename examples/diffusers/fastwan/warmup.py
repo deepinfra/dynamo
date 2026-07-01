@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """
-Pre-compile LTX-2.3 torch.compile / triton / inductor caches for every
+Pre-compile FastWan-QAD-FP8 torch.compile / triton / inductor caches for every
 production shape so the first production request is fast.
 
 Routes each shape through the same ``lib.pool.SubprocessPool`` code path
@@ -12,23 +12,21 @@ in code path to the runtime serving subprocess. Per-shape
 on the child env (/cache/per-shape/<shape_key>/{torchinductor,triton}),
 matching what production reads at serve time.
 
-CROSS-PROCESS CACHE PORTABILITY (LTX-2.3, instrumented 2026-06-18, fxgraph
-hit/miss counters): the implicit on-disk per-shape cache (these dirs) does NOT
-port to a fresh process for EITHER profile -- a fresh worker recomputes a
-different fxgraph key and RECOMPILES (MISS=8), confirmed on mode=default AND
-max-autotune. (This refutes an earlier "mode=default ports" note.) The per-shape
-dirs here are only the in-process compile scratch for THIS bake run.
+CROSS-PROCESS CACHE PORTABILITY: the implicit on-disk per-shape cache (these
+dirs) does NOT port to a fresh process -- a fresh worker recomputes a different
+fxgraph key and RECOMPILES. The per-shape dirs here are only the in-process
+compile scratch for THIS bake run.
 
 To actually make a fresh pod warm, use torch **Mega-Cache**
 (save/load_cache_artifacts -- wired in fastvideo gpu_worker + lib/pool.py): it
-DOES port and halves cold-start (~1103s -> ~560s). The remaining residual is the
-torch.compile FRONT-END (dynamo + AOTAutograd re-traces every process to produce
-the cache key) -- not cacheable short of AOTInductor. Full strategy, bake steps,
-and measurements: **ltx23/CACHING.md** + ~/ltx23_cache_investigation_report.md.
-Do NOT relitigate -- this is settled.
+DOES port across processes. The remaining residual is the torch.compile
+FRONT-END (dynamo + AOTAutograd re-traces every process to produce the cache
+key) -- not cacheable short of AOTInductor. The shared machinery and the full
+investigation (instrumented on LTX-2.3, 2026-06-18) live in
+**ltx23/CACHING.md** + ~/ltx23_cache_investigation_report.md.
 
 Usage:
-  python ltx23/warmup.py --shapes ltx23/shapes.json \\
+  python fastwan/warmup.py --shapes fastwan/shapes.json \\
       --output-dir /tmp/warmup --model /data/default
 """
 
@@ -282,7 +280,7 @@ def _run_driver(args: argparse.Namespace) -> int:
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="LTX-2.3 warmup / compile-cache populator. Routes each "
+        description="FastWan-QAD-FP8 warmup / compile-cache populator. Routes each "
         "shape through lib.pool.SubprocessPool so the cache-building "
         "subprocess matches the runtime serving subprocess in code path. "
         "Cache keys produced here match what the runtime asks for at "
@@ -292,7 +290,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--shapes",
         default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "shapes.json"),
-        help="path to shapes JSON (default: ltx23/shapes.json next to this script)",
+        help="path to shapes JSON (default: fastwan/shapes.json next to this script)",
     )
     p.add_argument(
         "--output-dir", default="/tmp/warmup", help="where to save rendered MP4s"
