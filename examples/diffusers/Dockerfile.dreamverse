@@ -1,0 +1,63 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# LTX-2.3 SPEED serving image, built FROM FastVideo's validated dreamverse env
+# (fastvideo @ 4f3ad3f6 with its intended prerelease kernel stack) + the Dynamo
+# serving layer (ai-dynamo, deepinfra patches, worker app). Rebuild the base:
+#   git clone https://github.com/hao-ai-lab/FastVideo && cd FastVideo
+#   git checkout 4f3ad3f6df9327257f08f4c45d24154b52c06616
+#   docker build -f apps/dreamverse/docker/Dockerfile -t dreamverse:johan-ltx .
+FROM dreamverse:johan-ltx
+
+# dreamverse venv is /opt/venv (python 3.12); uv is on PATH (/root/.local/bin).
+ENV VIRTUAL_ENV=/opt/venv
+ENV PATH="/opt/venv/bin:${PATH}"
+
+# Freeze the proven prerelease FP4-kernel stack + torch. These versions are
+# ALREADY installed in dreamverse; the constraint just prevents the ai-dynamo
+# resolve below from moving them. --prerelease=allow (below) is required because
+# nvidia-cutlass-dsl==4.6.0.dev0 is a prerelease.
+RUN printf 'torch==2.11.0\nnvidia-cutlass-dsl==4.6.0.dev0\nquack-kernels==0.5.3\nflashinfer-python==0.6.13\n' > /opt/dynamo-constraint.txt
+ENV UV_CONSTRAINT=/opt/dynamo-constraint.txt
+
+# Dynamo runtime needs libucx0 (already present in dreamverse's CUDA base in
+# most cases, but install defensively).
+RUN apt-get update \
+ && apt-get install -yq libucx0 \
+ && apt-get clean
+
+# Install Dynamo with /v1/videos support. --prerelease=allow so the constraint's
+# cutlass-dsl dev pin is honored; the constraint keeps torch/kernels frozen.
+RUN . /opt/venv/bin/activate \
+ && uv pip install --prerelease=allow ai-dynamo==1.1.1
+
+# deepinfra patches, applied to the INSTALLED (non-editable) fastvideo package.
+# The patches are git-format (a/fastvideo/... b/fastvideo/...); -p1 from
+# site-packages strips a/ -> fastvideo/... . dreamverse's fastvideo is @4f3ad3f6,
+# the exact commit these patches were authored against, so they apply clean.
+COPY patches/ltx23_gpu_worker_megacache.patch /tmp/megacache.patch
+COPY patches/x264-threads-cap.patch /tmp/x264-threads-cap.patch
+# NOTE: verify by grepping the patched source, NOT by importing fastvideo --
+# importing pulls in triton, which fails to init its driver in a GPU-less build
+# ("0 active drivers").
+RUN SP=/opt/venv/lib/python3.12/site-packages \
+ && patch -p1 -d "$SP" --forward --fuzz=0 < /tmp/megacache.patch \
+ && patch -p1 -d "$SP" --forward --fuzz=0 < /tmp/x264-threads-cap.patch \
+ && grep -q 'torch.compiler.load_cache_artifacts' "$SP/fastvideo/worker/gpu_worker.py" \
+ && grep -q 'FASTVIDEO_X264_THREADS' "$SP/fastvideo/entrypoints/video_generator.py" \
+ && echo "patches applied + verified"
+
+ENV FASTVIDEO_VIDEO_CODEC=libx264
+ENV FASTVIDEO_X264_PRESET=ultrafast
+
+# Worker app tree + entrypoint (page-cache warming; unsets LD_LIBRARY_PATH,
+# which is a no-op for refine speed -- Experiment X showed torch loads its
+# bundled cuBLAS regardless of LD, refine time is set by the FP4-kernel packages).
+WORKDIR /opt/app
+COPY . /opt/app/
+ENTRYPOINT ["/opt/app/entrypoint.sh"]
+
+# LOAD-BEARING: FastVideo picks the DISTILLED preset by string-matching the
+# weights path (needs "ltx-2"+"distilled"; miss = silent base preset, ~2.4x
+# slower). Prod mounts weights at /data/default, so alias it. factory.py
+# hard-fails at boot if the preset does not resolve.
+RUN mkdir -p /models && ln -s /data/default /models/ltx-2.3-distilled-diffusers

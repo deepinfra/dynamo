@@ -136,6 +136,7 @@ def _run_driver(args: argparse.Namespace) -> int:
     runtime worker asks for at serve time.
     """
     from lib.pool import SubprocessPool
+    from ltx23.config import profile_attention_backend
 
     cfg = _read_shapes_config(args)
 
@@ -145,6 +146,29 @@ def _run_driver(args: argparse.Namespace) -> int:
     guidance_scale = float(cfg.get("guidance_scale", 1.0))
     seed = int(cfg.get("seed", 42))
     shapes = cfg["shapes"]
+
+    # Bake attention MUST match what the serving worker uses, or the compile
+    # cache misses. Both derive the default from LTX23_PROFILE (quality ->
+    # FLASH_ATTN, speed -> TORCH_SDPA) via the same helper.
+    profile = os.environ.get("LTX23_PROFILE", "quality")
+    attention_backend = profile_attention_backend(profile)
+
+    # LOUD GUARD: a ship image needs the Mega-Cache blobs, not just the inductor
+    # /cache. Without LTX_MEGACACHE_DIR set here, this bake produces NO
+    # .megacache.bin, and a fresh pod from the resulting image cold-compiles the
+    # torch.compile front-end (~33 min/shape for SPEED) on EVERY boot instead of
+    # the ~12 min Mega-Cache boot-warm. This is silent unless you look. See
+    # ltx23/CACHING.md "Production: bake the Mega-Cache blobs into the image".
+    if not os.environ.get("LTX_MEGACACHE_DIR"):
+        print(
+            "[warmup] *** WARNING: LTX_MEGACACHE_DIR is UNSET. This bake will NOT "
+            "produce Mega-Cache blobs -- a ship image from this cache cold-compiles "
+            "on every pod boot (no ~12 min boot-warm). For a ship image, set "
+            "LTX_MEGACACHE_DIR (e.g. -e LTX_MEGACACHE_DIR=/cache/megacache). "
+            "See ltx23/CACHING.md. ***",
+            file=sys.stderr,
+            flush=True,
+        )
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -171,10 +195,12 @@ def _run_driver(args: argparse.Namespace) -> int:
             # by the LTX23_PROFILE env (quality|speed), which factory.load_model
             # reads -- the pool subprocess inherits it. enable_optimizations=True
             # lets the SPEED profile apply NVFP4 (QUALITY stays bf16 regardless).
-            # Denoise steps come from the shapes file (8 quality / 5 speed).
-            # See ltx23/config.py + ltx23/PROFILES.md.
+            # attention_backend follows the profile (quality -> FLASH_ATTN,
+            # speed -> TORCH_SDPA) via the same helper the worker uses, so the
+            # baked cache matches what serving asks for. Denoise steps come from
+            # the shapes file (8 quality / 5 speed). See config.py + PROFILES.md.
             enable_optimizations=True,
-            attention_backend="FLASH_ATTN",
+            attention_backend=attention_backend,
             model_factory_dotted="ltx23.factory:load_model",
             model_label="ltx2-3-distilled",
         )

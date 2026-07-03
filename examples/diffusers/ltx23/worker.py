@@ -44,16 +44,17 @@ from lib.metrics import VIDEO_REGISTRY
 from dynamo.common.utils.prometheus import register_engine_metrics_callback
 from dynamo.runtime import DistributedRuntime
 
+from .config import profile_attention_backend, profile_default_optimizations
 from .factory import load_model
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL = "FastVideo/LTX-2.3-Distilled-Diffusers"
-# FastVideo's deployed LTX-2.3 1080p recipe uses FLASH_ATTN (their optimized
-# SM100/SM103 kernels); streaming_demo launch sets FASTVIDEO_ATTENTION_BACKEND=
-# FLASH_ATTN. TORCH_SDPA (the prior default, inherited from LTX-2) is the slow
-# generic fallback and does NOT reproduce the ~4.5s/1080p result.
-DEFAULT_ATTENTION_BACKEND = "FLASH_ATTN"
+# Attention backend and NVFP4-optimization defaults follow LTX23_PROFILE (see
+# config.py): QUALITY -> FLASH_ATTN + bf16; SPEED -> TORCH_SDPA + NVFP4. Pinning
+# them to the profile means a ship image only needs LTX23_PROFILE baked in -- the
+# full recipe lives in the image, not a redis deploy-config flag. Both are still
+# overridable via --attention-backend / --[no-]enable-optimizations.
 DEFAULT_MODEL_LABEL = "ltx2-3-distilled"
 
 # Where the LTX-2.3 shapes JSON lives in the production image. Production
@@ -77,6 +78,10 @@ def _attention_backend_choices() -> tuple[str, ...]:
 
 def _parse_args() -> argparse.Namespace:
     choices = _attention_backend_choices()
+    # Defaults follow the baked-in profile so a ship image is self-describing.
+    profile = os.environ.get("LTX23_PROFILE", "quality")
+    default_attention = profile_attention_backend(profile)
+    default_optimizations = profile_default_optimizations(profile)
     parser = argparse.ArgumentParser(
         description="FastVideo Worker for Dynamo (non-streaming)"
     )
@@ -99,19 +104,23 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--enable-optimizations",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=default_optimizations,
         dest="enable_optimizations",
-        help="Enable FP4 quantization (if available) and torch.compile",
+        help=(
+            "Enable FP4 quantization (if available) and torch.compile. "
+            f"Defaults from LTX23_PROFILE={profile!r} (default: {default_optimizations})"
+        ),
     )
     parser.add_argument(
         "--attention-backend",
         choices=choices,
-        default=DEFAULT_ATTENTION_BACKEND,
+        default=default_attention,
         dest="attention_backend",
         help=(
             "Attention backend to set via FASTVIDEO_ATTENTION_BACKEND "
             f"(choices: {', '.join(choices)}; "
-            f"default: {DEFAULT_ATTENTION_BACKEND})"
+            f"default from LTX23_PROFILE={profile!r}: {default_attention})"
         ),
     )
     return parser.parse_args()
