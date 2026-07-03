@@ -9,11 +9,19 @@
 # never reads FastVideo's `[tool.uv] prerelease = "allow"`, silently resolving
 # the FP4-kernel packages to OLDER STABLE releases (nvidia-cutlass-dsl 4.5.2 /
 # quack-kernels 0.5.0 / flashinfer-python 0.6.12) instead of the prereleases
-# FastVideo validated (4.6.0.dev0 / 0.5.3 / 0.6.13). Those older FP4 GEMM
-# kernels make the 1920x1088 refine stage 15.4s instead of ~few s -> 26s vs 10s.
-# Measured: same recipe/weights/commit, only these packages differ. Building
-# FROM dreamverse inherits the exact coherent prerelease stack and stops us
-# hand-reconstructing (and missing pieces of) their environment.
+# FastVideo validated (4.6.0.dev0 / 0.5.3 / 0.6.13). Building FROM dreamverse
+# inherits FastVideo's exact validated environment and stops us
+# hand-reconstructing (and missing pieces of) it. NOTE the measured root cause
+# of the 10s-vs-25s gap was the pipeline PRESET (see the symlink below), not
+# these package versions -- the dreamverse base is about environment fidelity
+# (serve on the stack FastVideo validated), not a measured package speedup.
+#
+# To (re)build the dreamverse:johan-ltx base itself:
+#   git clone https://github.com/hao-ai-lab/FastVideo && cd FastVideo
+#   git checkout 4f3ad3f6df9327257f08f4c45d24154b52c06616
+#   docker build -f apps/dreamverse/docker/Dockerfile -t dreamverse:johan-ltx .
+# (their Dockerfile; installs "/opt/FastVideo[dreamverse]" from the repo CWD so
+# the [tool.uv] prerelease/index settings apply.)
 #
 # On top of dreamverse we add ONLY the Dynamo serving layer:
 #   - ai-dynamo==1.1.1 (the /v1/videos serving surface)

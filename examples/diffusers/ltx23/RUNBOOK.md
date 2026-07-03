@@ -178,19 +178,38 @@ model-config env would *override* the image ENV and can silently drift away
 from the baked cache (wrong recipe + cache miss, no error). Leave it out of
 the deploy config so the image wins.
 
-To bake the **SPEED** (fast / ~10s) image:
+To bake the **SPEED** (fast / ~10s) image (flow validated 2026-07-03: dynamo pool
++ prod weights = 10.6–10.9s/clip warm):
 
-1. Step 3 warmup — add `-e LTX23_PROFILE=speed` **and `-e LTX_MEGACACHE_DIR=/cache/megacache`**
-   to the `docker run`, and use the **`ltx23/`** driver and shapes (the snippet
-   above still shows stale `ltx2/` paths):
+0. **Base image = `Dockerfile.dreamverse`** (NOT the old `warmupbase`). It builds
+   FROM the dreamverse env (FastVideo's own validated prerelease FP4 kernel
+   stack) and layers ai-dynamo + the deepinfra patches on top; see the header of
+   that file for how to (re)build the `dreamverse:johan-ltx` base. It also
+   creates the `/models/ltx-2.3-distilled-diffusers -> /data/default` symlink —
+   **load-bearing**: FastVideo selects the DISTILLED pipeline preset by
+   string-matching the weights path; a path without "ltx-2"+"distilled" silently
+   falls back to the BASE preset (extra guidance forwards per step, ~2.4x slower,
+   output visually fine). `factory.py` hard-fails the worker at boot if the
+   distilled preset does not resolve, so a broken alias is an error, not a
+   regression. The SPEED recipe itself is `ltx23/streaming_speed.yaml`, loaded
+   verbatim via `VideoGenerator.from_file` — do not re-derive settings in code.
    ```bash
-   ... -e HF_HUB_OFFLINE=1 -e LTX23_PROFILE=speed -e LTX_MEGACACHE_DIR=/cache/megacache -w /opt/app \
-     localhost:30500/fastvideo-runtime:<version>-ltx23-warmupbase \
-     python3 ltx23/warmup.py --shapes ltx23/shapes.json \
-       --output-dir /tmp/warmup-outputs --model /data/default --per-shape-timeout 3600
+   docker build -f Dockerfile.dreamverse -t localhost:30500/fastvideo-runtime:<version>-ltx23-dreamverse-base .
    ```
-   `ltx23/warmup.py` runs the pool with `enable_optimizations=True`, so the SPEED
-   profile applies NVFP4 (QUALITY stays bf16 regardless).
+
+1. Step 3 warmup — two passes on ONE persistent `/cache`, both with
+   `-e LTX23_PROFILE=speed -e LTX_MEGACACHE_DIR=/cache/megacache
+   -e VIDEO_POOL_GEN_TIMEOUT_S=5400` and weights at `/data/default`:
+   ```bash
+   # pass 1: t2v compile + blob (~25 min cold)
+   ... localhost:30500/fastvideo-runtime:<version>-ltx23-dreamverse-base \
+     python3 ltx23/bench_speed.py
+   # pass 2: extend the blob with i2v graphs (move the pass-1 blob aside first —
+   # a present blob suppresses saving — and set LTX_MEGACACHE_SAVE_EVERY=1)
+   ... -e LTX_MEGACACHE_SAVE_EVERY=1 ... python3 ltx23/bake_i2v.py
+   ```
+   The pool runs `enable_optimizations=True`, so SPEED applies NVFP4 (QUALITY
+   stays bf16 regardless).
 
    **`LTX_MEGACACHE_DIR` is NOT optional for a ship image.** Without it the bake
    produces only the inductor `/cache`, not the per-shape `*.megacache.bin`
@@ -203,7 +222,7 @@ To bake the **SPEED** (fast / ~10s) image:
    to the bake Dockerfile and use a distinct tag so quality and speed images are
    never conflated (`IMAGE_SHAPE_HASH` only encodes the shape menu, not the recipe):
    ```bash
-   printf 'FROM localhost:30500/fastvideo-runtime:<version>-ltx23-warmupbase\nADD cache.tar /\nENV IMAGE_SHAPE_HASH=%s\nENV LTX23_PROFILE=speed\nENV LTX_MEGACACHE_DIR=/cache/megacache\n' "$HASH" > Dockerfile
+   printf 'FROM localhost:30500/fastvideo-runtime:<version>-ltx23-dreamverse-base\nADD cache.tar /\nENV IMAGE_SHAPE_HASH=%s\nENV LTX23_PROFILE=speed\nENV LTX_MEGACACHE_DIR=/cache/megacache\n' "$HASH" > Dockerfile
    docker build -t localhost:30500/fastvideo-runtime:<version>-ltx23-speed-$HASH .
    ```
    Pinning `LTX_MEGACACHE_DIR` in the image ENV (rather than the model's redis
