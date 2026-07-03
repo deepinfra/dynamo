@@ -1,34 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 #
-# LTX-2.3 SPEED serving image built FROM FastVideo's OWN validated dreamverse
-# environment (dreamverse:johan-ltx = FastVideo @ 4f3ad3f6, built via their
-# apps/dreamverse/docker/Dockerfile with `[tool.uv] prerelease = "allow"` in
-# effect). That is the ONLY environment measured at ~10s/clip.
-#
-# WHY not our from-scratch Dockerfile: it installs FastVideo with `cd /` so uv
-# never reads FastVideo's `[tool.uv] prerelease = "allow"`, silently resolving
-# the FP4-kernel packages to OLDER STABLE releases (nvidia-cutlass-dsl 4.5.2 /
-# quack-kernels 0.5.0 / flashinfer-python 0.6.12) instead of the prereleases
-# FastVideo validated (4.6.0.dev0 / 0.5.3 / 0.6.13). Building FROM dreamverse
-# inherits FastVideo's exact validated environment and stops us
-# hand-reconstructing (and missing pieces of) it. NOTE the measured root cause
-# of the 10s-vs-25s gap was the pipeline PRESET (see the symlink below), not
-# these package versions -- the dreamverse base is about environment fidelity
-# (serve on the stack FastVideo validated), not a measured package speedup.
-#
-# To (re)build the dreamverse:johan-ltx base itself:
+# LTX-2.3 SPEED serving image, built FROM FastVideo's validated dreamverse env
+# (fastvideo @ 4f3ad3f6 with its intended prerelease kernel stack) + the Dynamo
+# serving layer (ai-dynamo, deepinfra patches, worker app). Rebuild the base:
 #   git clone https://github.com/hao-ai-lab/FastVideo && cd FastVideo
 #   git checkout 4f3ad3f6df9327257f08f4c45d24154b52c06616
 #   docker build -f apps/dreamverse/docker/Dockerfile -t dreamverse:johan-ltx .
-# (their Dockerfile; installs "/opt/FastVideo[dreamverse]" from the repo CWD so
-# the [tool.uv] prerelease/index settings apply.)
-#
-# On top of dreamverse we add ONLY the Dynamo serving layer:
-#   - ai-dynamo==1.1.1 (the /v1/videos serving surface)
-#   - deepinfra Mega-Cache + x264-thread-cap patches to the installed fastvideo
-#   - the worker app tree + page-cache-warming entrypoint
-# The kernel packages + torch are pinned in a uv constraint so the ai-dynamo
-# install cannot downgrade them back to the slow set.
 FROM dreamverse:johan-ltx
 
 # dreamverse venv is /opt/venv (python 3.12); uv is on PATH (/root/.local/bin).
@@ -79,10 +56,8 @@ WORKDIR /opt/app
 COPY . /opt/app/
 ENTRYPOINT ["/opt/app/entrypoint.sh"]
 
-# FastVideo selects the DISTILLED pipeline preset by string-matching the weights
-# path (fastvideo/registry.py: needs "ltx-2"/"ltx2" AND "distilled" in the path;
-# miss -> silent fallback to the BASE preset -> extra guidance forwards per
-# denoise step -> ~2.4x slower, visually fine: the 10s-vs-25s bug). Prod mounts
-# weights at /data/default, so provide a detector-matching alias for the yaml
-# (ltx23/streaming_speed.yaml) to reference.
+# LOAD-BEARING: FastVideo picks the DISTILLED preset by string-matching the
+# weights path (needs "ltx-2"+"distilled"; miss = silent base preset, ~2.4x
+# slower). Prod mounts weights at /data/default, so alias it. factory.py
+# hard-fails at boot if the preset does not resolve.
 RUN mkdir -p /models && ln -s /data/default /models/ltx-2.3-distilled-diffusers

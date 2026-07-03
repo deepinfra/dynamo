@@ -181,18 +181,13 @@ the deploy config so the image wins.
 To bake the **SPEED** (fast / ~10s) image (flow validated 2026-07-03: dynamo pool
 + prod weights = 10.6–10.9s/clip warm):
 
-0. **Base image = `Dockerfile.dreamverse`** (NOT the old `warmupbase`). It builds
-   FROM the dreamverse env (FastVideo's own validated prerelease FP4 kernel
-   stack) and layers ai-dynamo + the deepinfra patches on top; see the header of
-   that file for how to (re)build the `dreamverse:johan-ltx` base. It also
-   creates the `/models/ltx-2.3-distilled-diffusers -> /data/default` symlink —
-   **load-bearing**: FastVideo selects the DISTILLED pipeline preset by
-   string-matching the weights path; a path without "ltx-2"+"distilled" silently
-   falls back to the BASE preset (extra guidance forwards per step, ~2.4x slower,
-   output visually fine). `factory.py` hard-fails the worker at boot if the
-   distilled preset does not resolve, so a broken alias is an error, not a
-   regression. The SPEED recipe itself is `ltx23/streaming_speed.yaml`, loaded
-   verbatim via `VideoGenerator.from_file` — do not re-derive settings in code.
+0. **Base image = `Dockerfile.dreamverse`** (not the old `warmupbase`): FastVideo's
+   validated dreamverse env + the dynamo layer. It creates the load-bearing
+   `/models/ltx-2.3-distilled-diffusers -> /data/default` symlink: FastVideo picks
+   the DISTILLED preset by string-matching the weights path; a miss silently
+   serves the ~2.4x-slower base preset. `factory.py` hard-fails boot if the
+   preset does not resolve. The recipe is `ltx23/streaming_speed.yaml`, loaded
+   verbatim (`VideoGenerator.from_file`) -- never re-derive it in code.
    ```bash
    docker build -f Dockerfile.dreamverse -t localhost:30500/fastvideo-runtime:<version>-ltx23-dreamverse-base .
    ```
@@ -203,10 +198,10 @@ To bake the **SPEED** (fast / ~10s) image (flow validated 2026-07-03: dynamo poo
    ```bash
    # pass 1: t2v compile + blob (~25 min cold)
    ... localhost:30500/fastvideo-runtime:<version>-ltx23-dreamverse-base \
-     python3 ltx23/bench_speed.py
+     python3 ltx23/bake_bench.py t2v
    # pass 2: extend the blob with i2v graphs (move the pass-1 blob aside first —
    # a present blob suppresses saving — and set LTX_MEGACACHE_SAVE_EVERY=1)
-   ... -e LTX_MEGACACHE_SAVE_EVERY=1 ... python3 ltx23/bake_i2v.py
+   ... -e LTX_MEGACACHE_SAVE_EVERY=1 ... python3 ltx23/bake_bench.py i2v
    ```
    The pool runs `enable_optimizations=True`, so SPEED applies NVFP4 (QUALITY
    stays bf16 regardless).

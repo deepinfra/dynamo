@@ -23,14 +23,10 @@ logger = logging.getLogger(__name__)
 
 
 def _assert_distilled_preset(yaml_path: str) -> None:
-    """Fail the worker LOUDLY if FastVideo would not resolve the DISTILLED preset.
+    """Fail boot if FastVideo would not resolve the DISTILLED preset.
 
-    FastVideo selects the pipeline preset by string-matching the weights path
-    (fastvideo/registry.py: needs "ltx-2"/"ltx2" AND "distilled" in the path).
-    A path that misses the detector silently falls back to the BASE preset,
-    which runs extra guidance forward passes per denoising step: ~2.4x slower
-    with visually fine output (the 10s-vs-25s bug, 2026-07). A mount/rename
-    that breaks the detector must be a boot failure, not a silent regression.
+    FastVideo picks the preset by string-matching the weights path (needs
+    "ltx-2"+"distilled"); a miss silently serves the BASE preset ~2.4x slower.
     """
     import yaml as _yaml
 
@@ -43,12 +39,10 @@ def _assert_distilled_preset(yaml_path: str) -> None:
     preset = getattr(info, "default_preset", None) if info else None
     if preset != "ltx2_distilled":
         raise RuntimeError(
-            f"LTX23_PROFILE=speed but FastVideo resolved preset {preset!r} "
-            f"(not 'ltx2_distilled') for model_path={model_path!r}. The path "
-            "must contain 'ltx-2' and 'distilled' for the registry detector "
-            "to pick the distilled preset; serving with the base preset is "
-            "~2.4x slower. Fix the weights mount/alias (see Dockerfile "
-            "symlink /models/ltx-2.3-distilled-diffusers)."
+            f"LTX23_PROFILE=speed but FastVideo resolved preset {preset!r} for "
+            f"model_path={model_path!r}; the path must contain 'ltx-2' and "
+            "'distilled' (base preset is ~2.4x slower). Fix the weights alias "
+            "(Dockerfile symlink /models/ltx-2.3-distilled-diffusers)."
         )
     logger.info("LTX-2.3 preset check OK: %s -> ltx2_distilled", model_path)
 
@@ -84,16 +78,9 @@ def load_model(
     # lives in the shapes file / per-request num_inference_steps, not here.
     profile = os.environ.get("LTX23_PROFILE", "quality").strip().lower()
 
-    # SPEED: build via the EXACT FastVideo recipe that produced the ~10s clip --
-    # VideoGenerator.from_file() on the streaming yaml, the same loader + config
-    # object as the validated from_file run. We deliberately do NOT re-derive the
-    # compile / quant / inductor settings here: re-implementing the recipe (extra
-    # inductor knobs, hand-set kwargs) is exactly where deviations crept in and
-    # made the served refine 15s instead of ~2s. from_file IS the 10s code path,
-    # so there is nothing to deviate from. Attention backend (TORCH_SDPA) is
-    # supplied via FASTVIDEO_ATTENTION_BACKEND in the environment, matching the
-    # 10s run. streaming_speed.yaml ships next to this file; its paths point at
-    # the mounted weights (/data/default).
+    # SPEED loads the validated recipe verbatim via from_file -- do NOT re-derive
+    # compile/quant/inductor settings in code (hand-set knobs are where the
+    # recipe drifted before). Attention backend comes from the env (TORCH_SDPA).
     if profile == "speed":
         yaml_path = os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "streaming_speed.yaml"
