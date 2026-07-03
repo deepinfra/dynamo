@@ -52,6 +52,28 @@ def load_model(
     # See ltx23/config.py / ltx23/PROFILES.md. The denoise step count (8 vs 5)
     # lives in the shapes file / per-request num_inference_steps, not here.
     profile = os.environ.get("LTX23_PROFILE", "quality").strip().lower()
+
+    # SPEED: build via the EXACT FastVideo recipe that produced the ~10s clip --
+    # VideoGenerator.from_file() on the streaming yaml, the same loader + config
+    # object as the validated from_file run. We deliberately do NOT re-derive the
+    # compile / quant / inductor settings here: re-implementing the recipe (extra
+    # inductor knobs, hand-set kwargs) is exactly where deviations crept in and
+    # made the served refine 15s instead of ~2s. from_file IS the 10s code path,
+    # so there is nothing to deviate from. Attention backend (TORCH_SDPA) is
+    # supplied via FASTVIDEO_ATTENTION_BACKEND in the environment, matching the
+    # 10s run. streaming_speed.yaml ships next to this file; its paths point at
+    # the mounted weights (/data/default).
+    if profile == "speed":
+        yaml_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "streaming_speed.yaml"
+        )
+        logger.info(
+            "LTX-2.3 profile=speed: VideoGenerator.from_file(%s) "
+            "[exact 10s recipe, no re-derivation]",
+            yaml_path,
+        )
+        return VideoGenerator.from_file(yaml_path)
+
     optimization_kwargs = profile_kwargs(profile)
 
     # Inductor knobs from FastVideo's LTX-2.3 reference (basic_ltx2_3_distilled).

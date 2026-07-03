@@ -1,0 +1,80 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# LTX-2.3 SPEED serving image built FROM FastVideo's OWN validated dreamverse
+# environment (dreamverse:johan-ltx = FastVideo @ 4f3ad3f6, built via their
+# apps/dreamverse/docker/Dockerfile with `[tool.uv] prerelease = "allow"` in
+# effect). That is the ONLY environment measured at ~10s/clip.
+#
+# WHY not our from-scratch Dockerfile: it installs FastVideo with `cd /` so uv
+# never reads FastVideo's `[tool.uv] prerelease = "allow"`, silently resolving
+# the FP4-kernel packages to OLDER STABLE releases (nvidia-cutlass-dsl 4.5.2 /
+# quack-kernels 0.5.0 / flashinfer-python 0.6.12) instead of the prereleases
+# FastVideo validated (4.6.0.dev0 / 0.5.3 / 0.6.13). Those older FP4 GEMM
+# kernels make the 1920x1088 refine stage 15.4s instead of ~few s -> 26s vs 10s.
+# Measured: same recipe/weights/commit, only these packages differ. Building
+# FROM dreamverse inherits the exact coherent prerelease stack and stops us
+# hand-reconstructing (and missing pieces of) their environment.
+#
+# On top of dreamverse we add ONLY the Dynamo serving layer:
+#   - ai-dynamo==1.1.1 (the /v1/videos serving surface)
+#   - deepinfra Mega-Cache + x264-thread-cap patches to the installed fastvideo
+#   - the worker app tree + page-cache-warming entrypoint
+# The kernel packages + torch are pinned in a uv constraint so the ai-dynamo
+# install cannot downgrade them back to the slow set.
+FROM dreamverse:johan-ltx
+
+# dreamverse venv is /opt/venv (python 3.12); uv is on PATH (/root/.local/bin).
+ENV VIRTUAL_ENV=/opt/venv
+ENV PATH="/opt/venv/bin:${PATH}"
+
+# Freeze the proven prerelease FP4-kernel stack + torch. These versions are
+# ALREADY installed in dreamverse; the constraint just prevents the ai-dynamo
+# resolve below from moving them. --prerelease=allow (below) is required because
+# nvidia-cutlass-dsl==4.6.0.dev0 is a prerelease.
+RUN printf 'torch==2.11.0\nnvidia-cutlass-dsl==4.6.0.dev0\nquack-kernels==0.5.3\nflashinfer-python==0.6.13\n' > /opt/dynamo-constraint.txt
+ENV UV_CONSTRAINT=/opt/dynamo-constraint.txt
+
+# Dynamo runtime needs libucx0 (already present in dreamverse's CUDA base in
+# most cases, but install defensively).
+RUN apt-get update \
+ && apt-get install -yq libucx0 \
+ && apt-get clean
+
+# Install Dynamo with /v1/videos support. --prerelease=allow so the constraint's
+# cutlass-dsl dev pin is honored; the constraint keeps torch/kernels frozen.
+RUN . /opt/venv/bin/activate \
+ && uv pip install --prerelease=allow ai-dynamo==1.1.1
+
+# deepinfra patches, applied to the INSTALLED (non-editable) fastvideo package.
+# The patches are git-format (a/fastvideo/... b/fastvideo/...); -p1 from
+# site-packages strips a/ -> fastvideo/... . dreamverse's fastvideo is @4f3ad3f6,
+# the exact commit these patches were authored against, so they apply clean.
+COPY patches/ltx23_gpu_worker_megacache.patch /tmp/megacache.patch
+COPY patches/x264-threads-cap.patch /tmp/x264-threads-cap.patch
+# NOTE: verify by grepping the patched source, NOT by importing fastvideo --
+# importing pulls in triton, which fails to init its driver in a GPU-less build
+# ("0 active drivers").
+RUN SP=/opt/venv/lib/python3.12/site-packages \
+ && patch -p1 -d "$SP" --forward --fuzz=0 < /tmp/megacache.patch \
+ && patch -p1 -d "$SP" --forward --fuzz=0 < /tmp/x264-threads-cap.patch \
+ && grep -q 'torch.compiler.load_cache_artifacts' "$SP/fastvideo/worker/gpu_worker.py" \
+ && grep -q 'FASTVIDEO_X264_THREADS' "$SP/fastvideo/entrypoints/video_generator.py" \
+ && echo "patches applied + verified"
+
+ENV FASTVIDEO_VIDEO_CODEC=libx264
+ENV FASTVIDEO_X264_PRESET=ultrafast
+
+# Worker app tree + entrypoint (page-cache warming; unsets LD_LIBRARY_PATH,
+# which is a no-op for refine speed -- Experiment X showed torch loads its
+# bundled cuBLAS regardless of LD, refine time is set by the FP4-kernel packages).
+WORKDIR /opt/app
+COPY . /opt/app/
+ENTRYPOINT ["/opt/app/entrypoint.sh"]
+
+# FastVideo selects the DISTILLED pipeline preset by string-matching the weights
+# path (fastvideo/registry.py: needs "ltx-2"/"ltx2" AND "distilled" in the path;
+# miss -> silent fallback to the BASE preset -> extra guidance forwards per
+# denoise step -> ~2.4x slower, visually fine: the 10s-vs-25s bug). Prod mounts
+# weights at /data/default, so provide a detector-matching alias for the yaml
+# (ltx23/streaming_speed.yaml) to reference.
+RUN mkdir -p /models && ln -s /data/default /models/ltx-2.3-distilled-diffusers
