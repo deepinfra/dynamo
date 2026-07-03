@@ -611,7 +611,9 @@ def _set_parent_death_signal(sig: int = signal.SIGTERM) -> None:
 def _megacache_blob_path(shape_key: str) -> str | None:
     """Per-shape Mega-Cache blob path, or None if the feature is off.
 
-    Opt-in via ``LTX_MEGACACHE_DIR``. When set, the dir holds one
+    Opt-in via ``DI_MEGACACHE_DIR`` (legacy alias ``LTX_MEGACACHE_DIR`` still
+    honored during the transition -- the mechanism is torch.compiler Mega-Cache
+    and not LTX-specific). When set, the dir holds one
     ``<shape_key>.megacache.bin`` per shape: a portable ``torch.compiler``
     artifact bundle (FX graphs + Triton + autotune best_configs). At bake
     time the dir is writable and starts empty (worker compiles cold, then
@@ -619,7 +621,7 @@ def _megacache_blob_path(shape_key: str) -> str | None:
     time the worker LOADs them so a fresh pod skips the autotune recompile.
     Unset => no-op (legacy behavior: compile cold per process).
     """
-    base = os.environ.get("LTX_MEGACACHE_DIR")
+    base = os.environ.get("DI_MEGACACHE_DIR") or os.environ.get("LTX_MEGACACHE_DIR")
     if not base:
         return None
     return os.path.join(base, f"{shape_key}.megacache.bin")
@@ -631,13 +633,17 @@ def _export_megacache_env(shape_key: str) -> None:
     The actual ``torch.compiler.save/load_cache_artifacts`` calls MUST run in
     the process that compiles -- and FastVideo's MultiprocExecutor compiles in a
     spawned worker child, NOT here. So this pool-worker only resolves the
-    per-shape path and exports it as ``LTX_MEGACACHE_BLOB`` BEFORE the factory
+    per-shape path and exports it as ``DI_MEGACACHE_BLOB`` BEFORE the factory
     builds the generator (which spawns that child). The child inherits the env
     and does the load (before first forward) / save (after first forward). See
-    fastvideo/worker/gpu_worker.py. No-op when ``LTX_MEGACACHE_DIR`` is unset.
+    fastvideo/worker/gpu_worker.py. No-op when ``DI_MEGACACHE_DIR`` is unset.
     """
     path = _megacache_blob_path(shape_key)
     if path:
+        os.environ["DI_MEGACACHE_BLOB"] = path
+        # Transition: also export the legacy name so a pre-rename gpu_worker
+        # patch (older baked image) still resolves the blob. Drop once every
+        # video image has been rebuilt with the renamed patch below.
         os.environ["LTX_MEGACACHE_BLOB"] = path
         print(
             f"[pool-worker/{shape_key}] megacache blob path -> {path} "

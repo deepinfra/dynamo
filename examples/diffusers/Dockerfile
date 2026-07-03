@@ -91,7 +91,7 @@ ENV FASTVIDEO_SHA=${FASTVIDEO_SHA}
 # reuses baked compile artifacts instead of recompiling. COPY'd here (before
 # the FastVideo build) so `git apply` below picks it up; the full app tree is
 # only COPYd to /opt/app later. See examples/diffusers/ltx23/CACHING.md.
-COPY patches/ltx23_gpu_worker_megacache.patch /tmp/megacache.patch
+COPY patches/gpu_worker_megacache.patch /tmp/megacache.patch
 
 # deepinfra encode patch: cap libx264 -threads so the CPU mp4 encode can't grab
 # the whole shared node (no NVENC on B200 -> CPU libx264). git apply'd below;

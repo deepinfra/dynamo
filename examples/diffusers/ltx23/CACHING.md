@@ -34,8 +34,9 @@ One resident process, both per-mode blobs loaded (glob-load), sequence t2v→i2v
   wrong" risk from the cache.
 
 ## What's wired (code)
-- **Mega-Cache** — `lib/pool.py` exports `LTX_MEGACACHE_BLOB=<dir>/<shape_key>.megacache.bin` (from
-  `LTX_MEGACACHE_DIR`) before building the generator; `fastvideo/worker/gpu_worker.py` (fork patch) LOADS
+- **Mega-Cache** — `lib/pool.py` exports `DI_MEGACACHE_BLOB=<dir>/<shape_key>.megacache.bin` (from
+  `DI_MEGACACHE_DIR`; legacy alias `LTX_MEGACACHE_DIR` still honored during transition) before building the
+  generator; `fastvideo/worker/gpu_worker.py` (fork patch) LOADS
   the blob before the first forward and SAVES it after the first forward. Per-shape (one blob per shape).
   Best-effort: a missing/incompatible blob silently falls back to a cold compile (never wedges a pod).
 - **CuTe / CUDA / QuACK env caches** — `lib/pool.py` sets `CUTE_DSL_CACHE_DIR=/cache/cutedsl`,
@@ -47,11 +48,11 @@ One resident process, both per-mode blobs loaded (glob-load), sequence t2v→i2v
 The blob is keyed by (profile + shape + torch version + GPU arch + code/image), so **bake per profile** and
 **rebake on any image change** (a mismatch just falls back to cold compile, so it's safe, just slow).
 
-1. **Bake** on a Blackwell box, `LTX_MEGACACHE_DIR` pointed at a writable scratch (one run does all shapes
+1. **Bake** on a Blackwell box, `DI_MEGACACHE_DIR` pointed at a writable scratch (one run does all shapes
    in `shapes.json`; the worker saves a blob per shape):
    ```
    docker run --gpus '"device=<UUID>"' \
-     -e LTX23_PROFILE=quality -e VIDEO_MODEL_FAMILY=ltx23 -e LTX_MEGACACHE_DIR=/cache/megacache \
+     -e LTX23_PROFILE=quality -e VIDEO_MODEL_FAMILY=ltx23 -e DI_MEGACACHE_DIR=/cache/megacache \
      -v <weights>:/data/default:ro -v /scratch/ltx23-bake:/cache \
      <image> python3 ltx23/warmup.py --shapes ltx23/shapes.json --output-dir /cache/out --per-shape-timeout 3600
    # -> /scratch/ltx23-bake/megacache/<shape_key>.megacache.bin  (one per shape, ~300 MB each)
@@ -61,7 +62,7 @@ The blob is keyed by (profile + shape + torch version + GPU arch + code/image), 
    tar -cf megacache.tar -C /scratch/ltx23-bake megacache
    # Dockerfile: ADD megacache.tar /opt/app/    -> /opt/app/megacache/<shape_key>.megacache.bin
    ```
-3. **Serve**: set `LTX_MEGACACHE_DIR=/opt/app/megacache` in the LTX-2.3 model's `extra_env` (per-model, so
+3. **Serve**: set `DI_MEGACACHE_DIR=/opt/app/megacache` in the LTX-2.3 model's `extra_env` (per-model, so
    LTX-2 is unaffected). The per-shape pool worker loads its shape's blob before the first compile.
 4. **Boot-warm gate**: have the pod route one dummy request per shape at startup (the ~560 s cost) before
    marking ready, so no real request ever hits a cold compile. The resident pool then serves warm.
@@ -71,7 +72,7 @@ The blob is keyed by (profile + shape + torch version + GPU arch + code/image), 
   bites and it stops recompiling that location. Fine for our 2-shape menu; bump
   `torch._dynamo.config.cache_size_limit` if a single process must serve more.
 - **One blob per shape — NOT one multi-shape blob.** A blob saved from a process that compiled multiple
-  shapes (via `LTX_MEGACACHE_SAVE_EVERY`) fails to hit the *first* shape on reload (its key gets polluted by
+  shapes (via `DI_MEGACACHE_SAVE_EVERY`) fails to hit the *first* shape on reload (its key gets polluted by
   later compilation). Keep the per-shape pool + per-shape blobs (the proven path).
 - **Implicit inductor cache (`TORCHINDUCTOR_CACHE_DIR`) does NOT port** across processes — don't ship/rely
   on it for cold-start (LTX-2's tar+ADD bake only "worked" because of the di-slc-35 host-pin).
