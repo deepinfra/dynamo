@@ -22,6 +22,37 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+def _assert_distilled_preset(yaml_path: str) -> None:
+    """Fail the worker LOUDLY if FastVideo would not resolve the DISTILLED preset.
+
+    FastVideo selects the pipeline preset by string-matching the weights path
+    (fastvideo/registry.py: needs "ltx-2"/"ltx2" AND "distilled" in the path).
+    A path that misses the detector silently falls back to the BASE preset,
+    which runs extra guidance forward passes per denoising step: ~2.4x slower
+    with visually fine output (the 10s-vs-25s bug, 2026-07). A mount/rename
+    that breaks the detector must be a boot failure, not a silent regression.
+    """
+    import yaml as _yaml
+
+    with open(yaml_path) as fh:
+        model_path = _yaml.safe_load(fh)["generator"]["model_path"]
+
+    from fastvideo.registry import _get_config_info
+
+    info = _get_config_info(model_path, raise_on_missing=False)
+    preset = getattr(info, "default_preset", None) if info else None
+    if preset != "ltx2_distilled":
+        raise RuntimeError(
+            f"LTX23_PROFILE=speed but FastVideo resolved preset {preset!r} "
+            f"(not 'ltx2_distilled') for model_path={model_path!r}. The path "
+            "must contain 'ltx-2' and 'distilled' for the registry detector "
+            "to pick the distilled preset; serving with the base preset is "
+            "~2.4x slower. Fix the weights mount/alias (see Dockerfile "
+            "symlink /models/ltx-2.3-distilled-diffusers)."
+        )
+    logger.info("LTX-2.3 preset check OK: %s -> ltx2_distilled", model_path)
+
+
 def load_model(
     model_path: str,
     num_gpus: int,
@@ -67,6 +98,7 @@ def load_model(
         yaml_path = os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "streaming_speed.yaml"
         )
+        _assert_distilled_preset(yaml_path)
         logger.info(
             "LTX-2.3 profile=speed: VideoGenerator.from_file(%s) "
             "[exact 10s recipe, no re-derivation]",
