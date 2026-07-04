@@ -105,16 +105,26 @@ metrics each live.
 
 # Part 2 — What DeepInfra Added on Top of Upstream
 
-All paths below are on **`deep-main-v1.1.1-videogen`**. There are two
-distinct buckets.
+All paths below are on **`deep-main-v1.1.1-videogen`** (a moving branch —
+re-fetch before relying on specifics). There are three buckets: a large
+video-generation feature (2A), small Rust runtime/protocol extensions (2B),
+and in-flight work not yet merged (2C).
 
-## 2A. LTX-2 Video Generation Backend (the big one)
+## 2A. Video Generation Backend — a multi-model family (the big one)
 
-DeepInfra added a **FastVideo-backed text-to-video backend** for Dynamo,
-serving the ~19B-param **LTX-2** model through the runtime's `/v1/videos`
-endpoint. It is structured so additional video models plug in as new
-per-model packages without duplicating the pool / IPC / metrics
-infrastructure.
+DeepInfra added a **FastVideo-backed video-generation backend** for Dynamo,
+serving through the runtime's `/v1/videos` endpoint. What started as a single
+LTX-2 worker has grown into a **multi-model video family**: generic
+infrastructure in `lib/` plus per-model packages that each plug a factory
+function into the same pool / IPC / metrics machinery, with **no duplication**
+of that infrastructure. As of the current `deep-main-v1.1.1-videogen` there
+are **three model families shipping**, and more are in flight (see 2C).
+
+| Family | Model | Notes |
+|---|---|---|
+| `ltx2/` | LTX-2 (~19B) | The original text-to-video worker. Fully documented `ARCHITECTURE.md` + `RUNBOOK.md`. |
+| `ltx23/` | LTX-2.3-Distilled | Text-to-video **and image-to-video (i2v)**, refine upsampler, QUALITY/SPEED profiles, Mega-Cache cold-start. The most sophisticated family. |
+| `fastwan/` | FastWan-QAD-FP8-1.3B | Smaller FP8 model, TAEHV decode, portrait shapes. |
 
 **Start here (read in this order):**
 
@@ -122,35 +132,56 @@ infrastructure.
    and entry points.
 2. [`examples/diffusers/ltx2/ARCHITECTURE.md`](examples/diffusers/ltx2/ARCHITECTURE.md)
    — **the most important document.** It explains *why* the worker is shaped
-   the way it is, and records the dead ends that were tried and rejected.
-3. [`examples/diffusers/ltx2/RUNBOOK.md`](examples/diffusers/ltx2/RUNBOOK.md)
+   the way it is, and records the dead ends that were tried and rejected. The
+   design decisions here (§ below) apply to every family.
+3. [`examples/diffusers/ltx23/CACHING.md`](examples/diffusers/ltx23/CACHING.md)
+   — **the second most important document.** The Mega-Cache cold-start
+   strategy, with measured numbers (§ below).
+4. [`examples/diffusers/ltx23/PROFILES.md`](examples/diffusers/ltx23/PROFILES.md)
+   — the QUALITY vs SPEED profiles and how each mirrors a FastVideo recipe.
+5. [`examples/diffusers/ltx2/RUNBOOK.md`](examples/diffusers/ltx2/RUNBOOK.md)
+   and [`examples/diffusers/ltx23/RUNBOOK.md`](examples/diffusers/ltx23/RUNBOOK.md)
    — operational procedures: adding a shape, baking an image, rollback, CI
    drift, diagnosing failures, updating FastVideo.
 
-**Code map:**
+**Code map (current):**
 
 ```
 examples/diffusers/
 ├── worker.py            top-level shim: dispatches --pool-worker invocations
-│                        into lib.pool BEFORE importing ltx2.worker
+│                        into lib.pool BEFORE importing the model worker
 ├── lib/                 GENERIC video-pipeline infrastructure (model-agnostic)
 │   ├── pool.py            SubprocessPool, Connection-based IPC wire protocol,
-│   │                      _pool_worker_main, PR_SET_PDEATHSIG handling
+│   │                      _pool_worker_main, PR_SET_PDEATHSIG, Mega-Cache
+│   │                      blob env wiring
 │   ├── backend.py         GenericVideoBackend: Dynamo endpoint, legacy
 │   │                      in-process path + pool routing path
+│   ├── i2v_input.py       image-to-video input handling (decode + validation)
 │   ├── metrics.py         video_pool_* Prometheus series (per-model label)
 │   ├── models.py          Pydantic request/response models
 │   ├── menu.py            shape-menu hash + boot assertion
 │   └── dynamo_wiring.py   get_worker_namespace, register_model
-└── ltx2/                LTX-2-SPECIFIC code
-    ├── worker.py           main_cli: CLI parse, backend setup, registration
-    ├── factory.py          load_model(): the shared VideoGenerator factory
-    ├── config.py           canonical kwargs (cache-keying)
-    ├── shapes.json         the supported (width, height, num_frames) menu
-    ├── warmup.py           per-shape compile-cache producer (bake time)
-    ├── benchmark.py        post-bake validation harness
-    └── ARCHITECTURE.md / RUNBOOK.md / tests
+├── ltx2/                LTX-2 family (worker/factory/config/shapes/warmup +
+│                        ARCHITECTURE.md, RUNBOOK.md, benchmark, tests)
+├── ltx23/               LTX-2.3 family (worker/factory/config/shapes/warmup +
+│                        ARCHITECTURE.md, CACHING.md, PROFILES.md, RUNBOOK.md,
+│                        bake_bench.py, prompt_extension_system_prompt.md,
+│                        streaming_speed.yaml, tests)
+├── fastwan/             FastWan family (worker/factory/shapes/warmup + tests)
+├── patches/             FastVideo fork patches baked into the image:
+│                        ltx23_gpu_worker_megacache.patch, x264-threads-cap.patch
+├── Dockerfile,          the standard image, plus
+│   Dockerfile.dreamverse  the dreamverse-based image for the distilled/speed path
+├── deploy/, local/      k8s manifests / docker-compose dev loop
 ```
+
+Every family package exposes the same surface — `worker.py` (`main_cli`),
+`factory.py` (`load_model()`, the shared factory used by both the legacy and
+pool paths), `config.py` (canonical cache-keying kwargs), `shapes.json` (the
+supported `(width, height, num_frames)` menu), `warmup.py` (per-shape
+compile-cache producer), and `test_shapes.py`/`test_config.py` (pin the menu
+hash and ship-path kwargs). To onboard a new video model you add a new package
+in this shape; you do not touch `lib/`.
 
 Also touched in the core tree (diffusion plumbing across backends):
 `components/src/dynamo/common/protocols/video_protocol.py`,
@@ -210,14 +241,58 @@ DoS risk, mitigated by parent-side validation + the deepapi admission layer);
 and orphan risk on non-SIGTERM parent crashes (mitigated by
 `PR_SET_PDEATHSIG`).
 
+### LTX-2.3 additions you must understand (`ltx23/`)
+
+LTX-2.3 is the most involved family and introduces concepts the LTX-2 docs
+don't cover. Read `ltx23/CACHING.md` and `ltx23/PROFILES.md` in full.
+
+- **Mega-Cache cold-start strategy.** Cold first-gen (compile + generate) is
+  ~1103s (QUALITY 1080p). **Mega-Cache** — torch's
+  `save_cache_artifacts` / `load_cache_artifacts` — halves it to ~560s by
+  restoring the **inductor back-end**. The remaining ~512s is the
+  torch.compile **front-end** (dynamo trace + AOTAutograd), which re-runs in
+  every process to *produce the cache key* and is **not** cacheable short of
+  AOTInductor. So the production model is **Mega-Cache + resident pool +
+  boot-warm behind a readiness gate**: a pod pays ~560s once at boot, then
+  serves warm at **~24s/clip** (QUALITY) with no on-the-fly recompile. The
+  blob is per-shape, loaded before the first forward and saved after — wired
+  via a FastVideo fork patch (`patches/ltx23_gpu_worker_megacache.patch`) and
+  `lib/pool.py` env export. Correctness is validated (PSNR: blob-served output
+  is as correct as cold).
+- **1080p-only is a memory constraint, not a preference.** One resident
+  process holding both t2v and i2v modes (16 compiled graphs) peaks at
+  ~119 GB and fits a B200 (180 GB). Two *resolutions* would need two resident
+  pool processes (~238 GB) → OOM. So the shape menu is deliberately 1080p-only.
+- **Image-to-video (i2v).** LTX-2.3 serves i2v as a **separate compile** from
+  t2v (both must be boot-warmed). Image input is routed via the top-level
+  `input_reference` and handled by `lib/i2v_input.py`, which validates the
+  image is decodable *before* handing off to the GPU subprocess.
+- **QUALITY vs SPEED profiles.** Selected by the `LTX23_PROFILE` env var
+  (`quality` default). Each faithfully mirrors a specific FastVideo recipe;
+  they differ in quant (bf16 vs NVFP4), denoise steps, and refine settings.
+  `ltx23/config.py` is the source of truth and `test_config.py` pins both.
+- **Refine upsampler path** and Blackwell-specific Inductor knobs
+  (`shape_padding=False`, `conv_1x1_as_mm`, `coordinate_descent_tuning`, …),
+  `FLASH_ATTN` attention backend, and the cu128/CUDA-12.9 image are all wired
+  in `factory.py`.
+
+### FastWan additions (`fastwan/`)
+
+A smaller **FastWan-QAD-FP8-1.3B** family with TAEHV decode (width/height/
+num_frames plumbed through for correct portrait output) and a portrait
+480×832 shape in the warm menu. Good example of a *lightweight* family that
+reuses all of `lib/` with minimal per-model code.
+
 ### Suggested exercises for 2A
 
 - Read `lib/pool.py` and trace one request from `backend.py` → pool → pinned
   subprocess → Connection round-trip → MP4-as-base64 response.
-- Read `warmup.py` and `factory.py` together; explain how the bake-time cache
-  and the runtime cache stay key-compatible.
+- Read `warmup.py` and `factory.py` together (pick one family); explain how
+  the bake-time cache and the runtime cache stay key-compatible.
 - Trace the shape-menu hash through `lib/menu.py`, `shapes.json`, the bake
   step, and the boot assertion — explain what drift the hash guards against.
+- Read `ltx23/CACHING.md` end to end and explain, in one sentence each, what
+  Mega-Cache *does* fix and what it *cannot* fix (the front-end residual).
 - Locally: `examples/diffusers/local/` has a `docker-compose.yml` and
   `run_local.sh` for a non-B200 dev loop.
 
@@ -248,6 +323,27 @@ failures), `PR_SET_PDEATHSIG` on pool subprocesses, defensive cleanup on
 spawn failure / graceful exit on parent disconnect, a `DYN_SYSTEM_PORT`
 warning, and the local-launch flag note
 (`--request-plane tcp --event-plane zmq`, since the v1.1.1 default changed).
+More recent hardening around the video families: **x264 encode-thread cap**
+(`FASTVIDEO_X264_THREADS`, default 32, via `patches/x264-threads-cap.patch`),
+**prompt no longer logged** in `create_video` (privacy parity), and
+i2v image decodability validation before the GPU subprocess.
+
+## 2C. In-flight work (branches not yet merged into `deep-main`)
+
+At the time of writing these `johan/*` branches carry work ahead of
+`deep-main-v1.1.1-videogen` — useful to know what's coming:
+
+- **`johan/ltx23`** — SSRF guard on the i2v image-URL fetch (server-side
+  request forgery protection for user-supplied image references).
+- **`johan/megacache-rename`** — rename `LTX_MEGACACHE_*` env vars to a
+  generic `DI_MEGACACHE_*` (backward-compatible), reflecting that the cache
+  strategy is no longer LTX-specific.
+- **`johan/cosmos-encode-threads`** — cap CPU video-encoder threads in
+  `dynamo.common` `video_utils`; the "cosmos" name hints a **Cosmos** video
+  family may be the next model onboarded.
+
+(`johan/fastwan`, `johan/ltx23-speed-bake`, and `johan/x264-threads-cap` have
+already been merged into `deep-main` and are described above.)
 
 ---
 
@@ -257,9 +353,14 @@ warning, and the local-launch flag note
 # DeepInfra-authored commits = those WITHOUT an upstream (#NNNN) PR suffix:
 git log --oneline origin/deep-main-v1.1.1-videogen | grep -vE '\(#[0-9]+\)'
 
-# The whole video backend:
+# The whole video backend (all families):
 git ls-tree -r --name-only origin/deep-main-v1.1.1-videogen \
-  | grep -iE 'diffus|ltx|video'
+  | grep -iE 'diffus|ltx|fastwan|video'
+
+# In-flight work ahead of deep-main:
+for b in $(git branch -r | grep 'origin/johan/'); do
+  echo "== $b =="; git log --oneline origin/deep-main-v1.1.1-videogen..$b
+done
 
 # Inspect a specific runtime change:
 git show 1c9412d27   # engine_data nvext field
