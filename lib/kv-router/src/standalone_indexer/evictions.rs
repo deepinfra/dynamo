@@ -87,6 +87,13 @@ impl PendingEvictions {
         self.pending.len()
     }
 
+    /// Raw queue length, including stale (cancelled/superseded) entries that
+    /// still occupy memory until a drain pops them. `queue_len - len` is the
+    /// dead weight from re-stored blocks.
+    pub fn queue_len(&self) -> usize {
+        self.queue.len()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.pending.is_empty()
     }
@@ -182,13 +189,39 @@ pub fn spawn_cleanup_loop(
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(SWEEP_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut tick_count: u64 = 0;
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => return,
                 _ = ticker.tick() => {}
             }
+            tick_count += 1;
 
-            let Some(usage) = memory_usage_fraction() else {
+            let usage = memory_usage_fraction();
+
+            // Once a minute, log buffer/memory state unconditionally — this is
+            // the only visibility into the buffers below the sweep threshold,
+            // and the pod's log retention is far too short to rely on
+            // startup-time lines.
+            if tick_count % 4 == 1 {
+                let (mut pending, mut queued) = (0usize, 0usize);
+                let records = registry.listener_records();
+                for (_, _, record) in &records {
+                    let buffer = record.pending_evictions();
+                    let buffer = buffer.lock();
+                    pending += buffer.len();
+                    queued += buffer.queue_len();
+                }
+                tracing::info!(
+                    memory_fraction = usage.map(|u| format!("{u:.3}")),
+                    pending_evictions = pending,
+                    queued_entries = queued,
+                    listeners = records.len(),
+                    "keep-evictions status"
+                );
+            }
+
+            let Some(usage) = usage else {
                 tracing::warn!("keep-evictions sweep: could not read memory usage; skipping");
                 continue;
             };
