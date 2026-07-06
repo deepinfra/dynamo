@@ -24,7 +24,7 @@ crate-type = ["cdylib", "rlib"]
 [features]
 default = []
 media-ffmpeg = ["dynamo-llm/media-ffmpeg"]
-kv-indexer = ["dep:clap", "dep:tracing-subscriber", "dynamo-kv-router/kube-discovery"]
+kv-indexer = ["dep:clap", "dep:tracing-subscriber", "dep:tracing-appender", "dynamo-kv-router/kube-discovery"]
 kv-indexer-metrics = ["kv-indexer", "dynamo-kv-router/metrics"]
 mocker-kvbm-offload = ["dynamo-mocker/kvbm-offload"]
 aic-forward-pass = ["dynamo-mocker/aic-forward-pass", "dep:aiconfigurator-core"]
@@ -72,6 +72,7 @@ uuid = { version = "1.18.1" }
 dynamo-kv-router = { path = "../../kv-router", features = ["standalone-indexer"] }
 clap = { version = "4.5", features = ["derive"], optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+tracing-appender = { version = "0.2", optional = true }
 
 # "extension-module" tells pyo3 we want to build an extension module (skips linking against libpython.so)
 # "abi3-py310" tells pyo3 (and maturin) to build using the stable ABI with minimum Python version 3.10, which is the minimum version in pyproject.toml

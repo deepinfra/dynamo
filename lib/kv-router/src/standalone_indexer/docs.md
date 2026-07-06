@@ -44,8 +44,8 @@ response goes back to the client:
 **On every KV event ingested from the engine** (both the live SUB stream over
 ZMQ, `source="live"`, and events pulled in by HTTP gap recovery via
 `GET /kv_recover`, `source="recover"`). Logged *before* the
-`--ignore-evictions` filter, so it reflects what the engine actually published
-(real `worker_id`, evictions not dropped):
+`--keep-evictions` filter, so it reflects what the engine actually published
+(real `worker_id`, evictions not parked):
 - `kind` — `STORE` (Stored) / `EVICT` (Removed) / `CLEAR` (Cleared). There is
   no "modify" event; the protocol only has these three.
 - `ts_ms`, `worker_id`, `dp_rank`, `storage_tier`, `event_id`, `seq`

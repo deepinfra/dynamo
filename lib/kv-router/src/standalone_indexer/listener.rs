@@ -4,6 +4,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use parking_lot::Mutex;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
@@ -12,6 +13,7 @@ use crate::protocols::{KvCacheEventData, RouterEvent, WorkerId, WorkerWithDpRank
 use crate::recovery::{CursorObservation, CursorState};
 use crate::zmq_wire::{ZmqEventNormalizer, decode_event_batch};
 
+use super::evictions::PendingEvictions;
 use super::indexer::Indexer;
 use super::registry::ListenerRecord;
 use super::zmq::{MultipartMessage, SharedSocket, connect_sub_socket, recv_multipart};
@@ -27,7 +29,7 @@ fn cursor_from_watermark(watermark: u64) -> CursorState {
 }
 
 /// Emit a `kv_audit` line for a single KV event ingested from the engine,
-/// before the `ignore_evictions` measurement filter is applied, so the log
+/// before the `keep_evictions` measurement filter is applied, so the log
 /// reflects what the engine actually published. `source`
 /// distinguishes the live SUB stream (`"live"`) from events pulled in by
 /// gap recovery (`"recover"`). No-op unless audit logging is enabled.
@@ -69,8 +71,7 @@ fn audit_log_event(router_event: &RouterEvent, seq: u64, source: &'static str) {
         }
         KvCacheEventData::Removed(data) => {
             // Removal events carry only sequence (external) block hashes.
-            let sequence_block_hashes: Vec<u64> =
-                data.block_hashes.iter().map(|h| h.0).collect();
+            let sequence_block_hashes: Vec<u64> = data.block_hashes.iter().map(|h| h.0).collect();
             tracing::info!(
                 target: "kv_audit",
                 kind = "EVICT",
@@ -115,6 +116,9 @@ struct ListenerLoop {
     recover_endpoint: Option<String>,
     http_client: reqwest::Client,
     watermark: Arc<AtomicU64>,
+    /// Shared with the listener's registry record; the keep-evictions sweep
+    /// drains it through there. Untouched unless `--keep-evictions` is set.
+    pending_evictions: Arc<Mutex<PendingEvictions>>,
     normalizer: ZmqEventNormalizer,
     messages_processed: u64,
 }
@@ -131,6 +135,7 @@ impl ListenerLoop {
         recover_endpoint: Option<String>,
         http_client: reqwest::Client,
         watermark: Arc<AtomicU64>,
+        pending_evictions: Arc<Mutex<PendingEvictions>>,
     ) -> Self {
         Self {
             worker_id,
@@ -141,8 +146,35 @@ impl ListenerLoop {
             recover_endpoint,
             http_client,
             watermark,
+            pending_evictions,
             normalizer: ZmqEventNormalizer::new(block_size),
             messages_processed: 0,
+        }
+    }
+
+    /// `--keep-evictions` interception, applied to every event before it can
+    /// reach the tree. STOREs cancel any pending eviction of their blocks and
+    /// then apply as usual; EVICTs are parked in the buffer instead of
+    /// applied; CLEARs are dropped (matching the old `--ignore-evictions`
+    /// behavior). Returns `true` when the event must NOT be applied.
+    fn keep_evictions_intercept(&self, event: &RouterEvent) -> bool {
+        if !super::keep_evictions() {
+            return false;
+        }
+        match &event.event.data {
+            KvCacheEventData::Stored(data) => {
+                self.pending_evictions
+                    .lock()
+                    .cancel(data.blocks.iter().map(|b| b.block_hash.0));
+                false
+            }
+            KvCacheEventData::Removed(data) => {
+                self.pending_evictions
+                    .lock()
+                    .buffer(&data.block_hashes, event.storage_tier);
+                true
+            }
+            KvCacheEventData::Cleared => true,
         }
     }
 
@@ -246,6 +278,10 @@ impl ListenerLoop {
                 // `remove_worker`) so a sibling dp_rank's state is left intact.
                 // The dump carries synthetic 0-based event ids; the real resume
                 // point is `last_event_id`.
+                // Pending evictions refer to the state being replaced, so drop
+                // them too — replaying them against the snapshot could remove
+                // blocks the dump says are live.
+                self.pending_evictions.lock().clear();
                 self.indexer
                     .remove_worker_dp_rank(self.worker_id, self.dp_rank)
                     .await;
@@ -303,7 +339,7 @@ impl ListenerLoop {
     /// `worker_id`/`dp_rank` are informational (the contract says to apply
     /// events under the worker that was queried), so they are rewritten before
     /// applying. Returns the count actually applied (after the
-    /// `ignore_evictions` measurement filter).
+    /// `keep_evictions` measurement filter).
     async fn apply_recovered_events(&self, events: Vec<RouterEvent>) -> u64 {
         let mut applied = 0;
         for mut event in events {
@@ -314,12 +350,7 @@ impl ListenerLoop {
             audit_log_event(&event, event.event.event_id, "recover");
 
             // Feed-layer measurement filter (same as apply_live_batch).
-            if super::ignore_evictions()
-                && matches!(
-                    event.event.data,
-                    KvCacheEventData::Removed(_) | KvCacheEventData::Cleared
-                )
-            {
+            if self.keep_evictions_intercept(&event) {
                 continue;
             }
             self.indexer.apply_event_routed(event).await;
@@ -388,12 +419,7 @@ impl ListenerLoop {
             // measurement filter below can drop it.
             audit_log_event(&router_event, seq, "live");
             // Feed-layer measurement filter.
-            if super::ignore_evictions()
-                && matches!(
-                    router_event.event.data,
-                    KvCacheEventData::Removed(_) | KvCacheEventData::Cleared
-                )
-            {
+            if self.keep_evictions_intercept(&router_event) {
                 continue;
             }
             self.indexer.apply_event_routed(router_event).await;
@@ -507,6 +533,7 @@ async fn run_listener(
     let block_size = record.block_size();
     let indexer = record.indexer();
     let watermark = record.watermark();
+    let pending_evictions = record.pending_evictions();
 
     tracing::info!(worker_id, dp_rank, endpoint, "ZMQ listener starting");
 
@@ -550,6 +577,7 @@ async fn run_listener(
         recover_endpoint,
         http_client,
         watermark,
+        pending_evictions,
     )
     .run()
     .await
@@ -613,6 +641,9 @@ mod tests {
             None,
             reqwest::Client::new(),
             watermark.clone(),
+            std::sync::Arc::new(parking_lot::Mutex::new(
+                crate::standalone_indexer::evictions::PendingEvictions::default(),
+            )),
         );
         (listener, indexer, watermark)
     }

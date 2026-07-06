@@ -4,8 +4,8 @@
 #
 # Used by DeepInfra's KV-cache measurement pod (backend kubernetes/9X-kv-measurer.yaml):
 # three copies of this image run side-by-side under different policy flags
-#   8090  --ignore-evictions --merge-shards   (PERFECT      : no evictions, one global shard)
-#   8091  --ignore-evictions                  (ROUTING_COST : no evictions, per-shard)
+#   8090  --keep-evictions --merge-shards     (PERFECT      : evictions parked, one global shard)
+#   8091  --keep-evictions                    (ROUTING_COST : evictions parked, per-shard)
 #   8092  (no flags)                          (REALITY      : real evictions, per-shard)
 # Each subscribes over ZMQ to the engine shards' KV-event tee and serves the
 # HTTP API: /register /unregister /query /workers /dump /health (+ /metrics).

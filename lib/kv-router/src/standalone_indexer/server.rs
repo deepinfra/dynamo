@@ -327,8 +327,8 @@ async fn run_tiered_query(
 ) -> (StatusCode, Json<serde_json::Value>) {
     // Snapshot the raw hashes for logging up front (find_tiered_matches takes
     // ownership). Skip the allocation entirely when logging is off.
-    let logged_hashes: Option<Vec<u64>> = super::logging_enabled()
-        .then(|| block_hashes.iter().map(|h| h.0).collect());
+    let logged_hashes: Option<Vec<u64>> =
+        super::logging_enabled().then(|| block_hashes.iter().map(|h| h.0).collect());
 
     let (status, body) = match indexer.find_tiered_matches(block_hashes).await {
         Ok(tiered) => (

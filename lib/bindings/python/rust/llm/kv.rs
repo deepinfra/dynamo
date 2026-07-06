@@ -71,11 +71,23 @@ struct KvIndexerCli {
     #[arg(long)]
     peers: Option<String>,
 
-    /// Drop Removed and Cleared events before applying to the tree.
-    /// Simulates infinite memory (evictions never happen).
-    /// Use for the "ideal ceiling" and "infinite memory + sharded" measurement modes.
+    /// Park Removed events in a buffer (and drop Cleared) instead of applying
+    /// them, approximating infinite memory for the "ideal ceiling" and
+    /// "infinite memory + sharded" measurement modes. Buffered evictions older
+    /// than --evict-retention-secs are replayed into the tree once memory
+    /// usage crosses --evict-memory-threshold of the cgroup limit.
     #[arg(long, default_value_t = false)]
-    ignore_evictions: bool,
+    keep_evictions: bool,
+
+    /// Minimum age (seconds) a parked eviction must reach before the memory
+    /// sweep may apply it to the tree. Only meaningful with --keep-evictions.
+    #[arg(long, default_value_t = 1800)]
+    evict_retention_secs: u64,
+
+    /// Fraction of the memory limit (0..1] above which the sweep replays aged
+    /// evictions. Only meaningful with --keep-evictions.
+    #[arg(long, default_value_t = 0.75)]
+    evict_memory_threshold: f64,
 
     /// Emit verbose audit logs on the `kv_audit` tracing target: one line per
     /// query (block hashes + full indexer response) and one line per
@@ -85,13 +97,15 @@ struct KvIndexerCli {
     enable_logging: bool,
 
     /// Kubernetes namespace to watch for engine pods. Providing this together
-    /// with --watch-label enables pod auto-discovery (subscribe on Ready,
-    /// unsubscribe on delete).
+    /// with --watch-model-name (or --watch-label) enables pod auto-discovery
+    /// (subscribe on Ready, unsubscribe on delete).
     #[arg(long)]
     watch_namespace: Option<String>,
 
-    /// Label selector picking out this model's engine pods,
-    /// e.g. "engine_hash=d4b7a85131172ca6". Required with --watch-namespace.
+    /// Raw label selector picking out this model's engine pods, e.g.
+    /// "engine_hash=d4b7a85131172ca6". Overrides the selector derived from
+    /// --watch-model-name. Prefer --watch-model-name: engine_hash fragments
+    /// per GPU config, so a single-hash watch misses replicas.
     #[arg(long)]
     watch_label: Option<String>,
 
@@ -104,7 +118,12 @@ struct KvIndexerCli {
     #[arg(long)]
     watch_recover_port: Option<u16>,
 
-    /// Model name to register discovered pods under. Defaults to --model-name.
+    /// Model name whose engine pods to discover, e.g. "openai/gpt-oss-120b".
+    /// Unless --watch-label overrides it, the pod watch uses the selector
+    /// `di/model_name=<sanitized name>` (the stable label the backend stamps
+    /// on every engine pod, spanning all engine_hash variants). Discovered
+    /// pods are also registered under this name; defaults to --model-name
+    /// for registration when only --watch-label is given.
     #[arg(long)]
     watch_model_name: Option<String>,
 }
@@ -123,15 +142,24 @@ where
 
         init_standalone_logging();
 
-        // Build the optional Kubernetes discovery config. --watch-namespace and
-        // --watch-label must be supplied together; --block-size is then required
-        // because discovered engines are registered with it.
-        let kube_discovery = match (cli.watch_namespace, cli.watch_label) {
-            (Some(namespace), Some(label_selector)) => {
+        // Build the optional Kubernetes discovery config. --watch-namespace
+        // enables discovery and needs a selector source: --watch-label is used
+        // raw when given, otherwise the selector is derived from
+        // --watch-model-name (`di/model_name=<sanitized>`). --block-size is
+        // then required because discovered engines are registered with it.
+        let kube_discovery = match cli.watch_namespace {
+            Some(namespace) => {
+                let label_selector = match (cli.watch_label, cli.watch_model_name.as_deref()) {
+                    (Some(raw), _) => raw,
+                    (None, Some(model_name)) => {
+                        standalone_indexer::model_name_label_selector(model_name)
+                    }
+                    (None, None) => anyhow::bail!(
+                        "--watch-namespace requires --watch-model-name or --watch-label"
+                    ),
+                };
                 let block_size = cli.block_size.ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "--block-size is required when --watch-namespace/--watch-label are set"
-                    )
+                    anyhow::anyhow!("--block-size is required when --watch-namespace is set")
                 })?;
                 Some(KubeDiscoveryConfig {
                     namespace,
@@ -143,8 +171,13 @@ where
                     block_size,
                 })
             }
-            (None, None) => None,
-            _ => anyhow::bail!("--watch-namespace and --watch-label must be provided together"),
+            None if cli.watch_label.is_some() || cli.watch_model_name.is_some() => {
+                anyhow::bail!(
+                    "--watch-label/--watch-model-name require --watch-namespace to enable \
+                     pod discovery"
+                )
+            }
+            None => None,
         };
 
         let rt = tokio::runtime::Runtime::new()?;
@@ -156,7 +189,9 @@ where
             model_name: cli.model_name,
             tenant_id: cli.tenant_id,
             peers: cli.peers,
-            ignore_evictions: cli.ignore_evictions,
+            keep_evictions: cli.keep_evictions,
+            evict_retention_secs: cli.evict_retention_secs,
+            evict_memory_threshold: cli.evict_memory_threshold,
             enable_logging: cli.enable_logging,
             kube_discovery,
         }))
@@ -173,11 +208,30 @@ where
 
 #[cfg(feature = "kv-indexer")]
 fn init_standalone_logging() {
+    use std::sync::OnceLock;
+
+    // The guard owns the background writer thread; dropping it would flush
+    // and stop logging, so it lives for the life of the process.
+    static LOG_GUARD: OnceLock<tracing_appender::non_blocking::WorkerGuard> = OnceLock::new();
+
+    // Log lines are handed to a dedicated writer thread through a large
+    // in-memory buffer, keeping formatting/IO off the event hot path (the
+    // kv_audit target logs one line per engine event). `lossy(false)` blocks
+    // the caller instead of dropping lines if the buffer ever fills; at 512k
+    // buffered lines that should never happen in practice.
+    let (writer, guard) = tracing_appender::non_blocking::NonBlockingBuilder::default()
+        .buffered_lines_limit(512_000)
+        .lossy(false)
+        .thread_name("log-writer")
+        .finish(std::io::stdout());
+    let _ = LOG_GUARD.set(guard);
+
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
+        .with_writer(writer)
         .try_init();
 }
 

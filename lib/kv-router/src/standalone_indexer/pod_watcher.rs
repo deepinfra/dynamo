@@ -286,14 +286,11 @@ fn ready_pod_endpoint(pod: &Pod) -> Option<(String, String)> {
     let status = pod.status.as_ref()?;
     let ip = status.pod_ip.clone()?;
 
-    let ready = status
-        .conditions
-        .as_ref()
-        .is_some_and(|conditions| {
-            conditions
-                .iter()
-                .any(|c| c.type_ == "Ready" && c.status == "True")
-        });
+    let ready = status.conditions.as_ref().is_some_and(|conditions| {
+        conditions
+            .iter()
+            .any(|c| c.type_ == "Ready" && c.status == "True")
+    });
 
     if ready { Some((name, ip)) } else { None }
 }

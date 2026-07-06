@@ -16,6 +16,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::protocols::WorkerId;
 
+use super::evictions::PendingEvictions;
 use super::indexer::{Indexer, create_indexer};
 use super::listener::spawn_zmq_listener;
 
@@ -155,6 +156,10 @@ pub struct ListenerRecord {
     block_size: u32,
     indexer: Indexer,
     watermark: Arc<AtomicU64>,
+    /// Eviction events parked by `--keep-evictions` instead of being applied;
+    /// drained by the background sweep in [`super::evictions`]. Unused (and
+    /// empty) when the flag is off.
+    pending_evictions: Arc<Mutex<PendingEvictions>>,
     runtime: Mutex<ListenerRuntime>,
 }
 
@@ -172,6 +177,7 @@ impl ListenerRecord {
             block_size,
             indexer,
             watermark,
+            pending_evictions: Arc::new(Mutex::new(PendingEvictions::default())),
             runtime: Mutex::new(ListenerRuntime {
                 status: ListenerStatus::Pending,
                 last_error: None,
@@ -199,6 +205,10 @@ impl ListenerRecord {
 
     pub(super) fn watermark(&self) -> Arc<AtomicU64> {
         self.watermark.clone()
+    }
+
+    pub(super) fn pending_evictions(&self) -> Arc<Mutex<PendingEvictions>> {
+        self.pending_evictions.clone()
     }
 
     pub(super) fn start_pending(&self) -> (u64, CancellationToken) {
@@ -739,6 +749,23 @@ impl WorkerRegistry {
                     entry.value().indexer.clone(),
                     entry.value().block_size,
                 )
+            })
+            .collect()
+    }
+
+    /// Every live listener as `(worker_id, dp_rank, record)`, for the
+    /// keep-evictions sweep to drain each worker's pending-eviction buffer.
+    pub(super) fn listener_records(&self) -> Vec<(WorkerId, u32, Arc<ListenerRecord>)> {
+        self.workers
+            .iter()
+            .flat_map(|entry| {
+                let worker_id = *entry.key();
+                entry
+                    .value()
+                    .listeners
+                    .iter()
+                    .map(|(dp_rank, record)| (worker_id, *dp_rank, record.clone()))
+                    .collect::<Vec<_>>()
             })
             .collect()
     }

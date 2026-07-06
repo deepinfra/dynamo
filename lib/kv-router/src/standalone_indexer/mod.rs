@@ -23,6 +23,7 @@
 //! Tier counts are CUMULATIVE through each tier's walk — see the doc on the
 //! response struct in [`server`] for the exact semantics.
 
+pub mod evictions;
 pub mod indexer;
 pub mod listener;
 pub mod metrics;
@@ -49,13 +50,15 @@ use server::{AppState, create_router};
 // in the hot listener path.  `OnceLock` is free after the first `get()`
 // (it is a thin wrapper around `Option`) and suits flags that are written
 // exactly once and read many times.
-static IGNORE_EVICTIONS: OnceLock<bool> = OnceLock::new();
+static KEEP_EVICTIONS: OnceLock<bool> = OnceLock::new();
 static ENABLE_LOGGING: OnceLock<bool> = OnceLock::new();
 
-/// Returns `true` when this indexer instance should drop `Removed` and
-/// `Cleared` events, simulating a tree with infinite memory capacity.
-pub(crate) fn ignore_evictions() -> bool {
-    *IGNORE_EVICTIONS.get().unwrap_or(&false)
+/// Returns `true` when this indexer instance parks `Removed` events in the
+/// per-listener pending-evictions buffer (and drops `Cleared`) instead of
+/// applying them, approximating a tree with infinite memory capacity. Aged
+/// entries are replayed under memory pressure — see [`evictions`].
+pub(crate) fn keep_evictions() -> bool {
+    *KEEP_EVICTIONS.get().unwrap_or(&false)
 }
 
 /// Returns `true` when verbose audit logging is enabled. When on, the query
@@ -76,6 +79,38 @@ pub(crate) fn now_unix_millis() -> u64 {
         .unwrap_or(0)
 }
 
+/// Label key the backend stamps on every engine pod with the sanitized model
+/// name. Stable across GPU configs and engine versions, unlike `engine_hash`,
+/// which fragments per GPU config (B200 vs B300 replicas of the same model
+/// get different hashes).
+pub const MODEL_NAME_LABEL: &str = "di/model_name";
+
+/// Sanitize a model name into the backend's `di/model_name` label value:
+/// lowercase, then every char NOT in `[a-z0-9-]` becomes `-`. This MUST match
+/// the backend's `re.sub('[^a-z0-9-]', '-', name.lower())` exactly — if the
+/// two drift, the derived selector matches zero pods.
+pub fn sanitize_model_name_label(name: &str) -> String {
+    name.to_lowercase()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+/// Kubernetes label selector matching every engine pod of `model_name`,
+/// across all engine_hash variants: `di/model_name=<sanitized>`.
+pub fn model_name_label_selector(model_name: &str) -> String {
+    format!(
+        "{MODEL_NAME_LABEL}={}",
+        sanitize_model_name_label(model_name)
+    )
+}
+
 /// Configuration for Kubernetes pod auto-discovery.
 ///
 /// Plain data (no `kube` types) so it can live in the always-compiled config
@@ -85,8 +120,9 @@ pub(crate) fn now_unix_millis() -> u64 {
 pub struct KubeDiscoveryConfig {
     /// Namespace to watch for engine pods.
     pub namespace: String,
-    /// Label selector that picks out this model's engine pods,
-    /// e.g. `engine_hash=d4b7a85131172ca6`.
+    /// Label selector that picks out this model's engine pods. Either derived
+    /// from the model name (`di/model_name=<sanitized>`, spans every
+    /// engine_hash) or supplied raw, e.g. `engine_hash=d4b7a85131172ca6`.
     pub label_selector: String,
     /// ZMQ KV-event port the engines publish on (e.g. 5557).
     pub zmq_port: u16,
@@ -112,10 +148,18 @@ pub struct IndexerConfig {
     pub peers: Option<String>,
     /// When set, watch Kubernetes and auto-register/deregister engine pods.
     pub kube_discovery: Option<KubeDiscoveryConfig>,
-    /// Drop `Removed` and `Cleared` events before applying to the tree.
-    /// Simulates infinite memory (evictions never happen). Useful for the
-    /// "ideal ceiling" measurement mode.
-    pub ignore_evictions: bool,
+    /// Park `Removed` events in a buffer (and drop `Cleared`) instead of
+    /// applying them, approximating infinite memory for the "ideal ceiling"
+    /// measurement mode. Entries older than `evict_retention_secs` are
+    /// replayed into the tree once memory usage crosses
+    /// `evict_memory_threshold` of the cgroup limit.
+    pub keep_evictions: bool,
+    /// Minimum age (seconds) a parked eviction must reach before the sweep
+    /// may replay it. Only meaningful with `keep_evictions`.
+    pub evict_retention_secs: u64,
+    /// Fraction of the memory limit (0..1] above which the sweep replays
+    /// aged evictions. Only meaningful with `keep_evictions`.
+    pub evict_memory_threshold: f64,
     /// Emit verbose per-query and per-event audit logs on the `kv_audit`
     /// tracing target. See [`logging_enabled`].
     pub enable_logging: bool,
@@ -224,7 +268,7 @@ pub async fn run_server(config: IndexerConfig) -> anyhow::Result<()> {
     // Set process-global filter flags before spawning any listeners.
     // `set` returns Err if already set; that should never happen since
     // run_server is called once, so we discard the result.
-    let _ = IGNORE_EVICTIONS.set(config.ignore_evictions);
+    let _ = KEEP_EVICTIONS.set(config.keep_evictions);
     let _ = ENABLE_LOGGING.set(config.enable_logging);
     if config.enable_logging {
         tracing::info!(
@@ -263,6 +307,26 @@ pub async fn run_server(config: IndexerConfig) -> anyhow::Result<()> {
     );
 
     let registry = Arc::new(WorkerRegistry::new(config.threads));
+
+    if config.keep_evictions {
+        anyhow::ensure!(
+            config.evict_memory_threshold > 0.0 && config.evict_memory_threshold <= 1.0,
+            "--evict-memory-threshold must be in (0, 1], got {}",
+            config.evict_memory_threshold
+        );
+        evictions::spawn_cleanup_loop(
+            registry.clone(),
+            config.evict_retention_secs,
+            config.evict_memory_threshold,
+            cancel_token.clone(),
+        );
+        tracing::info!(
+            retention_secs = config.evict_retention_secs,
+            memory_threshold = config.evict_memory_threshold,
+            "keep-evictions enabled: parking eviction events, sweeping under memory pressure"
+        );
+    }
+
     run_common(&config, &registry, cancel_token).await
 }
 
@@ -387,6 +451,33 @@ async fn run_common(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The sanitization contract with the backend, verbatim. The backend
+    /// stamps pods with `re.sub('[^a-z0-9-]', '-', name.lower())`; if these
+    /// exact outputs drift from that, the derived selector matches zero pods.
+    #[test]
+    fn test_model_name_label_selector_matches_backend_contract() {
+        assert_eq!(
+            model_name_label_selector("openai/gpt-oss-120b"),
+            "di/model_name=openai-gpt-oss-120b"
+        );
+        assert_eq!(
+            model_name_label_selector("meta-llama/Llama-3.3-70B"),
+            "di/model_name=meta-llama-llama-3-3-70b"
+        );
+        assert_eq!(
+            model_name_label_selector("Qwen/Qwen2.5-72B-Instruct"),
+            "di/model_name=qwen-qwen2-5-72b-instruct"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_model_name_label_replaces_every_disallowed_char() {
+        // '/', '.', uppercase, '_', and non-ASCII all become '-'.
+        assert_eq!(sanitize_model_name_label("A_b.c/Dé9-"), "a-b-c-d-9-");
+        // Already-clean names pass through untouched.
+        assert_eq!(sanitize_model_name_label("gpt-oss-20b"), "gpt-oss-20b");
+    }
 
     #[test]
     fn test_parse_workers() {
