@@ -55,6 +55,10 @@ pub struct RegisterRequest {
     /// their own salt internally. Plumbed for forward compatibility.
     #[serde(default, alias = "additionalsalt")]
     pub additional_salt: Option<String>,
+    /// Optional raw pod name, surfaced in `/workers` and `/query` responses.
+    /// Purely informational; `instance_id` remains the canonical key.
+    #[serde(default)]
+    pub pod_name: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -119,6 +123,9 @@ struct ScoreResponse {
 /// and is useful as a single-number "best prefix length" the gateway can use.
 #[derive(Serialize, Default)]
 struct InstanceTierBreakdown {
+    /// Raw pod name of the worker, when known (pod-watcher registrations).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pod_name: Option<String>,
     longest_matched: u32,
     gpu: u32,
     /// Per-`dp_rank` device-tier match counts.
@@ -150,6 +157,7 @@ async fn register(
             req.tenant_id,
             req.block_size,
             req.recover_endpoint,
+            req.pod_name,
         )
         .await
     {
@@ -224,7 +232,11 @@ async fn list_workers(
 /// (Mooncake RFC #1403) shapes from a tiered match result.
 ///
 /// All token counts are scaled from blocks → tokens via `block_size`.
-fn build_score_response(tiered: &TieredMatchDetails, block_size: u32) -> ScoreResponse {
+fn build_score_response(
+    tiered: &TieredMatchDetails,
+    block_size: u32,
+    pod_names: &HashMap<WorkerId, String>,
+) -> ScoreResponse {
     // Flat fields (unchanged) come from the device-tier overlap.
     let device = &tiered.device.overlap_scores;
 
@@ -287,6 +299,9 @@ fn build_score_response(tiered: &TieredMatchDetails, block_size: u32) -> ScoreRe
 
         let entry = instances.entry(worker.worker_id.to_string()).or_default();
 
+        if entry.pod_name.is_none() {
+            entry.pod_name = pod_names.get(&worker.worker_id).cloned();
+        }
         entry.dp.insert(worker.dp_rank.to_string(), gpu_tokens);
         entry.gpu = entry.gpu.max(gpu_tokens);
         entry.cpu = entry.cpu.max(cpu_tokens);
@@ -323,6 +338,7 @@ async fn run_tiered_query(
     indexer: &Indexer,
     block_hashes: Vec<LocalBlockHash>,
     block_size: u32,
+    pod_names: &HashMap<WorkerId, String>,
     audit: QueryAudit<'_>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     // Snapshot the raw hashes for logging up front (find_tiered_matches takes
@@ -333,7 +349,7 @@ async fn run_tiered_query(
     let (status, body) = match indexer.find_tiered_matches(block_hashes).await {
         Ok(tiered) => (
             StatusCode::OK,
-            serde_json::json!(build_score_response(&tiered, block_size)),
+            serde_json::json!(build_score_response(&tiered, block_size, pod_names)),
         ),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -391,6 +407,7 @@ async fn query(
         &indexer,
         block_hashes,
         block_size,
+        &state.registry.pod_names(),
         QueryAudit {
             model_name: &key.model_name,
             tenant_id: &key.tenant_id,
@@ -428,6 +445,7 @@ async fn query_by_hash(
         &indexer,
         block_hashes,
         block_size,
+        &state.registry.pod_names(),
         QueryAudit {
             model_name: &key.model_name,
             tenant_id: &key.tenant_id,
@@ -673,7 +691,7 @@ mod tests {
 
         let sequence = vec![LocalBlockHash(11), LocalBlockHash(12), LocalBlockHash(13)];
         let tiered = indexer.find_tiered_matches(sequence).await.unwrap();
-        let response = build_score_response(&tiered, block_size);
+        let response = build_score_response(&tiered, block_size, &HashMap::new());
 
         // Flat shape (legacy callers) carries device-tier overlap scaled by block_size.
         assert_eq!(
@@ -785,6 +803,7 @@ mod tests {
                 "acme".to_string(),
                 4,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -798,6 +817,7 @@ mod tests {
                 "mistral".to_string(),
                 "acme".to_string(),
                 8,
+                None,
                 None,
             )
             .await

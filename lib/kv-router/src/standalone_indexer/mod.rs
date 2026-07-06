@@ -377,6 +377,7 @@ async fn run_common(
                     config.tenant_id.clone(),
                     block_size,
                     None,
+                    None,
                 )
                 .await?;
         }

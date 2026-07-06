@@ -108,6 +108,11 @@ pub struct ListenerInfo {
 #[derive(Debug, Clone, Serialize)]
 pub struct WorkerInfo {
     instance_id: WorkerId,
+    /// Raw pod name this worker was discovered under (pod-watcher
+    /// registrations, or callers that pass one). `instance_id` stays the
+    /// canonical key; this is purely informational.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pod_name: Option<String>,
     source: WorkerSource,
     status: ListenerStatus,
     model_name: String,
@@ -319,6 +324,7 @@ impl ListenerRecord {
 
 pub struct WorkerEntry {
     key: IndexerKey,
+    pod_name: Option<String>,
     listeners: HashMap<u32, Arc<ListenerRecord>>,
 }
 
@@ -391,6 +397,7 @@ impl WorkerRegistry {
         tenant_id: String,
         block_size: u32,
         recover_endpoint: Option<String>,
+        pod_name: Option<String>,
     ) -> Result<()> {
         let key = IndexerKey {
             model_name,
@@ -459,8 +466,12 @@ impl WorkerRegistry {
                 .entry(instance_id)
                 .or_insert_with(|| WorkerEntry {
                     key: key.clone(),
+                    pod_name: None,
                     listeners: HashMap::new(),
                 });
+            if pod_name.is_some() {
+                entry.pod_name = pod_name;
+            }
             entry.listeners.insert(dp_rank, record.clone());
         }
 
@@ -699,6 +710,7 @@ impl WorkerRegistry {
                 let status = ListenerStatus::aggregate(listeners.values().map(|info| info.status));
                 Some(WorkerInfo {
                     instance_id: *entry.key(),
+                    pod_name: worker.pod_name.clone(),
                     source: WorkerSource::Zmq,
                     status,
                     model_name: key.model_name.clone(),
@@ -749,6 +761,20 @@ impl WorkerRegistry {
                     entry.value().indexer.clone(),
                     entry.value().block_size,
                 )
+            })
+            .collect()
+    }
+
+    /// Known pod names by worker id, for enriching query responses.
+    pub fn pod_names(&self) -> HashMap<WorkerId, String> {
+        self.workers
+            .iter()
+            .filter_map(|entry| {
+                entry
+                    .value()
+                    .pod_name
+                    .clone()
+                    .map(|pod_name| (*entry.key(), pod_name))
             })
             .collect()
     }
@@ -819,6 +845,7 @@ mod tests {
                 "default".to_string(),
                 1,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -850,6 +877,7 @@ mod tests {
                 "default".to_string(),
                 1,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -862,6 +890,7 @@ mod tests {
                 "test-model".to_string(),
                 "default".to_string(),
                 1,
+                None,
                 None,
             )
             .await
@@ -899,6 +928,7 @@ mod tests {
                 "default".to_string(),
                 1,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -921,6 +951,7 @@ mod tests {
                 "test-model".to_string(),
                 "default".to_string(),
                 1,
+                None,
                 None,
             )
             .await
@@ -950,6 +981,7 @@ mod tests {
                 "test-model".to_string(),
                 "default".to_string(),
                 1,
+                None,
                 None,
             )
             .await
@@ -984,6 +1016,7 @@ mod tests {
                 "acme".to_string(),
                 4,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -996,6 +1029,7 @@ mod tests {
                 "mistral".to_string(),
                 "acme".to_string(),
                 8,
+                None,
                 None,
             )
             .await
@@ -1027,6 +1061,7 @@ mod tests {
                 "acme".to_string(),
                 4,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -1039,6 +1074,7 @@ mod tests {
                 "mistral".to_string(),
                 "acme".to_string(),
                 8,
+                None,
                 None,
             )
             .await
@@ -1066,6 +1102,7 @@ mod tests {
                 "acme".to_string(),
                 4,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -1078,6 +1115,7 @@ mod tests {
                 "llama3".to_string(),
                 "other-tenant".to_string(),
                 4,
+                None,
                 None,
             )
             .await
@@ -1120,6 +1158,7 @@ mod tests {
             99u64,
             WorkerEntry {
                 key,
+                pod_name: None,
                 listeners: HashMap::new(),
             },
         );

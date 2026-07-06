@@ -209,6 +209,7 @@ async fn reconcile(
                 config.tenant_id.clone(),
                 config.block_size,
                 recover_endpoint,
+                Some(name.clone()),
             )
             .await
         {
