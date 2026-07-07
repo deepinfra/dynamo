@@ -1,0 +1,17 @@
+diff --git a/fastvideo/entrypoints/video_generator.py b/fastvideo/entrypoints/video_generator.py
+index bfc1633..ef4f213 100644
+--- a/fastvideo/entrypoints/video_generator.py
++++ b/fastvideo/entrypoints/video_generator.py
+@@ -1010,6 +1010,12 @@ class VideoGenerator:
+             video_stream.options = {
+                 "preset": "ultrafast",
+                 "tune": "zerolatency",
++                # Skip x264's scene-cut cost analysis: a pure encode-speed lever
++                # with no quality/compat effect for our fixed-GOP single-file
++                # output. Env-configurable (mirrors FASTVIDEO_X264_THREADS /
++                # FASTVIDEO_X264_PRESET below) so it's opt-out per model without
++                # a rebuild. Measured ~50-100ms/clip (deepinfra, 2026-07-07).
++                "x264-params": f"scenecut={os.getenv('FASTVIDEO_X264_SCENECUT', '0')}",
+             }
+ 
+             audio_stream = output.add_stream("aac", rate=sample_rate, layout=layout)
