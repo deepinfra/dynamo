@@ -28,12 +28,18 @@ landscape, 121 frames @ 24fps, guidance 1.0, negative "", refine upsampler =
 <model>/spatial_upscaler, vae_tiling False, the Blackwell Inductor
 knobs (factory.py: shape_padding=False etc.), LD_LIBRARY_PATH unset, cu128 env.
 
-Attention backend is per-profile (see profile_attention_backend): QUALITY uses
-FLASH_ATTN (FastVideo's SM100/SM103 fast kernels, what prod runs); SPEED uses
-TORCH_SDPA -- the config we validated end-to-end on B200 (~10s, quality OK'd by
-Johan). FastVideo's own streaming_demo speed path uses FLASH_ATTN (faster,
-~4.5s), but SPEED+FLASH_ATTN is NOT something we have validated, so we ship the
-attention we tested. Revisit with worker.py --attention-backend.
+Attention backend is per-profile (see profile_attention_backend): both QUALITY
+and SPEED use FLASH_ATTN -- FastVideo's SM100/SM103 FA4 kernels, matching their
+actual streaming_demo speed recipe. SPEED previously shipped TORCH_SDPA as a
+stand-in (~10.4s, quality OK'd by Johan) because FA4 (flash-attn-cute) didn't
+build: the pinned XOR-op fork was stale against cutlass-dsl 4.5+ API moves
+(cute.core.ThrMma, cute.make_fragment renamed/moved). FastVideo hit the same
+break and fixed it 2026-07-06 (hao-ai-lab/FastVideo#1564): they dropped the fork
+and now pin flash-attn-4 straight from Dao-AILab/flash-attention upstream at a
+CuTe-DSL-4.6-compatible commit. Reproducing that exact fix (+ FastVideo's own
+matching `[:2]` tuple-unpack fix in their flash_attn_cute.py wrapper) gets FA4
+working end-to-end: ~7.3s warm, quality OK'd by Johan as on par or better than
+TORCH_SDPA. Override with worker.py --attention-backend to revisit TORCH_SDPA.
 
 Changing any of these requires a coordinated re-bake (the compile cache is keyed
 on the kwargs + shape). Do NOT hand-edit values away from the FastVideo source.
@@ -130,15 +136,18 @@ def profile_uses_nvfp4(profile: str) -> bool:
 def profile_attention_backend(profile: str) -> str:
     """Attention backend per profile.
 
-    QUALITY -> FLASH_ATTN (FastVideo's SM100/SM103 fast kernels; what prod runs).
-    SPEED   -> TORCH_SDPA: the config validated end-to-end on B200 (~10s,
-    quality OK'd). FastVideo's streaming_demo speed path actually uses FLASH_ATTN
-    (faster, ~4.5s), but we have NOT validated SPEED+FLASH_ATTN ourselves, so we
-    ship the attention we tested. Bake (warmup) and serve (worker) both derive
-    the default from here so the compile cache always matches; override with
-    worker.py --attention-backend to revisit FLASH_ATTN.
+    Both QUALITY and SPEED -> FLASH_ATTN (FastVideo's SM100/SM103 FA4 kernels),
+    matching FastVideo's actual recipes. Validated for SPEED 2026-07-08: ~7.3s
+    warm (down from TORCH_SDPA's ~10.4s), quality OK'd by Johan as on par or
+    better. Requires the flash-attn-4 install pinned to a CuTe-DSL-4.6-compatible
+    commit (see Dockerfile.dreamverse) + the matching fastvideo wrapper patch
+    (patches/flash-attn-cute-fa4-tuple-fix.patch) -- without both, FA4 fails to
+    import/run and this setting would silently break the worker. Bake (warmup)
+    and serve (worker) both derive the default from here so the compile cache
+    always matches; override with worker.py --attention-backend to revisit
+    TORCH_SDPA.
     """
-    return "TORCH_SDPA" if (profile or "quality").strip().lower() == "speed" else "FLASH_ATTN"
+    return "FLASH_ATTN"
 
 
 def profile_default_optimizations(profile: str) -> bool:

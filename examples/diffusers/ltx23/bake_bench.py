@@ -12,12 +12,20 @@ import asyncio, logging, os, sys, time
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from lib.pool import SubprocessPool
+from ltx23.config import profile_attention_backend
 
 OUT = os.environ.get("BENCH_OUT", "/tmp/bench-out")
 os.makedirs(OUT, exist_ok=True)
 W, H, NF, FPS, STEPS, GS = 1920, 1088, 121, 24, 5, 1.0
 SHAPE = "%dx%d@%df" % (W, H, NF)
-MAX_WARM_S = float(os.environ.get("LTX23_MAX_WARM_S", "14"))
+# Derive from the profile (same source as ltx23/worker.py + warmup.py) instead
+# of hardcoding a backend -- a hardcoded value silently drifts from whatever
+# the served profile actually uses, baking the WRONG kernels into Mega-Cache.
+PROFILE = os.environ.get("LTX23_PROFILE", "speed")
+ATTENTION_BACKEND = os.environ.get(
+    "FASTVIDEO_ATTENTION_BACKEND", profile_attention_backend(PROFILE)
+)
+MAX_WARM_S = float(os.environ.get("LTX23_MAX_WARM_S", "10"))
 I2V_IMAGE = os.environ.get("LTX23_I2V_IMAGE", "/work/joy_nordic_woman_mid.png")
 T2V_PROMPTS = [
     ("musician", "A street musician in her thirties sings and strums an acoustic guitar on a sunny city sidewalk, natural human face, photorealistic, sharp focus."),
@@ -39,7 +47,7 @@ def req(tag: str, prompt: str, **extra) -> dict:
 async def main(mode: str) -> int:
     pool = SubprocessPool(
         model_path=os.environ.get("LTX23_MODEL_PATH", "/models/ltx-2.3-distilled-diffusers"),
-        num_gpus=1, enable_optimizations=True, attention_backend="TORCH_SDPA",
+        num_gpus=1, enable_optimizations=True, attention_backend=ATTENTION_BACKEND,
         model_factory_dotted="ltx23.factory:load_model", model_label="ltx23-bake",
     )
     warm_times: list[tuple[str, float]] = []
@@ -62,11 +70,17 @@ async def main(mode: str) -> int:
         print("BAKE_BENCH_DONE mode=%s" % mode, flush=True)
     finally:
         await pool.shutdown()
-    slow = [(tag, dt) for tag, dt in warm_times[1:] or warm_times if dt > MAX_WARM_S]
-    if slow:
-        print("LATENCY GATE FAILED (> %.0fs warm): %s -- do NOT ship this bake; "
-              "check the preset boot log and recent env/package changes." % (MAX_WARM_S, slow), flush=True)
-        return 1
+    # Latency gate only applies to the t2v pass: there the first gen is the cold
+    # compile and the rest (warm_times[1:]) are genuinely warm cache hits. The
+    # i2v pass has a single gen that is ALWAYS a cold compile (it exists to
+    # extend the Mega-Cache blob with i2v graphs), so there is no warm sample to
+    # gate -- skip it there to avoid a guaranteed false-positive failure.
+    if mode == "t2v":
+        slow = [(tag, dt) for tag, dt in warm_times[1:] if dt > MAX_WARM_S]
+        if slow:
+            print("LATENCY GATE FAILED (> %.0fs warm): %s -- do NOT ship this bake; "
+                  "check the preset boot log and recent env/package changes." % (MAX_WARM_S, slow), flush=True)
+            return 1
     return 0
 
 

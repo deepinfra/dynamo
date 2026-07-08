@@ -1,0 +1,22 @@
+diff --git a/fastvideo/attention/utils/flash_attn_cute.py b/fastvideo/attention/utils/flash_attn_cute.py
+index 99cb5c7..38d2d88 100644
+--- a/fastvideo/attention/utils/flash_attn_cute.py
++++ b/fastvideo/attention/utils/flash_attn_cute.py
+@@ -37,7 +37,7 @@ def _flash_attn_cute_forward(
+         softcap=0.0,
+         num_splits=1,
+         pack_gqa=None,
+-    )
++    )[:2]
+     return out, lse
+ 
+ 
+@@ -129,7 +129,7 @@ def _flash_attn_cute_varlen_forward(
+         softcap=0.0,
+         num_splits=1,
+         pack_gqa=None,
+-    )
++    )[:2]
+     return out, lse
+ 
+ 
