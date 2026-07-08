@@ -31,7 +31,13 @@ pub fn compute_block_hash(data: &[u8]) -> LocalBlockHash {
 pub struct BlockHashOptions<'a> {
     pub block_mm_infos: Option<&'a [Option<BlockExtraInfo>]>,
     pub lora_name: Option<&'a str>,
+    pub cache_namespace: Option<&'a str>,
     pub is_eagle: Option<bool>,
+}
+
+fn block_hash_seed(options: BlockHashOptions<'_>) -> u64 {
+    dynamo_kv_hashing::compute_salt_hash(options.cache_namespace, options.lora_name)
+        .expect("string salt derivation is infallible")
 }
 
 #[inline]
@@ -57,18 +63,29 @@ fn hash_block_no_mm(chunk: &[u32], seed: u64, scratch_bytes: &mut Vec<u8>) -> Lo
     }
 }
 
-/// Compute the hash for a sequence of tokens, optionally including multimodal metadata
-/// and LoRA adapter identity.
+/// sglang's `MultimodalItem._compute_pad_value` constants — must track upstream;
+/// if they drift, MM routing silently degrades to text-prefix. Pinned by
+/// `pad_value_matches_sglang_protocol`.
+pub const MM_PAD_SHIFT_VALUE: u64 = 1_000_000;
+pub const MM_PAD_HASH_MASK: u64 = (1 << 30) - 1;
+
+/// Canonical per-image pad_value from a routing-side `mm_hash`, called by both
+/// the frontend and the kv-router so request- and event-side hashes agree.
+/// Keeps the low 30 bits only (sglang's limit).
+pub fn pad_value_for_mm_hash(mm_hash: u64) -> u32 {
+    (MM_PAD_SHIFT_VALUE + (mm_hash & MM_PAD_HASH_MASK)) as u32
+}
+
+/// Compute the hash for a sequence of tokens, optionally including multimodal metadata,
+/// LoRA adapter identity, and cache namespace.
 ///
 /// When multimodal extra info is provided, the mm_hashes are included in the hash computation
 /// to ensure that blocks with identical tokens but different multimodal objects produce
 /// different hashes.
 ///
-/// When `lora_name` is provided, the adapter name is mixed into the XXH3 seed so that
-/// blocks cached under different LoRA adapters (or the base model) produce distinct hashes.
-/// Because LoRA identity applies uniformly to every block in a sequence, encoding it in the
-/// seed is more efficient than appending per-block bytes and matches the approach used by
-/// KVBM's `SaltHash`.
+/// When `lora_name` or `cache_namespace` is provided, those request-wide identities are
+/// mixed into the XXH3 seed so blocks cached under different adapters or namespaces produce
+/// distinct hashes. Empty strings are treated as absent.
 pub fn compute_block_hash_for_seq(
     tokens: &[u32],
     kv_block_size: u32,
@@ -78,10 +95,7 @@ pub fn compute_block_hash_for_seq(
         return Vec::new();
     }
 
-    let seed = match options.lora_name.filter(|n| !n.is_empty()) {
-        Some(name) => XXH3_SEED.wrapping_add(xxh3::xxh3_64(name.as_bytes())),
-        None => XXH3_SEED,
-    };
+    let seed = block_hash_seed(options);
     let is_eagle_flag = options.is_eagle.unwrap_or(false);
     let stride = kv_block_size as usize;
     let window_size = if is_eagle_flag { stride + 1 } else { stride };
@@ -166,9 +180,16 @@ pub trait WorkerConfigLike {
     fn data_parallel_size(&self) -> u32;
     fn max_num_batched_tokens(&self) -> Option<u64>;
     fn total_kv_blocks(&self) -> Option<u64>;
+
+    /// Tokens retained by the backend's native KV offloading tier, if available.
+    fn native_offloading_capacity_tokens(&self) -> Option<u64> {
+        None
+    }
+
     fn taints(&self) -> &HashSet<String> {
         &EMPTY_WORKER_TAINTS
     }
+
     /// Stable identifier for the worker, preserved across process restarts.
     ///
     /// In Kubernetes StatefulSet deployments this is the pod hostname (`worker-0`, `worker-1`,
@@ -179,8 +200,46 @@ pub trait WorkerConfigLike {
     fn stable_routing_id(&self) -> Option<&str> {
         None
     }
+
+    /// Returns the worker's topology domain labels (e.g. {"zone": "us-east-1a", "rack": "rack1"}).
+    /// Topology-aware routing turns these labels into canonical worker taints such as
+    /// `dynamo.topology/zone=us-east-1a`.
+    /// Returns `None` by default for backward compatibility.
+    fn topology_domains(&self) -> Option<&HashMap<String, String>> {
+        None
+    }
+
+    /// Returns the topology domain to enforce for KV-cache transfers (e.g. "zone").
+    /// When set, decode worker selection is constrained to workers sharing the same
+    /// topology domain value as the prefill worker.
+    fn kv_transfer_domain(&self) -> Option<&str> {
+        None
+    }
+
+    /// Returns the KV transfer topology enforcement mode.
+    fn kv_transfer_enforcement(&self) -> Option<KvTransferEnforcement> {
+        None
+    }
+
+    /// Returns the taint preference weight used when KV transfer topology enforcement is preferred.
+    fn kv_transfer_preferred_weight(&self) -> Option<f32> {
+        None
+    }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum KvTransferEnforcement {
+    /// Put the generated topology taint in `RoutingConstraints.required_taints`.
+    Required,
+    /// Put the generated topology taint in `RoutingConstraints.preferred_taints`.
+    Preferred,
+}
+
+/// Request-level taint constraints evaluated against each worker's published taints.
+///
+/// Topology-aware routing uses the same fields with canonical taints such as
+/// `dynamo.topology/zone=us-east-1a`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct RoutingConstraints {
     #[serde(default, skip_serializing_if = "HashSet::is_empty")]
@@ -290,7 +349,7 @@ impl StorageTier {
     pub fn from_kv_medium(medium: &str) -> Option<Self> {
         match medium {
             "GPU" | "DEVICE" => Some(Self::Device),
-            "CPU_PINNED" | "CPU_TIER1" => Some(Self::HostPinned),
+            "CPU" | "CPU_PINNED" | "CPU_TIER1" => Some(Self::HostPinned),
             "CPU_TIER2" | "DISK" | "NVME" => Some(Self::Disk),
             "EXTERNAL" | "NETWORK" | "REMOTE" | "SHARED" => Some(Self::External),
             _ => None,
@@ -385,8 +444,30 @@ pub enum RouterRequest {
         block_mm_infos: Option<Vec<Option<BlockExtraInfo>>>,
         #[serde(default, skip_serializing_if = "RoutingConstraints::is_empty")]
         routing_constraints: RoutingConstraints,
+        #[serde(default)]
+        priority_jump: f64,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        strict_priority: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lora_name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_namespace: Option<String>,
     },
-    MarkPrefill,
+    PotentialLoads {
+        tokens: Vec<Token>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        block_mm_infos: Option<Vec<Option<BlockExtraInfo>>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lora_name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_namespace: Option<String>,
+    },
+    MarkPrefill {
+        // once prefill completes, the frontend might not be allowed to send a
+        // request with linking the id. In this case, the request_id is provided in the payload.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
+    },
     MarkFree {
         // once request is cancelled, the frontend might not be allowed to send a
         // request with linking the id. In this case, the request_id is provided in the payload.
@@ -401,8 +482,26 @@ impl Default for RouterRequest {
             tokens: vec![],
             block_mm_infos: None,
             routing_constraints: RoutingConstraints::default(),
+            priority_jump: 0.0,
+            strict_priority: 0,
+            lora_name: None,
+            cache_namespace: None,
         }
     }
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PotentialLoad {
+    pub worker_id: WorkerId,
+    pub dp_rank: DpRank,
+    pub potential_prefill_tokens: usize,
+    pub potential_decode_blocks: usize,
+    #[serde(default)]
+    pub active_requests: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -414,11 +513,23 @@ pub enum RouterResponse {
         dp_rank: DpRank,
         overlap_blocks: u32,
     },
+    QueueRejected {
+        rejection: crate::scheduling::QueueRejection,
+    },
     PrefillMarked {
         success: bool,
     },
     FreeMarked {
         success: bool,
+    },
+    PotentialLoads {
+        // loads of every worker tracked by the scheduler.
+        loads: Vec<PotentialLoad>,
+        // the queue sizes for this specific router instance.
+        #[serde(default)]
+        pending_count: usize,
+        #[serde(default)]
+        pending_isl_tokens: usize,
     },
 }
 
@@ -531,6 +642,8 @@ pub enum ActiveSequenceEventData {
         #[serde(default)]
         prefill_load_hint: Option<PrefillLoadHint>,
     },
+    // NOTE: Output-block growth is intentionally not a replica-sync event. It can occur
+    // at high frequency, and broadcasting it would consume disproportionate network bandwidth.
     Free,
     MarkPrefillCompleted,
 }
@@ -895,7 +1008,7 @@ impl OverlapScores {
     pub fn new() -> Self {
         Self {
             scores: FxHashMap::default(),
-            frequencies: Vec::with_capacity(32),
+            frequencies: Vec::new(),
         }
     }
 
@@ -911,16 +1024,6 @@ impl OverlapScores {
         for worker in workers {
             let score = self.scores.entry(*worker).or_insert(0);
             *score += 1;
-        }
-    }
-
-    /// Add an entry in the frequency list.
-    pub fn add_frequency(&mut self, frequency: usize) {
-        if frequency != 0 {
-            self.frequencies
-                .last()
-                .inspect(|elem| debug_assert!(**elem >= frequency));
-            self.frequencies.push(frequency);
         }
     }
 }
@@ -941,6 +1044,7 @@ pub struct TokensWithHashes {
     block_size: u32,
     block_mm_infos: Option<Vec<Option<BlockExtraInfo>>>,
     lora_name: Option<String>,
+    cache_namespace: Option<String>,
     block_hashes: Option<Vec<LocalBlockHash>>,
     seq_hashes: Option<Vec<SequenceHash>>,
     is_eagle: Option<bool>,
@@ -954,6 +1058,7 @@ impl TokensWithHashes {
             block_size,
             block_mm_infos: None,
             lora_name: None,
+            cache_namespace: None,
             block_hashes: None,
             seq_hashes: None,
             is_eagle: None,
@@ -963,12 +1068,21 @@ impl TokensWithHashes {
     /// Adds multimodal extra info for blocks.
     pub fn with_mm_infos(mut self, infos: Vec<Option<BlockExtraInfo>>) -> Self {
         self.block_mm_infos = Some(infos);
+        self.invalidate_hashes();
         self
     }
 
     /// Sets the LoRA adapter name for hash computation.
     pub fn with_lora_name(mut self, name: String) -> Self {
         self.lora_name = Some(name);
+        self.invalidate_hashes();
+        self
+    }
+
+    /// Sets the cache namespace for hash computation.
+    pub fn with_cache_namespace(mut self, namespace: String) -> Self {
+        self.cache_namespace = Some(namespace);
+        self.invalidate_hashes();
         self
     }
 
@@ -986,6 +1100,10 @@ impl TokensWithHashes {
         }
 
         self.is_eagle = is_eagle;
+        self.invalidate_hashes();
+    }
+
+    fn invalidate_hashes(&mut self) {
         self.block_hashes = None;
         self.seq_hashes = None;
     }
@@ -1024,6 +1142,7 @@ impl TokensWithHashes {
                 BlockHashOptions {
                     block_mm_infos: self.block_mm_infos.as_deref(),
                     lora_name: self.lora_name.as_deref(),
+                    cache_namespace: self.cache_namespace.as_deref(),
                     is_eagle: self.is_eagle,
                 },
             ));
@@ -1063,6 +1182,28 @@ mod tests {
     use rstest::rstest;
     use serde_json;
 
+    /// Pin the sglang pad_value constants and formula against upstream
+    /// `MultimodalItem._compute_pad_value`. If sglang bumps a constant, this
+    /// fails — otherwise routing-side pad_value would silently diverge from
+    /// sglang's `BlockStored` bytes and MM-routing would degrade to text-prefix.
+    #[test]
+    fn pad_value_matches_sglang_protocol() {
+        assert_eq!(MM_PAD_SHIFT_VALUE, 1_000_000);
+        assert_eq!(MM_PAD_HASH_MASK, (1u64 << 30) - 1);
+        assert_eq!(pad_value_for_mm_hash(0), MM_PAD_SHIFT_VALUE as u32);
+        let fits = (1u64 << 30) - 1;
+        assert_eq!(
+            pad_value_for_mm_hash(fits),
+            (MM_PAD_SHIFT_VALUE + fits) as u32
+        );
+        let overflow = (1u64 << 30) | 0xCAFE;
+        assert_eq!(
+            pad_value_for_mm_hash(overflow),
+            (MM_PAD_SHIFT_VALUE + 0xCAFE) as u32,
+            "high bits above the 30-bit mask must be discarded"
+        );
+    }
+
     #[test]
     fn test_router_event_new() {
         let worker_id = 0;
@@ -1093,12 +1234,6 @@ mod tests {
         } else {
             panic!("Expected KvCacheEventData::Stored");
         }
-    }
-
-    #[test]
-    fn test_overlap_scores_default() {
-        let overlap_scores: OverlapScores = Default::default();
-        assert!(overlap_scores.scores.is_empty());
     }
 
     #[rstest]
@@ -1164,6 +1299,28 @@ mod tests {
     }
 
     #[test]
+    fn test_lora_hash_matches_kv_hashing_contract() {
+        let tokens: Vec<u32> = (0..4).collect();
+        let lora_name = "adapter-a";
+        let actual = compute_block_hash_for_seq(
+            &tokens,
+            4,
+            BlockHashOptions {
+                lora_name: Some(lora_name),
+                ..Default::default()
+            },
+        );
+        let token_bytes = tokens
+            .iter()
+            .flat_map(|token| token.to_le_bytes())
+            .collect::<Vec<_>>();
+        let salt_hash = dynamo_kv_hashing::compute_salt_hash(None, Some(lora_name)).unwrap();
+        let expected = LocalBlockHash(dynamo_kv_hashing::compute_hash_v2(&token_bytes, salt_hash));
+
+        assert_eq!(actual, vec![expected]);
+    }
+
+    #[test]
     fn test_lora_name_empty_string_normalized_to_none() {
         let tokens: Vec<u32> = (0..4).collect();
         let base = compute_block_hash_for_seq(&tokens, 4, BlockHashOptions::default());
@@ -1182,6 +1339,87 @@ mod tests {
     }
 
     #[test]
+    fn test_cache_namespace_produces_different_hash() {
+        let tokens: Vec<u32> = (0..4).collect();
+        let base = compute_block_hash_for_seq(&tokens, 4, BlockHashOptions::default());
+        let namespace_a = compute_block_hash_for_seq(
+            &tokens,
+            4,
+            BlockHashOptions {
+                cache_namespace: Some("tenant-a"),
+                ..Default::default()
+            },
+        );
+        let namespace_b = compute_block_hash_for_seq(
+            &tokens,
+            4,
+            BlockHashOptions {
+                cache_namespace: Some("tenant-b"),
+                ..Default::default()
+            },
+        );
+        let lora_a = compute_block_hash_for_seq(
+            &tokens,
+            4,
+            BlockHashOptions {
+                lora_name: Some("tenant-a"),
+                ..Default::default()
+            },
+        );
+
+        assert_ne!(base[0], namespace_a[0]);
+        assert_ne!(base[0], namespace_b[0]);
+        assert_ne!(namespace_a[0], namespace_b[0]);
+        assert_ne!(
+            namespace_a[0], lora_a[0],
+            "namespace and lora salts must use independent seed domains"
+        );
+    }
+
+    #[test]
+    fn test_cache_namespace_hash_matches_kv_hashing_contract() {
+        let tokens: Vec<u32> = (0..4).collect();
+        let cache_namespace = "tenant-a";
+        let lora_name = "adapter-a";
+        let actual = compute_block_hash_for_seq(
+            &tokens,
+            4,
+            BlockHashOptions {
+                lora_name: Some(lora_name),
+                cache_namespace: Some(cache_namespace),
+                ..Default::default()
+            },
+        );
+        let token_bytes = tokens
+            .iter()
+            .flat_map(|token| token.to_le_bytes())
+            .collect::<Vec<_>>();
+        let salt_hash =
+            dynamo_kv_hashing::compute_salt_hash(Some(cache_namespace), Some(lora_name)).unwrap();
+        let expected = LocalBlockHash(dynamo_kv_hashing::compute_hash_v2(&token_bytes, salt_hash));
+
+        assert_eq!(actual, vec![expected]);
+    }
+
+    #[test]
+    fn test_cache_namespace_empty_string_normalized_to_none() {
+        let tokens: Vec<u32> = (0..4).collect();
+        let base = compute_block_hash_for_seq(&tokens, 4, BlockHashOptions::default());
+        let empty = compute_block_hash_for_seq(
+            &tokens,
+            4,
+            BlockHashOptions {
+                cache_namespace: Some(""),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            base, empty,
+            "empty cache_namespace should be treated as absent"
+        );
+    }
+
+    #[test]
     fn test_tokens_with_hashes_lora() {
         let tokens: Vec<u32> = (0..8).collect();
 
@@ -1196,6 +1434,104 @@ mod tests {
         for (b, l) in base_hashes.iter().zip(lora_hashes.iter()) {
             assert_ne!(b, l);
         }
+    }
+
+    #[test]
+    fn test_tokens_with_hashes_lora_change_recomputes_cached_hashes() {
+        let tokens: Vec<u32> = (0..8).collect();
+        let mut with_hashes = TokensWithHashes::new(tokens.clone(), 4);
+        let base_sequence_hashes = with_hashes.get_or_compute_seq_hashes().to_vec();
+
+        let mut with_hashes = with_hashes.with_lora_name("my-adapter".to_string());
+        let actual_block_hashes = with_hashes.get_or_compute_block_hashes().to_vec();
+        let actual_sequence_hashes = with_hashes.get_or_compute_seq_hashes().to_vec();
+        let expected_block_hashes = compute_block_hash_for_seq(
+            &tokens,
+            4,
+            BlockHashOptions {
+                lora_name: Some("my-adapter"),
+                ..Default::default()
+            },
+        );
+        let expected_sequence_hashes = compute_seq_hash_for_block(&expected_block_hashes);
+
+        assert_eq!(actual_block_hashes, expected_block_hashes);
+        assert_eq!(actual_sequence_hashes, expected_sequence_hashes);
+        assert_ne!(actual_sequence_hashes, base_sequence_hashes);
+    }
+
+    #[test]
+    fn test_tokens_with_hashes_mm_change_recomputes_cached_hashes() {
+        let tokens: Vec<u32> = (0..4).collect();
+        let mm_infos = vec![
+            Some(BlockExtraInfo {
+                mm_objects: vec![BlockMmObjectInfo {
+                    mm_hash: 42,
+                    offsets: vec![(0, 1)],
+                }],
+            }),
+            None,
+        ];
+        let mut with_hashes = TokensWithHashes::new(tokens.clone(), 2);
+        let text_sequence_hashes = with_hashes.get_or_compute_seq_hashes().to_vec();
+
+        let mut with_hashes = with_hashes.with_mm_infos(mm_infos.clone());
+        let actual_block_hashes = with_hashes.get_or_compute_block_hashes().to_vec();
+        let actual_sequence_hashes = with_hashes.get_or_compute_seq_hashes().to_vec();
+        let expected_block_hashes = compute_block_hash_for_seq(
+            &tokens,
+            2,
+            BlockHashOptions {
+                block_mm_infos: Some(&mm_infos),
+                ..Default::default()
+            },
+        );
+        let expected_sequence_hashes = compute_seq_hash_for_block(&expected_block_hashes);
+
+        assert_eq!(actual_block_hashes, expected_block_hashes);
+        assert_eq!(actual_sequence_hashes, expected_sequence_hashes);
+        assert_ne!(actual_sequence_hashes, text_sequence_hashes);
+    }
+
+    #[test]
+    fn test_tokens_with_hashes_cache_namespace() {
+        let tokens: Vec<u32> = (0..8).collect();
+
+        let mut base = TokensWithHashes::new(tokens.clone(), 4);
+        let base_hashes = base.get_or_compute_block_hashes().to_vec();
+
+        let mut with_namespace =
+            TokensWithHashes::new(tokens, 4).with_cache_namespace("tenant-a".to_string());
+        let namespace_hashes = with_namespace.get_or_compute_block_hashes().to_vec();
+
+        assert_eq!(base_hashes.len(), namespace_hashes.len());
+        for (base, namespaced) in base_hashes.iter().zip(namespace_hashes.iter()) {
+            assert_ne!(base, namespaced);
+        }
+    }
+
+    #[test]
+    fn test_tokens_with_hashes_cache_namespace_change_recomputes_cached_hashes() {
+        let tokens: Vec<u32> = (0..8).collect();
+        let mut with_hashes = TokensWithHashes::new(tokens.clone(), 4);
+        let base_sequence_hashes = with_hashes.get_or_compute_seq_hashes().to_vec();
+
+        let mut with_hashes = with_hashes.with_cache_namespace("tenant-a".to_string());
+        let actual_block_hashes = with_hashes.get_or_compute_block_hashes().to_vec();
+        let actual_sequence_hashes = with_hashes.get_or_compute_seq_hashes().to_vec();
+        let expected_block_hashes = compute_block_hash_for_seq(
+            &tokens,
+            4,
+            BlockHashOptions {
+                cache_namespace: Some("tenant-a"),
+                ..Default::default()
+            },
+        );
+        let expected_sequence_hashes = compute_seq_hash_for_block(&expected_block_hashes);
+
+        assert_eq!(actual_block_hashes, expected_block_hashes);
+        assert_eq!(actual_sequence_hashes, expected_sequence_hashes);
+        assert_ne!(actual_sequence_hashes, base_sequence_hashes);
     }
 
     #[test]
@@ -1286,59 +1622,6 @@ mod tests {
     }
 
     #[test]
-    fn test_kv_cache_events_serialization() {
-        let event_data = KvCacheEventData::Stored(KvCacheStoreData {
-            parent_hash: Some(ExternalSequenceBlockHash(1)),
-            start_position: None,
-            blocks: vec![KvCacheStoredBlockData {
-                block_hash: ExternalSequenceBlockHash(2),
-                tokens_hash: LocalBlockHash(3),
-                mm_extra_info: None,
-            }],
-        });
-
-        let event = KvCacheEvent {
-            event_id: 1,
-            data: event_data,
-            dp_rank: 0,
-        };
-
-        let events = KvCacheEvents {
-            events: vec![event],
-            shutdown: false,
-        };
-
-        let serialized = serde_json::to_string(&events).unwrap();
-        let deserialized: KvCacheEvents = serde_json::from_str(&serialized).unwrap();
-
-        assert_eq!(deserialized.events.len(), 1);
-        assert_eq!(deserialized.events[0].event_id, 1);
-        if let KvCacheEventData::Stored(store_data) = &deserialized.events[0].data {
-            assert_eq!(store_data.parent_hash.unwrap().0, 1);
-            assert_eq!(store_data.blocks.len(), 1);
-            assert_eq!(store_data.blocks[0].block_hash.0, 2);
-            assert_eq!(store_data.blocks[0].tokens_hash.0, 3);
-        } else {
-            panic!("Expected KvCacheEventData::Stored variant");
-        }
-        assert!(!deserialized.shutdown);
-    }
-
-    #[test]
-    fn test_kv_cache_remove_data_serialization() {
-        let remove_data = KvCacheRemoveData {
-            block_hashes: vec![ExternalSequenceBlockHash(4), ExternalSequenceBlockHash(5)],
-        };
-
-        let serialized = serde_json::to_string(&remove_data).unwrap();
-        let deserialized: KvCacheRemoveData = serde_json::from_str(&serialized).unwrap();
-
-        assert_eq!(deserialized.block_hashes.len(), 2);
-        assert_eq!(deserialized.block_hashes[0].0, 4);
-        assert_eq!(deserialized.block_hashes[1].0, 5);
-    }
-
-    #[test]
     fn test_router_request_mark_free_backwards_compatible_deserialization() {
         let request: RouterRequest = serde_json::from_str(r#"{"method":"mark_free"}"#).unwrap();
 
@@ -1409,6 +1692,58 @@ mod tests {
     }
 
     #[test]
+    fn test_kv_transfer_enforcement_serde() {
+        assert_eq!(
+            serde_json::to_string(&KvTransferEnforcement::Required).unwrap(),
+            r#""required""#
+        );
+        assert_eq!(
+            serde_json::from_str::<KvTransferEnforcement>(r#""preferred""#).unwrap(),
+            KvTransferEnforcement::Preferred
+        );
+        assert!(serde_json::from_str::<KvTransferEnforcement>(r#""fallback""#).is_err());
+    }
+
+    #[test]
+    fn test_worker_config_like_topology_domains_default() {
+        // A minimal implementor that does NOT override topology_domains()
+        struct MinimalConfig;
+        impl WorkerConfigLike for MinimalConfig {
+            fn data_parallel_start_rank(&self) -> u32 {
+                0
+            }
+            fn data_parallel_size(&self) -> u32 {
+                1
+            }
+            fn max_num_batched_tokens(&self) -> Option<u64> {
+                None
+            }
+            fn total_kv_blocks(&self) -> Option<u64> {
+                None
+            }
+        }
+
+        let config = MinimalConfig;
+        assert!(
+            config.topology_domains().is_none(),
+            "Default topology_domains() should return None"
+        );
+        assert!(
+            config.kv_transfer_domain().is_none(),
+            "Default kv_transfer_domain() should return None"
+        );
+        assert!(
+            config.kv_transfer_enforcement().is_none(),
+            "Default kv_transfer_enforcement() should return None"
+        );
+        assert!(
+            config.kv_transfer_preferred_weight().is_none(),
+            "Default kv_transfer_preferred_weight() should return None"
+        );
+        assert!(config.native_offloading_capacity_tokens().is_none());
+    }
+
+    #[test]
     fn test_router_request_mark_free_serialization_with_request_id() {
         let request = RouterRequest::MarkFree {
             request_id: Some("req-123".to_string()),
@@ -1427,5 +1762,269 @@ mod tests {
                 request_id: Some(ref request_id)
             } if request_id == "req-123"
         ));
+    }
+
+    #[test]
+    fn test_router_request_new_serialization_with_priority_jump() {
+        let request = RouterRequest::New {
+            tokens: vec![1, 2, 3],
+            block_mm_infos: None,
+            routing_constraints: RoutingConstraints::default(),
+            priority_jump: 5.0,
+            strict_priority: 0,
+            lora_name: None,
+            cache_namespace: None,
+        };
+
+        let serialized = serde_json::to_string(&request).unwrap();
+        let deserialized: RouterRequest = serde_json::from_str(&serialized).unwrap();
+
+        assert_eq!(
+            serialized,
+            r#"{"method":"new","tokens":[1,2,3],"priority_jump":5.0}"#
+        );
+        assert!(matches!(
+            deserialized,
+            RouterRequest::New {
+                priority_jump,
+                ..
+            } if priority_jump == 5.0
+        ));
+    }
+
+    #[test]
+    fn test_router_request_new_serialization_with_lora_name() {
+        let request = RouterRequest::New {
+            tokens: vec![1, 2, 3],
+            block_mm_infos: None,
+            routing_constraints: RoutingConstraints::default(),
+            priority_jump: 0.0,
+            strict_priority: 0,
+            lora_name: Some("adapter-a".to_string()),
+            cache_namespace: None,
+        };
+
+        let serialized = serde_json::to_string(&request).unwrap();
+        let deserialized: RouterRequest = serde_json::from_str(&serialized).unwrap();
+
+        assert_eq!(
+            serialized,
+            r#"{"method":"new","tokens":[1,2,3],"priority_jump":0.0,"lora_name":"adapter-a"}"#
+        );
+        assert!(matches!(
+            deserialized,
+            RouterRequest::New {
+                tokens,
+                lora_name: Some(ref lora_name),
+                ..
+            } if tokens == vec![1, 2, 3] && lora_name == "adapter-a"
+        ));
+    }
+
+    #[test]
+    fn test_router_request_new_defaults_lora_name() {
+        let deserialized: RouterRequest =
+            serde_json::from_str(r#"{"method":"new","tokens":[1,2,3]}"#).unwrap();
+
+        assert!(matches!(
+            deserialized,
+            RouterRequest::New {
+                tokens,
+                lora_name: None,
+                ..
+            } if tokens == vec![1, 2, 3]
+        ));
+    }
+
+    #[test]
+    fn test_router_request_new_strict_priority_compatibility() {
+        let request = RouterRequest::New {
+            tokens: vec![1, 2, 3],
+            block_mm_infos: None,
+            routing_constraints: RoutingConstraints::default(),
+            priority_jump: 0.0,
+            strict_priority: 4,
+            lora_name: None,
+            cache_namespace: None,
+        };
+
+        let serialized = serde_json::to_string(&request).unwrap();
+        assert_eq!(
+            serialized,
+            r#"{"method":"new","tokens":[1,2,3],"priority_jump":0.0,"strict_priority":4}"#
+        );
+
+        let missing: RouterRequest =
+            serde_json::from_str(r#"{"method":"new","tokens":[1,2,3]}"#).unwrap();
+        assert!(matches!(
+            missing,
+            RouterRequest::New {
+                strict_priority: 0,
+                ..
+            }
+        ));
+
+        let zero = RouterRequest::New {
+            tokens: vec![1, 2, 3],
+            block_mm_infos: None,
+            routing_constraints: RoutingConstraints::default(),
+            priority_jump: 0.0,
+            strict_priority: 0,
+            lora_name: None,
+            cache_namespace: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&zero).unwrap(),
+            r#"{"method":"new","tokens":[1,2,3],"priority_jump":0.0}"#
+        );
+    }
+
+    #[test]
+    fn test_router_request_new_serialization_with_cache_namespace() {
+        let request = RouterRequest::New {
+            tokens: vec![1, 2, 3],
+            block_mm_infos: None,
+            routing_constraints: RoutingConstraints::default(),
+            priority_jump: 0.0,
+            strict_priority: 0,
+            lora_name: None,
+            cache_namespace: Some("tenant-a".to_string()),
+        };
+
+        let serialized = serde_json::to_string(&request).unwrap();
+        let deserialized: RouterRequest = serde_json::from_str(&serialized).unwrap();
+
+        assert_eq!(
+            serialized,
+            r#"{"method":"new","tokens":[1,2,3],"priority_jump":0.0,"cache_namespace":"tenant-a"}"#
+        );
+        assert!(matches!(
+            deserialized,
+            RouterRequest::New {
+                tokens,
+                cache_namespace: Some(ref cache_namespace),
+                ..
+            } if tokens == vec![1, 2, 3] && cache_namespace == "tenant-a"
+        ));
+    }
+
+    #[test]
+    fn test_router_request_potential_loads_serialization_with_lora_name() {
+        let request = RouterRequest::PotentialLoads {
+            tokens: vec![1, 2, 3],
+            block_mm_infos: None,
+            lora_name: Some("adapter-a".to_string()),
+            cache_namespace: None,
+        };
+
+        let serialized = serde_json::to_string(&request).unwrap();
+        let deserialized: RouterRequest = serde_json::from_str(&serialized).unwrap();
+
+        assert_eq!(
+            serialized,
+            r#"{"method":"potential_loads","tokens":[1,2,3],"lora_name":"adapter-a"}"#
+        );
+        assert!(matches!(
+            deserialized,
+            RouterRequest::PotentialLoads {
+                tokens,
+                block_mm_infos: None,
+                lora_name: Some(ref lora_name),
+                cache_namespace: None,
+            } if tokens == vec![1, 2, 3] && lora_name == "adapter-a"
+        ));
+    }
+
+    #[test]
+    fn test_router_request_potential_loads_serialization_with_cache_namespace() {
+        let request = RouterRequest::PotentialLoads {
+            tokens: vec![1, 2, 3],
+            block_mm_infos: None,
+            lora_name: None,
+            cache_namespace: Some("tenant-a".to_string()),
+        };
+
+        let serialized = serde_json::to_string(&request).unwrap();
+        let deserialized: RouterRequest = serde_json::from_str(&serialized).unwrap();
+
+        assert_eq!(
+            serialized,
+            r#"{"method":"potential_loads","tokens":[1,2,3],"cache_namespace":"tenant-a"}"#
+        );
+        assert!(matches!(
+            deserialized,
+            RouterRequest::PotentialLoads {
+                tokens,
+                cache_namespace: Some(ref cache_namespace),
+                ..
+            } if tokens == vec![1, 2, 3] && cache_namespace == "tenant-a"
+        ));
+    }
+
+    #[test]
+    fn test_router_request_potential_loads_defaults_lora_name() {
+        let deserialized: RouterRequest =
+            serde_json::from_str(r#"{"method":"potential_loads","tokens":[1,2,3]}"#).unwrap();
+
+        assert!(matches!(
+            deserialized,
+            RouterRequest::PotentialLoads {
+                tokens,
+                block_mm_infos: None,
+                lora_name: None,
+                cache_namespace: None,
+            } if tokens == vec![1, 2, 3]
+        ));
+    }
+
+    #[test]
+    fn test_router_request_mark_prefill_serialization_with_request_id() {
+        let request = RouterRequest::MarkPrefill {
+            request_id: Some("req-123".to_string()),
+        };
+
+        let serialized = serde_json::to_string(&request).unwrap();
+        let deserialized: RouterRequest = serde_json::from_str(&serialized).unwrap();
+
+        assert_eq!(
+            serialized,
+            r#"{"method":"mark_prefill","request_id":"req-123"}"#
+        );
+        assert!(matches!(
+            deserialized,
+            RouterRequest::MarkPrefill {
+                request_id: Some(ref request_id)
+            } if request_id == "req-123"
+        ));
+    }
+
+    #[test]
+    fn test_potential_load_defaults_active_requests() {
+        let load = serde_json::from_str::<PotentialLoad>(
+            r#"{"worker_id":1,"dp_rank":0,"potential_prefill_tokens":16,"potential_decode_blocks":4}"#,
+        )
+        .unwrap();
+
+        assert_eq!(load.worker_id, 1);
+        assert_eq!(load.dp_rank, 0);
+        assert_eq!(load.potential_prefill_tokens, 16);
+        assert_eq!(load.potential_decode_blocks, 4);
+        assert_eq!(load.active_requests, 0);
+    }
+
+    #[test]
+    fn test_potential_load_serializes_active_requests() {
+        let load = PotentialLoad {
+            worker_id: 1,
+            dp_rank: 0,
+            potential_prefill_tokens: 16,
+            potential_decode_blocks: 4,
+            active_requests: 2,
+        };
+
+        assert_eq!(
+            serde_json::to_string(&load).unwrap(),
+            r#"{"worker_id":1,"dp_rank":0,"potential_prefill_tokens":16,"potential_decode_blocks":4,"active_requests":2}"#
+        );
     }
 }

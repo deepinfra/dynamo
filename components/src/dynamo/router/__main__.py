@@ -134,10 +134,16 @@ class StandaloneRouterHandler:
                 "disaggregated_params": worker_output.get("disaggregated_params"),  # type: ignore[attr-defined]
                 "extra_args": worker_output.get("extra_args"),  # type: ignore[attr-defined]
                 "completion_usage": worker_output.get("completion_usage"),  # type: ignore[attr-defined]
+                # engine_data carries routed_experts/prompt_logprobs; routing_data carries
+                # worker_id/token_ids/timing. Forward both so they survive this router.
+                "engine_data": worker_output.get("engine_data"),  # type: ignore[attr-defined]
+                "routing_data": worker_output.get("routing_data"),  # type: ignore[attr-defined]
             }
             yield llm_engine_output
 
-    async def best_worker_id(self, token_ids, router_config_override=None):
+    async def best_worker_id(
+        self, token_ids, router_config_override=None, cache_namespace=None
+    ):
         """
         Get the best worker ID for a given set of tokens without actually routing.
 
@@ -150,7 +156,9 @@ class StandaloneRouterHandler:
             raise RuntimeError("Router not initialized")
 
         (worker_id, _dp_rank, _overlap_blocks) = await self.kv_router.best_worker(
-            token_ids, router_config_override
+            token_ids,
+            router_config_override,
+            cache_namespace=cache_namespace,
         )
 
         yield worker_id
@@ -173,6 +181,7 @@ class StandaloneRouterHandler:
             request.get("block_mm_infos"),
             request.get("lora_name"),
             request.get("include_shared", True),
+            request.get("cache_namespace"),
         )
 
         yield scores
@@ -193,6 +202,7 @@ async def worker(runtime: DistributedRuntime):
     logger.debug(
         f"Configuration: endpoint={config.endpoint}, router_block_size={config.router_block_size}, "
         f"overlap_score_credit={config.overlap_score_credit}, "
+        f"overlap_score_credit_decay={config.overlap_score_credit_decay}, "
         f"prefill_load_scale={config.prefill_load_scale}, "
         f"router_temperature={config.router_temperature}, "
         f"use_kv_events={config.use_kv_events}, "

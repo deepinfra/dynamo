@@ -7,23 +7,36 @@ Tests for the tool-stripping behaviour of _prepare_request when
 tool_choice='none' and the exclude_tools_when_tool_choice_none flag.
 """
 
+import json
 from types import SimpleNamespace
 
 import pytest
 from _routed_engine_fakes import FakeRoutedEngine as _FakeRoutedEngine
 from transformers import AutoTokenizer
+from vllm.tool_parsers.qwen3_engine_tool_parser import Qwen3EngineToolParser
 
 from dynamo.frontend.prepost import _prepare_request
 
-# Needs vllm packages (gpu_1 container).  No need for parallel marker.
+# NOTE: dynamo.frontend.vllm_processor is imported lazily inside the tests that
+# need it (and via the vllm_processor_module fixture). Importing it at module
+# top level would run its `from vllm.tasks import ...` /
+# `from vllm.v1.engine.parallel_sampling import ...` imports during pytest
+# collection, which breaks the pytest-marker-report pre-commit hook (its vllm
+# stub list does not cover those submodules).
+
+# Needs vllm packages (gpu_1 container), but does not allocate GPU VRAM.
 pytestmark = [
     pytest.mark.unit,
     pytest.mark.vllm,
     pytest.mark.gpu_1,
+    pytest.mark.xpu_1,
     pytest.mark.pre_merge,
+    pytest.mark.profiled_vram_gib(0),
+    pytest.mark.timeout(180),  # 0-GiB unit tests, floor 180s
 ]
 
 MODEL = "Qwen/Qwen3-0.6B"
+_DEFAULT_MM_DATA = object()
 
 TOOL_REQUEST = {
     "model": MODEL,
@@ -119,6 +132,171 @@ class TestPrepareRequestToolStripping:  # FRONTEND.1 + FRONTEND.3 — tool strip
         assert (
             chat_params.chat_template_kwargs["tools"] is None
         ), "No tools in request should produce None tools in template"
+
+
+class TestMultimodalFeatureMetadata:
+    def _feature(
+        self, modality, mm_hash, offset, length, data=_DEFAULT_MM_DATA, is_embed=None
+    ):
+        return SimpleNamespace(
+            modality=modality,
+            mm_hash=mm_hash,
+            data=data,
+            mm_position=SimpleNamespace(
+                offset=offset,
+                length=length,
+                is_embed=is_embed,
+            ),
+        )
+
+    def test_groups_hashes_and_placeholders_by_modality(self):
+        from dynamo.frontend.vllm_processor import _group_mm_feature_metadata
+
+        features = [
+            self._feature("image", "image_hash", 4, 8),
+            self._feature("audio", "audio_hash", 20, 6),
+        ]
+
+        (
+            flat_hashes,
+            flat_placeholders,
+            hashes_by_modality,
+            placeholders_by_modality,
+        ) = _group_mm_feature_metadata(features)
+
+        assert flat_hashes == []
+        assert flat_placeholders == []
+        assert hashes_by_modality == {
+            "image": ["image_hash"],
+            "audio": ["audio_hash"],
+        }
+        assert placeholders_by_modality == {
+            "image": [(4, 8)],
+            "audio": [(20, 6)],
+        }
+
+    def test_image_only_metadata_keeps_legacy_flat_fields(self):
+        from dynamo.frontend.vllm_processor import _group_mm_feature_metadata
+
+        features = [
+            self._feature("image", "image_hash_0", 4, 8),
+            self._feature("image", "image_hash_1", 20, 6),
+        ]
+
+        (
+            flat_hashes,
+            flat_placeholders,
+            hashes_by_modality,
+            placeholders_by_modality,
+        ) = _group_mm_feature_metadata(features)
+
+        assert flat_hashes == ["image_hash_0", "image_hash_1"]
+        assert flat_placeholders == [(4, 8), (20, 6)]
+        assert hashes_by_modality == {"image": ["image_hash_0", "image_hash_1"]}
+        assert placeholders_by_modality == {"image": [(4, 8), (20, 6)]}
+
+    def test_placeholder_metadata_preserves_is_embed_mask(self):
+        from dynamo.frontend.vllm_processor import _group_mm_feature_metadata
+
+        mask = [False, True, True, False]
+        features = [
+            self._feature("image", "image_hash", 4, 4, is_embed=mask),
+        ]
+
+        _, flat_placeholders, _, placeholders_by_modality = _group_mm_feature_metadata(
+            features
+        )
+
+        expected = {"offset": 4, "length": 4, "is_embed": mask}
+        assert flat_placeholders == [expected]
+        assert placeholders_by_modality == {"image": [expected]}
+
+    def test_missing_hash_skips_only_that_feature(self):
+        from dynamo.frontend.vllm_processor import _group_mm_feature_metadata
+
+        features = [
+            self._feature("image", "image_hash", 4, 8),
+            self._feature("image", None, 20, 8),
+        ]
+
+        assert _group_mm_feature_metadata(features) == (
+            ["image_hash"],
+            [(4, 8)],
+            {"image": ["image_hash"]},
+            {"image": [(4, 8)]},
+        )
+
+    def test_single_transfer_modality_rejects_mixed_features(self):
+        from dynamo.frontend.vllm_processor import _single_transfer_modality
+
+        assert (
+            _single_transfer_modality(
+                [
+                    self._feature("image", "image_hash", 4, 8),
+                    self._feature("audio", "audio_hash", 20, 6),
+                ]
+            )
+            is None
+        )
+        assert (
+            _single_transfer_modality(
+                [
+                    self._feature("image", "image_hash_0", 4, 8),
+                    self._feature("image", "image_hash_1", 20, 8),
+                ]
+            )
+            == "image"
+        )
+
+
+@pytest.mark.asyncio
+async def test_prepare_mm_routing_skips_single_modality_transfer_for_mixed_features(
+    vllm_processor_module,
+    monkeypatch,
+):
+    def fail_sender():
+        raise AssertionError("mixed-modality requests must not construct a sender")
+
+    monkeypatch.setattr(vllm_processor_module, "MmKwargsShmSender", fail_sender)
+
+    processor = vllm_processor_module.VllmProcessor.__new__(
+        vllm_processor_module.VllmProcessor
+    )
+    processor.block_size = 16
+    processor.nixl_mm_enabled = True
+    processor.use_shm_transfer = True
+    processor._sender = None
+
+    def feature(modality, mm_hash, offset, length):
+        return SimpleNamespace(
+            modality=modality,
+            mm_hash=mm_hash,
+            data=object(),
+            mm_position=SimpleNamespace(offset=offset, length=length),
+        )
+
+    vllm_preproc = SimpleNamespace(
+        prompt_token_ids=list(range(32)),
+        mm_features=[
+            feature("image", "a" * 64, 0, 16),
+            feature("audio", "b" * 64, 16, 8),
+        ],
+    )
+    dynamo_preproc = {}
+
+    mm_routing_info, cleanup_items, transferred = await processor._prepare_mm_routing(
+        vllm_preproc,
+        dynamo_preproc,
+    )
+
+    assert mm_routing_info is not None
+    assert cleanup_items == []
+    assert transferred is False
+    assert dynamo_preproc["extra_args"]["mm_hashes"] == []
+    assert dynamo_preproc["extra_args"]["mm_hashes_by_modality"] == {
+        "image": ["a" * 64],
+        "audio": ["b" * 64],
+    }
 
 
 class TestReasoningParserMetadata:
@@ -320,18 +498,247 @@ class TestRoutedEnginePath:
 
         chunks = await _run_generate(processor, _base_preproc())
 
-        assert chunks == [
-            {
-                "id": "request-id",
-                "choices": [
-                    {
-                        "index": 0,
-                        "delta": {"content": "x"},
-                        "finish_reason": None,
-                    }
-                ],
-                "created": chunks[0]["created"],
-                "model": MODEL,
-                "object": "chat.completion.chunk",
-            }
+        # One annotated envelope per iteration carries both data and the
+        # llm_metrics annotation; observer strips the annotation before SSE.
+        assert len(chunks) == 1
+        envelope = chunks[0]
+
+        assert envelope["_dynamo_annotated"] is True
+        assert envelope["data"] == {
+            "id": "request-id",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"content": "x"},
+                    "finish_reason": None,
+                }
+            ],
+            "created": envelope["data"]["created"],
+            "model": MODEL,
+            "object": "chat.completion.chunk",
+        }
+
+        assert envelope["event"] == "llm_metrics"
+        assert len(envelope["comment"]) == 1
+        # Zero counts are omitted (text-only request), mirroring the Rust skip-zero behavior.
+        assert json.loads(envelope["comment"][0]) == {
+            "input_tokens": 3,
+            "output_tokens": 1,
+            "chunk_tokens": 1,
+        }
+
+    @pytest.mark.asyncio
+    async def test_routed_stream_emits_multimodal_counts(self, vllm_processor_module):
+        # The Rust postprocessor is bypassed on this path, so the processor must
+        # emit per-request multimodal content-part counts itself.
+        routed_engine = _FakeRoutedEngine(
+            [{"token_ids": [101], "index": 0, "finish_reason": None}]
+        )
+        processor = _make_processor(vllm_processor_module, routed_engine)
+
+        request = {
+            "model": MODEL,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "compare"},
+                        {"type": "image_url", "image_url": {"url": "http://x/a.png"}},
+                        {"type": "image_url", "image_url": {"url": "http://x/b.png"}},
+                        {"type": "video_url", "video_url": {"url": "http://x/c.mp4"}},
+                    ],
+                }
+            ],
+        }
+        preproc = _base_preproc()
+        chunks = [
+            item
+            async for item in processor._generate_and_stream(
+                "request-id",
+                request,
+                preproc,
+                preproc["token_ids"],
+                SimpleNamespace(
+                    sampling_params=SimpleNamespace(n=1),
+                    request_id="vllm-request",
+                    external_req_id=None,
+                ),
+                {0: _FakePostProcessor()},
+                mm_routing_info=None,
+                context=None,
+            )
         ]
+
+        metrics = json.loads(chunks[0]["comment"][0])
+        assert metrics["image_count"] == 2
+        assert metrics["video_count"] == 1
+        # audio has zero parts, so the key is omitted from the emitted metrics.
+        assert metrics.get("audio_count") is None
+
+
+OBJECT_TYPED_TOOL_REQUEST = {
+    "model": MODEL,
+    "messages": [{"role": "user", "content": "set my profile"}],
+    "tools": [
+        {
+            "type": "function",
+            "function": {
+                "name": "set_profile",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "profile": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string"},
+                                "age": {"type": "integer"},
+                            },
+                        }
+                    },
+                    "required": ["profile"],
+                },
+            },
+        }
+    ],
+    "tool_choice": "auto",
+}
+
+
+# ---------------------------------------------------------------------------
+# _prepare_request: schema-aware tool-parser end-to-end regression
+# ---------------------------------------------------------------------------
+
+
+class TestSchemaAwareToolParser:
+    """Schema-aware parsers (e.g. qwen3_coder) need ``tools`` at construction
+    to coerce object/array-typed parameter values from raw text into JSON;
+    without them, the value comes through as a string-in-a-string inside the
+    final ``arguments`` JSON.
+    """
+
+    def test_qwen3_coder_coerces_object_typed_arg(self, tokenizer):
+        """qwen3_coder must coerce object-typed parameter values into nested
+        objects, not leave them as JSON-encoded strings inside ``arguments``.
+        """
+        model_output = (
+            "<tool_call><function=set_profile>\n"
+            "<parameter=profile>\n"
+            '{"name": "Alice", "age": 30}\n'
+            "</parameter>\n"
+            "</function></tool_call>"
+        )
+
+        request_for_sampling, parser, _, _, _ = _prepare_request(
+            OBJECT_TYPED_TOOL_REQUEST,
+            tokenizer=tokenizer,
+            tool_parser_class=Qwen3EngineToolParser,
+        )
+        assert parser is not None, "Expected _prepare_request to construct the parser"
+
+        result = parser.extract_tool_calls(model_output, request_for_sampling)
+
+        assert result.tools_called, f"Expected tools_called=True; got {result!r}"
+        assert len(result.tool_calls) == 1
+        args = json.loads(result.tool_calls[0].function.arguments)
+        assert isinstance(args["profile"], dict), (
+            f"Schema-aware parser should coerce object-typed arg to dict; "
+            f"got {type(args['profile']).__name__}: {args['profile']!r}"
+        )
+        assert args["profile"] == {"name": "Alice", "age": 30}
+
+
+# ---------------------------------------------------------------------------
+# _prepare_request: chat_template_kwargs forwarding
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.core
+class TestChatTemplateKwargsForwarding:
+    """chat_template_kwargs from the request are forwarded to ChatParams.
+
+    Uses Qwen3 which supports enable_thinking: False to suppress <think> blocks.
+    """
+
+    @staticmethod
+    def _messages():
+        return [{"role": "user", "content": "Hello"}]
+
+    def _prepare(self, request, tokenizer):
+        """Return (chat_params, messages) from _prepare_request."""
+        _, _, _, messages, chat_params = _prepare_request(
+            request,
+            tokenizer=tokenizer,
+            tool_parser_class=None,
+        )
+        return chat_params, messages
+
+    def _render(self, tokenizer, chat_params) -> str:
+        """Render prompt text using the chat_params template kwargs."""
+        kwargs = {**chat_params.chat_template_kwargs, "tokenize": False}
+        return tokenizer.apply_chat_template(self._messages(), **kwargs)
+
+    def test_qwen3_enable_thinking_true_no_closed_think_block(self, tokenizer):
+        """enable_thinking=True leaves reasoning open (model generates <think> itself)."""
+        chat_params, _ = self._prepare(
+            {
+                "model": MODEL,
+                "messages": self._messages(),
+                "chat_template_kwargs": {"enable_thinking": True},
+            },
+            tokenizer,
+        )
+        prompt = self._render(tokenizer, chat_params)
+        assert "</think>" not in prompt
+
+    def test_qwen3_thinking_flag_changes_tokens(self, tokenizer):
+        """enable_thinking=True vs False produces different rendered prompts."""
+        think_params, _ = self._prepare(
+            {
+                "model": MODEL,
+                "messages": self._messages(),
+                "chat_template_kwargs": {"enable_thinking": True},
+            },
+            tokenizer,
+        )
+        no_think_params, _ = self._prepare(
+            {
+                "model": MODEL,
+                "messages": self._messages(),
+                "chat_template_kwargs": {"enable_thinking": False},
+            },
+            tokenizer,
+        )
+        assert self._render(tokenizer, think_params) != self._render(
+            tokenizer, no_think_params
+        )
+
+    def test_reasoning_effort_forwarded_to_template_kwargs(self, tokenizer):
+        """reasoning_effort is always present in chat_params.chat_template_kwargs."""
+        chat_params, _ = self._prepare(
+            {
+                "model": MODEL,
+                "messages": self._messages(),
+                "reasoning_effort": "low",
+            },
+            tokenizer,
+        )
+        assert chat_params.chat_template_kwargs.get("reasoning_effort") == "low"
+
+
+@pytest.mark.parametrize(
+    ("runtime_config", "expected"),
+    [
+        ({"context_length": 1048576}, 1048576),
+        ({}, None),
+        ({"context_length": None}, None),
+        ({"context_length": 0}, None),
+        ({"context_length": -1}, None),
+        ({"context_length": "1048576"}, None),
+        ({"context_length": True}, None),
+        (None, None),
+    ],
+)
+def test_runtime_config_context_length(vllm_processor_module, runtime_config, expected):
+    mdc = SimpleNamespace(runtime_config=lambda: runtime_config)
+
+    assert vllm_processor_module._runtime_config_context_length(mdc) == expected
