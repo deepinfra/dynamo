@@ -30,7 +30,7 @@ use connector::Connector;
 use lease::*;
 pub use lock::*;
 
-use super::utils::build_in_runtime;
+use super::utils::{build_in_runtime, RuntimeHandle};
 use crate::config::environment_names::etcd as env_etcd;
 
 /// ETCD Client
@@ -42,7 +42,7 @@ pub struct Client {
     // Exclusive runtime for etcd lease keep-alive and watch tasks
     // Avoid those tasks from being starved when the main runtime is busy
     // WARNING: Do not await on main runtime from this runtime or deadlocks may occur
-    rt: Arc<tokio::runtime::Runtime>,
+    rt: RuntimeHandle,
 }
 
 impl std::fmt::Debug for Client {
