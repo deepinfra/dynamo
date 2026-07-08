@@ -30,7 +30,7 @@ use connector::Connector;
 use lease::*;
 pub use lock::*;
 
-use super::utils::build_in_runtime;
+use super::utils::{build_in_runtime, RuntimeHandle};
 use crate::config::environment_names::etcd as env_etcd;
 
 const STARTUP_CONNECT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -49,7 +49,7 @@ pub struct Client {
     // Exclusive runtime for etcd lease keep-alive and watch tasks
     // Avoid those tasks from being starved when the main runtime is busy
     // WARNING: Do not await on main runtime from this runtime or deadlocks may occur
-    rt: Arc<tokio::runtime::Runtime>,
+    rt: RuntimeHandle,
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]

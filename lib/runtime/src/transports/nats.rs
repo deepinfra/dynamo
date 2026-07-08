@@ -51,7 +51,7 @@ use crate::config::environment_names::nats as env_nats;
 pub use crate::slug::Slug;
 use tracing as log;
 
-use super::utils::build_in_runtime;
+use super::utils::{build_in_runtime, RuntimeHandle};
 
 pub const URL_PREFIX: &str = "nats://";
 
@@ -59,6 +59,10 @@ pub const URL_PREFIX: &str = "nats://";
 pub struct Client {
     client: client::Client,
     js_ctx: jetstream::Context,
+    // Keeps the dedicated connection runtime alive for as long as this client (or
+    // any clone) exists. Dropping the last clone reclaims the runtime's worker
+    // threads — without this the runtime leaked (see `build_in_runtime`).
+    _rt: RuntimeHandle,
 }
 
 impl Client {
@@ -406,7 +410,7 @@ impl ClientOptions {
             None => options,
         };
 
-        let (client, _) = build_in_runtime(
+        let (client, rt) = build_in_runtime(
             async move {
                 options
                     .connect(self.server)
@@ -419,7 +423,11 @@ impl ClientOptions {
 
         let js_ctx = jetstream::new(client.clone());
 
-        Ok(Client { client, js_ctx })
+        Ok(Client {
+            client,
+            js_ctx,
+            _rt: rt,
+        })
     }
 }
 
