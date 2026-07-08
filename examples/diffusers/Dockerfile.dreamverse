@@ -30,6 +30,24 @@ RUN apt-get update \
 RUN . /opt/venv/bin/activate \
  && uv pip install --prerelease=allow ai-dynamo==1.1.1
 
+# FA4 (flash-attn-cute) source swap. dreamverse's baked-in install is the
+# XOR-op/flash-attention fork FastVideo's June-26 pyproject pinned (commit
+# f4c68c7f) -- stale against cutlass-dsl 4.5+, which moved/renamed APIs the
+# fork's kernels call (cute.core.ThrMma -> cute.ThrMma/cute.atom.ThrMma;
+# cute.make_fragment -> make_rmem_tensor). FastVideo hit this exact break and
+# fixed it 2026-07-06 (hao-ai-lab/FastVideo#1564): they dropped the fork and
+# now pin flash-attn-4 straight from the real upstream, Dao-AILab/flash-attention,
+# at a CuTe-DSL-4.6-compatible commit (= upstream PR #2648). Reproduce that
+# exact pin -- do not bump to a newer/moving commit without re-validating.
+ARG FA4_CUTE_REF=82d6441eec5d4dfec120153db2c0145ae855a083
+RUN . /opt/venv/bin/activate \
+ && pip uninstall -y flash-attn-cute \
+ && git clone https://github.com/Dao-AILab/flash-attention.git /tmp/fa-upstream \
+ && cd /tmp/fa-upstream && git checkout ${FA4_CUTE_REF} \
+ && cd / \
+ && uv pip install --no-build-isolation /tmp/fa-upstream/flash_attn/cute \
+ && rm -rf /tmp/fa-upstream
+
 # deepinfra patches, applied to the INSTALLED (non-editable) fastvideo package.
 # The patches are git-format (a/fastvideo/... b/fastvideo/...); -p1 from
 # site-packages strips a/ -> fastvideo/... . dreamverse's fastvideo is @4f3ad3f6,
@@ -37,6 +55,7 @@ RUN . /opt/venv/bin/activate \
 COPY patches/ltx23_gpu_worker_megacache.patch /tmp/megacache.patch
 COPY patches/x264-threads-cap.patch /tmp/x264-threads-cap.patch
 COPY patches/pyav-scenecut.patch /tmp/pyav-scenecut.patch
+COPY patches/flash-attn-cute-fa4-tuple-fix.patch /tmp/flash-attn-cute-fa4-tuple-fix.patch
 # NOTE: verify by grepping the patched source, NOT by importing fastvideo --
 # importing pulls in triton, which fails to init its driver in a GPU-less build
 # ("0 active drivers").
@@ -44,9 +63,11 @@ RUN SP=/opt/venv/lib/python3.12/site-packages \
  && patch -p1 -d "$SP" --forward --fuzz=0 < /tmp/megacache.patch \
  && patch -p1 -d "$SP" --forward --fuzz=0 < /tmp/x264-threads-cap.patch \
  && patch -p1 -d "$SP" --forward --fuzz=0 < /tmp/pyav-scenecut.patch \
+ && patch -p1 -d "$SP" --forward --fuzz=0 < /tmp/flash-attn-cute-fa4-tuple-fix.patch \
  && grep -q 'torch.compiler.load_cache_artifacts' "$SP/fastvideo/worker/gpu_worker.py" \
  && grep -q 'FASTVIDEO_X264_THREADS' "$SP/fastvideo/entrypoints/video_generator.py" \
  && grep -q 'FASTVIDEO_X264_SCENECUT' "$SP/fastvideo/entrypoints/video_generator.py" \
+ && grep -q ')\[:2\]' "$SP/fastvideo/attention/utils/flash_attn_cute.py" \
  && echo "patches applied + verified"
 
 ENV FASTVIDEO_VIDEO_CODEC=libx264
