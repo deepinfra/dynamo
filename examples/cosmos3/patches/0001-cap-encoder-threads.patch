@@ -1,0 +1,30 @@
+diff --git a/cosmos_framework/utils/easy_io/handlers/imageio_video_handler.py b/cosmos_framework/utils/easy_io/handlers/imageio_video_handler.py
+index fdc944f..359d016 100644
+--- a/cosmos_framework/utils/easy_io/handlers/imageio_video_handler.py
++++ b/cosmos_framework/utils/easy_io/handlers/imageio_video_handler.py
+@@ -1,6 +1,7 @@
+ # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ # SPDX-License-Identifier: OpenMDW-1.1
+ 
++import os
+ from typing import IO, Any, Dict, Tuple
+ 
+ import imageio
+@@ -171,6 +172,17 @@ class ImageioVideoHandler(BaseFileHandler):
+             }
+         # Update with any other kwargs
+         mimsave_kwargs.update(kwargs)
++
++        # deepinfra: cap CPU encoder threads (covers the crf and qscale branches
++        # above, plus any caller-supplied ffmpeg_params). With no -threads, x264
++        # auto-detects every core and oversubscribes on shared multi-GPU nodes
++        # (8 GPUs / 224 cores), contending with neighbouring pods so encode
++        # latency drifts with node load. Override via DI_VIDEO_ENCODE_THREADS.
++        _params = list(mimsave_kwargs.get("ffmpeg_params") or [])
++        if "-threads" not in _params:
++            _params += ["-threads", os.getenv("DI_VIDEO_ENCODE_THREADS", "32")]
++        mimsave_kwargs["ffmpeg_params"] = _params
++
+         log.debug(f"mimsave_kwargs: {mimsave_kwargs}")
+ 
+         imageio.mimsave(file, obj, format, **mimsave_kwargs)
