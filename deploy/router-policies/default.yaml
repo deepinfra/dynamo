@@ -1,0 +1,33 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 DeepInfra. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Router policy profiles baked into every runtime/frontend image at
+# /workspace/deploy/router-policies/. model-manager points frontends at one
+# of these via --router-policy-config; per-model selection is just a
+# different path in the model's extra_args. Validated by
+# lib/kv-router/tests/router_policies.rs against the real parser.
+#
+# - standard: default family for all traffic. Unset busy thresholds fall
+#   back to dynamo's default (prefill_busy_threshold_frac 16.0 x
+#   max_num_batched_tokens per worker); queue depth is bounded per
+#   discovered worker.
+# - no-queue: selected per request via the x-dynamo-meta-policy-class
+#   header (deepapi sends it for OpenRouter / early_throttle / guest
+#   traffic). request_queue_limit_per_worker 0 -> rejected with HTTP 529
+#   the moment all workers are busy, never queued.
+default_policy_family: standard
+uncached_isl_buckets:
+  - min_tokens: 0
+    bucket: all
+policy_classes:
+  - name: standard
+    policy_family: standard
+    cache_bucket: all
+    queue_policy: fcfs
+    quantum: 2048
+    request_queue_limit_per_worker: 16
+    raw_isl_token_queue_limit_per_worker: 1048576
+  - name: no-queue
+    queue_policy: fcfs
+    quantum: 2048
+    request_queue_limit_per_worker: 0
