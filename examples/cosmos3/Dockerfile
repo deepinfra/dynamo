@@ -44,12 +44,12 @@ WORKDIR /workspace
 RUN git clone --filter=blob:none ${COSMOS_FRAMEWORK_REPO} /workspace && \
     git -C /workspace checkout ${COSMOS_FRAMEWORK_REF}
 
-# DeepInfra patches to upstream code (reviewed in deepinfra/dynamo).
-COPY patches /workspace/deepinfra-patches
-RUN git -C /workspace apply --verbose deepinfra-patches/*.patch
-
 # Upstream build steps (mirrors NVIDIA/cosmos-framework Dockerfile @ the pin,
 # minus bind-mounts: the sources are already in the layer from the clone).
+# NOTE: patches are applied LAST (near the entrypoint), not here. cosmos_framework
+# is installed editable (`uv pip install -e`), so patching /workspace afterward is
+# picked up live at runtime — and keeping the patch layer last means editing a
+# patch rebuilds in seconds instead of re-running the ~11GB gated HF prefetch.
 RUN --mount=type=cache,target=/root/.cache/uv uv python install
 RUN echo "$CUDA_VERSION" | sed -E 's/^([0-9]+)\.([0-9]+).*/cu\1\2/' > /root/.cuda-name
 RUN --mount=type=cache,target=/root/.cache/uv \
@@ -129,6 +129,13 @@ ENV LD_LIBRARY_PATH=""
 ENV TORCHINDUCTOR_CACHE_DIR="/cache/torchinductor"
 ENV TRITON_CACHE_DIR="/cache/triton"
 RUN mkdir -p /cache/torchinductor /cache/triton
+
+# DeepInfra patches to upstream code (reviewed in deepinfra/dynamo). Applied
+# last so a patch edit doesn't invalidate the expensive prefetch layer above;
+# the editable install makes them live at runtime. Fails loudly if a patch no
+# longer applies against COSMOS_FRAMEWORK_REF (the signal to rebase or drop it).
+COPY patches /workspace/deepinfra-patches
+RUN git -C /workspace apply --verbose deepinfra-patches/*.patch
 
 # DeepInfra Dynamo videogen worker. Runtime args
 # (--served-model-name, --model, --num-gpus, ...) are appended to this command.
