@@ -581,6 +581,27 @@ class PlannerConfig(BaseModel):
             "when every engine breaches it. Set to None to disable."
         ),
     )
+    reactive_floor_decay_ticks: int = Field(
+        default=360,
+        ge=0,
+        description=(
+            "Load ticks (~5s each) without a prefill force-up before the "
+            "reactive high-water floor decays by one replica (~30min at "
+            "default). The floor holds the fleet at the level burst-driven "
+            "force-ups proved necessary, preventing mean-wait sizing from "
+            "re-triggering the burst/force-up cycle. 0 disables the floor."
+        ),
+    )
+    prefill_force_up_persistence_ticks: int = Field(
+        default=3,
+        ge=1,
+        description=(
+            "Consecutive load ticks (~5s each) the all-engines-have-queued-"
+            "prefill condition must hold before forcing a scale-up. 1 restores "
+            "the instantaneous trigger; 3 (~15s) ignores transient bursts that "
+            "drain in seconds while still reacting to real capacity shortage."
+        ),
+    )
     scale_down_cooldown_ticks: int = Field(
         default=120,
         ge=0,
