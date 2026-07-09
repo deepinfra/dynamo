@@ -180,14 +180,14 @@ class NativePlannerBase:
         # FPM subscribers (one per component type, populated during _async_init)
         self._prefill_fpm_sub: Optional[FpmEventSubscriber] = None
         self._decode_fpm_sub: Optional[FpmEventSubscriber] = None
-        # DEEPINFRA: per-(label) stale-FPM tracker. FpmEventSubscriber retains a
-        # worker's last snapshot after its publisher stops (drain / pause_fpm)
-        # while the worker is still in discovery (pod alive), so the planner
-        # keeps counting a frozen engine -> FPM>DGD -> reconcile wedge. Maps
-        # label -> {(wid, dp): (raw_bytes, consecutive_unchanged_polls)}.
-        self._fpm_stale_tracker: dict[
-            str, dict[tuple[str, int], tuple[bytes, int]]
-        ] = {}
+        # DEEPINFRA: per-(label) idle-FPM tracker. The Rust FpmDirectPublisher
+        # keeps an idle-heartbeat task that emits zeroed snapshots every ~5s
+        # with an incrementing counter — so bytes-based staleness can't tell a
+        # drained worker from an active one. Track instead by FPM semantics:
+        # any consecutive run of polls where wall_time==0 and no scheduled
+        # work was observed counts as drained/idle. Maps
+        # label -> {(wid, dp): consecutive_idle_polls}.
+        self._fpm_stale_tracker: dict[str, dict[tuple[str, int], int]] = {}
 
         # Runtime client caches
         self._prefill_client = None
@@ -568,12 +568,13 @@ class NativePlannerBase:
     # Data collection (runtime I/O)
     # ------------------------------------------------------------------
 
-    # DEEPINFRA: a worker whose FPM publisher stopped (drain / pause_fpm) but is
-    # still in discovery keeps returning a byte-identical snapshot from
-    # get_recent_stats(). Live workers' bytes change every poll (the published
-    # FPM carries an incrementing counter_id, so even idle heartbeats differ), so
-    # N consecutive identical snapshots => departed/drained worker. Evict it from
-    # the observed set so it doesn't inflate the engine count past DGD.
+    # DEEPINFRA: a worker emitting wall_time==0 with no scheduled work for N
+    # consecutive polls is treated as drained/idle and dropped from the
+    # observed set so it doesn't inflate the engine count past DGD. Drain v9's
+    # Python emission gate produces exactly this shape (Rust heartbeats keep
+    # firing zeroed snapshots while paused). Real idle workers (truly no
+    # traffic) get evicted too, which is fine — they re-enter the moment a
+    # non-zero FPM arrives.
     _FPM_STALE_POLLS = 3
 
     def _decode_fpm_bytes(
@@ -587,23 +588,26 @@ class NativePlannerBase:
         tracker = self._fpm_stale_tracker.setdefault(label, {})
         result: dict[tuple[str, int], ForwardPassMetrics] = {}
         for key, raw_bytes in raw.items():
-            prev = tracker.get(key)
-            if prev is not None and prev[0] == raw_bytes:
-                stale = prev[1] + 1
-            else:
-                stale = 0
-            tracker[key] = (raw_bytes, stale)
+            fpm = decode_fpm(raw_bytes)
+            if fpm is None:
+                continue
+            sched = fpm.scheduled_requests
+            is_idle = (
+                fpm.wall_time == 0.0
+                and sched.num_prefill_requests == 0
+                and sched.num_decode_requests == 0
+            )
+            stale = tracker.get(key, 0) + 1 if is_idle else 0
+            tracker[key] = stale
             if stale >= self._FPM_STALE_POLLS:
                 if stale == self._FPM_STALE_POLLS:
                     logger.warning(
-                        f"Evicting stale FPM engine {key[0]}:dp{key[1]} ({label}): "
-                        f"snapshot unchanged for {stale} polls (publisher stopped / "
-                        f"drained while still in discovery)"
+                        f"Evicting idle FPM engine {key[0]}:dp{key[1]} ({label}): "
+                        f"wall_time==0 with no scheduled work for {stale} polls "
+                        f"(publisher paused or worker truly idle)"
                     )
                 continue
-            fpm = decode_fpm(raw_bytes)
-            if fpm is not None:
-                result[key] = fpm
+            result[key] = fpm
         # forget keys the subscriber no longer reports (worker left discovery)
         for key in [k for k in tracker if k not in raw]:
             del tracker[key]
