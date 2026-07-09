@@ -1,0 +1,29 @@
+diff --git a/cosmos_framework/auxiliary/guardrail/common/presets.py b/cosmos_framework/auxiliary/guardrail/common/presets.py
+index 8536685..932daa5 100644
+--- a/cosmos_framework/auxiliary/guardrail/common/presets.py
++++ b/cosmos_framework/auxiliary/guardrail/common/presets.py
+@@ -21,13 +21,22 @@ def create_text_guardrail_runner(offload_model_to_cpu: bool = False) -> Guardrai
+ 
+ 
+ def create_video_guardrail_runner(offload_model_to_cpu: bool = False) -> GuardrailRunner:
+-    """Create the video guardrail runner."""
++    """Create the video guardrail runner.
++
++    deepinfra: the RetinaFace face-blur postprocessor is intentionally removed.
++    It unconditionally pixelates every detected face in every output frame,
++    which breaks the product (people are a core use case) and is a privacy/
++    anti-deepfake measure, not a content-safety control. The content-safety
++    value lives in the text-prompt guardrail (Blocklist + Qwen3Guard), which is
++    unchanged. Upstream's VideoContentSafetyFilter is already disabled by NVIDIA
++    (false positives), so the video runner is now a no-op passthrough.
++    """
+     return GuardrailRunner(
+         safety_models=[
+             # VideoContentSafetyFilter(offload_model_to_cpu=offload_model_to_cpu)
+             # Too many false positives, add back when fixed
+         ],
+-        postprocessors=[RetinaFaceFilter(offload_model_to_cpu=offload_model_to_cpu)],
++        postprocessors=[],
+     )
+ 
+ 
