@@ -137,8 +137,13 @@ RUN mkdir -p /cache/torchinductor /cache/triton
 COPY patches /workspace/deepinfra-patches
 RUN git -C /workspace apply --verbose deepinfra-patches/*.patch
 
-# DeepInfra Dynamo videogen worker. Runtime args
-# (--served-model-name, --model, --num-gpus, ...) are appended to this command.
-# worker.py self-relaunches under torchrun when --num-gpus > 1.
-COPY worker.py /workspace/worker.py
+# DeepInfra Dynamo videogen worker. MM2's dynamo deployment runs
+# `python3 worker.py` with workingDir=/opt/app (the videogen-worker convention),
+# so worker.py MUST live at /opt/app/worker.py — NOT /workspace (where the
+# framework is cloned). cosmos_framework is installed editable, so it imports
+# fine regardless of cwd. Runtime args (--served-model-name, --model=/data/default,
+# --num-gpus) are appended by the deployment; worker.py self-relaunches under
+# torchrun when --num-gpus > 1.
+COPY worker.py /opt/app/worker.py
+WORKDIR /opt/app
 ENTRYPOINT ["python3", "worker.py"]
