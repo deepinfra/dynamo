@@ -134,6 +134,12 @@ def _sync_config_from_engine_args(config: Config, engine_args: dict) -> None:
 
 
 def _register_memory_routes(runtime, handler) -> None:
+    # DEEPINFRA: MM (deepapi EvictDrainedShards) drives drain via /engine/sleep
+    # and /engine/wake_up — vLLM-native names. Register aliases so the drain
+    # protocol works on TRT-LLM workers, and register unconditionally (the GMS
+    # gate at the call sites is dropped) so non-GMS deployments get the routes.
+    runtime.register_engine_route("sleep", handler.release_memory_occupation)
+    runtime.register_engine_route("wake_up", handler.resume_memory_occupation)
     runtime.register_engine_route(
         "control/release_memory_occupation",
         handler.release_memory_occupation,
@@ -143,8 +149,9 @@ def _register_memory_routes(runtime, handler) -> None:
         handler.resume_memory_occupation,
     )
     logging.info(
-        "Registered engine routes: "
-        "/engine/control/release_memory_occupation, /engine/control/resume_memory_occupation"
+        "Registered engine routes: /engine/sleep, /engine/wake_up, "
+        "/engine/control/release_memory_occupation, "
+        "/engine/control/resume_memory_occupation"
     )
 
 
@@ -791,8 +798,9 @@ async def init_llm_worker(
             ) as publisher:
                 handler_config.publisher = publisher
                 handler = RequestHandlerFactory().get_request_handler(handler_config)
-                if config.load_format == "gms":
-                    _register_memory_routes(runtime, handler)
+                # DEEPINFRA: register drain routes unconditionally (was gated on
+                # load_format=="gms"; MM needs /engine/sleep on all deployments).
+                _register_memory_routes(runtime, handler)
 
                 encoder_cache = getattr(handler, "_encoder_cache", None)
                 if encoder_cache is not None:
@@ -813,8 +821,8 @@ async def init_llm_worker(
                 consolidator_publisher.shutdown()
         else:
             handler = RequestHandlerFactory().get_request_handler(handler_config)
-            if config.load_format == "gms":
-                _register_memory_routes(runtime, handler)
+            # DEEPINFRA: register drain routes unconditionally (see above).
+            _register_memory_routes(runtime, handler)
             await endpoint.serve_endpoint(
                 handler.generate, health_check_payload=health_check_payload
             )
