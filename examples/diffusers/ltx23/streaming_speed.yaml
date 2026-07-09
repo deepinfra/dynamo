@@ -50,12 +50,20 @@ generator:
       pin_cpu_memory: true
 
     # internal: gpu_pool.py:251-258 + the just-uncommented "mode" line
-    # — torch.compile on for transformer + text encoder, inductor
+    # — torch.compile on for transformer + text encoder + VAE, inductor
     # backend, fullgraph for graph-break debugging, max-autotune-
     # no-cudagraphs for the kernel sweep, dynamic off (static shapes).
+    # vae_enabled matches FastVideo's batch path (video_generation.py sets
+    # vae_enabled=ENABLE_TORCH_COMPILE, default on); measured A/B on the FA4
+    # image (2026-07-09, di-slc-140 B200) cut warm gen 7.16s -> 5.02s (~2.1s,
+    # ~30%) by compiling the VAE decode. Quality-neutral (torch.compile is
+    # numerically ~identical). Requires a re-bake so the Mega-Cache captures
+    # the VAE graphs (save_cache_artifacts snapshots them after the first
+    # forward); a stale blob just cold-compiles the VAE, never wedges.
     compile:
       enabled: true
       text_encoder_enabled: true
+      vae_enabled: true
       backend: inductor
       fullgraph: true
       mode: max-autotune-no-cudagraphs
