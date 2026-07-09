@@ -228,7 +228,10 @@ class Cosmos3VideoRequest(BaseModel):
                     if (w, h) in _SIZE_TO_RES_AR:
                         res, ar = _SIZE_TO_RES_AR[(w, h)]
                 except ValueError:
-                    pass
+                    log.warning(
+                        "ignoring unparseable size %r; using resolution defaults",
+                        self.size,
+                    )
         vision_url = self.video_url or self.image_url or self.input_reference
         return nf, res, ar, fps, seed, vision_url
 
