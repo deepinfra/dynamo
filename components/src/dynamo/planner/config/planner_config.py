@@ -859,21 +859,31 @@ class PlannerConfig(BaseModel):
                 )
 
         if self.aic_perf_model is not None:
+            # DEEPINFRA: a missing per-worker pick is a supported
+            # configuration, not an error — that worker's perf model falls
+            # back to the pure FPM linear regression (see rust_adapter
+            # ._build_aic_config), which for decode is often preferable to
+            # AIC's batch-scaling extrapolation. Warn so the mode is visible
+            # in logs, but don't refuse to start.
             if (
                 self.mode in ("disagg", "prefill")
                 and self.aic_perf_model.prefill_pick is None
             ):
-                raise ValueError(
-                    "aic_perf_model.prefill_pick is required for prefill "
-                    f"perf queries in mode={self.mode!r}"
+                logger.warning(
+                    "aic_perf_model.prefill_pick is not set in mode=%r; "
+                    "prefill perf queries will use the FPM regression "
+                    "fallback instead of AIC",
+                    self.mode,
                 )
             if (
                 self.mode in ("disagg", "decode", "agg")
                 and self.aic_perf_model.decode_pick is None
             ):
-                raise ValueError(
-                    "aic_perf_model.decode_pick is required for decode/agg "
-                    f"perf queries in mode={self.mode!r}"
+                logger.warning(
+                    "aic_perf_model.decode_pick is not set in mode=%r; "
+                    "decode/agg perf queries will use the FPM regression "
+                    "fallback instead of AIC",
+                    self.mode,
                 )
 
         intervals = [float(self.load_adjustment_interval_seconds)]
