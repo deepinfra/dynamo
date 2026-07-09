@@ -697,6 +697,54 @@ class PlannerEnginePerfModel:
                     self._fallback_per_token_slope_s(),
                 )
                 return fallback
+            # DEEPINFRA: strip batching credit. The shim's batch sweep picks
+            # the batch size that maximizes throughput, but kv-router
+            # cache-affinity dispatch causes rotating per-pod imbalances that
+            # keep individual pods below their batching sweet spot in
+            # practice. Query AIC directly at batch=1's actual token count
+            # (effective_isl after prefix-cache discount) to get the true
+            # single-request iter latency, then rps = 1 / iter_ttft.
+            effective_isl = max(
+                1,
+                int(math.ceil(
+                    isl * (1.0 - _clamp_kv_hit_rate(kv_hit_rate))
+                )),
+            )
+            synth_fpm = ForwardPassMetrics(
+                version=FPM_VERSION,
+                worker_id="0",
+                dp_rank=0,
+                counter_id=0,
+                wall_time=0.0,
+                scheduled_requests=ScheduledRequestMetrics(),
+                queued_requests=QueuedRequestMetrics(
+                    num_prefill_requests=1,
+                    sum_prefill_tokens=effective_isl,
+                ),
+            )
+            try:
+                ttft_batch1_s = self._rust_model.get_queued_prefill_time(
+                    [synth_fpm]
+                )
+            except _RUST_SHIM_FALLBACK_EXCEPTIONS as e:
+                logger.warning(
+                    "RUST_CAPACITY[prefill]: batch-1 query failed: %s "
+                    "(keeping shim rps=%.2f)", e, rps,
+                )
+                ttft_batch1_s = None
+            if ttft_batch1_s is not None and ttft_batch1_s > 0:
+                rps_batch1 = 1.0 / ttft_batch1_s
+                ttft_batch1_ms = ttft_batch1_s * 1000.0
+                logger.info(
+                    "RUST_CAPACITY[prefill]: batch-1 override: "
+                    "shim rps=%.2f (batch≈%.1f, ttft=%.2fms) -> "
+                    "rps=%.2f (effective_isl=%d, ttft=%.2fms)",
+                    rps, rps * result.ttft_ms / 1000.0, result.ttft_ms,
+                    rps_batch1, effective_isl, ttft_batch1_ms,
+                )
+                rps = rps_batch1
+                # keep result.ttft_ms as the SLA-eligibility signal (unchanged)
+                # but capacity is now derived from the batch=1 iter.
         return PlannerEngineCapacity(
             rps=rps,
             ttft_ms=result.ttft_ms,
@@ -739,17 +787,13 @@ class PlannerEnginePerfModel:
         """
         if self._fallback_min_wt_s is None:
             return None
-        # Only override when shim is clearly unphysical: rps > 1e5 OR
-        # ttft below the observed system overhead floor.
-        min_wt_ms = self._fallback_min_wt_s * 1000.0
-        shim_is_unphysical = False
-        if shim_rps is not None and shim_rps > _FALLBACK_UNPHYSICAL_RPS:
-            shim_is_unphysical = True
-        if shim_ttft_ms is not None and shim_ttft_ms < min_wt_ms * 0.5:
-            # Significantly below the irreducible overhead — also a tell that
-            # the regression has hit its 1e-6 ms floor.
-            shim_is_unphysical = True
-        if not shim_is_unphysical:
+        # Override only on the 1e9-rps sentinel — the regression's .max(1e-6)
+        # ttft floor. The earlier "ttft < half min_wt" heuristic misfired under
+        # AIC native: min_wt drifts up with load (tracks smallest busy iter,
+        # not the true overhead floor), so any legitimate AIC prediction that
+        # beats current busy iters gets rejected. AIC's low predictions are
+        # exactly what we want to trust when piecewise CUDA graphs are active.
+        if shim_rps is None or shim_rps <= _FALLBACK_UNPHYSICAL_RPS:
             return None
         slope_s = self._fallback_per_token_slope_s()
         if slope_s is None:
