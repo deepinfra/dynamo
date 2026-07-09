@@ -410,6 +410,67 @@ class PrometheusAPIClient:
             logger.warning(f"Error getting avg kv hit rate: {e}")
             return None
 
+    def scrape_gap_recent(
+        self,
+        model_name: str,
+        lookback_s: int = 90,
+        scrape_period_s: int = 15,
+        min_healthy_fraction: float = 0.6,
+    ) -> bool:
+        """DEEPINFRA: True when the request counter is missing recent samples.
+
+        A Prometheus outage poisons count-type inputs twice: an empty read
+        during the gap, then one ``increase()`` window holding the whole
+        gap's counter delta (the engine looks back past the window start for
+        the previous point). Both poisoned reads occur while the lookback
+        window is missing samples — so sample completeness, not value
+        magnitude, is the reliable discriminator (a genuine demand surge has
+        a full complement of samples and must never be suppressed).
+
+        Checks ``count_over_time`` of the request counter over ``lookback_s``
+        per series (frontend pods) and reports a gap when any series has
+        fewer than ``min_healthy_fraction`` of the expected samples, when no
+        series matches, or when the query itself fails (Prometheus down).
+        """
+        metric = self._frontend_metric_name(
+            prometheus_names.frontend_service.REQUESTS_STARTED_TOTAL
+        )
+        expected = lookback_s / scrape_period_s
+        threshold = expected * min_healthy_fraction
+        try:
+            result = self.prom.custom_query(
+                query=f"count_over_time({metric}[{lookback_s}s])"
+            )
+        except Exception as e:  # noqa: BLE001 - treat query failure as a gap
+            logger.warning("Scrape-gap check query failed (%s): assuming gap", e)
+            return True
+        counts = []
+        for entry in result or []:
+            labels = entry.get("metric", {})
+            if labels.get("model", "").lower() != model_name.lower():
+                continue
+            if labels.get("dynamo_namespace") != self.dynamo_namespace:
+                continue  # skip the duplicate service-job scrape
+            try:
+                counts.append(float(entry["value"][1]))
+            except (KeyError, IndexError, ValueError):
+                continue
+        if not counts:
+            logger.warning(
+                "Scrape-gap check: no per-pod series for %s: assuming gap",
+                model_name,
+            )
+            return True
+        worst = min(counts)
+        if worst < threshold:
+            logger.warning(
+                "Scrape-gap check: series has %.0f/%.0f expected samples in "
+                "the last %ds — metrics gap in progress or just ended",
+                worst, expected, lookback_s,
+            )
+            return True
+        return False
+
     @staticmethod
     def _quote_label_value(value: str) -> str:
         return value.replace("\\", "\\\\").replace('"', '\\"')
