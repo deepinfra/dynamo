@@ -57,6 +57,22 @@ class TrafficObservation:
 
 
 @dataclass
+class TrafficShape:
+    """Second-moment shape statistics of live traffic (DEEPINFRA).
+
+    Measured from Prometheus histograms over a long window (shape drifts over
+    hours, so it is sampled coarsely and cached, unlike the per-tick means in
+    :class:`TrafficObservation`). Consumed by Erlang-C prefill sizing to derive
+    the service-time variability term.
+    """
+
+    isl_scv: Optional[float] = None  # squared coefficient of variation of ISL
+    one_minus_hit_scv: Optional[float] = None  # SCV of (1 - kv_hit_rate)
+    isl_samples: float = 0.0
+    hit_samples: float = 0.0
+
+
+@dataclass
 class WorkerCounts:
     """Current worker inventory as reported by the adapter."""
 

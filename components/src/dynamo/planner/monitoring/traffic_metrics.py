@@ -15,15 +15,73 @@
 
 import logging
 import math
+import time
 import typing
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Tuple
 
 from prometheus_api_client import PrometheusConnect
 from pydantic import BaseModel, ValidationError
 
 from dynamo import prometheus_names
+from dynamo.planner.core.types import TrafficShape
 from dynamo.runtime.logging import configure_dynamo_logging
+
+
+def _histogram_moments(
+    bucket_sums: Dict[str, float],
+    *,
+    log_spaced: bool,
+    calibrate_mean: Optional[float] = None,
+) -> Optional[Tuple[float, float, float]]:
+    """(mean, second moment, count) from cumulative histogram buckets.
+
+    Each bucket's mass is placed at a representative point: the geometric mean
+    of its edges for log-spaced buckets (frontend token histograms), the
+    midpoint for linear ones (router hit-rate histogram); ``1.5 * lower`` for
+    the +Inf bucket and ``upper / 2`` for the first. When ``calibrate_mean``
+    (the exact ``_sum/_count`` mean) is given, points are rescaled so the
+    histogram mean matches it — removing most binning bias where it matters.
+    Returns None when the buckets are empty or malformed.
+    """
+    try:
+        rows: List[Tuple[float, float]] = sorted(
+            (math.inf if le in ("+Inf", "Inf", "inf") else float(le), v)
+            for le, v in bucket_sums.items()
+        )
+    except ValueError:
+        return None
+    if not rows:
+        return None
+
+    masses: List[float] = []
+    points: List[float] = []
+    prev_le, prev_cum = 0.0, 0.0
+    for le, cum in rows:
+        mass = cum - prev_cum
+        if mass > 0:
+            if math.isinf(le):
+                point = prev_le * 1.5
+            elif prev_le <= 0:
+                point = le / 2.0
+            elif log_spaced:
+                point = math.sqrt(prev_le * le)
+            else:
+                point = (prev_le + le) / 2.0
+            masses.append(mass)
+            points.append(point)
+        prev_le, prev_cum = le, cum
+
+    n = sum(masses)
+    if n <= 0:
+        return None
+    mean = sum(m * p for m, p in zip(masses, points)) / n
+    if calibrate_mean is not None and calibrate_mean > 0 and mean > 0:
+        scale = calibrate_mean / mean
+        points = [p * scale for p in points]
+        mean = calibrate_mean
+    m2 = sum(m * p * p for m, p in zip(masses, points)) / n
+    return mean, m2, n
 
 
 class _BearerTokenFileAuth:
@@ -113,6 +171,9 @@ class PrometheusAPIClient:
             self.prom._session.verify = ca_bundle
         self.dynamo_namespace = dynamo_namespace
         self.metrics_source = metrics_source  # "frontend" | "router"
+        # DEEPINFRA: cached traffic-shape stats (second moments drift over
+        # hours; sample coarsely instead of per tick).
+        self._shape_cache: Optional[Tuple[float, "TrafficShape"]] = None
 
     def _frontend_metric_name(self, metric_name: str) -> str:
         if metric_name.startswith(prometheus_names.name_prefix.FRONTEND):
@@ -460,6 +521,183 @@ class PrometheusAPIClient:
             )
             return True
         return False
+
+    # ------------------------------------------------------------------
+    # DEEPINFRA: traffic-shape (second moment) measurement for Erlang-C
+    # prefill sizing. Means come from _sum/_count ratios (scrape-duplication
+    # safe); shapes come from histogram buckets, which must exclude the
+    # duplicate service-job scrape — the per-pod scrape is identified by the
+    # presence of the dynamo_namespace label (frontend metrics) or its
+    # dash-form value (router metrics, stamped from pod labels).
+    # ------------------------------------------------------------------
+
+    def _filtered_bucket_sums(
+        self,
+        metric: str,
+        interval: str,
+        match: typing.Callable[[dict], bool],
+    ) -> Dict[str, float]:
+        """Per-``le`` sums of ``increase(metric[interval])`` over series
+        accepted by ``match``. Returns {} on missing data."""
+        result = self.prom.custom_query(query=f"increase({metric}[{interval}])")
+        sums: Dict[str, float] = {}
+        for entry in result or []:
+            labels = entry.get("metric", {})
+            if not match(labels):
+                continue
+            le = labels.get("le")
+            if le is None:
+                continue
+            try:
+                value = float(entry["value"][1])
+            except (KeyError, IndexError, ValueError):
+                continue
+            if math.isnan(value):
+                continue
+            sums[le] = sums.get(le, 0.0) + value
+        return sums
+
+    def _filtered_scalar_sum(
+        self,
+        metric: str,
+        interval: str,
+        match: typing.Callable[[dict], bool],
+    ) -> Optional[float]:
+        result = self.prom.custom_query(query=f"increase({metric}[{interval}])")
+        total, matched = 0.0, False
+        for entry in result or []:
+            if not match(entry.get("metric", {})):
+                continue
+            try:
+                value = float(entry["value"][1])
+            except (KeyError, IndexError, ValueError):
+                continue
+            if math.isnan(value):
+                continue
+            total += value
+            matched = True
+        return total if matched else None
+
+    def get_traffic_shape(
+        self,
+        model_name: str,
+        window: str = "1h",
+        ttl_s: float = 300.0,
+        min_samples: float = 2000.0,
+    ) -> "TrafficShape":
+        """Shape statistics (SCVs) of ISL and router kv-hit distributions.
+
+        Cached for ``ttl_s``; individual fields are ``None`` when the source
+        histogram is missing or has fewer than ``min_samples`` observations
+        in ``window`` — callers fall back to configured defaults.
+        """
+        now = time.monotonic()
+        if self._shape_cache is not None and now - self._shape_cache[0] < ttl_s:
+            return self._shape_cache[1]
+
+        shape = TrafficShape()
+        try:
+            shape.isl_scv, shape.isl_samples = self._measure_isl_scv(
+                model_name, window, min_samples
+            )
+        except Exception as e:  # noqa: BLE001 - shape is best-effort
+            logger.warning("Traffic shape: ISL SCV measurement failed: %s", e)
+        try:
+            (
+                shape.one_minus_hit_scv,
+                shape.hit_samples,
+            ) = self._measure_one_minus_hit_scv(window, min_samples)
+        except Exception as e:  # noqa: BLE001 - shape is best-effort
+            logger.warning("Traffic shape: kv-hit SCV measurement failed: %s", e)
+
+        self._shape_cache = (now, shape)
+        logger.info(
+            "Traffic shape refreshed: isl_scv=%s (n=%.0f) one_minus_hit_scv=%s "
+            "(n=%.0f)",
+            None if shape.isl_scv is None else f"{shape.isl_scv:.2f}",
+            shape.isl_samples,
+            None
+            if shape.one_minus_hit_scv is None
+            else f"{shape.one_minus_hit_scv:.2f}",
+            shape.hit_samples,
+        )
+        return shape
+
+    def _measure_isl_scv(
+        self, model_name: str, window: str, min_samples: float
+    ) -> Tuple[Optional[float], float]:
+        metric = self._frontend_metric_name(
+            prometheus_names.frontend_service.INPUT_SEQUENCE_TOKENS
+        )
+
+        def match(labels: dict) -> bool:
+            # Per-pod scrape only: the duplicate service-job scrape carries no
+            # dynamo_namespace label.
+            return (
+                labels.get("model", "").lower() == model_name.lower()
+                and labels.get("dynamo_namespace") == self.dynamo_namespace
+            )
+
+        buckets = self._filtered_bucket_sums(f"{metric}_bucket", window, match)
+        exact_sum = self._filtered_scalar_sum(f"{metric}_sum", window, match)
+        exact_count = self._filtered_scalar_sum(f"{metric}_count", window, match)
+        exact_mean = (
+            exact_sum / exact_count if exact_sum and exact_count else None
+        )
+        moments = _histogram_moments(
+            buckets, log_spaced=True, calibrate_mean=exact_mean
+        )
+        if moments is None or moments[2] < min_samples:
+            return None, moments[2] if moments else 0.0
+        mean, m2, n = moments
+        if mean <= 0:
+            return None, n
+        return max(0.0, (m2 - mean * mean) / (mean * mean)), n
+
+    def _measure_one_minus_hit_scv(
+        self, window: str, min_samples: float
+    ) -> Tuple[Optional[float], float]:
+        metric = (
+            f"{prometheus_names.name_prefix.COMPONENT}_"
+            f"{prometheus_names.router.KV_HIT_RATE}"
+        )
+        ns_dash = self.dynamo_namespace
+        ns_under = self.dynamo_namespace.replace("-", "_")
+
+        def match_dash(labels: dict) -> bool:
+            return labels.get("dynamo_namespace") == ns_dash
+
+        def match_under(labels: dict) -> bool:
+            return labels.get("dynamo_namespace") == ns_under
+
+        # Prefer the per-pod scrape (dash-form namespace stamped from pod
+        # labels); fall back to the native underscore form for deployments
+        # without that relabeling.
+        buckets = self._filtered_bucket_sums(f"{metric}_bucket", window, match_dash)
+        match = match_dash
+        if not buckets:
+            buckets = self._filtered_bucket_sums(
+                f"{metric}_bucket", window, match_under
+            )
+            match = match_under
+        exact_sum = self._filtered_scalar_sum(f"{metric}_sum", window, match)
+        exact_count = self._filtered_scalar_sum(f"{metric}_count", window, match)
+        exact_mean = (
+            exact_sum / exact_count if exact_sum is not None and exact_count else None
+        )
+        moments = _histogram_moments(
+            buckets, log_spaced=False, calibrate_mean=exact_mean
+        )
+        if moments is None or moments[2] < min_samples:
+            return None, moments[2] if moments else 0.0
+        hit_mean, hit_m2, n = moments
+        hit_var = max(0.0, hit_m2 - hit_mean * hit_mean)
+        one_minus = 1.0 - hit_mean
+        if one_minus < 0.05:
+            # Near-total cache reuse: (1-hit) SCV is numerically unstable and
+            # the service time is overhead-dominated anyway.
+            return None, n
+        return hit_var / (one_minus * one_minus), n
 
     @staticmethod
     def _quote_label_value(value: str) -> str:
