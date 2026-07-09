@@ -417,6 +417,20 @@ class Publisher:
         # the publisher is shut down and None'd. Prevents silent planner poison
         # when running against a TRT-LLM version that predates #13199.
         self._fpm_schema_checked: bool = False
+        # DEEPINFRA drain (v9): keep the Rust FpmDirectPublisher alive across
+        # drain cycles and gate emissions in Python. Tearing down the publisher
+        # rebinds ZMQ to a new ephemeral port, which the K8s discovery layer
+        # captures as an `updated` snapshot but never translates into an
+        # Added/Removed event — leaving planner subscribers stuck on a dead
+        # port. Pausing in Python keeps the socket bound, the port stable, and
+        # the CR's FPM endpoint unchanged across drain/wake cycles. The
+        # planner's _decode_fpm_bytes evicts paused workers via the
+        # wall_time==0 + no-scheduled-work predicate.
+        self._fpm_paused: bool = False
+        # Stashed FpmDirectPublisher ctor kwargs (initialize() sets these).
+        # No longer used by pause/resume but retained for failure-recovery
+        # paths in _create_fpm_publisher (schema-probe shutdown, etc.).
+        self._fpm_publisher_init_args: Optional[Dict[str, Any]] = None
         self.kv_event_publishers: Optional[
             Dict[int, KvEventPublisher]
         ] = None  # One per attention_dp_rank
@@ -465,23 +479,13 @@ class Publisher:
         # attention-DP rank. Non-attention-DP engines report size 1. Under
         # attention-DP, TRT-LLM emits one IterationStats row per rank and
         # Dynamo forwards attentionDpRank as the FPM dp_rank.
-        try:
-            fpm_dp_size = max(1, int(self.attention_dp_size or 1))
-            self.fpm_publisher = FpmDirectPublisher(
-                endpoint=self.endpoint,
-                worker_id=str(self.worker_id),
-                dp_size=fpm_dp_size,
-            )
-            logging.info(f"FpmDirectPublisher initialized with dp_size={fpm_dp_size}")
-        except RuntimeError as e:
-            # PyO3 surfaces all FpmDirectPublisher::new failures as
-            # PyRuntimeError (Endpoint missing, tokio runtime missing,
-            # etc.). Catch only that — any other exception here would
-            # signal a programming error worth surfacing.
-            logging.warning(
-                f"Failed to initialize FpmDirectPublisher; FPM emission disabled: {e}"
-            )
-            self.fpm_publisher = None
+        fpm_dp_size = max(1, int(self.attention_dp_size or 1))
+        self._fpm_publisher_init_args = {
+            "endpoint": self.endpoint,
+            "worker_id": str(self.worker_id),
+            "dp_size": fpm_dp_size,
+        }
+        self._create_fpm_publisher()
 
         # Setup the kv cache events publisher
         # Publisher selection based on consolidator configuration:
@@ -631,6 +635,61 @@ class Publisher:
             )
         self.fpm_publisher = None
 
+    def _create_fpm_publisher(self) -> None:
+        """Create ``self.fpm_publisher`` from stashed ctor args (idempotent).
+
+        Used by ``initialize()`` on boot and ``resume_fpm()`` on wake. On
+        failure FPM stays disabled (publisher None) — the worker keeps
+        serving; the planner just won't see its FPM until a restart.
+        """
+        if self.fpm_publisher is not None:
+            return
+        if self._fpm_publisher_init_args is None:
+            logging.warning(
+                "Cannot create FpmDirectPublisher: init args were never stashed."
+            )
+            return
+        try:
+            self.fpm_publisher = FpmDirectPublisher(**self._fpm_publisher_init_args)
+            logging.info(
+                "FpmDirectPublisher initialized with dp_size=%s",
+                self._fpm_publisher_init_args.get("dp_size"),
+            )
+        except RuntimeError as e:
+            # PyO3 surfaces all FpmDirectPublisher::new failures as
+            # PyRuntimeError (Endpoint missing, tokio runtime missing,
+            # etc.). Catch only that — any other exception here would
+            # signal a programming error worth surfacing.
+            logging.warning(
+                f"Failed to initialize FpmDirectPublisher; FPM emission disabled: {e}"
+            )
+            self.fpm_publisher = None
+
+    def pause_fpm(self) -> None:
+        """DEEPINFRA drain (v9): gate FPM emission in Python while the worker
+        is drained, without tearing down the Rust publisher.
+
+        Keeping the FpmDirectPublisher alive preserves the bound ZMQ port,
+        which avoids triggering the K8s discovery `updated`-without-event
+        bug. The Rust heartbeat will keep emitting all-zero snapshots every
+        ~5s; the planner's _decode_fpm_bytes treats those as drained via the
+        wall_time==0 + no-scheduled-work predicate, so we don't inflate the
+        engine count.
+
+        Idempotent; mirrors resume_fpm().
+        """
+        if self._fpm_paused:
+            return
+        logging.info("Pausing FPM emission for drain (Python gate; publisher stays bound)")
+        self._fpm_paused = True
+
+    def resume_fpm(self) -> None:
+        """DEEPINFRA drain (v9): clear the Python emission gate on wake."""
+        if not self._fpm_paused:
+            return
+        logging.info("Resuming FPM emission after drain (Python gate cleared)")
+        self._fpm_paused = False
+
     async def _publish_stats_task(self):
         """
         Publish stats to the metrics publisher.
@@ -688,7 +747,7 @@ class Publisher:
             # worker's lifetime.
             if self.fpm_publisher is not None and not self._fpm_schema_checked:
                 self._check_fpm_schema(stat)
-            if self.fpm_publisher is not None:
+            if self.fpm_publisher is not None and not self._fpm_paused:
                 try:
                     ibs = stat.get("inflightBatchingStats") or {}
                     # numCtxTokens is the prefill compute volume *this iter*
