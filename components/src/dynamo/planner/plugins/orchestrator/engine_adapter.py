@@ -266,6 +266,11 @@ class OrchestratorEngineAdapter:
         self._in_process_plugins_loaded = False
         self._register_builtin_plugins()
 
+    def set_traffic_shape_provider(self, provider) -> None:
+        """DEEPINFRA: inject the Prometheus-backed traffic-shape provider
+        (see PlannerScalingState._traffic_shape_provider)."""
+        self._scaling_state._traffic_shape_provider = provider
+
     @property
     def plugins_bootstrapped(self) -> bool:
         return self._plugins_bootstrapped

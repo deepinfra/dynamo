@@ -270,6 +270,20 @@ class NativePlannerBase:
         )
 
         self._engine = OrchestratorEngineAdapter(self.config, caps)
+        # DEEPINFRA: give Erlang-C prefill sizing access to traffic-shape
+        # statistics (histogram second moments). The client caches results
+        # (~5min TTL) so the per-tick cost is a dict lookup.
+        if (
+            self.config.prefill_sizing_mode == "erlang_c"
+            and self.config.prefill_measure_traffic_shape
+        ):
+            self._engine.set_traffic_shape_provider(
+                lambda: self.prometheus_traffic_client.get_traffic_shape(
+                    self.model_name
+                )
+                if self.model_name
+                else None
+            )
         return self._engine
 
     def _load_predictor_warmup_observations(

@@ -604,6 +604,113 @@ class PlannerConfig(BaseModel):
             "decode_kv_saturation_threshold when None."
         ),
     )
+    throughput_utilization_target: float = Field(
+        default=1.0,
+        gt=0.0,
+        le=1.0,
+        description=(
+            "Prefill-only multiplier applied to the perf-model's per-engine "
+            "capacity RPS in throughput scaling. AIC's rps = 1/iter_ttft is "
+            "the 100%-utilisation ceiling where queue length diverges; setting "
+            "this below 1.0 targets a stable operating point. Decode is not "
+            "affected because its capacity already reflects batch concurrency. "
+            "Typical: 0.7-0.8. Ignored when prefill_sizing_mode='erlang_c' "
+            "(prefill_rho_ceiling takes over)."
+        ),
+    )
+    # ------------------------------------------------------------------
+    # DEEPINFRA: Erlang-C prefill sizing (queueing-derived headroom).
+    # Validated by simulation + a 21-day backtest on gpt-oss-120b-disagg
+    # (2026-07-02): tracks the SLA boundary at ~15% fewer pods than a
+    # hand-tuned static utilization target.
+    # ------------------------------------------------------------------
+    prefill_sizing_mode: Literal["static", "erlang_c"] = Field(
+        default="static",
+        description=(
+            "Prefill replica sizing formula. 'static': demand / (engine_rps * "
+            "throughput_utilization_target). 'erlang_c': smallest N whose "
+            "M/G/N mean queue wait (Erlang-C with the Allen-Cunneen "
+            "(Ca^2+Cs^2)/2 correction) fits the TTFT wait budget "
+            "(ttft - prefill_ttft_overhead_ms - service time). Service time "
+            "comes from the FPM-measured per-token slope, not AIC's batch-1 "
+            "estimate."
+        ),
+    )
+    prefill_rho_ceiling: float = Field(
+        default=0.85,
+        gt=0.0,
+        le=1.0,
+        description=(
+            "erlang_c mode: hard cap on per-pod utilization regardless of the "
+            "queueing solution; operator guardrail for large fleets where "
+            "Erlang-C tolerates high rho."
+        ),
+    )
+    prefill_ttft_overhead_ms: float = Field(
+        default=100.0,
+        ge=0.0,
+        description=(
+            "erlang_c mode: TTFT budget consumed outside prefill queue+compute "
+            "(KV transfer, decode first-token scheduling, frontend overhead). "
+            "Measured as frontend-TTFT minus prefill-engine-TTFT means."
+        ),
+    )
+    prefill_service_overhead_s: float = Field(
+        default=0.005,
+        ge=0.0,
+        description=(
+            "erlang_c mode: per-request fixed overhead added to the token-"
+            "proportional prefill service time (backlogged engines amortize "
+            "scheduling across batched prefills)."
+        ),
+    )
+    prefill_arrival_scv: float = Field(
+        default=6.0,
+        gt=0.0,
+        description=(
+            "erlang_c mode: squared coefficient of variation of arrivals "
+            "(Ca^2). 1.0 = Poisson; LLM traffic is burstier (measured "
+            "detrended index of dispersion ~6 on gpt-oss-120b-disagg)."
+        ),
+    )
+    prefill_service_scv: float = Field(
+        default=7.0,
+        gt=0.0,
+        description=(
+            "erlang_c mode: fallback service-time SCV (Cs^2) used when live "
+            "traffic-shape measurement is unavailable."
+        ),
+    )
+    prefill_measure_traffic_shape: bool = Field(
+        default=True,
+        description=(
+            "erlang_c mode: derive Cs^2 from the frontend ISL histogram and "
+            "router kv-hit histogram (cached ~5min) instead of the "
+            "prefill_service_scv constant."
+        ),
+    )
+    prefill_aic_service_kappa: float = Field(
+        default=0.67,
+        gt=0.0,
+        le=2.0,
+        description=(
+            "erlang_c mode: realization factor applied to AIC's batch-1 "
+            "prefill time when the FPM slope is not yet available: "
+            "S = aic_ttft / kappa. Measured as observed/AIC-implied sustained "
+            "token rate (~60k vs ~89k tok/s on gpt-oss-120b-disagg)."
+        ),
+    )
+    prefill_down_demand_pad: float = Field(
+        default=1.25,
+        ge=1.0,
+        le=2.0,
+        description=(
+            "erlang_c mode: down-hysteresis. The prescription only decreases "
+            "when the formula run with demand multiplied by this pad still "
+            "prescribes below the previous value; increases apply "
+            "immediately. Prevents integer-boundary dither. 1.0 disables."
+        ),
+    )
     decode_consolidation_peak_window_ticks: int = Field(
         default=360,
         ge=0,

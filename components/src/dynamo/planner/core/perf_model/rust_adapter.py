@@ -762,6 +762,19 @@ class PlannerEnginePerfModel:
             return None
         return statistics.median(ratios)
 
+    def measured_prefill_service_seconds(
+        self, eff_tokens: float, overhead_s: float
+    ) -> Optional[float]:
+        """FPM-measured mean prefill service time for ``eff_tokens`` computed
+        tokens: ``overhead + eff_tokens * slope``, where slope is the median
+        wall-time/token over compute-dominated iterations (DEEPINFRA, feeds
+        Erlang-C sizing). None until enough heavy iterations are observed.
+        """
+        slope_s = self._fallback_per_token_slope_s()
+        if slope_s is None or slope_s <= 0 or eff_tokens <= 0:
+            return None
+        return overhead_s + eff_tokens * slope_s
+
     def _fallback_capacity(
         self,
         *,
