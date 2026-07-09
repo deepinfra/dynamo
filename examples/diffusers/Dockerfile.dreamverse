@@ -54,7 +54,7 @@ RUN . /opt/venv/bin/activate \
 # the exact commit these patches were authored against, so they apply clean.
 COPY patches/ltx23_gpu_worker_megacache.patch /tmp/megacache.patch
 COPY patches/x264-threads-cap.patch /tmp/x264-threads-cap.patch
-COPY patches/pyav-scenecut.patch /tmp/pyav-scenecut.patch
+COPY patches/pyav-x264-tuning.patch /tmp/pyav-x264-tuning.patch
 COPY patches/flash-attn-cute-fa4-tuple-fix.patch /tmp/flash-attn-cute-fa4-tuple-fix.patch
 # NOTE: verify by grepping the patched source, NOT by importing fastvideo --
 # importing pulls in triton, which fails to init its driver in a GPU-less build
@@ -62,7 +62,7 @@ COPY patches/flash-attn-cute-fa4-tuple-fix.patch /tmp/flash-attn-cute-fa4-tuple-
 RUN SP=/opt/venv/lib/python3.12/site-packages \
  && patch -p1 -d "$SP" --forward --fuzz=0 < /tmp/megacache.patch \
  && patch -p1 -d "$SP" --forward --fuzz=0 < /tmp/x264-threads-cap.patch \
- && patch -p1 -d "$SP" --forward --fuzz=0 < /tmp/pyav-scenecut.patch \
+ && patch -p1 -d "$SP" --forward --fuzz=0 < /tmp/pyav-x264-tuning.patch \
  && patch -p1 -d "$SP" --forward --fuzz=0 < /tmp/flash-attn-cute-fa4-tuple-fix.patch \
  && grep -q 'torch.compiler.load_cache_artifacts' "$SP/fastvideo/worker/gpu_worker.py" \
  && grep -q 'FASTVIDEO_X264_THREADS' "$SP/fastvideo/entrypoints/video_generator.py" \

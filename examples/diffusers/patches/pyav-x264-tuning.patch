@@ -2,7 +2,7 @@ diff --git a/fastvideo/entrypoints/video_generator.py b/fastvideo/entrypoints/vi
 index bfc1633..ef4f213 100644
 --- a/fastvideo/entrypoints/video_generator.py
 +++ b/fastvideo/entrypoints/video_generator.py
-@@ -1010,6 +1010,12 @@ class VideoGenerator:
+@@ -1010,6 +1010,20 @@ class VideoGenerator:
              video_stream.options = {
                  "preset": "ultrafast",
                  "tune": "zerolatency",
@@ -12,6 +12,14 @@ index bfc1633..ef4f213 100644
 +                # FASTVIDEO_X264_PRESET below) so it's opt-out per model without
 +                # a rebuild. Measured ~50-100ms/clip (deepinfra, 2026-07-07).
 +                "x264-params": f"scenecut={os.getenv('FASTVIDEO_X264_SCENECUT', '0')}",
++                # Cap x264 threads. B200 has no NVENC so this is CPU libx264;
++                # unbounded, x264 auto-detects all node cores (~288) -> thread
++                # thrash. Isolated encode-only sweep (deepinfra 2026-07-09, 121f
++                # 1080p) bottoms out ~10-12 threads (~0.42s) and gets WORSE past
++                # 16 (0.64s+); 12 = sweet spot AND well under a fair share. The
++                # ffmpeg-pipe path caps at 32 but is dead on B200 (no ffmpeg on
++                # PATH). Env-configurable, no rebuild to change.
++                "threads": os.getenv("FASTVIDEO_X264_THREADS_PYAV", "12"),
              }
  
              audio_stream = output.add_stream("aac", rate=sample_rate, layout=layout)
