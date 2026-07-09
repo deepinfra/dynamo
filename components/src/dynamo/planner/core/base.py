@@ -692,6 +692,24 @@ class NativePlannerBase:
         m.num_req = self.prometheus_traffic_client.get_avg_request_count(
             interval_str, self.model_name
         )
+        # DEEPINFRA: metrics-gap guard. A Prometheus outage poisons count-type
+        # inputs twice: num_req=0 during the gap, then one increase() window
+        # holding the WHOLE gap's counter delta (observed 2026-07-08
+        # 00:23-00:25Z during a VM pod reschedule: 0.00 rps then 152 rps at
+        # true ~44; the poisoned tick set throughput bounds prefill=5/decode=6
+        # and the up-gate committed them within seconds). Gate on sample
+        # COMPLETENESS, not value magnitude — a genuine 3x+ demand surge has a
+        # full complement of scrape samples and must never be suppressed,
+        # while both poisoned readings occur while samples are missing from
+        # the lookback. On a detected gap, skip the tick entirely: bounds hold
+        # their last value and no poisoned rps gauge is published. Ratio
+        # metrics (isl/osl/hit) self-cancel across gaps and are not gated.
+        if self.prometheus_traffic_client.scrape_gap_recent(self.model_name):
+            logger.warning(
+                "Metrics gap detected around the request counter "
+                "(raw num_req=%.1f); skipping throughput tick", m.num_req
+            )
+            return None
         m.request_duration = self.prometheus_traffic_client.get_avg_request_duration(
             interval_str, self.model_name
         )
