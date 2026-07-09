@@ -59,28 +59,35 @@ from cosmos_framework.inference.common.init import init_script
 
 init_script()
 
-import argparse
-import asyncio
-import base64
-import mimetypes
-import os
-import random
-import re
-import shutil
-import sys
-import threading
-import time
-import uuid
-from pathlib import Path
-from typing import Any
+import argparse  # noqa: E402
+import asyncio  # noqa: E402
+import base64  # noqa: E402
+import mimetypes  # noqa: E402
+import os  # noqa: E402
+import random  # noqa: E402
+import re  # noqa: E402
+import shutil  # noqa: E402
+import sys  # noqa: E402
+import threading  # noqa: E402
+import time  # noqa: E402
+import uuid  # noqa: E402
+from pathlib import Path  # noqa: E402
+from typing import Any  # noqa: E402
 
-import torch
-from pydantic import BaseModel, Field
-
-from cosmos_framework.inference.args import OmniSampleOverrides, OmniSetupOverrides
-from cosmos_framework.inference.common.init import get_local_rank, get_rank, init_output_dir, is_rank0
-from cosmos_framework.inference.inference import OmniInference
-from cosmos_framework.utils import distributed, log
+import torch  # noqa: E402
+from cosmos_framework.inference.args import (  # noqa: E402
+    OmniSampleOverrides,
+    OmniSetupOverrides,
+)
+from cosmos_framework.inference.common.init import (  # noqa: E402
+    get_local_rank,
+    get_rank,
+    init_output_dir,
+    is_rank0,
+)
+from cosmos_framework.inference.inference import OmniInference  # noqa: E402
+from cosmos_framework.utils import distributed, log  # noqa: E402
+from pydantic import BaseModel, Field  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Control-plane process group (multi-GPU request dispatch)
@@ -101,7 +108,8 @@ if torch.distributed.is_available() and torch.distributed.is_initialized():
     import datetime as _dt
 
     _CONTROL_PG = torch.distributed.new_group(
-        backend="gloo", timeout=_dt.timedelta(days=7))
+        backend="gloo", timeout=_dt.timedelta(days=7)
+    )
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -115,11 +123,16 @@ _DATA_URI_RE = re.compile(r"^data:([^;,]+)?(?:;base64)?,(.*)$", re.DOTALL)
 # for resolutions we support). Used to decode the Dynamo frontend's "size" field
 # ("WxH") back to the resolution + aspect_ratio the inference engine expects.
 _SIZE_TO_RES_AR: dict[tuple[int, int], tuple[str, str]] = {}
+
+
 def _init_size_lookup() -> None:
     from cosmos_framework.data.generator.utils import VIDEO_RES_SIZE_INFO
+
     for res, ar_map in VIDEO_RES_SIZE_INFO.items():
         for ar, (w, h) in ar_map.items():
             _SIZE_TO_RES_AR[(w, h)] = (res, ar)
+
+
 _init_size_lookup()
 
 
@@ -159,6 +172,7 @@ _ACTION_MODES = frozenset({"forward_dynamics", "inverse_dynamics", "policy"})
 
 class NvExtFields(BaseModel):
     """Subset of Dynamo's NvExt that we care about."""
+
     model_config = {"extra": "ignore"}
     fps: int | None = None
     num_frames: int | None = None
@@ -230,6 +244,7 @@ class Cosmos3VideoDataItem(BaseModel):
 
 class Cosmos3VideoResponse(BaseModel):
     """Matches Dynamo's NvVideosResponse so the frontend can parse it."""
+
     id: str = Field(default_factory=lambda: f"video-{uuid.uuid4().hex}")
     object: str = "video"
     model: str = ""
@@ -314,8 +329,16 @@ def _run_generate(payload: dict[str, Any]) -> dict[str, Any] | None:
             output_file = rank_dir / output_file
 
         b64 = base64.b64encode(output_file.read_bytes()).decode("ascii")
-        media_type = "image" if output_file.suffix.lower() in (".jpg", ".jpeg", ".png") else "video"
-        resp: dict[str, Any] = {"b64_json": b64, "seed": payload["seed"], "media_type": media_type}
+        media_type = (
+            "image"
+            if output_file.suffix.lower() in (".jpg", ".jpeg", ".png")
+            else "video"
+        )
+        resp: dict[str, Any] = {
+            "b64_json": b64,
+            "seed": payload["seed"],
+            "media_type": media_type,
+        }
         if action_output is not None:
             resp["action"] = action_output
         return resp
@@ -357,13 +380,15 @@ def _generate_blocking(request: Cosmos3VideoRequest) -> Cosmos3VideoResponse:
     output_format = "jpeg" if media_type == "image" else "mp4"
     return Cosmos3VideoResponse(
         model=_served_model_name,
-        data=[Cosmos3VideoDataItem(
-            output_format=output_format,
-            b64_json=result["b64_json"],
-            seed=result["seed"],
-            media_type=media_type,
-            action=result.get("action"),
-        )],
+        data=[
+            Cosmos3VideoDataItem(
+                output_format=output_format,
+                b64_json=result["b64_json"],
+                seed=result["seed"],
+                media_type=media_type,
+                action=result.get("action"),
+            )
+        ],
     )
 
 
@@ -402,7 +427,11 @@ def _get_worker_namespace() -> str:
 
 
 async def _register_model(endpoint, served_name: str, model_path: str) -> None:
-    from dynamo.llm import ModelInput, ModelType, register_llm  # type: ignore[attr-defined]
+    from dynamo.llm import (  # type: ignore[attr-defined]
+        ModelInput,
+        ModelType,
+        register_llm,
+    )
 
     try:
         await register_llm(
@@ -425,7 +454,9 @@ async def _dynamo_main(args: argparse.Namespace) -> None:
     loop = asyncio.get_running_loop()
     discovery_backend = os.environ.get("DYN_DISCOVERY_BACKEND")
     if not discovery_backend:
-        discovery_backend = "kubernetes" if os.environ.get("KUBERNETES_SERVICE_HOST") else "file"
+        discovery_backend = (
+            "kubernetes" if os.environ.get("KUBERNETES_SERVICE_HOST") else "file"
+        )
     namespace_name = _get_worker_namespace()
     log.info(f"Dynamo discovery backend: {discovery_backend}")
     log.info(f"Dynamo namespace: {namespace_name}")
@@ -437,13 +468,17 @@ async def _dynamo_main(args: argparse.Namespace) -> None:
     component_name = "backend"
     endpoint_name = "generate"
     endpoint = runtime.endpoint(f"{namespace_name}.{component_name}.{endpoint_name}")
-    log.info(f"Serving Dynamo endpoint: {namespace_name}/{component_name}/{endpoint_name}")
+    log.info(
+        f"Serving Dynamo endpoint: {namespace_name}/{component_name}/{endpoint_name}"
+    )
 
     # Decorate the generate function with dynamo_endpoint for serialization.
     @dynamo_endpoint(Cosmos3VideoRequest, Cosmos3VideoResponse)
     async def create_video(request: Cosmos3VideoRequest):
         if request.model is not None and request.model != _served_model_name:
-            raise ValueError(f"Model {request.model!r} not found. This worker serves {_served_model_name!r}.")
+            raise ValueError(
+                f"Model {request.model!r} not found. This worker serves {_served_model_name!r}."
+            )
         result = await asyncio.to_thread(_generate_blocking, request)
         yield result.model_dump()
 
@@ -454,7 +489,9 @@ async def _dynamo_main(args: argparse.Namespace) -> None:
     except ValueError:
         _system_port_int = -1
     if _system_port_int < 0:
-        log.warning(f"DYN_SYSTEM_PORT not set (or is {_system_port!r}); metrics will NOT be exposed on a system port.")
+        log.warning(
+            f"DYN_SYSTEM_PORT not set (or is {_system_port!r}); metrics will NOT be exposed on a system port."
+        )
     else:
         log.info(f"Dynamo system port enabled: {_system_port_int}")
 
@@ -575,14 +612,18 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="Checkpoint path or registered name, e.g. Cosmos3-Nano or /data/default",
     )
-    parser.add_argument("--num-gpus", type=int, default=1, help="Number of GPUs for this worker")
+    parser.add_argument(
+        "--num-gpus", type=int, default=1, help="Number of GPUs for this worker"
+    )
     parser.add_argument(
         "--standalone",
         action="store_true",
         help="Run as standalone HTTP server (no Dynamo frontend required)",
     )
     parser.add_argument("--host", default="0.0.0.0", help="Host (standalone mode only)")
-    parser.add_argument("--port", type=int, default=80, help="Port (standalone mode only)")
+    parser.add_argument(
+        "--port", type=int, default=80, help="Port (standalone mode only)"
+    )
     return parser.parse_args()
 
 
@@ -611,7 +652,9 @@ def main() -> None:
         _relaunch_under_torchrun(args.num_gpus)
 
     _served_model_name = args.served_model_name
-    _output_root = Path(os.environ.get("COSMOS3_OUTPUT_DIR", "/tmp/cosmos3_worker_outputs")).absolute()
+    _output_root = Path(
+        os.environ.get("COSMOS3_OUTPUT_DIR", "/tmp/cosmos3_worker_outputs")
+    ).absolute()
     init_output_dir(_output_root)
 
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
