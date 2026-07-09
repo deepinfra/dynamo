@@ -9,6 +9,7 @@ Each subclass sets ``require_prefill`` / ``require_decode`` and overrides
 """
 
 import logging
+from typing import Optional
 
 from dynamo.planner.config.defaults import SubComponentType, TargetReplica
 from dynamo.planner.core.base import NativePlannerBase
@@ -56,11 +57,22 @@ class PrefillPlanner(NativePlannerBase):
         await self._install_benchmark_fpms(prefill_fpms=fpms)
 
     async def _apply_effects(self, effects: PlannerEffects) -> None:
+        # DEEPINFRA: publish the "wanted" replica count every tick so the
+        # gauge reflects the planner's current recommendation. Use a
+        # sticky ``_last_wanted_num_prefill`` on plugin-only ticks
+        # (no scale_to) so the gauge doesn't flap between the
+        # recommendation and the current running count.
+        if effects.scale_to is not None and effects.scale_to.num_prefill is not None:
+            self._last_wanted_num_prefill = effects.scale_to.num_prefill
+        if self.prometheus_port != 0:
+            wanted = self._last_wanted_num_prefill
+            if wanted is None and self._last_worker_counts is not None:
+                wanted = self._last_worker_counts.expected_num_prefill
+            if wanted is not None:
+                self.prometheus_metrics.predicted_num_prefill_replicas.set(wanted)
         if effects.scale_to is None or effects.scale_to.num_prefill is None:
             return
         desired = effects.scale_to.num_prefill
-        if self.prometheus_port != 0:
-            self.prometheus_metrics.predicted_num_prefill_replicas.set(desired)
         await self._apply_scaling_targets(
             [
                 TargetReplica(
@@ -97,11 +109,17 @@ class DecodePlanner(NativePlannerBase):
         await self._install_benchmark_fpms(decode_fpms=fpms)
 
     async def _apply_effects(self, effects: PlannerEffects) -> None:
+        if effects.scale_to is not None and effects.scale_to.num_decode is not None:
+            self._last_wanted_num_decode = effects.scale_to.num_decode
+        if self.prometheus_port != 0:
+            wanted = self._last_wanted_num_decode
+            if wanted is None and self._last_worker_counts is not None:
+                wanted = self._last_worker_counts.expected_num_decode
+            if wanted is not None:
+                self.prometheus_metrics.predicted_num_decode_replicas.set(wanted)
         if effects.scale_to is None or effects.scale_to.num_decode is None:
             return
         desired = effects.scale_to.num_decode
-        if self.prometheus_port != 0:
-            self.prometheus_metrics.predicted_num_decode_replicas.set(desired)
         await self._apply_scaling_targets(
             [
                 TargetReplica(
@@ -136,11 +154,17 @@ class AggPlanner(NativePlannerBase):
         await self._install_benchmark_fpms(agg_fpms=fpms)
 
     async def _apply_effects(self, effects: PlannerEffects) -> None:
+        if effects.scale_to is not None and effects.scale_to.num_decode is not None:
+            self._last_wanted_num_decode = effects.scale_to.num_decode
+        if self.prometheus_port != 0:
+            wanted = self._last_wanted_num_decode
+            if wanted is None and self._last_worker_counts is not None:
+                wanted = self._last_worker_counts.expected_num_decode
+            if wanted is not None:
+                self.prometheus_metrics.predicted_num_decode_replicas.set(wanted)
         if effects.scale_to is None or effects.scale_to.num_decode is None:
             return
         desired = effects.scale_to.num_decode
-        if self.prometheus_port != 0:
-            self.prometheus_metrics.predicted_num_decode_replicas.set(desired)
         await self._apply_scaling_targets(
             [
                 TargetReplica(
@@ -191,18 +215,26 @@ class DisaggPlanner(NativePlannerBase):
         )
 
     async def _apply_effects(self, effects: PlannerEffects) -> None:
+        scale_to = effects.scale_to
+        if scale_to is not None:
+            if scale_to.num_prefill is not None:
+                self._last_wanted_num_prefill = scale_to.num_prefill
+            if scale_to.num_decode is not None:
+                self._last_wanted_num_decode = scale_to.num_decode
+        if self.prometheus_port != 0:
+            wanted_p: Optional[int] = self._last_wanted_num_prefill
+            wanted_d: Optional[int] = self._last_wanted_num_decode
+            if wanted_p is None and self._last_worker_counts is not None:
+                wanted_p = self._last_worker_counts.expected_num_prefill
+            if wanted_d is None and self._last_worker_counts is not None:
+                wanted_d = self._last_worker_counts.expected_num_decode
+            if wanted_p is not None:
+                self.prometheus_metrics.predicted_num_prefill_replicas.set(wanted_p)
+            if wanted_d is not None:
+                self.prometheus_metrics.predicted_num_decode_replicas.set(wanted_d)
         if effects.scale_to is None:
             return
         decision = effects.scale_to
-
-        if decision.num_prefill is not None and self.prometheus_port != 0:
-            self.prometheus_metrics.predicted_num_prefill_replicas.set(
-                decision.num_prefill
-            )
-        if decision.num_decode is not None and self.prometheus_port != 0:
-            self.prometheus_metrics.predicted_num_decode_replicas.set(
-                decision.num_decode
-            )
 
         targets = []
         if decision.num_prefill is not None:

@@ -213,6 +213,13 @@ class NativePlannerBase:
         # reaching into engine internals.
         self._last_worker_counts: Optional[WorkerCounts] = None
 
+        # Sticky "planner-wanted" counts for the predicted_num_* replica
+        # gauges. Updated on any tick that produces a scaling decision;
+        # used as the fallback on plugin-only ticks so the gauge doesn't
+        # flap between the recommendation and the current running count.
+        self._last_wanted_num_prefill: Optional[int] = None
+        self._last_wanted_num_decode: Optional[int] = None
+
     # ------------------------------------------------------------------
     # Engine bootstrap
     # ------------------------------------------------------------------
