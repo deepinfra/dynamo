@@ -361,11 +361,14 @@ class PrometheusAPIClient:
     def get_avg_kv_hit_rate(self, interval: str, model_name: str) -> Optional[float]:
         """Average predicted KV cache hit rate (0.0-1.0) from the router.
 
-        Only available when metrics_source == "router" (the histogram lives on
-        the LocalRouter component). In disagg deployments the scrape is
-        namespace-filtered, so if the planner's ``dynamo_namespace`` matches
-        the prefill pool, the returned value pools only prefill-router
-        observations.
+        Queried regardless of ``metrics_source``: the histogram lives on the
+        LocalRouter component and, when its PodMonitor is configured, the
+        value is the only system-wide proxy for block-reuse rate the planner
+        can see — without it, ``find_engine_capacity_rps`` assumes zero reuse
+        and inflates the prefill replica recommendation (observed: 9 replicas
+        for a workload whose ~60% reuse rate justifies ~4). If the router is
+        not scraped the query returns empty and this method returns ``None``,
+        same as before.
 
         Returns ``None`` (not ``0.0``) on missing data — Prometheus scrape
         gaps must not be confused with a real "no reuse" signal: the state
@@ -374,8 +377,6 @@ class PrometheusAPIClient:
         every scrape failure. The caller's ``_clamp_kv_hit_rate(None)``
         falls back to no-discount behavior, which is the safe choice.
         """
-        if self.metrics_source != "router":
-            return None
         full_metric_name = (
             f"{prometheus_names.name_prefix.COMPONENT}_"
             f"{prometheus_names.router.KV_HIT_RATE}"
