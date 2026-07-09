@@ -829,6 +829,17 @@ class PlannerEnginePerfModel:
         return False
 
     @property
+    def is_regression(self) -> bool:
+        """DEEPINFRA: True when predictions come from the affine FPM
+        regression (no AIC pick configured, or best_available fell back).
+        Consumers may then treat the ITL model as exactly affine in load —
+        e.g. the closed-form steady-state K* in decode consolidation."""
+        if self._rust_model is None:
+            return False
+        source = str(self._rust_diagnostics().get("source", ""))
+        return "regression" in source.lower()
+
+    @property
     def num_observations(self) -> int:
         value = self._rust_diagnostics().get("retained_observations", 0)
         return int(value) if isinstance(value, int) else 0
