@@ -53,11 +53,14 @@ class LoadScalingMixin:
     _diag_load_reason_prefill: Optional[str]
     _diag_load_reason_decode: Optional[str]
     _scaling_confirmation_ticks: int
+    _scaling_confirmation_ticks_up: int
     _proposed_buffer_p: deque
     _proposed_buffer_d: deque
     _last_suggested_p: int
     _last_suggested_d: int
     _last_real_fpm: dict
+    _confirm_ticks: dict
+    _last_up_tick: dict
 
     def _confirm_proposal(
         self,
@@ -66,18 +69,32 @@ class LoadScalingMixin:
         last_suggested_attr: str,
         observed: int,
     ) -> int:
-        """N-tick proposal-confirmation gate.
+        """Asymmetric proposal-confirmation gate with monotone emission.
 
-        Appends ``proposed`` to ``buffer`` (last N replica-count proposals).
-        Returns the planner's current commitment (``self.<last_suggested_attr>``)
-        unless every entry in a *full* buffer is unanimously higher or
-        unanimously lower than the commitment — in which case the commitment is
-        updated to ``proposed`` and that value is emitted. Lazily latches the
-        commitment to ``observed`` on the first tick so the gate has a baseline.
+        Appends ``proposed`` to ``buffer`` (last N replica-count proposals) and
+        returns the planner's commitment (``self.<last_suggested_attr>``),
+        raising or lowering it under different rules per direction:
 
-        Comparison is against the commitment, not the moving observed count: a
-        worker coming online doesn't invalidate older buffer entries, and a
-        single dissenting sample blocks an otherwise-unanimous buffer.
+        - Scale-UP: confirms when the last ``_scaling_confirmation_ticks_up``
+          proposals all exceed the commitment, and emits the MINIMUM of that
+          window — the largest value those ticks unanimously justify. Under-
+          provisioning during a surge costs seconds-per-tick of user-visible
+          queueing (2026-07-02 20:43Z breach: the symmetric 6-tick gate held
+          the commit at 5-6 for ~6 minutes while the throughput bound demanded
+          8-10, because +1 load proposals interleaved with a rising bound never
+          produced six identical-direction ticks). The throughput bound feeding
+          the proposal is already 30s-smoothed; a long symmetric debounce
+          double-filters it.
+        - Scale-DOWN: unchanged gate — every entry of a *full* buffer strictly
+          below the commitment (one dissenting tick blocks) — but emits the
+          MAXIMUM of the buffer, the least-aggressive step every tick agreed
+          on, instead of the latest sample.
+
+        The commitment is lazily latched to ``observed`` on the first tick so
+        the gate has a baseline. Comparison is against the commitment, not the
+        moving observed count: a worker coming online doesn't invalidate older
+        buffer entries. Setting ``_scaling_confirmation_ticks`` to 1 disables
+        the gate in both directions.
         """
         last_suggested: int = getattr(self, last_suggested_attr)
         if last_suggested == 0:
@@ -86,6 +103,24 @@ class LoadScalingMixin:
 
         buffer.append(proposed)
         label = "prefill" if last_suggested_attr.endswith("_p") else "decode"
+        assert buffer.maxlen is not None
+        ticks_up = max(1, min(self._scaling_confirmation_ticks_up, buffer.maxlen))
+        tick = self._confirm_ticks.get(last_suggested_attr, 0) + 1
+        self._confirm_ticks[last_suggested_attr] = tick
+
+        # Scale-up: short window, emit the minimum the window agrees on.
+        up_window = list(buffer)[-ticks_up:]
+        if len(up_window) >= ticks_up and all(p > last_suggested for p in up_window):
+            confirmed = min(up_window)
+            logger.info(
+                "Confirmation buffer [%s]: last %d proposals=%s commit=%d "
+                "observed=%d -> CONFIRMED %d (up, min of last %d)",
+                label, len(buffer), list(buffer), last_suggested, observed,
+                confirmed, ticks_up,
+            )
+            setattr(self, last_suggested_attr, confirmed)
+            self._last_up_tick[last_suggested_attr] = tick
+            return confirmed
 
         if len(buffer) < buffer.maxlen:
             logger.info(
@@ -96,19 +131,34 @@ class LoadScalingMixin:
             )
             return last_suggested
 
-        all_higher = all(p > last_suggested for p in buffer)
-        all_lower = all(p < last_suggested for p in buffer)
-        if all_higher or all_lower:
+        # Scale-down: full-buffer strict unanimity, emit the least-aggressive
+        # step the whole buffer justifies. DEEPINFRA: suppressed for
+        # ``scale_down_cooldown_ticks`` after an upward commit so a freshly
+        # booted worker isn't killed by the next quiet stretch (boot/kill
+        # cycles cost cache warmth and churn).
+        if all(p < last_suggested for p in buffer):
+            last_up = self._last_up_tick.get(last_suggested_attr)
+            cooldown = self._config.scale_down_cooldown_ticks
+            if last_up is not None and tick - last_up < cooldown:
+                logger.info(
+                    "Confirmation buffer [%s]: last %d proposals=%s commit=%d "
+                    "observed=%d -> HOLD (down suppressed, cooldown %d/%d "
+                    "ticks since scale-up)",
+                    label, buffer.maxlen, list(buffer), last_suggested,
+                    observed, tick - last_up, cooldown,
+                )
+                return last_suggested
+            confirmed = max(buffer)
             logger.info(
                 "Confirmation buffer [%s]: last %d proposals=%s commit=%d "
-                "observed=%d -> CONFIRMED %d (unanimous %s)",
+                "observed=%d -> CONFIRMED %d (down, max of buffer)",
                 label, buffer.maxlen, list(buffer), last_suggested, observed,
-                proposed, "up" if all_higher else "down",
+                confirmed,
             )
-            setattr(self, last_suggested_attr, proposed)
-            return proposed
-        # Full buffer but not a unanimous move off the commitment. Two sub-cases
-        # worth distinguishing: every proposal already EQUALS the commitment
+            setattr(self, last_suggested_attr, confirmed)
+            return confirmed
+        # Not a confirmed move off the commitment. Two sub-cases worth
+        # distinguishing: every proposal already EQUALS the commitment
         # (steady state — nothing to change) vs a genuine mix of above/below/at
         # (noisy — the debounce is doing its job).
         if all(p == last_suggested for p in buffer):

@@ -581,6 +581,16 @@ class PlannerConfig(BaseModel):
             "when every engine breaches it. Set to None to disable."
         ),
     )
+    scale_down_cooldown_ticks: int = Field(
+        default=120,
+        ge=0,
+        description=(
+            "Confirmation-gate ticks (~5s each) after an upward replica commit "
+            "during which scale-down confirms are suppressed (~10min at "
+            "default). Prevents boot/kill churn: a freshly added worker gets "
+            "a full traffic cycle to prove necessary before removal."
+        ),
+    )
     prefill_scale_up_queue_tokens: Optional[int] = Field(
         default=SLAPlannerDefaults.prefill_scale_up_queue_tokens,
         ge=0,
