@@ -578,7 +578,62 @@ class PlannerConfig(BaseModel):
         le=1.0,
         description=(
             "KV utilisation fraction (0.0-1.0) that triggers decode scale-up "
-            "when every engine breaches it. Set to None to disable."
+            "when every engine breaches it. Fallback for the scale-up-only "
+            "and consolidation-only thresholds below when they are unset. "
+            "Set to None to disable saturation-based scaling entirely."
+        ),
+    )
+    decode_kv_scale_up_threshold: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "SLA-mode override: KV utilisation fraction that forces scale-up "
+            "when all engines breach it. Falls back to "
+            "decode_kv_saturation_threshold when None."
+        ),
+    )
+    decode_kv_consolidation_ceiling: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "SLA-mode override: KV utilisation fraction above which "
+            "consolidation (scale-down) is refused for the projected "
+            "post-consolidation KV. Falls back to "
+            "decode_kv_saturation_threshold when None."
+        ),
+    )
+    decode_consolidation_peak_window_ticks: int = Field(
+        default=360,
+        ge=0,
+        description=(
+            "Load ticks (~5s each) of trailing fleet decode-KV history whose "
+            "PEAK the consolidation checks must fit on the surviving fleet "
+            "(~30min at default). Fleet KV is wave-like (median 2x swing per "
+            "30min window measured on gpt-oss-120b-disagg); consolidating on "
+            "an instantaneous dip gets bounced by the scale-up threshold "
+            "when the next wave arrives. 0 disables the peak term."
+        ),
+    )
+    decode_consolidation_horizon_ticks: int = Field(
+        default=360,
+        ge=0,
+        description=(
+            "Load ticks (~5s each) over which the measured fleet decode-KV "
+            "growth rate is extrapolated when evaluating consolidation "
+            "(~30min at default, roughly a pod cycle). Consolidating during "
+            "a demand ramp otherwise passes on instantaneous KV and gets "
+            "bounced back by the scale-up threshold within the hour. 0 "
+            "disables trend projection (instantaneous evaluation)."
+        ),
+    )
+    decode_consolidation_pad_max: float = Field(
+        default=2.0,
+        ge=1.0,
+        description=(
+            "Upper clamp on the decode consolidation trend pad (projected/"
+            "current fleet KV over the horizon)."
         ),
     )
     reactive_floor_decay_ticks: int = Field(
