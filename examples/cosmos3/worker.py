@@ -668,6 +668,13 @@ def main() -> None:
     setup_args = OmniSetupOverrides(
         checkpoint_path=args.model,
         output_dir=_output_root,
+        # Content guardrails disabled. The bundled Qwen3Guard text guard is unfit:
+        # a single coarse "Sexual Content" category (no CSAM/minor distinction),
+        # demonstrable demographic bias (blocks benign prompts by subject race),
+        # and it runs the prompt check AFTER generation so every rejection wastes
+        # a full clip. Content filtering will be handled by a platform-level
+        # video-gen guardrail applied uniformly across models, not per-model here.
+        guardrails=False,
     ).build_setup(world_size=world_size)
     _pipe = OmniInference.create(setup_args)
     log.success("Model loaded.")
