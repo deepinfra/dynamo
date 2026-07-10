@@ -984,6 +984,8 @@ class LoadScalingMixin:
         sum_queued_kv = 0
         sum_curr_itl_s = 0.0
         sum_post_itl_s = 0.0
+        sum_post_itl_raw_s = 0.0
+        n_groups_with_post_raw = 0
         n_groups_with_est = 0
         n_groups_with_post = 0
         groups_list = self._decode_regression.query_groups(fpm_stats)
@@ -1015,6 +1017,17 @@ class LoadScalingMixin:
                     if post_itl is not None:
                         sum_post_itl_s += post_itl
                         n_groups_with_post += 1
+                    # Unpadded projection (pure N/(N-1) redistribution of
+                    # CURRENT demand) — input to the K* residency fixed point,
+                    # which must not compound with the spike pad (see check 3).
+                    post_itl_raw = self._decode_regression.estimate_scheduled_decode_itl(
+                        group,
+                        decode_scale=consolidation,
+                        include_queued_decode=True,
+                    )
+                    if post_itl_raw is not None:
+                        sum_post_itl_raw_s += post_itl_raw
+                        n_groups_with_post_raw += 1
 
         self._record_decode_kv_observation(sum_sched_kv + sum_queued_kv)
 
@@ -1033,6 +1046,8 @@ class LoadScalingMixin:
         #     KV is higher than naive. K* = naive_kv * itl0 / (itl_curr +
         #     itl0 - itl_naive). itl0 recovered via finite difference;
         #     exact for affine regressions, approximate otherwise.
+        #     Computed at the UNPADDED post-consolidation state — the spike
+        #     pad must not feed the feedback loop (checks 1/2 carry the pad).
         if can_scale_down and n_groups_with_est > 0 and max_kv and max_kv > 0:
             avg_sched_kv = sum_sched_kv / num_workers
             avg_queued_kv = sum_queued_kv / num_workers
@@ -1071,19 +1086,35 @@ class LoadScalingMixin:
                 if sla_refuse:
                     can_scale_down = False
                     consolidation_refused = True
+                elif n_groups_with_post_raw == 0:
+                    logger.info(
+                        "Consolidation check (3) skipped: "
+                        "no unpadded post-consolidation ITL estimates available"
+                    )
+                    can_scale_down = False
                 else:
                     k_curr = int(avg_sched_kv + avg_queued_kv)
-                    k_naive = post_sched_kv
+                    # (3) Steady-state K* is computed at the UNPADDED
+                    # post-consolidation state: the residency feedback is
+                    # physics for the current demand redistributed over the
+                    # survivors, while the spike pad is a hypothetical future
+                    # wave. Feeding the padded projection into the fixed point
+                    # guards against spike x feedback compounding — observed
+                    # 2026-07-10 23:00Z as K*=inf (q=1.23) at 16% actual
+                    # fleet utilisation. A real spike raises current KV and
+                    # the saturation scale-up trigger handles it reactively.
+                    k_naive = int((avg_sched_kv + avg_queued_kv) * consolidation)
+                    avg_post_itl_raw_s = sum_post_itl_raw_s / n_groups_with_post_raw
 
-                    # (3) Steady-state K*. In regression mode the ITL model
-                    # is exactly affine in load, so the residency fixed point
-                    # has a closed form with an explicit divergence verdict
-                    # (q >= 1: residency growth outruns capacity — a state
-                    # the truncated iteration below can under-detect).
+                    # In regression mode the ITL model is exactly affine in
+                    # load, so the residency fixed point has a closed form
+                    # with an explicit divergence verdict (q >= 1: residency
+                    # growth outruns capacity — a state the truncated
+                    # iteration below can under-detect).
                     k_star_cf = q_cf = None
                     if getattr(self._decode_regression, "is_regression", False):
                         k_star_cf, q_cf = _kstar_affine(
-                            k_curr, k_naive, avg_curr_itl_s, avg_post_itl_s
+                            k_curr, k_naive, avg_curr_itl_s, avg_post_itl_raw_s
                         )
                     if k_star_cf is not None:
                         k_star = k_star_cf
@@ -1091,9 +1122,9 @@ class LoadScalingMixin:
                         logger.info(
                             f"Consolidation check (3) K* [avg, closed-form]: "
                             f"K*={k_star:.0f}, q={q_cf:.3f}, "
-                            f"max_kv={max_kv}, naive_kv={k_naive}, "
+                            f"max_kv={max_kv}, naive_kv={k_naive} (unpadded), "
                             f"itl_curr={avg_curr_itl_s * 1000:.2f}ms, "
-                            f"itl_naive={avg_post_itl_s * 1000:.2f}ms, "
+                            f"itl_naive={avg_post_itl_raw_s * 1000:.2f}ms, "
                             f"result={'REFUSE' if kstar_refuse else 'pass'}"
                         )
                         if kstar_refuse:
@@ -1110,8 +1141,8 @@ class LoadScalingMixin:
                         # region and matches observed post-consolidation KV to
                         # within a few percent empirically. Also the fallback
                         # when the closed form hits degenerate inputs.
-                        # Iter 0 uses avg_post_itl_s already computed above.
-                        K_iter = k_naive * avg_post_itl_s / avg_curr_itl_s
+                        # Iter 0 uses the unpadded avg_post_itl_raw_s.
+                        K_iter = k_naive * avg_post_itl_raw_s / avg_curr_itl_s
                         trajectory = [k_naive, K_iter]
                         # Iter 1: query AIC at K_iter/k_curr scale across groups.
                         scale_2 = K_iter / k_curr if k_curr > 0 else 0.0
@@ -1135,9 +1166,9 @@ class LoadScalingMixin:
                         logger.info(
                             f"Consolidation check (3) K* [avg, 2-iter]: "
                             f"K*={k_star:.0f}, max_kv={max_kv}, "
-                            f"naive_kv={k_naive}, "
+                            f"naive_kv={k_naive} (unpadded), "
                             f"itl_curr={avg_curr_itl_s * 1000:.2f}ms, "
-                            f"itl_naive={avg_post_itl_s * 1000:.2f}ms, "
+                            f"itl_naive={avg_post_itl_raw_s * 1000:.2f}ms, "
                             f"trajectory=[{','.join(f'{int(x)}' for x in trajectory)}], "
                             f"result={'REFUSE' if kstar_refuse else 'pass'}"
                         )
