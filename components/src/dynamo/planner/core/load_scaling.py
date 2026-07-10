@@ -1047,7 +1047,9 @@ class LoadScalingMixin:
         #     itl0 - itl_naive). itl0 recovered via finite difference;
         #     exact for affine regressions, approximate otherwise.
         #     Computed at the UNPADDED post-consolidation state — the spike
-        #     pad must not feed the feedback loop (checks 1/2 carry the pad).
+        #     pad must not feed the feedback loop — then the spike guard is
+        #     applied to the SETTLED state: refuse iff K* * effective_pad
+        #     >= max_kv (spike-on-top-of-steady-state must still fit).
         if can_scale_down and n_groups_with_est > 0 and max_kv and max_kv > 0:
             avg_sched_kv = sum_sched_kv / num_workers
             avg_queued_kv = sum_queued_kv / num_workers
@@ -1118,10 +1120,18 @@ class LoadScalingMixin:
                         )
                     if k_star_cf is not None:
                         k_star = k_star_cf
-                        kstar_refuse = k_star >= max_kv
+                        # Spike guard applied to the SETTLED state: after
+                        # consolidation reaches steady state K*, the next
+                        # measured-or-assumed spike must still fit. The spike's
+                        # own feedback is deliberately not modelled (transient;
+                        # the saturation scale-up trigger owns it), so this
+                        # does not reintroduce pad-inside-feedback compounding.
+                        kstar_refuse = k_star * effective_pad >= max_kv
                         logger.info(
                             f"Consolidation check (3) K* [avg, closed-form]: "
                             f"K*={k_star:.0f}, q={q_cf:.3f}, "
+                            f"K*xpad={k_star * effective_pad:.0f} "
+                            f"(pad={effective_pad:.3f}), "
                             f"max_kv={max_kv}, naive_kv={k_naive} (unpadded), "
                             f"itl_curr={avg_curr_itl_s * 1000:.2f}ms, "
                             f"itl_naive={avg_post_itl_raw_s * 1000:.2f}ms, "
@@ -1162,10 +1172,13 @@ class LoadScalingMixin:
                             K_iter = k_naive * avg_itl_2_s / avg_curr_itl_s
                             trajectory.append(K_iter)
                         k_star = K_iter
-                        kstar_refuse = k_star >= max_kv
+                        # Same settled-state spike guard as the closed form.
+                        kstar_refuse = k_star * effective_pad >= max_kv
                         logger.info(
                             f"Consolidation check (3) K* [avg, 2-iter]: "
-                            f"K*={k_star:.0f}, max_kv={max_kv}, "
+                            f"K*={k_star:.0f}, "
+                            f"K*xpad={k_star * effective_pad:.0f} "
+                            f"(pad={effective_pad:.3f}), max_kv={max_kv}, "
                             f"naive_kv={k_naive} (unpadded), "
                             f"itl_curr={avg_curr_itl_s * 1000:.2f}ms, "
                             f"itl_naive={avg_post_itl_raw_s * 1000:.2f}ms, "
