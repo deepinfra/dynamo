@@ -1090,6 +1090,17 @@ class NativePlannerBase:
         self._set_if_observed(
             pm.engine_decode_capacity_requests_per_second, diag.engine_rps_decode
         )
+        # Raw throughput-model bounds (sticky across ticks in the state
+        # machine), exported pre-merge so operators can separate the queueing
+        # model's ask from load scaling and anti-flap.
+        self._set_if_observed(
+            pm.throughput_lower_bound_prefill_replicas,
+            diag.throughput_lower_bound_prefill,
+        )
+        self._set_if_observed(
+            pm.throughput_lower_bound_decode_replicas,
+            diag.throughput_lower_bound_decode,
+        )
         # The throughput-decision enum stays gated on the builtin throughput
         # cadence: it reflects a builtin-loop decision, not a plugin prediction.
         if tick.run_throughput_scaling:

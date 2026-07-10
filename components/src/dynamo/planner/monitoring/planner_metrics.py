@@ -119,6 +119,18 @@ class PlannerPrometheusMetrics:
             f"{PREFIX}_predicted_num_decode_replicas",
             "Decided number of decode replicas",
         )
+        # Raw throughput-model bounds (Erlang-C prefill sizing / decode
+        # closed-form), BEFORE the max-merge with load scaling and before
+        # anti-flap (confirmation gate, cooldown, floors). Lets operators plot
+        # what the queueing model alone asked for vs the decided counts above.
+        self.throughput_lower_bound_prefill_replicas = Gauge(
+            f"{PREFIX}_throughput_lower_bound_prefill_replicas",
+            "Raw throughput-model prefill replica lower bound (pre load-scaling merge)",
+        )
+        self.throughput_lower_bound_decode_replicas = Gauge(
+            f"{PREFIX}_throughput_lower_bound_decode_replicas",
+            "Raw throughput-model decode replica lower bound (pre load-scaling merge)",
+        )
 
         # -- Cumulative GPU usage -----------------------------------------
         self.gpu_hours = Gauge(
