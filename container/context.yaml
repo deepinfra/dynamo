@@ -133,7 +133,7 @@ trtllm:
     # DEEPINFRA: custom TRT-LLM build off upstream commit 130ae826d02565d3c791aa70c1538abfe59ad9ae
     runtime_image: localhost:30500/trtllm
     base_image_tag: 26.02-cuda13.1-devel-ubuntu24.04
-    runtime_image_tag: "130a"
+    runtime_image_tag: "130a-fix-kv-removed-event-membership-leaf"
     # Per-arch baseline stem (re-captured against tensorrt-llm/release, both arches).
     baseline_sbom: release@1532b388
   nixl_ref: v1.0.1
