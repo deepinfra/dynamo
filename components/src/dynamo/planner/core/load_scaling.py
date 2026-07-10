@@ -102,6 +102,18 @@ class LoadScalingMixin:
     _decode_kv_history: deque
 
     @staticmethod
+    def _consolidation_reserve_pad(threshold: Optional[float]) -> float:
+        """Static prior on unmeasured demand spikes, as a pad ratio.
+
+        A consolidation ceiling of e.g. 0.5 means "leave room for the next
+        peak to be 2x current" — expressed as a next-peak/current ratio so it
+        can be combined with the measured trend pad by max (see the guard
+        comment in _decode_load_decision)."""
+        if threshold is not None and 0.0 < threshold <= 1.0:
+            return 1.0 / threshold
+        return 1.0
+
+    @staticmethod
     def _anchor_no_change_proposal(
         final: int,
         observed: int,
@@ -947,15 +959,6 @@ class LoadScalingMixin:
             if self._config.decode_kv_consolidation_ceiling is not None
             else self._config.decode_kv_saturation_threshold
         )
-        kv_ceiling = (
-            consolidation_threshold * max_kv
-            if (
-                consolidation_threshold is not None
-                and 0.0 < consolidation_threshold <= 1.0
-                and max_kv is not None
-            )
-            else max_kv
-        )
         can_scale_down = num_workers > 1
         consolidation_refused = False
         # DEEPINFRA: consolidation is evaluated at PROJECTED demand (trailing
@@ -964,8 +967,19 @@ class LoadScalingMixin:
         # scale-up trigger 20min later — fleet KV had tripled at constant
         # rps/ITL (a long-OSL wave reaching steady state), and such 2-3x
         # waves recur within most 30min windows. See _decode_consolidation_pad.
+        #
+        # Two guards estimate the SAME quantity — the ratio of next-peak KV to
+        # current KV: the trend pad measures it from history (known spikes),
+        # while the consolidation ceiling reserves static headroom for
+        # unmeasured ones (1/ceiling as a prior on unknown spikes). Two
+        # estimators of one ratio combine by MAX (the more conservative one
+        # wins), not by product — multiplying would model a measured wave and
+        # an unknown wave landing simultaneously, which neither guard means.
+        # The padded projection is then compared against FULL max_kv.
         trend_pad = self._decode_consolidation_pad()
-        consolidation_padded = consolidation * trend_pad
+        reserve_pad = self._consolidation_reserve_pad(consolidation_threshold)
+        effective_pad = max(trend_pad, reserve_pad)
+        consolidation_padded = consolidation * effective_pad
         sum_sched_kv = 0
         sum_queued_kv = 0
         sum_curr_itl_s = 0.0
@@ -1024,12 +1038,13 @@ class LoadScalingMixin:
             avg_queued_kv = sum_queued_kv / num_workers
             post_sched_kv = int((avg_sched_kv + avg_queued_kv) * consolidation_padded)
 
-            cache_refuse = post_sched_kv >= kv_ceiling
+            cache_refuse = post_sched_kv >= max_kv
             logger.info(
                 f"Consolidation check (1) cache_feasibility [avg]: "
-                f"post_sched_kv={post_sched_kv}, ceiling={kv_ceiling:.0f}, "
-                f"max_kv={max_kv}, num_workers={num_workers}, "
-                f"trend_pad={trend_pad:.3f}, "
+                f"post_sched_kv={post_sched_kv}, max_kv={max_kv}, "
+                f"num_workers={num_workers}, "
+                f"pad=max(trend={trend_pad:.3f}, reserve={reserve_pad:.3f})"
+                f"={effective_pad:.3f}, "
                 f"result={'REFUSE' if cache_refuse else 'pass'}"
             )
             if cache_refuse:
@@ -1072,11 +1087,11 @@ class LoadScalingMixin:
                         )
                     if k_star_cf is not None:
                         k_star = k_star_cf
-                        kstar_refuse = k_star >= kv_ceiling
+                        kstar_refuse = k_star >= max_kv
                         logger.info(
                             f"Consolidation check (3) K* [avg, closed-form]: "
                             f"K*={k_star:.0f}, q={q_cf:.3f}, "
-                            f"ceiling={kv_ceiling:.0f}, naive_kv={k_naive}, "
+                            f"max_kv={max_kv}, naive_kv={k_naive}, "
                             f"itl_curr={avg_curr_itl_s * 1000:.2f}ms, "
                             f"itl_naive={avg_post_itl_s * 1000:.2f}ms, "
                             f"result={'REFUSE' if kstar_refuse else 'pass'}"
@@ -1116,10 +1131,10 @@ class LoadScalingMixin:
                             K_iter = k_naive * avg_itl_2_s / avg_curr_itl_s
                             trajectory.append(K_iter)
                         k_star = K_iter
-                        kstar_refuse = k_star >= kv_ceiling
+                        kstar_refuse = k_star >= max_kv
                         logger.info(
                             f"Consolidation check (3) K* [avg, 2-iter]: "
-                            f"K*={k_star:.0f}, ceiling={kv_ceiling:.0f}, "
+                            f"K*={k_star:.0f}, max_kv={max_kv}, "
                             f"naive_kv={k_naive}, "
                             f"itl_curr={avg_curr_itl_s * 1000:.2f}ms, "
                             f"itl_naive={avg_post_itl_s * 1000:.2f}ms, "

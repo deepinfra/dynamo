@@ -598,9 +598,12 @@ class PlannerConfig(BaseModel):
         ge=0.0,
         le=1.0,
         description=(
-            "SLA-mode override: KV utilisation fraction above which "
-            "consolidation (scale-down) is refused for the projected "
-            "post-consolidation KV. Falls back to "
+            "SLA-mode override: static headroom reserve for consolidation "
+            "(scale-down). 1/ceiling acts as a prior on unmeasured demand "
+            "spikes and is combined with the measured trend pad by MAX (the "
+            "more conservative estimate of the next-peak/current KV ratio "
+            "wins; they are not multiplied). The padded projection is then "
+            "required to fit under full max_kv. Falls back to "
             "decode_kv_saturation_threshold when None."
         ),
     )

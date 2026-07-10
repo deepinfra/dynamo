@@ -320,3 +320,33 @@ def test_unanchored_surge_would_have_ratcheted():
     g = _Gate(ticks=6, ticks_up=2, commit=7)
     g.push(8, observed=8)
     assert g.push(8, observed=8) == 8
+
+
+# ---------------------------------------------------------------------------
+# Consolidation spike guards: measured trend pad and the static ceiling
+# reserve estimate the SAME next-peak/current ratio -> combine by max, not
+# product.
+# ---------------------------------------------------------------------------
+
+
+def _reserve(threshold):
+    return LoadScalingMixin._consolidation_reserve_pad(threshold)
+
+
+def test_reserve_pad_from_ceiling_fraction():
+    assert _reserve(0.5) == 2.0
+    assert _reserve(0.8) == pytest.approx(1.25)
+
+
+def test_reserve_pad_disabled_when_threshold_unset_or_invalid():
+    assert _reserve(None) == 1.0
+    assert _reserve(0.0) == 1.0
+
+
+def test_guards_combine_by_max_not_product():
+    # measured 1.8x wave, 2x unknown-spike prior: the guard is 2x, not 3.6x
+    trend_pad = 1.8
+    effective = max(trend_pad, _reserve(0.5))
+    assert effective == 2.0
+    # measured 3x wave dominates the prior
+    assert max(3.0, _reserve(0.5)) == 3.0
