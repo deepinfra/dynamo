@@ -350,3 +350,59 @@ def test_guards_combine_by_max_not_product():
     assert effective == 2.0
     # measured 3x wave dominates the prior
     assert max(3.0, _reserve(0.5)) == 3.0
+
+
+# ---------------------------------------------------------------------------
+# Stale-FPM tolerance: a wedged (ready but non-reporting) worker must not
+# veto load decisions forever.
+# ---------------------------------------------------------------------------
+
+
+class _Tolerator(LoadScalingMixin):
+    from dynamo.planner.core.state_machine import (
+        PlannerScalingState as _PSS,
+    )
+
+    _reconcile_fpm_worker_count = staticmethod(
+        _PSS.__dict__["_reconcile_fpm_worker_count"].__func__
+    )
+
+    def __init__(self, tolerance=3):
+        self._fpm_mismatch_ticks = {}
+        self._config = SimpleNamespace(fpm_mismatch_tolerance_ticks=tolerance)
+
+
+def _stats(n_workers, dp=1):
+    return {(f"w{i}", d): object() for i in range(n_workers) for d in range(dp)}
+
+
+def test_tolerance_holds_then_proceeds_with_reporting_subset():
+    t = _Tolerator(tolerance=3)
+    # 10 of 11 ready workers report (one wedged): hold for 2 ticks...
+    assert t._reconcile_fpm_or_tolerate(_stats(10), 11, "decode") is None
+    assert t._reconcile_fpm_or_tolerate(_stats(10), 11, "decode") is None
+    # ...then proceed with the 10 that report.
+    assert t._reconcile_fpm_or_tolerate(_stats(10), 11, "decode") == 10
+
+
+def test_tolerance_resets_when_coverage_recovers():
+    t = _Tolerator(tolerance=3)
+    t._reconcile_fpm_or_tolerate(_stats(10), 11, "decode")
+    t._reconcile_fpm_or_tolerate(_stats(10), 11, "decode")
+    # full coverage: pass-through and streak reset
+    assert t._reconcile_fpm_or_tolerate(_stats(11), 11, "decode") == 11
+    assert t._reconcile_fpm_or_tolerate(_stats(10), 11, "decode") is None
+
+
+def test_tolerance_never_proceeds_with_zero_reporting():
+    t = _Tolerator(tolerance=2)
+    for _ in range(5):
+        assert t._reconcile_fpm_or_tolerate({}, 11, "decode") is None
+
+
+def test_tolerance_per_component_streaks_independent():
+    t = _Tolerator(tolerance=2)
+    assert t._reconcile_fpm_or_tolerate(_stats(2), 3, "prefill") is None
+    assert t._reconcile_fpm_or_tolerate(_stats(10), 11, "decode") is None
+    assert t._reconcile_fpm_or_tolerate(_stats(2), 3, "prefill") == 2
+    assert t._reconcile_fpm_or_tolerate(_stats(10), 11, "decode") == 10

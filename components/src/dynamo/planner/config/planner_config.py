@@ -545,6 +545,18 @@ class PlannerConfig(BaseModel):
     enable_load_scaling: bool = SLAPlannerDefaults.enable_load_scaling
 
     # Load-based scaling settings
+    fpm_mismatch_tolerance_ticks: int = Field(
+        default=12,
+        gt=0,
+        description=(
+            "Consecutive load ticks of FPM-coverage mismatch (fewer reporting "
+            "workers than ready workers) after which load decisions proceed "
+            "with the reporting subset instead of holding. A wedged worker "
+            "that stops publishing FPM otherwise vetoes every decode/prefill "
+            "decision indefinitely. Booting workers are not ready, so the "
+            "startup window does not trip this."
+        ),
+    )
     load_adjustment_interval_seconds: int = Field(
         default=SLAPlannerDefaults.load_adjustment_interval_seconds,
         gt=0,

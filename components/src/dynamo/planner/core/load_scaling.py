@@ -96,10 +96,48 @@ class LoadScalingMixin:
     _all_queued_streak_p: int
     _confirm_ticks: dict
     _last_up_tick: dict
+    _fpm_mismatch_ticks: dict
     _reactive_floor_p: int
     _reactive_floor_bump_tick: int
     _load_tick_counter: int
     _decode_kv_history: deque
+
+    def _reconcile_fpm_or_tolerate(
+        self,
+        fpm_stats: dict,
+        num_workers: int,
+        label: str,
+    ) -> Optional[int]:
+        """Effective worker count for load decisions, with stale-FPM tolerance.
+
+        Returns ``num_workers`` when FPM coverage matches the ready count, and
+        ``None`` while a mismatch is fresh (the historical hard veto). But a
+        READY worker that publishes no FPM — wedged engine, silently dead
+        publisher — would otherwise veto every load decision indefinitely:
+        observed 2026-07-13, one wedged decode held an 11-worker fleet at
+        commit=11 for an hour at near-zero traffic because every tick aborted
+        with worker_count_mismatch. After
+        ``fpm_mismatch_tolerance_ticks`` consecutive mismatched ticks, proceed
+        using the workers that ARE reporting. Booting workers are not in the
+        ready count, so a persistent mismatch indicates a broken worker, not a
+        startup race; planner-initiated scaling is already excluded upstream
+        by the scaling-in-progress guard.
+        """
+        if self._reconcile_fpm_worker_count(fpm_stats, num_workers, label):
+            self._fpm_mismatch_ticks[label] = 0
+            return num_workers
+        ticks = self._fpm_mismatch_ticks.get(label, 0) + 1
+        self._fpm_mismatch_ticks[label] = ticks
+        tolerance = self._config.fpm_mismatch_tolerance_ticks
+        reporting = len({wid for wid, _ in fpm_stats})
+        if ticks < tolerance or reporting == 0:
+            return None
+        logger.warning(
+            f"FPM coverage mismatch persisted {ticks} ticks for {label}: "
+            f"proceeding with {reporting} reporting workers "
+            f"(ready={num_workers})"
+        )
+        return reporting
 
     @staticmethod
     def _consolidation_reserve_pad(threshold: Optional[float]) -> float:
@@ -323,9 +361,11 @@ class LoadScalingMixin:
         if not fpm_stats:
             self._diag_load_reason = "no_fpm_data"
             return None
-        if not self._reconcile_fpm_worker_count(fpm_stats, num_workers, component):
+        effective = self._reconcile_fpm_or_tolerate(fpm_stats, num_workers, component)
+        if effective is None:
             self._diag_load_reason = "worker_count_mismatch"
             return None
+        num_workers = effective
 
         easy = self._config.optimization_target != "sla"
         if easy:
@@ -472,20 +512,28 @@ class LoadScalingMixin:
             self._diag_load_reason_prefill = "scaling_in_progress"
             self._diag_load_reason_decode = "scaling_in_progress"
             return None
-        if p_stats and not self._reconcile_fpm_worker_count(
-            p_stats, self._num_p_workers, "prefill"
-        ):
-            self._diag_load_reason = "worker_count_mismatch"
-            self._diag_load_reason_prefill = "worker_count_mismatch"
-            self._diag_load_reason_decode = "worker_count_mismatch"
-            return None
-        if d_stats and not self._reconcile_fpm_worker_count(
-            d_stats, self._num_d_workers, "decode"
-        ):
-            self._diag_load_reason = "worker_count_mismatch"
-            self._diag_load_reason_prefill = "worker_count_mismatch"
-            self._diag_load_reason_decode = "worker_count_mismatch"
-            return None
+        eff_p_workers = self._num_p_workers
+        if p_stats:
+            eff = self._reconcile_fpm_or_tolerate(
+                p_stats, self._num_p_workers, "prefill"
+            )
+            if eff is None:
+                self._diag_load_reason = "worker_count_mismatch"
+                self._diag_load_reason_prefill = "worker_count_mismatch"
+                self._diag_load_reason_decode = "worker_count_mismatch"
+                return None
+            eff_p_workers = eff
+        eff_d_workers = self._num_d_workers
+        if d_stats:
+            eff = self._reconcile_fpm_or_tolerate(
+                d_stats, self._num_d_workers, "decode"
+            )
+            if eff is None:
+                self._diag_load_reason = "worker_count_mismatch"
+                self._diag_load_reason_prefill = "worker_count_mismatch"
+                self._diag_load_reason_decode = "worker_count_mismatch"
+                return None
+            eff_d_workers = eff
 
         easy = self._config.optimization_target != "sla"
 
@@ -502,9 +550,9 @@ class LoadScalingMixin:
         if p_stats:
             self._diag_load_reason = None
             p_desired = (
-                self._prefill_easy_decision(p_stats, self._num_p_workers)
+                self._prefill_easy_decision(p_stats, eff_p_workers)
                 if easy
-                else self._prefill_load_decision(p_stats, self._num_p_workers)
+                else self._prefill_load_decision(p_stats, eff_p_workers)
             )
             p_reason = self._diag_load_reason
 
@@ -513,9 +561,9 @@ class LoadScalingMixin:
         if d_stats:
             self._diag_load_reason = None
             d_desired = (
-                self._decode_easy_decision(d_stats, self._num_d_workers)
+                self._decode_easy_decision(d_stats, eff_d_workers)
                 if easy
-                else self._decode_load_decision(d_stats, self._num_d_workers)
+                else self._decode_load_decision(d_stats, eff_d_workers)
             )
             d_reason = self._diag_load_reason
 
@@ -648,9 +696,11 @@ class LoadScalingMixin:
             )
             self._diag_load_reason = "scaling_in_progress"
             return None
-        if not self._reconcile_fpm_worker_count(fpm_stats, num_workers, "agg"):
+        effective_agg = self._reconcile_fpm_or_tolerate(fpm_stats, num_workers, "agg")
+        if effective_agg is None:
             self._diag_load_reason = "worker_count_mismatch"
             return None
+        num_workers = effective_agg
 
         easy = self._config.optimization_target != "sla"
         if easy:
