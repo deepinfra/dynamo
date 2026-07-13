@@ -267,17 +267,17 @@ class BuiltinThroughputPropose:
             try:
                 diag = model._rust_diagnostics()
             except Exception as e:  # noqa: BLE001 - diagnostics is best-effort
-                logger.warning("RUST_DIAG[%s]: collection failed: %s", name, e)
+                log.warning("RUST_DIAG[%s]: collection failed: %s", name, e)
                 continue
             if not diag:
                 continue
             try:
-                logger.info(
+                log.info(
                     "RUST_DIAG[%s]: %s",
                     name, _json.dumps(diag, default=str, sort_keys=True),
                 )
             except (TypeError, ValueError) as e:
-                logger.warning("RUST_DIAG[%s]: serialize failed: %s", name, e)
+                log.warning("RUST_DIAG[%s]: serialize failed: %s", name, e)
 
     async def Propose(self, req: ProposeStageRequest) -> ProposeStageResponse:
         # See BuiltinLoadPredict.Predict for why builtin methods are async.
