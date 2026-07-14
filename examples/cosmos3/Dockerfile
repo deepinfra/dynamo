@@ -63,10 +63,12 @@ ENV TRITON_PTXAS_PATH="/usr/local/cuda/bin/ptxas"
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install fastapi uvicorn ai-dynamo==1.1.1 uvloop
 
-# Pre-install the HF CLI tool so that `uvx hf@1.13.0` reuses this
-# installation instead of creating an ephemeral env missing `click`.
+# Pre-install the HF CLI tool at the version the framework invokes at runtime
+# (`uvx hf@1.16.4` in cosmos_framework's checkpoint_db) so uvx reuses this
+# baked copy instead of fetching the tool from PyPI at every pod boot. MUST
+# match the framework's pinned hf version, else uvx re-downloads it.
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv tool install hf@1.13.0 --with click
+    uv tool install hf@1.16.4 --with click
 
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --no-deps -e /workspace
@@ -83,32 +85,32 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # — guardrails are disabled in worker.py (guardrails=False), so it is never
 # loaded at runtime. Re-add its download here (and the BuildKit hf_token secret
 # it needs) if guardrails are ever turned back on.
-RUN uvx hf@1.13.0 download --format=json \
+RUN uvx hf@1.16.4 download --format=json \
         Qwen/Qwen3-0.6B \
         --repo-type model \
         --revision c1899de289a04d12100db370d81485cdf75e47ca \
         --include '*.json' --include '*.txt' && \
-    uvx hf@1.13.0 download --format=json \
+    uvx hf@1.16.4 download --format=json \
         Qwen/Qwen3-VL-2B-Instruct \
         --repo-type model \
         --revision 89644892e4d85e24eaac8bacfd4f463576704203 \
         --include '*.json' --include '*.txt' && \
-    uvx hf@1.13.0 download --format=json \
+    uvx hf@1.16.4 download --format=json \
         Qwen/Qwen3-VL-8B-Instruct \
         --repo-type model \
         --revision 0c351dd01ed87e9c1b53cbc748cba10e6187ff3b \
         --include '*.json' --include '*.txt' && \
-    uvx hf@1.13.0 download --format=json \
+    uvx hf@1.16.4 download --format=json \
         Qwen/Qwen3-VL-32B-Instruct \
         --repo-type model \
         --revision 0cfaf48183f594c314753d30a4c4974bc75f3ccb \
         --include '*.json' --include '*.txt' && \
-    uvx hf@1.13.0 download --format=json \
+    uvx hf@1.16.4 download --format=json \
         Wan-AI/Wan2.1-T2V-14B \
         --repo-type model \
         --revision a064a6c71f5be440641209c07bf2a5ce7a2ff5e4 \
         Wan2.1_VAE.pth && \
-    uvx hf@1.13.0 download --format=json \
+    uvx hf@1.16.4 download --format=json \
         Wan-AI/Wan2.2-TI2V-5B \
         --repo-type model \
         --revision 921dbaf3f1674a56f47e83fb80a34bac8a8f203e \
