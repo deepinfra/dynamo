@@ -122,13 +122,28 @@ pub(super) async fn start_zmq_listener(
                         metrics.increment_zmq_event("accepted", event_type);
                     }
                     let event_id = next_event_id.fetch_add(1, Ordering::SeqCst);
-                    let Some(event) =
-                        normalizer.normalize_preprocessed(raw_event, event_id, worker)
-                    else {
-                        if let Some(metrics) = &metrics {
-                            metrics.increment_zmq_conversion_issue(event_type, "conversion_none");
+                    let event = match normalizer.normalize_preprocessed(raw_event, event_id, worker)
+                    {
+                        Ok(Some(event)) => event,
+                        Ok(None) => {
+                            if let Some(metrics) = &metrics {
+                                metrics
+                                    .increment_zmq_conversion_issue(event_type, "conversion_none");
+                            }
+                            continue;
                         }
-                        continue;
+                        Err(error) => {
+                            // Config error: every event would fail identically,
+                            // so stop the listener instead of spinning on it.
+                            if let Some(metrics) = &metrics {
+                                metrics.increment_zmq_conversion_issue(
+                                    event_type,
+                                    "block_size_mismatch",
+                                );
+                            }
+                            tracing::error!(endpoint = %zmq_endpoint, %error, "Fatal KV event config error; stopping ZMQ listener");
+                            break 'main format!("fatal KV event config error: {error}");
+                        }
                     };
                     if matches!(event.event.data, KvCacheEventData::Stored(ref data) if data.blocks.is_empty())
                         && let Some(metrics) = &metrics

@@ -13,6 +13,36 @@ use crate::protocols::{
 
 use super::types::{BlockHashValue, RawKvEvent};
 
+/// Fatal conversion failures. These are configuration errors, not data
+/// anomalies: every subsequent event would fail the same way, so callers
+/// should escalate loudly instead of skipping the event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConvertError {
+    /// The engine publishes blocks of a different size than this indexer was
+    /// configured for. Every stored block would be rejected, leaving the
+    /// index permanently empty while the event stream looks alive.
+    BlockSizeMismatch {
+        event_block_size: usize,
+        configured_block_size: u32,
+    },
+}
+
+impl std::fmt::Display for ConvertError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BlockSizeMismatch {
+                event_block_size,
+                configured_block_size,
+            } => write!(
+                f,
+                "engine block size {event_block_size} != configured --block-size {configured_block_size}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ConvertError {}
+
 /// Convert a raw event coming from the ZMQ channel into a placement-aware worker event.
 pub fn convert_event(
     raw: RawKvEvent,
@@ -20,13 +50,13 @@ pub fn convert_event(
     kv_block_size: u32,
     worker: WorkerWithDpRank,
     warning_count: &Arc<AtomicU32>,
-) -> Option<PlacementEvent> {
+) -> Result<Option<PlacementEvent>, ConvertError> {
     let storage_tier = match &raw {
         RawKvEvent::BlockStored { medium, .. } | RawKvEvent::BlockRemoved { medium, .. } => {
             StorageTier::from_kv_medium_or_default(medium.as_deref())
         }
         RawKvEvent::AllBlocksCleared => StorageTier::Device,
-        RawKvEvent::Ignored => return None,
+        RawKvEvent::Ignored => return Ok(None),
     };
     let dp_rank = worker.dp_rank;
     let event = match raw {
@@ -43,6 +73,23 @@ pub fn convert_event(
             kv_cache_spec_kind: _,
             kv_cache_spec_sliding_window: _,
         } => {
+            if !block_hashes.is_empty() && block_size != kv_block_size as usize {
+                tracing::error!(
+                    event_id,
+                    worker_id = worker.worker_id,
+                    dp_rank = worker.dp_rank,
+                    event_block_size = block_size,
+                    configured_block_size = kv_block_size,
+                    "Block size mismatch: every stored block would be dropped and the \
+                     index would stay empty. Fix the indexer's --block-size to match \
+                     the engine's --block-size."
+                );
+                return Err(ConvertError::BlockSizeMismatch {
+                    event_block_size: block_size,
+                    configured_block_size: kv_block_size,
+                });
+            }
+
             // Reject self-referencing blocks: all block hashes (including parent) must be unique.
             {
                 let mut seen = HashSet::with_capacity(block_hashes.len() + 1);
@@ -58,7 +105,7 @@ pub fn convert_event(
                     // Return an empty Removed instead of Cleared to avoid nuking
                     // the worker's entire index state. An empty Removed is a no-op
                     // in the radix tree (zero iterations, returns Ok(())).
-                    return Some(PlacementEvent::new(
+                    return Ok(Some(PlacementEvent::new(
                         Placement::local_worker(worker.worker_id, worker.dp_rank, storage_tier),
                         KvCacheEvent {
                             event_id,
@@ -67,7 +114,7 @@ pub fn convert_event(
                             }),
                             dp_rank,
                         },
-                    ));
+                    )));
                 }
             }
 
@@ -76,6 +123,27 @@ pub fn convert_event(
                 .into_iter()
                 .map(BlockHashValue::into_u64)
                 .collect();
+            let blocks = create_stored_blocks(
+                kv_block_size,
+                &token_ids,
+                &num_block_tokens,
+                &block_hashes_u64,
+                lora_name.as_deref(),
+                warning_count,
+                block_mm_infos.as_deref(),
+                is_eagle,
+            );
+            if blocks.len() < block_hashes_u64.len() {
+                tracing::error!(
+                    event_id,
+                    worker_id = worker.worker_id,
+                    dp_rank = worker.dp_rank,
+                    expected = block_hashes_u64.len(),
+                    published = blocks.len(),
+                    token_ids_len = token_ids.len(),
+                    "Stored blocks dropped during conversion; the index will miss them"
+                );
+            }
             KvCacheEvent {
                 event_id,
                 data: KvCacheEventData::Stored(KvCacheStoreData {
@@ -83,16 +151,7 @@ pub fn convert_event(
                         .map(BlockHashValue::into_u64)
                         .map(ExternalSequenceBlockHash::from),
                     start_position: None,
-                    blocks: create_stored_blocks(
-                        kv_block_size,
-                        &token_ids,
-                        &num_block_tokens,
-                        &block_hashes_u64,
-                        lora_name.as_deref(),
-                        warning_count,
-                        block_mm_infos.as_deref(),
-                        is_eagle,
-                    ),
+                    blocks,
                 }),
                 dp_rank,
             }
@@ -119,10 +178,10 @@ pub fn convert_event(
         RawKvEvent::Ignored => unreachable!("ignored events return before conversion"),
     };
 
-    Some(PlacementEvent::new(
+    Ok(Some(PlacementEvent::new(
         Placement::local_worker(worker.worker_id, worker.dp_rank, storage_tier),
         event,
-    ))
+    )))
 }
 
 pub fn create_stored_block_from_parts(

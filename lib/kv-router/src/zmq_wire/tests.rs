@@ -482,7 +482,8 @@ fn test_convert_event_bigram_emits_eagle_windows() {
     };
     let warning_count = Arc::new(AtomicU32::new(0));
     let placement_event =
-        convert_event(raw_event, 7, 2, WorkerWithDpRank::new(3, 0), &warning_count);
+        convert_event(raw_event, 7, 2, WorkerWithDpRank::new(3, 0), &warning_count)
+            .expect("block size matches");
 
     match placement_event.unwrap().event.data {
         KvCacheEventData::Stored(store_data) => {
@@ -515,6 +516,94 @@ fn test_convert_event_bigram_emits_eagle_windows() {
 
             assert_eq!(store_data.blocks[0].tokens_hash, expected_first[0]);
             assert_eq!(store_data.blocks[1].tokens_hash, expected_second[0]);
+        }
+        other => panic!("expected Stored event, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_convert_event_block_size_mismatch_is_fatal() {
+    let raw_event = RawKvEvent::BlockStored {
+        block_hashes: vec![BlockHashValue::Unsigned(21)],
+        parent_block_hash: None,
+        token_ids: vec![10; 256],
+        block_size: 256,
+        medium: None,
+        lora_name: None,
+        block_mm_infos: None,
+        is_eagle: None,
+        group_idx: None,
+        kv_cache_spec_kind: None,
+        kv_cache_spec_sliding_window: None,
+    };
+    let warning_count = Arc::new(AtomicU32::new(0));
+    let result = convert_event(raw_event, 7, 128, WorkerWithDpRank::new(3, 0), &warning_count);
+
+    assert_eq!(
+        result.unwrap_err(),
+        ConvertError::BlockSizeMismatch {
+            event_block_size: 256,
+            configured_block_size: 128,
+        }
+    );
+}
+
+#[test]
+fn test_convert_event_empty_store_is_not_fatal() {
+    // No blocks to publish -> nothing can mismatch; must not error.
+    let raw_event = RawKvEvent::BlockStored {
+        block_hashes: vec![],
+        parent_block_hash: Some(BlockHashValue::Unsigned(9)),
+        token_ids: vec![],
+        block_size: 256,
+        medium: None,
+        lora_name: None,
+        block_mm_infos: None,
+        is_eagle: None,
+        group_idx: None,
+        kv_cache_spec_kind: None,
+        kv_cache_spec_sliding_window: None,
+    };
+    let warning_count = Arc::new(AtomicU32::new(0));
+    let placement_event =
+        convert_event(raw_event, 7, 128, WorkerWithDpRank::new(3, 0), &warning_count)
+            .expect("empty store is not a config error");
+
+    match placement_event.unwrap().event.data {
+        KvCacheEventData::Stored(store_data) => assert!(store_data.blocks.is_empty()),
+        other => panic!("expected Stored event, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_convert_event_short_token_ids_keeps_parsed_blocks() {
+    // Two hashes but token_ids only covers the first block: the second is
+    // dropped (loudly), the first is still published.
+    let raw_event = RawKvEvent::BlockStored {
+        block_hashes: vec![BlockHashValue::Unsigned(21), BlockHashValue::Unsigned(22)],
+        parent_block_hash: None,
+        token_ids: vec![10, 11],
+        block_size: 2,
+        medium: None,
+        lora_name: None,
+        block_mm_infos: None,
+        is_eagle: None,
+        group_idx: None,
+        kv_cache_spec_kind: None,
+        kv_cache_spec_sliding_window: None,
+    };
+    let warning_count = Arc::new(AtomicU32::new(0));
+    let placement_event =
+        convert_event(raw_event, 7, 2, WorkerWithDpRank::new(3, 0), &warning_count)
+            .expect("short token_ids is not a config error");
+
+    match placement_event.unwrap().event.data {
+        KvCacheEventData::Stored(store_data) => {
+            assert_eq!(store_data.blocks.len(), 1);
+            assert_eq!(
+                store_data.blocks[0].block_hash,
+                ExternalSequenceBlockHash(21)
+            );
         }
         other => panic!("expected Stored event, got {other:?}"),
     }

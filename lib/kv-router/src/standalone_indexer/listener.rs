@@ -405,12 +405,27 @@ impl ListenerLoop {
             .data_parallel_rank
             .map_or(self.dp_rank, |rank| rank.cast_unsigned());
         for raw_event in batch.events {
-            let Some(placement_event) = self.normalizer.normalize(
+            let placement_event = match self.normalizer.normalize(
                 raw_event,
                 seq,
                 WorkerWithDpRank::new(self.worker_id, effective_dp_rank),
-            ) else {
-                continue;
+            ) {
+                Ok(Some(event)) => event,
+                Ok(None) => continue,
+                Err(error) => {
+                    // A config error, not a data anomaly: every event from this
+                    // engine would fail the same way and the index would stay
+                    // empty while looking alive. Crash so k8s surfaces it as a
+                    // CrashLoopBackOff instead of a silently useless indexer.
+                    tracing::error!(
+                        self.worker_id,
+                        self.dp_rank,
+                        seq,
+                        %error,
+                        "Fatal KV event config error; exiting"
+                    );
+                    std::process::exit(1);
+                }
             };
             let router_event = placement_event
                 .into_router_event()

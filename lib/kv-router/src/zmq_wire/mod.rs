@@ -23,7 +23,7 @@ mod filter;
 mod tests;
 mod types;
 
-pub use convert::{convert_event, create_stored_block_from_parts, create_stored_blocks};
+pub use convert::{ConvertError, convert_event, create_stored_block_from_parts, create_stored_blocks};
 pub use extra_keys::{extra_keys_to_block_mm_infos, parse_mm_hash_from_extra_key};
 pub use filter::KvCacheSpecKind;
 pub use types::{BlockHashValue, ExtraKeyItem, KvEventBatch, KvTokenIds, RawKvEvent};
@@ -113,7 +113,7 @@ impl ZmqEventNormalizer {
         raw: RawKvEvent,
         event_id: u64,
         worker: WorkerWithDpRank,
-    ) -> Option<PlacementEvent> {
+    ) -> Result<Option<PlacementEvent>, ConvertError> {
         convert_event(
             raw,
             event_id,
@@ -128,8 +128,10 @@ impl ZmqEventNormalizer {
         raw: RawKvEvent,
         event_id: u64,
         worker: WorkerWithDpRank,
-    ) -> Option<PlacementEvent> {
-        let raw = self.preprocess(raw, worker)?;
+    ) -> Result<Option<PlacementEvent>, ConvertError> {
+        let Some(raw) = self.preprocess(raw, worker) else {
+            return Ok(None);
+        };
         self.normalize_preprocessed(raw, event_id, worker)
     }
 
