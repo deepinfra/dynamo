@@ -25,7 +25,9 @@ use super::metrics::{register_lora_allocation_metrics, register_model_ready_metr
 use super::worker_metrics::register_worker_metrics;
 use crate::discovery::ModelManager;
 use crate::endpoint_type::EndpointType;
-use crate::kv_router::metrics::{RoutingOverheadMetrics, register_router_queue_metrics};
+use crate::kv_router::metrics::{
+    RoutingOverheadMetrics, register_router_queue_metrics, register_worker_kv_metrics,
+};
 use crate::reasoning_field::ReasoningField;
 use crate::request_template::RequestTemplate;
 use anyhow::{Context, Result};
@@ -1320,6 +1322,12 @@ impl HttpServiceConfigBuilder {
         register_model_ready_metric(&registry, state.manager_clone(), model_ready_metrics_prefix)?;
 
         register_worker_metrics(&registry, state.manager_clone())?;
+
+        // Engine-reported KV occupancy per worker (worker_kv_used_blocks /
+        // worker_kv_total_blocks), updated by KvWorkerMonitor from ActiveLoad.
+        if let Err(e) = register_worker_kv_metrics(&registry) {
+            tracing::warn!("Failed to register worker KV metrics: {}", e);
+        }
 
         // Register router queue metrics (pending requests per worker_type)
         // These are updated by KvScheduler on enqueue/update/free

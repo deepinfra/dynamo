@@ -692,6 +692,88 @@ impl WorkerLoadMetrics {
 
 pub static WORKER_LOAD_METRICS: LazyLock<WorkerLoadMetrics> = LazyLock::new(WorkerLoadMetrics::new);
 
+/// Per-worker engine-truth KV gauges, published by `KvWorkerMonitor` from the
+/// worker's own `ActiveLoad.kv_used_blocks` reports and the registration-time
+/// `total_kv_blocks`. Unlike [`WorkerLoadMetrics`] these are NOT router
+/// estimates: `worker_active_decode_blocks` counts logical 32-token blocks the
+/// router booked and structurally undercounts physical occupancy (e.g. ~2x on
+/// VSWA models, where the engine keeps a block pool per attention-window
+/// group). Dashboards and capacity math should use these gauges.
+///
+/// No `worker_type` label: the monitor observes ActiveLoad namespace-wide and
+/// does not know a worker's role; `worker_id` is unique regardless.
+pub struct WorkerKvMetrics {
+    pub kv_used_blocks: IntGaugeVec,
+    pub kv_total_blocks: IntGaugeVec,
+}
+
+impl WorkerKvMetrics {
+    pub fn observe(&self, worker_id: u64, dp_rank: u32, used: Option<u64>, total: Option<u64>) {
+        let worker_id_str = worker_id.to_string();
+        let dp_rank_str = dp_rank.to_string();
+        let labels = &[worker_id_str.as_str(), dp_rank_str.as_str()];
+        if let Some(used) = used {
+            self.kv_used_blocks
+                .with_label_values(labels)
+                .set(used as i64);
+        }
+        if let Some(total) = total {
+            self.kv_total_blocks
+                .with_label_values(labels)
+                .set(total as i64);
+        }
+    }
+
+    pub fn cleanup(&self, worker_id: u64, dp_ranks: &[u32]) {
+        let worker_id_str = worker_id.to_string();
+        for dp_rank in dp_ranks {
+            let dp_rank_str = dp_rank.to_string();
+            let labels = &[worker_id_str.as_str(), dp_rank_str.as_str()];
+            let _ = self.kv_used_blocks.remove_label_values(labels);
+            let _ = self.kv_total_blocks.remove_label_values(labels);
+        }
+    }
+}
+
+pub static WORKER_KV_METRICS: LazyLock<WorkerKvMetrics> = LazyLock::new(|| WorkerKvMetrics {
+    kv_used_blocks: IntGaugeVec::new(
+        Opts::new(
+            format!(
+                "{}_{}",
+                name_prefix::FRONTEND,
+                frontend_service::WORKER_KV_USED_BLOCKS
+            ),
+            "Engine-reported KV blocks in use per worker (authoritative occupancy)",
+        ),
+        &[labels::WORKER_ID, labels::DP_RANK],
+    )
+    .expect("Failed to create worker_kv_used_blocks gauge"),
+    kv_total_blocks: IntGaugeVec::new(
+        Opts::new(
+            format!(
+                "{}_{}",
+                name_prefix::FRONTEND,
+                frontend_service::WORKER_KV_TOTAL_BLOCKS
+            ),
+            "Engine-reported total KV block capacity per worker (from runtime config)",
+        ),
+        &[labels::WORKER_ID, labels::DP_RANK],
+    )
+    .expect("Failed to create worker_kv_total_blocks gauge"),
+});
+
+/// Register the engine-truth KV gauges with the frontend registry. They are
+/// registered directly rather than through the worker inventory collector, which
+/// only exports samples carrying a `worker_type` label.
+pub fn register_worker_kv_metrics(
+    registry: &prometheus::Registry,
+) -> Result<(), prometheus::Error> {
+    let kv = &*WORKER_KV_METRICS;
+    registry.register(Box::new(kv.kv_used_blocks.clone()))?;
+    registry.register(Box::new(kv.kv_total_blocks.clone()))?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Router queue and admission metrics
 // ---------------------------------------------------------------------------
