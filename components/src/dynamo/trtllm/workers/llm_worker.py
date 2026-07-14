@@ -12,11 +12,13 @@ import json
 import logging
 import os
 import sys
+import time
 from typing import Optional
 
 from prometheus_client import REGISTRY
 from tensorrt_llm.llmapi import (
     CapacitySchedulerPolicy,
+    DisaggregatedParams,
     DynamicBatchConfig,
     KvCacheConfig,
     SchedulerConfig,
@@ -58,7 +60,10 @@ from dynamo.runtime import DistributedRuntime
 from dynamo.trtllm.args import Config
 from dynamo.trtllm.constants import DisaggregationMode, Modality
 from dynamo.trtllm.engine import Backend, get_llm_engine
-from dynamo.trtllm.health_check import TrtllmHealthCheckPayload
+from dynamo.trtllm.health_check import (
+    TrtllmHealthCheckPayload,
+    _get_bos_token_id_from_tokenizer,
+)
 from dynamo.trtllm.multimodal_processor import MultimodalRequestProcessor
 from dynamo.trtllm.publisher import DYNAMO_COMPONENT_REGISTRY, get_publisher
 from dynamo.trtllm.request_handlers.handlers import (
@@ -153,6 +158,147 @@ def _register_memory_routes(runtime, handler) -> None:
         "/engine/control/release_memory_occupation, "
         "/engine/control/resume_memory_occupation"
     )
+
+
+# Generous bound for the 1-token capacity probe: engine init (including CUDA
+# graph capture) has already completed by the time it runs, so the real cost
+# is one prefill+decode iteration.
+_KV_CAPACITY_PROBE_GENERATION_TIMEOUT_S = 180
+_KV_CAPACITY_PROBE_STATS_TIMEOUT_S = 30
+
+
+def _reset_iteration_result_singletons(engine) -> None:
+    """Drop TRT-LLM's lazily-created IterationResult singletons after the probe.
+
+    ``aget_stats`` constructs ``_iter_stats_result`` (and the sibling
+    ``_iter_kv_events_result``) on first use; its AsyncQueue's asyncio.Event
+    binds to the event loop that first *awaits* it — during the probe, the
+    main loop. The Publisher's stats thread (ManagedThread) runs a private
+    loop and awaits the same singleton, which then raises "bound to a
+    different event loop" and kills the stats thread: frozen trtllm_* and
+    dynamo_component_* gauges, no kv_used_blocks ActiveLoad, no FPM.
+    Dropping the singletons restores the pre-probe lazy-init order — the
+    publisher's first poll rebuilds them on its own loop.
+    """
+    executor = getattr(engine.llm, "_executor", None)
+    if executor is None:
+        return
+    for attr in ("_iter_stats_result", "_iter_kv_events_result"):
+        if hasattr(executor, attr):
+            setattr(executor, attr, None)
+
+
+async def _probe_total_kv_blocks(engine, tokenizer, config: Config) -> Optional[int]:
+    """Learn the per-rank KV block capacity (``kvCacheStats.maxNumBlocks``).
+
+    TRT-LLM only exposes the KV pool size through iteration stats, and the
+    engine enqueues those only when a request actually iterates. Run a single
+    1-token probe generation — the same shape as the health-check canary —
+    and then drain the stats queue to read ``maxNumBlocks``.
+
+    This runs before ``register_model``, so no external traffic can race the
+    stats queue (the publisher's stats thread also starts later). The frontend
+    needs ``total_kv_blocks`` in the runtime config for
+    ``--active-decode-blocks-threshold`` overload rejection: without it the
+    worker monitor has no denominator and the threshold is a silent no-op.
+
+    Returns None (never raises) if the capacity cannot be determined;
+    registration then proceeds without ``total_kv_blocks``, matching the old
+    behavior.
+    """
+    if config.disaggregation_mode == DisaggregationMode.ENCODE:
+        # MultimodalEncoder: no KV cache, no generate surface.
+        return None
+    if not config.publish_events_and_metrics:
+        # enable_iter_perf_stats is tied to this flag; without it the engine
+        # never enqueues kvCacheStats, so there is nothing to probe.
+        logging.warning(
+            "Cannot probe total_kv_blocks: iteration stats are disabled "
+            "(publish_events_and_metrics=False). "
+            "--active-decode-blocks-threshold will not take effect for this worker."
+        )
+        return None
+    if os.getenv("DYN_TRTLLM_SKIP_KV_CAPACITY_PROBE") == "1":
+        logging.warning(
+            "Skipping total_kv_blocks probe (DYN_TRTLLM_SKIP_KV_CAPACITY_PROBE=1)."
+        )
+        return None
+
+    bos_token_id = _get_bos_token_id_from_tokenizer(tokenizer)
+    # end_id/pad_id must be set explicitly: the engine may run with
+    # skip_tokenizer_init, in which case TRT-LLM cannot infer them. Any valid
+    # token id works — max_tokens=1 ends the request regardless.
+    sampling_params = SamplingParams(
+        max_tokens=1,
+        end_id=bos_token_id,
+        pad_id=bos_token_id,
+        detokenize=False,
+    )
+    disaggregated_params = None
+    if config.disaggregation_mode in (
+        DisaggregationMode.PREFILL,
+        DisaggregationMode.DECODE,
+    ):
+        # Same trick as TrtllmHealthCheckPayload: run the probe as a local
+        # prefill+decode so no KV transceiver or peer worker is required.
+        disaggregated_params = DisaggregatedParams(
+            request_type="context_and_generation"
+        )
+
+    try:
+        try:
+            generation = engine.llm.generate_async(
+                inputs=[bos_token_id],
+                sampling_params=sampling_params,
+                disaggregated_params=disaggregated_params,
+                streaming=False,
+            )
+            await asyncio.wait_for(
+                generation.aresult(), timeout=_KV_CAPACITY_PROBE_GENERATION_TIMEOUT_S
+            )
+        except Exception:
+            logging.warning(
+                "total_kv_blocks probe generation failed; registering without it.",
+                exc_info=True,
+            )
+            return None
+
+        # The engine serializes iteration stats after the iteration completes;
+        # poll briefly. Take the max across rows: under attention DP each rank
+        # reports its own (homogeneous) pool, so any row carries the per-rank
+        # capacity the worker monitor expects.
+        total_kv_blocks = 0
+        deadline = time.monotonic() + _KV_CAPACITY_PROBE_STATS_TIMEOUT_S
+        while time.monotonic() < deadline:
+            try:
+                async for stat in engine.llm.get_stats_async(timeout=1):
+                    if isinstance(stat, str):
+                        stat = json.loads(stat)
+                    max_blocks = int(
+                        (stat.get("kvCacheStats") or {}).get("maxNumBlocks") or 0
+                    )
+                    total_kv_blocks = max(total_kv_blocks, max_blocks)
+            except (asyncio.TimeoutError, TimeoutError, asyncio.QueueEmpty):
+                pass
+            except Exception:
+                logging.warning(
+                    "total_kv_blocks probe failed reading engine stats.",
+                    exc_info=True,
+                )
+                return None
+            if total_kv_blocks > 0:
+                return total_kv_blocks
+            await asyncio.sleep(0.5)
+
+        logging.warning(
+            "total_kv_blocks probe timed out waiting for kvCacheStats; "
+            "registering without it."
+        )
+        return None
+    finally:
+        # Must run on every exit path once the engine was touched, or the
+        # Publisher's stats thread dies on its first poll (see helper doc).
+        _reset_iteration_result_singletons(engine)
 
 
 async def init_llm_worker(
@@ -534,14 +680,16 @@ async def init_llm_worker(
         if shutdown_endpoints is not None:
             shutdown_endpoints[:] = [endpoint]
 
-        # should ideally call get_engine_runtime_config
-        # this is because we don't have a good way to
-        # get total_kv_blocks from the engine yet without calling get_stats_async
-        # This causes an issue because get_stats_async doesn't work when no requests are sent to the engine
-        # So for now, we just set the parsers from the config
-        # TODO: fix this once we have a better way to get total_kv_blocks
         runtime_config = ModelRuntimeConfig()
         runtime_config.context_length = config.max_seq_len
+
+        # TRT-LLM reports KV capacity only via iteration stats, which need a
+        # request to flow. Probe it with a 1-token generation before
+        # registration; see _probe_total_kv_blocks. Without total_kv_blocks
+        # the frontend's --active-decode-blocks-threshold gate never fires.
+        total_kv_blocks = await _probe_total_kv_blocks(engine, tokenizer, config)
+        if total_kv_blocks:
+            runtime_config.total_kv_blocks = total_kv_blocks
 
         # Set values from config that are available immediately
         # Note: We populate max_num_seqs and max_num_batched_tokens from config
@@ -596,11 +744,10 @@ async def init_llm_worker(
             f"Set runtime config max_num_batched_tokens: {runtime_config.max_num_batched_tokens}"
         )
         logging.info(f"Set runtime config data_parallel_size: {attention_dp_size}")
-
-        # The get_engine_runtime_config function exists but is not called here due to:
-        # 1. get_stats_async requires active requests to work properly
-        # 2. We need runtime config during registration, before any requests are made
-        # 3. total_kv_blocks would ideally come from engine stats but is not critical for basic operation
+        logging.info(
+            f"Set runtime config total_kv_blocks: {runtime_config.total_kv_blocks} "
+            "(per-rank, probed from engine kvCacheStats.maxNumBlocks)"
+        )
 
         # Initialize TensorRT-LLM MetricsCollector and register with global REGISTRY
         # This enables exposing TRT-LLM's native Prometheus metrics (request latency, TTFT, TPOT, etc.)
