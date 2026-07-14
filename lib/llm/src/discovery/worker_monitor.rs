@@ -17,7 +17,7 @@ use crate::http::service::metrics::{
     WORKER_LAST_TIME_TO_FIRST_TOKEN_GAUGE,
 };
 use crate::kv_router::KV_METRICS_SUBJECT;
-use crate::kv_router::metrics::WORKER_LOAD_METRICS;
+use crate::kv_router::metrics::{WORKER_KV_METRICS, WORKER_LOAD_METRICS};
 use crate::model_card::ModelDeploymentCard;
 use dynamo_runtime::component::Client;
 use dynamo_runtime::discovery::{DiscoveryQuery, watch_and_extract_field};
@@ -34,6 +34,10 @@ const UNSET_DP_RANK_LABEL: &str = "none";
 /// This removes metrics with the given worker_id, dp_rank, and worker_type label combination.
 /// Called when workers are removed to prevent stale metrics from accumulating.
 fn cleanup_worker_metrics(worker_id: u64, dp_ranks: &[u32], worker_type: &str) {
+    // Engine-truth KV gauges carry no worker_type label; removing them here is
+    // idempotent even though some call sites invoke this once per worker_type.
+    WORKER_KV_METRICS.cleanup(worker_id, dp_ranks);
+
     let worker_id_str = worker_id.to_string();
     let m = &*WORKER_LOAD_METRICS;
     for dp_rank in dp_ranks {
@@ -820,6 +824,17 @@ impl WorkerLoadMonitor for KvWorkerMonitor {
                             let worker_overloaded = state.is_overloaded_for_config(&cfg);
                             (total_blocks, worker_overloaded)
                         };
+
+                        // Mirror the engine-truth occupancy to Prometheus. The router's
+                        // worker_active_decode_blocks gauge is a logical estimate that
+                        // structurally undercounts physical usage (e.g. ~2x on VSWA
+                        // models); these gauges expose what the worker itself reports.
+                        WORKER_KV_METRICS.observe(
+                            worker_id,
+                            dp_rank,
+                            active_load.kv_used_blocks,
+                            total_blocks,
+                        );
 
                         if tracing::enabled!(tracing::Level::DEBUG) {
                             tracing::debug!(

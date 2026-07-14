@@ -285,6 +285,15 @@ pub mod frontend_service {
     /// Gauge metric tracking current queued prefill tokens for each worker
     pub const WORKER_ACTIVE_PREFILL_TOKENS: &str = "worker_active_prefill_tokens";
 
+    /// Engine-reported KV blocks in use per worker (authoritative occupancy).
+    /// Unlike WORKER_ACTIVE_DECODE_BLOCKS (the router's logical estimate), this
+    /// mirrors the backend engine's own usedNumBlocks as published in ActiveLoad.
+    pub const WORKER_KV_USED_BLOCKS: &str = "worker_kv_used_blocks";
+
+    /// Engine-reported total KV block capacity per worker, from the
+    /// registration-time runtime config (same denominator the overload gate uses).
+    pub const WORKER_KV_TOTAL_BLOCKS: &str = "worker_kv_total_blocks";
+
     /// Last observed time to first token per worker (in seconds)
     /// Gauge metric tracking the most recent TTFT for each worker
     pub const WORKER_LAST_TIME_TO_FIRST_TOKEN_SECONDS: &str =
