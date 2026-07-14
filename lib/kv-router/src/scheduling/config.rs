@@ -769,6 +769,23 @@ impl KvRouterConfig {
         self.validate().map_err(|error| error.to_string())
     }
 
+    /// Derive the config for a prefill router from this (decode/main) config.
+    ///
+    /// The prefill router tracks no decode-block state, so
+    /// `router_track_active_blocks` is disabled — and `router_track_output_blocks`
+    /// must be disabled with it: prefill requests generate at most one token, and
+    /// the pair (`track_output_blocks=true`, `track_active_blocks=false`) fails
+    /// schema validation. Callers that cleared only `router_track_active_blocks`
+    /// produced an invalid config whenever output-block tracking was enabled
+    /// globally, which failed prefill-router activation and silently degraded
+    /// disaggregated deployments to decode-only passthrough.
+    pub fn for_prefill_router(&self) -> Self {
+        let mut prefill_config = self.clone();
+        prefill_config.router_track_active_blocks = false;
+        prefill_config.router_track_output_blocks = false;
+        prefill_config
+    }
+
     pub fn router_queue_recheck_interval(&self) -> Duration {
         const DEFAULT_RECHECK_INTERVAL: Duration = Duration::from_secs(60);
         const PREFILL_LOAD_RECHECK_INTERVAL: Duration = Duration::from_millis(100);
@@ -993,6 +1010,28 @@ mod tests {
 
         assert!(too_small.validate().is_err());
         assert!(too_large.validate().is_err());
+    }
+
+    /// Regression: 2026-07-14 disagg outage. Prefill-config derivation cleared
+    /// only `router_track_active_blocks`, so a base config with
+    /// `router_track_output_blocks=true` (e.g. DYN_ROUTER_TRACK_OUTPUT_BLOCKS=1)
+    /// produced an invalid prefill config; the activation error was swallowed
+    /// and disagg traffic went straight to decode workers (100% 500s).
+    #[test]
+    fn test_for_prefill_router_stays_valid_with_output_block_tracking() {
+        let base = KvRouterConfig {
+            router_track_output_blocks: true,
+            ..Default::default()
+        };
+        assert!(base.validate().is_ok(), "base config must be valid");
+
+        let prefill = base.for_prefill_router();
+        assert!(!prefill.router_track_active_blocks);
+        assert!(!prefill.router_track_output_blocks);
+        assert!(
+            prefill.validate().is_ok(),
+            "prefill config derived from a valid base config must remain valid"
+        );
     }
 
     #[test]

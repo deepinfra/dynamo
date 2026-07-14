@@ -821,8 +821,7 @@ pub unsafe extern "C" fn create_routers(
         // A background task watches discovery for prefill workers and activates
         // the router when one appears. Before activation, requests gracefully
         // fallback to decode-only routing.
-        let mut prefill_config = kv_router_config;
-        prefill_config.router_track_active_blocks = false;
+        let prefill_config = kv_router_config.for_prefill_router();
 
         let (prefill_tx, prefill_rx) = tokio::sync::oneshot::channel();
         let prefill_router = PrefillRouter::new(
