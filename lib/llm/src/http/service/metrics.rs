@@ -114,6 +114,29 @@ pub static WORKER_LAST_INTER_TOKEN_LATENCY_GAUGE: LazyLock<GaugeVec> = LazyLock:
     .expect("Failed to create worker_last_inter_token_latency gauge")
 });
 
+/// Global Prometheus histogram for output sequence length per decode worker (in tokens)
+/// Labels: worker_id, dp_rank, worker_type
+/// Observed once per completed request (in `ResponseMetricCollector::drop`),
+/// alongside the model-level OUTPUT_SEQUENCE_TOKENS histogram. Shares the same
+/// DYN_METRICS_OUTPUT_SEQUENCE_{MIN,MAX,COUNT} bucket configuration.
+pub static WORKER_OUTPUT_SEQUENCE_TOKENS_HISTOGRAM: LazyLock<HistogramVec> = LazyLock::new(|| {
+    let (osl_min, osl_max, osl_count) =
+        parse_bucket_config("DYN_METRICS_OUTPUT_SEQUENCE", 50.0, 32000.0, 10);
+    HistogramVec::new(
+        HistogramOpts::new(
+            format!(
+                "{}_{}",
+                name_prefix::FRONTEND,
+                frontend_service::WORKER_OUTPUT_SEQUENCE_TOKENS
+            ),
+            "Output sequence length in tokens per decode worker",
+        )
+        .buckets(generate_log_buckets(osl_min, osl_max, osl_count)),
+        &["worker_id", "dp_rank", "worker_type"],
+    )
+    .expect("Failed to create worker_output_sequence_tokens histogram")
+});
+
 /// Register the global per-worker TTFT/ITL/input-tokens Prometheus metrics with the given registry.
 ///
 /// This should be called once during HTTP service setup to expose the metrics
@@ -125,6 +148,7 @@ pub fn register_worker_timing_metrics(registry: &Registry) -> Result<(), prometh
     registry.register(Box::new(WORKER_LAST_TIME_TO_FIRST_TOKEN_GAUGE.clone()))?;
     registry.register(Box::new(WORKER_LAST_INPUT_SEQUENCE_TOKENS_GAUGE.clone()))?;
     registry.register(Box::new(WORKER_LAST_INTER_TOKEN_LATENCY_GAUGE.clone()))?;
+    registry.register(Box::new(WORKER_OUTPUT_SEQUENCE_TOKENS_HISTOGRAM.clone()))?;
     Ok(())
 }
 
@@ -1806,6 +1830,28 @@ impl Drop for ResponseMetricCollector {
                 .output_sequence_length
                 .with_label_values(&[&self.model])
                 .observe(self.osl as f64);
+
+            // Also record OSL against the decode worker that served the request,
+            // so per-worker output-length distributions are queryable (e.g. to
+            // spot a worker accumulating long-output traffic). Worker info is
+            // latched in `set_worker_info`; requests that errored before worker
+            // assignment simply skip this.
+            if let Some(worker_id) = self.decode_worker_id {
+                let dp_rank_str = self
+                    .decode_dp_rank
+                    .map_or(UNSET_DP_RANK_LABEL.to_string(), |r| r.to_string());
+                let worker_type = self
+                    .decode_worker_type
+                    .as_deref()
+                    .unwrap_or(WORKER_TYPE_DECODE);
+                WORKER_OUTPUT_SEQUENCE_TOKENS_HISTOGRAM
+                    .with_label_values(&[
+                        worker_id.to_string().as_str(),
+                        dp_rank_str.as_str(),
+                        worker_type,
+                    ])
+                    .observe(self.osl as f64);
+            }
         }
 
         // Record request summary on the enclosing span.
@@ -2125,6 +2171,44 @@ async fn handler_metrics(State(state): State<Arc<MetricsHandlerState>>) -> impl 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_worker_osl_histogram_observed_on_drop() {
+        let metrics = Arc::new(Metrics::new_with_prefix(None));
+        {
+            let mut collector = metrics
+                .clone()
+                .create_response_collector("test-model-worker-osl");
+            collector.set_worker_info(
+                None,
+                None,
+                None,
+                Some(4242),
+                Some(1),
+                Some(WORKER_TYPE_DECODE.to_string()),
+            );
+            collector.observe_current_osl(1234);
+        } // drop publishes OSL
+
+        // Use a worker_id unique to this test: the histogram is a global static
+        // shared across parallel tests.
+        let hist =
+            WORKER_OUTPUT_SEQUENCE_TOKENS_HISTOGRAM.with_label_values(&["4242", "1", WORKER_TYPE_DECODE]);
+        assert_eq!(hist.get_sample_count(), 1);
+        assert_eq!(hist.get_sample_sum(), 1234.0);
+
+        // A collector that never saw a worker id must not create an unlabeled series.
+        {
+            let mut collector = metrics.create_response_collector("test-model-worker-osl");
+            collector.observe_current_osl(99);
+        }
+        let hist = WORKER_OUTPUT_SEQUENCE_TOKENS_HISTOGRAM.with_label_values(&[
+            "4242",
+            "1",
+            WORKER_TYPE_DECODE,
+        ]);
+        assert_eq!(hist.get_sample_count(), 1, "workerless request must not observe");
+    }
 
     #[test]
     fn test_round_to_sig_figs() {

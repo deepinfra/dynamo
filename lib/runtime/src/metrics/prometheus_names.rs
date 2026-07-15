@@ -309,6 +309,13 @@ pub mod frontend_service {
     pub const WORKER_LAST_INTER_TOKEN_LATENCY_SECONDS: &str =
         "worker_last_inter_token_latency_seconds";
 
+    /// Output sequence length per decode worker (in tokens)
+    /// Histogram observed once per completed request, labeled by the decode
+    /// worker that served it. Complements OUTPUT_SEQUENCE_TOKENS (model-level)
+    /// with a per-worker breakdown; `_sum`/`_count` also yield true per-worker
+    /// average OSL and completion rate.
+    pub const WORKER_OUTPUT_SEQUENCE_TOKENS: &str = "worker_output_sequence_tokens";
+
     /// Number of requests pending in the router's scheduler queue (gauge per worker_type)
     pub const ROUTER_QUEUE_PENDING_REQUESTS: &str = "router_queue_pending_requests";
 
