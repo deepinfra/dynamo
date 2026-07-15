@@ -268,6 +268,8 @@ _pipe: OmniInference | None = None
 _served_model_name: str = ""
 _output_root: Path = Path("/tmp/cosmos3_worker_outputs")
 _generate_lock = threading.Lock()
+
+
 # Default denoising steps for VIDEO when a request doesn't specify one. Driven by
 # the COSMOS3_NUM_STEPS env (set via model-config extra_env) so step count is
 # tunable without an image rebuild. Parsed defensively: a bad value degrades to the
