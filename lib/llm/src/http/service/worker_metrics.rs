@@ -14,6 +14,7 @@ use prometheus::{
 use super::metrics::{
     WORKER_LAST_INPUT_SEQUENCE_TOKENS_GAUGE, WORKER_LAST_INTER_TOKEN_LATENCY_GAUGE,
     WORKER_LAST_TIME_TO_FIRST_TOKEN_GAUGE, WORKER_OUTPUT_SEQUENCE_TOKENS_HISTOGRAM,
+    WORKER_TOKEN_NEG_LOGPROB_HISTOGRAM,
 };
 use crate::discovery::ModelManager;
 use crate::discovery::worker_inventory::{WorkerGroupObservation, WorkerGroupState};
@@ -34,12 +35,13 @@ type AllowedRanks = HashMap<(u64, String), HashSet<u32>>;
 
 /// Series written per request by `ResponseMetricCollector`, which may not know the
 /// worker's dp_rank (label `none`).
-fn worker_last_metric_names() -> [String; 4] {
+fn worker_last_metric_names() -> [String; 5] {
     [
         frontend_service::WORKER_LAST_TIME_TO_FIRST_TOKEN_SECONDS,
         frontend_service::WORKER_LAST_INPUT_SEQUENCE_TOKENS,
         frontend_service::WORKER_LAST_INTER_TOKEN_LATENCY_SECONDS,
         frontend_service::WORKER_OUTPUT_SEQUENCE_TOKENS,
+        frontend_service::WORKER_TOKEN_NEG_LOGPROB,
     ]
     .map(|suffix| format!("{}_{suffix}", name_prefix::FRONTEND))
 }
@@ -291,6 +293,7 @@ pub(super) fn register_worker_metrics(
         Box::new(WORKER_LAST_INPUT_SEQUENCE_TOKENS_GAUGE.clone()),
         Box::new(WORKER_LAST_INTER_TOKEN_LATENCY_GAUGE.clone()),
         Box::new(WORKER_OUTPUT_SEQUENCE_TOKENS_HISTOGRAM.clone()),
+        Box::new(WORKER_TOKEN_NEG_LOGPROB_HISTOGRAM.clone()),
     ];
     registry.register(Box::new(WorkerMetricsCollector::new(inventory, values)?))
 }
