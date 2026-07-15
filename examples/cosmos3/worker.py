@@ -268,12 +268,28 @@ _pipe: OmniInference | None = None
 _served_model_name: str = ""
 _output_root: Path = Path("/tmp/cosmos3_worker_outputs")
 _generate_lock = threading.Lock()
-# Default denoising steps when a request doesn't specify one. Driven by the
-# COSMOS3_NUM_STEPS env (set via model-config extra_env) so step count is tunable
-# without an image rebuild; None falls back to the framework's per-modality default.
-_default_num_steps: int | None = (
-    int(os.environ["COSMOS3_NUM_STEPS"]) if os.environ.get("COSMOS3_NUM_STEPS") else None
-)
+# Default denoising steps for VIDEO when a request doesn't specify one. Driven by
+# the COSMOS3_NUM_STEPS env (set via model-config extra_env) so step count is
+# tunable without an image rebuild. Parsed defensively: a bad value degrades to the
+# framework default instead of crashing the worker at import. Applied to video only
+# (see the payload builders) — image modes keep their own framework default (e.g.
+# text2image defaults to 50, unvalidated at a lower count).
+def _parse_default_num_steps() -> int | None:
+    raw = os.environ.get("COSMOS3_NUM_STEPS")
+    if not raw:
+        return None
+    try:
+        n = int(raw)
+    except ValueError:
+        log.warning("ignoring non-integer COSMOS3_NUM_STEPS=%r", raw)
+        return None
+    if n <= 0:
+        log.warning("ignoring non-positive COSMOS3_NUM_STEPS=%r", raw)
+        return None
+    return n
+
+
+_default_num_steps: int | None = _parse_default_num_steps()
 
 
 def _run_generate(payload: dict[str, Any]) -> dict[str, Any] | None:
@@ -307,9 +323,11 @@ def _run_generate(payload: dict[str, Any]) -> dict[str, Any] | None:
             override_kwargs["model_mode"] = model_mode
         if payload.get("action_url") is not None:
             override_kwargs["action_path"] = payload["action_url"]
-        for key in ("domain_name", "action_chunk_size", "raw_action_dim", "image_size", "num_steps"):
+        for key in ("domain_name", "action_chunk_size", "raw_action_dim", "image_size"):
             if payload.get(key) is not None:
                 override_kwargs[key] = payload[key]
+        if payload.get("num_steps") is not None:
+            override_kwargs["num_steps"] = payload["num_steps"]
 
         overrides = OmniSampleOverrides(**override_kwargs)
         overrides.download(rank_dir / "inputs")
@@ -371,7 +389,11 @@ def _generate_blocking(request: Cosmos3VideoRequest) -> Cosmos3VideoResponse:
     }
     if aspect_ratio is not None:
         payload["aspect_ratio"] = aspect_ratio
-    ns = request.nvext.num_steps if (request.nvext is not None and request.nvext.num_steps is not None) else _default_num_steps
+    ns = None
+    if request.nvext is not None and request.nvext.num_steps is not None:
+        ns = request.nvext.num_steps
+    elif num_frames > 1:  # video only; image modes keep their framework default
+        ns = _default_num_steps
     if ns is not None:
         payload["num_steps"] = ns
     # Forward action fields when present.
@@ -554,7 +576,11 @@ def _run_standalone_http(args: argparse.Namespace) -> None:
         }
         if aspect_ratio is not None:
             payload["aspect_ratio"] = aspect_ratio
-        ns = req.nvext.num_steps if (req.nvext is not None and req.nvext.num_steps is not None) else _default_num_steps
+        ns = None
+        if req.nvext is not None and req.nvext.num_steps is not None:
+            ns = req.nvext.num_steps
+        elif num_frames > 1:  # video only; image modes keep their framework default
+            ns = _default_num_steps
         if ns is not None:
             payload["num_steps"] = ns
         # Forward action fields when present.
