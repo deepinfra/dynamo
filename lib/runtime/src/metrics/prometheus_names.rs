@@ -316,6 +316,14 @@ pub mod frontend_service {
     /// average OSL and completion rate.
     pub const WORKER_OUTPUT_SEQUENCE_TOKENS: &str = "worker_output_sequence_tokens";
 
+    /// Per-token negative log-probability per decode worker (nats)
+    /// Histogram observed for every generated token whose backend response
+    /// carries logprobs (client-requested, or sampled-in via
+    /// DYN_FORCE_LOGPROBS_SAMPLE_RATE). Values are -logprob, so mass
+    /// collapsing into the near-zero buckets signals degenerate/looping
+    /// generation on that worker.
+    pub const WORKER_TOKEN_NEG_LOGPROB: &str = "worker_token_neg_logprob";
+
     /// Number of requests pending in the router's scheduler queue (gauge per worker_type)
     pub const ROUTER_QUEUE_PENDING_REQUESTS: &str = "router_queue_pending_requests";
 

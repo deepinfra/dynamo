@@ -86,6 +86,27 @@ pub use crate::protocols::common::preprocessor::PreprocessedEmbeddingRequest;
 
 use crate::protocols::common::llm_backend::EmbeddingsEngineOutput;
 
+/// Fraction of requests (0.0..=1.0) on which to force `logprobs=1` toward the
+/// backend when the client did not ask for logprobs, feeding the per-decode-worker
+/// token-logprob histogram (WORKER_TOKEN_NEG_LOGPROB). The forced logprobs never
+/// reach the client: response serialization is gated on the client's own request
+/// fields. Default 0.0 (off) — logprobs add per-token work on the worker's
+/// Python/serialization path, so sample rather than blanket-enable.
+static FORCE_LOGPROBS_SAMPLE_RATE: std::sync::LazyLock<f64> = std::sync::LazyLock::new(|| {
+    std::env::var("DYN_FORCE_LOGPROBS_SAMPLE_RATE")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .map(|v| v.clamp(0.0, 1.0))
+        .unwrap_or(0.0)
+});
+
+/// Decide whether to force backend logprobs for this request. Pure so the
+/// sampling contract is testable: never overrides a client that asked for
+/// logprobs, never fires at rate 0.0, always fires at rate 1.0.
+fn should_force_logprobs(client_logprobs: Option<u32>, rate: f64, roll: f64) -> bool {
+    client_logprobs.is_none() && rate > 0.0 && roll < rate
+}
+
 fn routing_priorities(hints: Option<&AgentHints>) -> (Option<f64>, Option<u32>, Option<i32>) {
     let priority_jump = hints.and_then(|h| {
         h.priority
@@ -964,6 +985,18 @@ impl OpenAIPreprocessor {
                     "skip_special_tokens=true requested while a special-token-dependent parser is active; the engine's special tokens will be stripped before parsing, so tool_calls/reasoning_content will be empty and the markup will leak into content. Unset skip_special_tokens (Dynamo defaults it to false for these parsers) or set it to false."
                 );
             });
+        }
+        // Sampled logprob telemetry: force logprobs=1 toward the backend on a
+        // fraction of requests so the per-decode-worker token-logprob histogram
+        // stays populated even when no client asks for logprobs. Response
+        // serialization is gated on the client's own request fields, so the
+        // forced values never leak into client responses.
+        if should_force_logprobs(
+            output_options.logprobs,
+            *FORCE_LOGPROBS_SAMPLE_RATE,
+            rand::random::<f64>(),
+        ) {
+            output_options.logprobs = Some(1);
         }
         builder.output_options(output_options);
         builder.annotations(request.annotations().unwrap_or_default());
@@ -2281,6 +2314,16 @@ impl OpenAIPreprocessor {
                         .map(|d| d.finish_reason.is_some())
                         .unwrap_or(false);
 
+                    // Latch this chunk's raw logprobs before `map_data` consumes the
+                    // backend output; observed into the per-decode-worker histogram
+                    // below once worker attribution is known. None for the vast
+                    // majority of traffic (only logprobs-requesting or
+                    // DYN_FORCE_LOGPROBS_SAMPLE_RATE-sampled requests carry them).
+                    let chunk_log_probs = response
+                        .data
+                        .as_ref()
+                        .and_then(|backend_output| backend_output.log_probs.clone());
+
                     let (chunk_tokens, isl) = if let Some(ref backend_output) = response.data {
                         let chunk_tokens = backend_output.token_ids.len();
                         inner.cumulative_output_tokens += chunk_tokens;
@@ -2332,6 +2375,35 @@ impl OpenAIPreprocessor {
                         .as_ref()
                         .and_then(|t| t.decode_worker_type())
                         .map(String::from);
+
+                    // Per-decode-worker token logprob distribution (loop/poisoning
+                    // detector). -logprob so log-spaced buckets resolve the
+                    // near-zero high-confidence region a degenerate loop collapses
+                    // into. Label allocation only happens on chunks that actually
+                    // carry logprobs (sampled/requested), not on the hot path.
+                    if let (Some(log_probs), Some(worker_id)) =
+                        (chunk_log_probs.as_ref(), decode_worker_id)
+                        && !log_probs.is_empty()
+                    {
+                        let hist = crate::http::service::metrics::WORKER_TOKEN_NEG_LOGPROB_HISTOGRAM
+                            .with_label_values(&[
+                                worker_id.to_string().as_str(),
+                                decode_dp_rank
+                                    .map_or_else(
+                                        || crate::http::service::metrics::UNSET_DP_RANK_LABEL
+                                            .to_string(),
+                                        |r| r.to_string(),
+                                    )
+                                    .as_str(),
+                                decode_worker_type
+                                    .as_deref()
+                                    .unwrap_or(crate::http::service::metrics::WORKER_TYPE_DECODE),
+                            ]);
+                        for lp in log_probs {
+                            hist.observe(-lp);
+                        }
+                    }
+
                     let llm_metrics = LLMMetricAnnotation {
                         input_tokens: isl.unwrap_or(0),
                         output_tokens: current_osl,
@@ -3609,6 +3681,21 @@ mod tests {
     use super::*;
     use crate::protocols::common::preprocessor::MultimodalData;
     use crate::protocols::common::{OutputOptions, SamplingOptions, StopConditions};
+
+    #[test]
+    fn test_should_force_logprobs_contract() {
+        // Never override a client that asked for logprobs, even at rate 1.0.
+        assert!(!should_force_logprobs(Some(3), 1.0, 0.0));
+        assert!(!should_force_logprobs(Some(0), 1.0, 0.0));
+        // Rate 0.0 (default/off) never fires.
+        assert!(!should_force_logprobs(None, 0.0, 0.0));
+        // Rate 1.0 always fires for clients that didn't ask.
+        assert!(should_force_logprobs(None, 1.0, 0.999));
+        // Roll below rate fires; at/above rate doesn't.
+        assert!(should_force_logprobs(None, 0.05, 0.049));
+        assert!(!should_force_logprobs(None, 0.05, 0.05));
+        assert!(!should_force_logprobs(None, 0.05, 0.9));
+    }
 
     fn url_entry(u: &str) -> MultimodalData {
         MultimodalData::Url(url::Url::parse(u).unwrap())
