@@ -66,7 +66,7 @@ use super::RouteDoc;
 
 /// Worker type label values for Prometheus timing metrics
 pub use crate::discovery::{WORKER_TYPE_DECODE, WORKER_TYPE_PREFILL};
-const UNSET_DP_RANK_LABEL: &str = "none";
+pub(crate) const UNSET_DP_RANK_LABEL: &str = "none";
 const ITL_LOCAL_FLUSH_TOKENS: u64 = 64;
 
 /// Global Prometheus gauge for last observed TTFT per worker (in seconds)
@@ -144,6 +144,33 @@ pub static WORKER_OUTPUT_SEQUENCE_TOKENS_HISTOGRAM: LazyLock<HistogramVec> = Laz
     .expect("Failed to create worker_output_sequence_tokens histogram")
 });
 
+/// Global Prometheus histogram for per-token negative log-probability per decode worker
+/// Labels: worker_id, dp_rank, worker_type
+/// Observed in `transform_postprocessor_stream` for every generated token whose
+/// backend delta carries logprobs — i.e. requests that asked for logprobs, plus
+/// the sampled fraction forced by DYN_FORCE_LOGPROBS_SAMPLE_RATE. Values are
+/// -logprob (>= 0); a healthy worker shows a broad distribution, a looping or
+/// prefix-poisoned worker collapses into the near-zero buckets. Bucket bounds
+/// configurable via DYN_METRICS_TOKEN_NEG_LOGPROB_{MIN,MAX,COUNT}; the leading
+/// `le="0"` bucket counts exact-certainty tokens (logprob == 0).
+pub static WORKER_TOKEN_NEG_LOGPROB_HISTOGRAM: LazyLock<HistogramVec> = LazyLock::new(|| {
+    let (nl_min, nl_max, nl_count) =
+        parse_bucket_config("DYN_METRICS_TOKEN_NEG_LOGPROB", 0.0001, 20.0, 12);
+    HistogramVec::new(
+        HistogramOpts::new(
+            format!(
+                "{}_{}",
+                name_prefix::FRONTEND,
+                frontend_service::WORKER_TOKEN_NEG_LOGPROB
+            ),
+            "Per-token negative log-probability per decode worker (nats)",
+        )
+        .buckets(generate_log_buckets(nl_min, nl_max, nl_count)),
+        &["worker_id", "dp_rank", "worker_type"],
+    )
+    .expect("Failed to create worker_token_neg_logprob histogram")
+});
+
 /// Register the global per-worker TTFT/ITL/input-tokens Prometheus metrics with the given registry.
 ///
 /// This should be called once during HTTP service setup to expose the metrics
@@ -156,6 +183,7 @@ pub fn register_worker_timing_metrics(registry: &Registry) -> Result<(), prometh
     registry.register(Box::new(WORKER_LAST_INPUT_SEQUENCE_TOKENS_GAUGE.clone()))?;
     registry.register(Box::new(WORKER_LAST_INTER_TOKEN_LATENCY_GAUGE.clone()))?;
     registry.register(Box::new(WORKER_OUTPUT_SEQUENCE_TOKENS_HISTOGRAM.clone()))?;
+    registry.register(Box::new(WORKER_TOKEN_NEG_LOGPROB_HISTOGRAM.clone()))?;
     Ok(())
 }
 
@@ -2366,6 +2394,20 @@ mod tests {
             WORKER_TYPE_DECODE,
         ]);
         assert_eq!(hist.get_sample_count(), 1, "workerless request must not observe");
+    }
+
+    #[test]
+    fn test_worker_token_neg_logprob_histogram_buckets() {
+        // Use a worker_id unique to this test: the histogram is a global static
+        // shared across parallel tests.
+        let hist =
+            WORKER_TOKEN_NEG_LOGPROB_HISTOGRAM.with_label_values(&["5353", "0", WORKER_TYPE_DECODE]);
+        // Simulate a healthy mix and a couple of exact-certainty tokens.
+        for lp in [0.0f64, -0.0001, -0.5, -2.0, -19.0] {
+            hist.observe(-lp);
+        }
+        assert_eq!(hist.get_sample_count(), 5);
+        assert!((hist.get_sample_sum() - 21.5001).abs() < 1e-9);
     }
 
     #[test]
