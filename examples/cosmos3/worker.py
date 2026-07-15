@@ -177,6 +177,7 @@ class NvExtFields(BaseModel):
     fps: int | None = None
     num_frames: int | None = None
     seed: int | None = None
+    num_steps: int | None = None
 
 
 class Cosmos3VideoRequest(BaseModel):
@@ -267,6 +268,12 @@ _pipe: OmniInference | None = None
 _served_model_name: str = ""
 _output_root: Path = Path("/tmp/cosmos3_worker_outputs")
 _generate_lock = threading.Lock()
+# Default denoising steps when a request doesn't specify one. Driven by the
+# COSMOS3_NUM_STEPS env (set via model-config extra_env) so step count is tunable
+# without an image rebuild; None falls back to the framework's per-modality default.
+_default_num_steps: int | None = (
+    int(os.environ["COSMOS3_NUM_STEPS"]) if os.environ.get("COSMOS3_NUM_STEPS") else None
+)
 
 
 def _run_generate(payload: dict[str, Any]) -> dict[str, Any] | None:
@@ -300,7 +307,7 @@ def _run_generate(payload: dict[str, Any]) -> dict[str, Any] | None:
             override_kwargs["model_mode"] = model_mode
         if payload.get("action_url") is not None:
             override_kwargs["action_path"] = payload["action_url"]
-        for key in ("domain_name", "action_chunk_size", "raw_action_dim", "image_size"):
+        for key in ("domain_name", "action_chunk_size", "raw_action_dim", "image_size", "num_steps"):
             if payload.get(key) is not None:
                 override_kwargs[key] = payload[key]
 
@@ -364,6 +371,9 @@ def _generate_blocking(request: Cosmos3VideoRequest) -> Cosmos3VideoResponse:
     }
     if aspect_ratio is not None:
         payload["aspect_ratio"] = aspect_ratio
+    ns = request.nvext.num_steps if (request.nvext is not None and request.nvext.num_steps is not None) else _default_num_steps
+    if ns is not None:
+        payload["num_steps"] = ns
     # Forward action fields when present.
     if request.model_mode is not None:
         payload["model_mode"] = request.model_mode
@@ -544,6 +554,9 @@ def _run_standalone_http(args: argparse.Namespace) -> None:
         }
         if aspect_ratio is not None:
             payload["aspect_ratio"] = aspect_ratio
+        ns = req.nvext.num_steps if (req.nvext is not None and req.nvext.num_steps is not None) else _default_num_steps
+        if ns is not None:
+            payload["num_steps"] = ns
         # Forward action fields when present.
         if req.model_mode is not None:
             payload["model_mode"] = req.model_mode
