@@ -74,6 +74,12 @@ pub struct CommonExt {
     #[allow(unused)] // Not used
     pub guided_whitespace_pattern: Option<String>,
 
+    /// If specified, xgrammar structural tag constraint for guided decoding
+    /// (e.g. a triggered_tags payload), passed through to the engine verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[builder(default, setter(strip_option))]
+    pub guided_structural_tag: Option<serde_json::Value>,
+
     /// Whether to skip special tokens in the decoded output.
     /// When true, special tokens (like EOS, BOS, PAD) are removed from the output text.
     /// When false, special tokens are included in the output text.
@@ -107,6 +113,7 @@ pub trait CommonExtProvider {
     fn get_guided_decoding_backend(&self) -> Option<String>;
     #[allow(unused)] // Not used
     fn get_guided_whitespace_pattern(&self) -> Option<String>;
+    fn get_guided_structural_tag(&self) -> Option<serde_json::Value>;
 
     /// Other sampling Options
     fn get_top_k(&self) -> Option<i32>;
@@ -185,6 +192,30 @@ mod tests {
     }
 
     #[test]
+    fn test_guided_structural_tag_deserializes_and_builds() {
+        let tag = serde_json::json!({
+            "type": "triggered_tags",
+            "triggers": ["<|start|>assistant<|channel|>final<|message|>"],
+            "tags": [{
+                "begin": "<|start|>assistant<|channel|>final<|message|>",
+                "content": {"type": "json_schema", "json_schema": {"type": "object"}},
+                "end": ""
+            }],
+            "stop_after_first": true
+        });
+        let common_ext: CommonExt =
+            serde_json::from_value(serde_json::json!({"guided_structural_tag": tag}))
+                .expect("guided_structural_tag must deserialize");
+        assert_eq!(common_ext.guided_structural_tag.as_ref(), Some(&tag));
+
+        let built = CommonExt::builder()
+            .guided_structural_tag(tag.clone())
+            .build()
+            .unwrap();
+        assert_eq!(built.guided_structural_tag, Some(tag));
+    }
+
+    #[test]
     fn test_common_ext_fields() {
         // Test that CommonExt fields can be set and retrieved correctly
         let common_ext = CommonExt::builder()
@@ -215,6 +246,7 @@ mod tests {
             guided_choice: None,
             guided_decoding_backend: None,
             guided_whitespace_pattern: None,
+            guided_structural_tag: None,
             skip_special_tokens: None,
             prompt_logprobs: None,
         };
