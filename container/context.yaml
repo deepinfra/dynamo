@@ -21,7 +21,11 @@ dynamo:
     # is a STEM; the licenses stage appends -${TARGETARCH}.cdx.json so each arch
     # of a multi-arch build subtracts its own-arch floor (the @<digest8> is the
     # shared multi-arch index digest).
-  epp_image: us-central1-docker.pkg.dev/k8s-staging-images/gateway-api-inference-extension/epp:v1.5.0-rc.2
+  # DEEPINFRA: upstream pins epp to the k8s-staging-images registry, which is
+  # garbage-collected — the v1.5.0-rc.2 tag was purged 2026-07-15 and broke
+  # frontend builds. Mirror the binary in our registry (extracted from a
+  # previously built frontend image; the stage only donates /epp).
+  epp_image: localhost:30500/epp:v1.5.0-rc.2
   frontend_image: nvcr.io/nvidia/base/ubuntu:noble-20250619
   planner_build_image: python
   planner_build_image_tag: 3.12-slim
