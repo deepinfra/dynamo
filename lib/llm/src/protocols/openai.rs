@@ -160,6 +160,7 @@ impl<T: OpenAISamplingOptionsProvider + CommonExtProvider> SamplingOptionsProvid
         let guided_grammar = self.get_guided_grammar();
         let guided_choice = self.get_guided_choice();
         let guided_whitespace_pattern = self.get_guided_whitespace_pattern();
+        let guided_structural_tag = self.get_guided_structural_tag();
         let guided_decoding = match common::GuidedDecodingOptions::from_optional(
             guided_json,
             guided_regex,
@@ -167,7 +168,7 @@ impl<T: OpenAISamplingOptionsProvider + CommonExtProvider> SamplingOptionsProvid
             guided_grammar,
             guided_decoding_backend,
             guided_whitespace_pattern,
-            None,
+            guided_structural_tag,
         ) {
             Ok(options) => options,
             Err(e) => {

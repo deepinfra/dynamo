@@ -75,6 +75,12 @@ pub struct CommonExt {
     #[allow(unused)] // Not used
     pub guided_whitespace_pattern: Option<String>,
 
+    /// If specified, xgrammar structural tag constraint for guided decoding
+    /// (e.g. a triggered_tags payload), passed through to the engine verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[builder(default, setter(strip_option))]
+    pub guided_structural_tag: Option<serde_json::Value>,
+
     /// Whether to skip special tokens in the decoded output.
     /// When true, special tokens (like EOS, BOS, PAD) are removed from the output text.
     /// When false, special tokens are included in the output text.
@@ -108,6 +114,7 @@ pub trait CommonExtProvider {
     fn get_guided_decoding_backend(&self) -> Option<String>;
     #[allow(unused)] // Not used
     fn get_guided_whitespace_pattern(&self) -> Option<String>;
+    fn get_guided_structural_tag(&self) -> Option<serde_json::Value>;
 
     /// Other sampling Options
     fn get_top_k(&self) -> Option<i32>;
@@ -131,6 +138,100 @@ mod tests {
     use serde_json;
 
     #[test]
+    fn test_common_ext_builder_default() {
+        let common_ext = CommonExt::builder().build().unwrap();
+        assert_eq!(common_ext.ignore_eos, None);
+        assert_eq!(common_ext.min_tokens, None);
+        assert_eq!(common_ext.top_k, None);
+        assert_eq!(common_ext.repetition_penalty, None);
+        assert_eq!(common_ext.guided_json, None);
+        assert_eq!(common_ext.guided_regex, None);
+        assert_eq!(common_ext.guided_grammar, None);
+        assert_eq!(common_ext.guided_choice, None);
+        assert_eq!(common_ext.guided_decoding_backend, None);
+        assert_eq!(common_ext.include_stop_str_in_output, None);
+        assert_eq!(common_ext.skip_special_tokens, None);
+    }
+
+    #[test]
+    fn test_common_ext_builder_with_values() {
+        let common_ext = CommonExt::builder()
+            .ignore_eos(true)
+            .min_tokens(10)
+            .top_k(50)
+            .repetition_penalty(1.2)
+            .include_stop_str_in_output(true)
+            .guided_json(serde_json::json!({"key": "value"}))
+            .guided_regex("regex".to_string())
+            .guided_grammar("grammar".to_string())
+            .guided_choice(vec!["choice1".to_string(), "choice2".to_string()])
+            .guided_decoding_backend("backend".to_string())
+            .skip_special_tokens(false)
+            .build()
+            .unwrap();
+
+        assert_eq!(common_ext.ignore_eos, Some(true));
+        assert_eq!(common_ext.min_tokens, Some(10));
+        assert_eq!(common_ext.top_k, Some(50));
+        assert_eq!(common_ext.repetition_penalty, Some(1.2));
+        assert_eq!(common_ext.include_stop_str_in_output, Some(true));
+        assert_eq!(
+            common_ext.guided_json.as_ref(),
+            Some(&serde_json::json!({"key": "value"}))
+        );
+        assert_eq!(common_ext.guided_regex, Some("regex".to_string()));
+        assert_eq!(common_ext.guided_grammar, Some("grammar".to_string()));
+        assert_eq!(
+            common_ext.guided_choice,
+            Some(vec!["choice1".to_string(), "choice2".to_string()])
+        );
+        assert_eq!(
+            common_ext.guided_decoding_backend,
+            Some("backend".to_string())
+        );
+        assert_eq!(common_ext.skip_special_tokens, Some(false));
+    }
+
+    #[test]
+    fn test_guided_structural_tag_deserializes_and_builds() {
+        let tag = serde_json::json!({
+            "type": "triggered_tags",
+            "triggers": ["<|start|>assistant<|channel|>final<|message|>"],
+            "tags": [{
+                "begin": "<|start|>assistant<|channel|>final<|message|>",
+                "content": {"type": "json_schema", "json_schema": {"type": "object"}},
+                "end": ""
+            }],
+            "stop_after_first": true
+        });
+        let common_ext: CommonExt =
+            serde_json::from_value(serde_json::json!({"guided_structural_tag": tag}))
+                .expect("guided_structural_tag must deserialize");
+        assert_eq!(common_ext.guided_structural_tag.as_ref(), Some(&tag));
+
+        let built = CommonExt::builder()
+            .guided_structural_tag(tag.clone())
+            .build()
+            .unwrap();
+        assert_eq!(built.guided_structural_tag, Some(tag));
+    }
+
+    #[test]
+    fn test_common_ext_fields() {
+        // Test that CommonExt fields can be set and retrieved correctly
+        let common_ext = CommonExt::builder()
+            .ignore_eos(false)
+            .min_tokens(5)
+            .include_stop_str_in_output(true)
+            .build()
+            .unwrap();
+
+        assert_eq!(common_ext.ignore_eos, Some(false));
+        assert_eq!(common_ext.min_tokens, Some(5));
+        assert_eq!(common_ext.include_stop_str_in_output, Some(true));
+    }
+
+    #[test]
     fn test_validation_min_tokens() {
         // Test that min_tokens with 0 is valid
         let common_ext = CommonExt {
@@ -146,6 +247,7 @@ mod tests {
             guided_choice: None,
             guided_decoding_backend: None,
             guided_whitespace_pattern: None,
+            guided_structural_tag: None,
             skip_special_tokens: None,
             prompt_logprobs: None,
         };
