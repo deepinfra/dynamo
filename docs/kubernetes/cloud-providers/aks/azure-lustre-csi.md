@@ -4,14 +4,12 @@
 title: Azure Lustre CSI Driver for AKS
 ---
 
-# Azure Lustre CSI Driver for AKS
-
 This guide covers installing and configuring the [Azure Lustre CSI driver](https://github.com/kubernetes-sigs/azurelustre-csi-driver) on an AKS cluster so that Dynamo workloads can use Azure Managed Lustre (AMLFS) filesystems for high-performance model storage.
 
 ## Prerequisites
 
 **AKS cluster requirements**
-- Kubernetes 1.21 or later
+- Kubernetes 1.30 or later
 - Node pools must use the **Ubuntu** OS SKU — Windows and Azure Linux (CBL Mariner) nodes are not supported
 - AKS is the only supported Kubernetes distribution (self-managed clusters are not supported)
 

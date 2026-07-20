@@ -68,6 +68,7 @@ setup(
         "gpu_memory_service.cli.snapshot",
         "gpu_memory_service.common",
         "gpu_memory_service.common.protocol",
+        "gpu_memory_service.common.vmm",
         "gpu_memory_service.server",
         "gpu_memory_service.client",
         "gpu_memory_service.client.torch",
@@ -80,6 +81,7 @@ setup(
         "gpu_memory_service.integrations.trtllm",
         "gpu_memory_service.integrations.vllm",
         "gpu_memory_service.snapshot",
+        "gpu_memory_service.snapshot.backends",
     ],
     package_dir={
         "gpu_memory_service": ".",
@@ -87,6 +89,7 @@ setup(
         "gpu_memory_service.cli.snapshot": "cli/snapshot",
         "gpu_memory_service.common": "common",
         "gpu_memory_service.common.protocol": "common/protocol",
+        "gpu_memory_service.common.vmm": "common/vmm",
         "gpu_memory_service.server": "server",
         "gpu_memory_service.client": "client",
         "gpu_memory_service.client.torch": "client/torch",
@@ -99,6 +102,7 @@ setup(
         "gpu_memory_service.integrations.trtllm": "integrations/trtllm",
         "gpu_memory_service.integrations.vllm": "integrations/vllm",
         "gpu_memory_service.snapshot": "snapshot",
+        "gpu_memory_service.snapshot.backends": "snapshot/backends",
     },
     package_data={
         "gpu_memory_service.client.torch.extensions": ["*.cpp"],

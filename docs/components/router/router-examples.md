@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 title: Router Examples
+subtitle: Worked examples for the KvRouter Python API, Kubernetes deployments, and custom routing patterns.
 ---
 
 For quick start instructions, see the [Router README](README.md). This document provides further examples for using the Dynamo Router, including Python API usage, Kubernetes deployments, and custom routing patterns.
@@ -31,7 +32,9 @@ The `KvRouter` provides the following methods:
   - With `request_id`: Updates router lifecycle state to track the request. **Note**: If used with `request_id`, you must call `mark_prefill_complete()` and `free()` at the appropriate lifecycle points to maintain accurate load tracking
   - With `update_indexer=True`: Records the selected worker in the approximate indexer for future overlap predictions. This is only meaningful when `use_kv_events=False`
 
-- **`get_potential_loads(token_ids)`**: Get detailed load information for all workers, including potential prefill tokens and active decode blocks. Returns a list of load dictionaries.
+- **`get_potential_loads(token_ids)`**: Get detailed load information for all workers, including potential prefill tokens, potential decode blocks, and active requests. Returns a list of load dictionaries.
+
+- **`get_overlap_scores(token_ids, ...)`**: Get per-worker KV overlap by storage tier, including shared-cache overlap when configured.
 
 - **`mark_prefill_complete(request_id)`**: Signal that a request has completed its prefill phase. Only used for [manual lifecycle management](#2-manual-state-management-advanced) when using `best_worker()` for manual routing instead of `generate()`.
 
@@ -142,7 +145,7 @@ spec:
           value: "16"
       extraPodSpec:
         mainContainer:
-          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.1.1
+          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.2.1
 ```
 
 ### Alternative: Using Command Args in K8s
@@ -152,7 +155,7 @@ You can also pass CLI arguments directly in the container command:
 ```yaml
 extraPodSpec:
   mainContainer:
-    image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.1.1
+    image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.2.1
     command:
       - /bin/sh
       - -c

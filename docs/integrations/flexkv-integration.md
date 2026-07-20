@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 title: FlexKV
+subtitle: Integrate FlexKV with Dynamo's vLLM backend for multi-level KV cache offloading across CPU, SSD, and cloud storage.
 ---
 
 ## Introduction
@@ -66,8 +67,7 @@ For multi-worker deployments with KV-aware routing to maximize cache reuse:
 ```bash
 # Terminal 1: Start frontend with KV router
 python -m dynamo.frontend \
-    --router-mode kv \
-    --router-reset-states &
+    --router-mode kv &
 
 # Terminal 2: Worker 1
 DYNAMO_USE_FLEXKV=1 \

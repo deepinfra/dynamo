@@ -24,9 +24,12 @@
 use super::*;
 
 pub mod aic_callback;
+#[cfg(feature = "aic-forward-pass")]
+pub mod engine_perf;
 pub mod entrypoint;
 pub mod fpm;
 pub mod kv;
+pub mod kv_dc_relay;
 pub mod local_model;
 pub mod lora;
 pub mod model_card;

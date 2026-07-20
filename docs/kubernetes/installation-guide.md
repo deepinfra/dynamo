@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 title: Installation Guide
+subtitle: Installs the GPU Operator and Dynamo Platform Helm charts along with optional Grove, RDMA, and Prometheus add-ons.
 ---
 
 This guide walks you through installing everything needed to deploy models with Dynamo on Kubernetes. Follow the steps in order — each builds on the previous one.
@@ -10,10 +11,10 @@ This guide walks you through installing everything needed to deploy models with 
 
 Before you begin, make sure you have:
 
-- A **Kubernetes cluster (v1.24+)** with GPU-capable nodes. See the cloud provider guides if you need to create one:
+- A **Kubernetes cluster (v1.30+)** with GPU-capable nodes. See the cloud provider guides if you need to create one:
   - [Amazon EKS](cloud-providers/eks/eks.md) | [Azure AKS](cloud-providers/aks/aks.md) | [Google GKE](cloud-providers/gke/gke.md)
   - For local development: [Minikube Setup](deployment/minikube.md)
-- **kubectl** v1.24+ — [Install kubectl](https://kubernetes.io/docs/tasks/tools/#kubectl)
+- **kubectl** v1.30+ — [Install kubectl](https://kubernetes.io/docs/tasks/tools/#kubectl)
 - **Helm** v3.0+ — [Install Helm](https://helm.sh/docs/intro/install/)
 
 > [!IMPORTANT]
@@ -22,7 +23,7 @@ Before you begin, make sure you have:
 Verify your tools:
 
 ```bash
-kubectl version --client  # Should show v1.24+
+kubectl version --client  # Should show v1.30+
 helm version              # Should show v3.0+
 ```
 
@@ -82,7 +83,7 @@ Set your environment variables:
 
 ```bash
 export NAMESPACE=dynamo-system
-export RELEASE_VERSION=1.0.2  # match a version from https://github.com/ai-dynamo/dynamo/releases
+export RELEASE_VERSION=1.2.1  # match a version from https://github.com/ai-dynamo/dynamo/releases
 ```
 
 ```bash
@@ -116,7 +117,9 @@ helm install dynamo-platform dynamo-platform-$RELEASE_VERSION.tgz \
 > ```
 
 > [!WARNING]
-> **Namespace-restricted mode** (`namespaceRestriction.enabled=true`) is deprecated and will be removed in a future release. Use the default cluster-wide mode for all new deployments.
+> **Namespace-restricted mode** (`namespaceRestriction.enabled=true`) is only for development and
+> testing. It is not supported for production. Set `dynamo-operator.upgradeCRD=false`; see
+> [Dynamo Operator](dynamo-operator.md#namespace-restricted-mode).
 
 Verify the Dynamo platform is running:
 
@@ -154,10 +157,14 @@ For the `enabled=true` path, install Grove and KAI Scheduler separately first. S
 > |-----------------|---------------|-------|
 > | 1.0.x           | >= v0.13.0    | >= v0.1.0-alpha.6 |
 > | 1.1.x           | >= v0.13.4    | >= v0.1.0-alpha.8 |
+> | 1.3.x           | >= v0.13.4    | >= v0.1.0-alpha.8, < v0.1.0-alpha.9 |
+> | 1.4.x           | >= v0.13.4    | >= v0.1.0-alpha.10 |
+>
+> Grove should be upgraded in lockstep with Dynamo while Grove APIs are not stable. Dynamo 1.3.x expects Grove's earlier `ClusterTopology` API and is incompatible with the newer `ClusterTopologyBinding` API; Dynamo 1.4.x expects `ClusterTopologyBinding`.
 
 #### LWS + Volcano
 
-If you are not using Grove for multinode, you can use [LeaderWorkerSet (LWS)](https://lws.sigs.k8s.io/docs/installation/) (>= v0.7.0) with [Volcano](https://volcano.sh/en/docs/installation/) for gang scheduling. Both must be installed before deploying multinode workloads.
+If you are not using Grove for multinode, you can use [LeaderWorkerSet (LWS)](https://lws.sigs.k8s.io/docs/installation/) (>= v0.7.0) with [Volcano](https://github.com/volcano-sh/volcano#quick-start-guide) for gang scheduling. Both must be installed before deploying multinode workloads.
 
 1. Install Volcano:
 
@@ -179,7 +186,7 @@ helm install lws oci://registry.k8s.io/lws/charts/lws \
   --wait --timeout 300s
 ```
 
-See the [LWS docs](https://lws.sigs.k8s.io/docs/) and [Volcano docs](https://volcano.sh/en/docs/) for configuration options, and the [Multinode Deployment Guide](./deployment/multinode-deployment.md) for orchestrator selection.
+See the [LWS docs](https://lws.sigs.k8s.io/docs/) and [Volcano docs](https://github.com/volcano-sh/volcano#quick-start-guide) for configuration options, and the [Multinode Deployment Guide](./deployment/multinode-deployment.md) for orchestrator selection.
 
 ### Network Operator / RDMA
 
@@ -228,7 +235,7 @@ This checks kubectl connectivity, default StorageClass configuration, GPU node a
 
 ## Next Steps
 
-Your cluster is ready. Follow the **[Model Deployment Guide](model-deployment-guide.md)** to deploy a model using DGDR.
+Your cluster is ready. Follow the **[Deployment Overview](model-deployment-guide.md)** to choose between applying a tuned DGD recipe, creating a DGD directly, or using DGDR to generate one.
 
 ## Troubleshooting
 
@@ -241,13 +248,15 @@ Found existing namespace-restricted Dynamo operators in namespaces: ...
 
 Cause: Attempting cluster-wide install on a shared cluster with existing namespace-restricted operators.
 
-Solution: Migrate the existing namespace-restricted operators to cluster-wide mode. Namespace-restricted mode is deprecated.
+Solution: Remove the development/test namespace-restricted operators, then install one cluster-wide
+operator for production use.
 
 **CRDs already exist**
 
 Cause: Installing CRDs on a cluster where they're already present (common on shared clusters).
 
-Solution: CRDs are installed automatically by the Helm chart. If you encounter conflicts, check existing CRDs with `kubectl get crd | grep dynamo`.
+Solution: The cluster-wide operator's `crd-apply` init container manages CRDs automatically. If you
+encounter conflicts, check existing CRDs with `kubectl get crd | grep dynamo`.
 
 **Pods not starting?**
 ```bash

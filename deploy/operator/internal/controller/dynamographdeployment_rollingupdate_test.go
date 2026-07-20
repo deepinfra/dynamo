@@ -234,12 +234,15 @@ func TestShouldTriggerRollingUpdate_IgnoresReplicaChanges(t *testing.T) {
 	assert.False(t, trigger)
 }
 
-func TestInitializeWorkerHashIfNeeded_FirstDeploy(t *testing.T) {
+func TestCanonicalWorkerHashLifecycle_FirstDeploySpecChangeAndCompletion(t *testing.T) {
 	dgd := createTestDGD("test-dgd", map[string]*nvidiacomv1alpha1.DynamoComponentDeploymentSharedSpec{
 		"worker": {
 			ComponentType: consts.ComponentTypeWorker,
 			Envs: []corev1.EnvVar{
 				{Name: "FOO", Value: "bar"},
+			},
+			Resources: &nvidiacomv1alpha1.Resources{
+				Requests: &nvidiacomv1alpha1.ResourceItem{CPU: "1"},
 			},
 		},
 	})
@@ -252,16 +255,38 @@ func TestInitializeWorkerHashIfNeeded_FirstDeploy(t *testing.T) {
 	err := r.initializeWorkerHashIfNeeded(ctx, dgd)
 	require.NoError(t, err)
 
-	// Verify the hash was set
-	hash := r.getCurrentWorkerHash(dgd)
+	// Verify only the v2 hash was set.
+	hash := r.getCurrentWorkerHashV2(dgd)
 	assert.NotEmpty(t, hash, "Hash should be set after initialization")
+	assert.NotContains(t, dgd.Annotations, consts.AnnotationCurrentWorkerHash)
 
-	// Verify both compatibility hashes are correct.
-	expectedV1Hash, err := dynamo.ComputeLegacyAlphaDGDWorkersSpecHash(dgd)
-	require.NoError(t, err)
+	// Fresh deployments store one canonical v2 hash.
 	expectedV2Hash := betaDGDWorkersSpecHash(t, dgd)
-	assert.Equal(t, expectedV1Hash, hash, "v1 hash should remain the downgrade-compatible current hash")
-	assert.Equal(t, expectedV2Hash, dgd.Annotations[consts.AnnotationCurrentWorkerHashV2])
+	assert.Equal(t, expectedV2Hash, hash)
+
+	// A later worker change rolls directly from one canonical v2 generation to the next.
+	dgd.Spec.Components[0].PodTemplate.Spec.Containers[0].Env = append(
+		dgd.Spec.Components[0].PodTemplate.Spec.Containers[0].Env,
+		corev1.EnvVar{Name: "NEW_WORKER_SETTING", Value: "true"},
+	)
+	newV2Hash := betaDGDWorkersSpecHash(t, dgd)
+	newLegacyHash, err := dynamo.ComputeLegacyAlphaDGDWorkersSpecHash(dgd)
+	require.NoError(t, err)
+	require.NotEqual(t, expectedV2Hash, newV2Hash)
+	require.NotEqual(t, newLegacyHash, newV2Hash)
+
+	trigger, err := r.shouldTriggerRollingUpdate(dgd)
+	require.NoError(t, err)
+	require.True(t, trigger)
+
+	rollingCtx, err := r.buildRollingUpdateContext(ctx, dgd)
+	require.NoError(t, err)
+	require.Equal(t, newV2Hash, rollingCtx.NewWorkerHash)
+	require.NotEqual(t, newLegacyHash, rollingCtx.NewWorkerHash)
+
+	require.NoError(t, r.completeRollingUpdate(ctx, dgd, newV2Hash))
+	require.NotContains(t, dgd.Annotations, consts.AnnotationCurrentWorkerHash)
+	require.Equal(t, newV2Hash, dgd.Annotations[consts.AnnotationCurrentWorkerHashV2])
 }
 
 func TestInitializeWorkerHashIfNeeded_AlreadyInitialized(t *testing.T) {
@@ -392,7 +417,7 @@ func TestLegacyAlphaHashCompatibility_NoOpUpgradeUsesExistingWorkerGeneration(t 
 	require.NotEqual(t, "qwen-vllmdecodeworker-"+v2Hash, dcds["VllmDecodeWorker"].Name)
 }
 
-func TestLegacyAlphaHashCompatibility_WorkerSpecChangeUsesNewV1Generation(t *testing.T) {
+func TestLegacyAlphaHashCompatibility_WorkerSpecChangeUsesNewV2Generation(t *testing.T) {
 	dgd := createTestDGD("test-dgd", map[string]*nvidiacomv1alpha1.DynamoComponentDeploymentSharedSpec{
 		"worker": {
 			ComponentType: consts.ComponentTypeWorker,
@@ -434,8 +459,8 @@ func TestLegacyAlphaHashCompatibility_WorkerSpecChangeUsesNewV1Generation(t *tes
 
 	rollingCtx, err := r.buildRollingUpdateContext(context.Background(), dgd)
 	require.NoError(t, err)
-	require.Equal(t, newLegacyHash, rollingCtx.NewWorkerHash)
-	require.NotEqual(t, newV2Hash, rollingCtx.NewWorkerHash)
+	require.Equal(t, newV2Hash, rollingCtx.NewWorkerHash)
+	require.NotEqual(t, newLegacyHash, rollingCtx.NewWorkerHash)
 }
 
 func TestLegacyAlphaHashCompatibility_V2OnlyChangeUsesNewV2Generation(t *testing.T) {
@@ -464,7 +489,7 @@ func TestLegacyAlphaHashCompatibility_V2OnlyChangeUsesNewV2Generation(t *testing
 	require.NotEqual(t, v2Hash, newV2Hash)
 
 	require.NoError(t, r.migrateCurrentWorkerHashIfNeeded(context.Background(), dgd))
-	require.Empty(t, dgd.Annotations[consts.AnnotationCurrentWorkerHash])
+	require.Equal(t, legacyHash, dgd.Annotations[consts.AnnotationCurrentWorkerHash])
 	require.Equal(t, v2Hash, dgd.Annotations[consts.AnnotationCurrentWorkerHashV2])
 
 	trigger, err := r.shouldTriggerRollingUpdate(dgd)
@@ -517,7 +542,7 @@ func TestUnsupportedPathwayMigratesV1OnlyAndKeepsV2OnlyGeneration(t *testing.T) 
 	require.NotEqual(t, v2Hash, newV2Hash)
 
 	require.NoError(t, r.migrateCurrentWorkerHashIfNeeded(context.Background(), dgd))
-	require.Empty(t, dgd.Annotations[consts.AnnotationCurrentWorkerHash])
+	require.Equal(t, legacyHash, dgd.Annotations[consts.AnnotationCurrentWorkerHash])
 	require.Equal(t, v2Hash, dgd.Annotations[consts.AnnotationCurrentWorkerHashV2])
 
 	desired, err := r.desiredWorkerHashes(dgd)
@@ -1277,6 +1302,7 @@ func TestMergeWorkerComponentStatuses(t *testing.T) {
 					UpdatedReplicas:   2,
 					ReadyReplicas:     ptr.To(int32(2)),
 					AvailableReplicas: ptr.To(int32(2)),
+					RuntimeNamespace:  "dynamo-newhash1",
 				},
 			},
 			oldWorkerStatuses: map[string]nvidiacomv1beta1.ComponentReplicaStatus{
@@ -1287,6 +1313,7 @@ func TestMergeWorkerComponentStatuses(t *testing.T) {
 					UpdatedReplicas:   0,
 					ReadyReplicas:     ptr.To(int32(1)),
 					AvailableReplicas: ptr.To(int32(1)),
+					RuntimeNamespace:  "dynamo-oldhash1",
 				},
 			},
 			expected: map[string]nvidiacomv1beta1.ComponentReplicaStatus{
@@ -1297,6 +1324,7 @@ func TestMergeWorkerComponentStatuses(t *testing.T) {
 					UpdatedReplicas:   2, // Only new are "updated"
 					ReadyReplicas:     ptr.To(int32(3)),
 					AvailableReplicas: ptr.To(int32(3)),
+					RuntimeNamespace:  "dynamo-oldhash1",
 				},
 			},
 		},
@@ -1325,13 +1353,26 @@ func TestMergeWorkerComponentStatuses(t *testing.T) {
 			componentStatuses: map[string]nvidiacomv1beta1.ComponentReplicaStatus{},
 			oldWorkerStatuses: map[string]nvidiacomv1beta1.ComponentReplicaStatus{
 				"prefill": {
-					ComponentKind:  "Deployment",
-					ComponentNames: []string{"dgd-prefill-oldhash1"},
-					Replicas:       2,
-					ReadyReplicas:  ptr.To(int32(2)),
+					ComponentKind:     "Deployment",
+					ComponentNames:    []string{"dgd-prefill-oldhash1"},
+					Replicas:          2,
+					UpdatedReplicas:   2,
+					ReadyReplicas:     ptr.To(int32(2)),
+					AvailableReplicas: ptr.To(int32(2)),
+					RuntimeNamespace:  "dynamo-oldhash1",
 				},
 			},
-			expected: map[string]nvidiacomv1beta1.ComponentReplicaStatus{},
+			expected: map[string]nvidiacomv1beta1.ComponentReplicaStatus{
+				"prefill": {
+					ComponentKind:     "Deployment",
+					ComponentNames:    []string{"dgd-prefill-oldhash1"},
+					Replicas:          2,
+					UpdatedReplicas:   0,
+					ReadyReplicas:     ptr.To(int32(2)),
+					AvailableReplicas: ptr.To(int32(2)),
+					RuntimeNamespace:  "dynamo-oldhash1",
+				},
+			},
 		},
 		{
 			name: "handles nil ReadyReplicas and AvailableReplicas on old",
@@ -1427,6 +1468,7 @@ func TestAggregateOldWorkerServiceStatuses(t *testing.T) {
 				Namespace: "default",
 				Labels: map[string]string{
 					consts.KubeLabelDynamoGraphDeploymentName: "test-dgd",
+					consts.KubeLabelDynamoNamespace:           "base",
 					consts.KubeLabelDynamoWorkerHash:          testOldWorkerHash,
 				},
 			},
@@ -1439,11 +1481,12 @@ func TestAggregateOldWorkerServiceStatuses(t *testing.T) {
 			},
 			Status: nvidiacomv1alpha1.DynamoComponentDeploymentStatus{
 				Service: &nvidiacomv1alpha1.ServiceReplicaStatus{
-					ComponentKind:   "Deployment",
-					ComponentNames:  []string{"test-dgd-prefill-oldhash1"},
-					Replicas:        1,
-					UpdatedReplicas: 0,
-					ReadyReplicas:   ptr.To(int32(1)),
+					ComponentKind:    "Deployment",
+					ComponentNames:   []string{"test-dgd-prefill-oldhash1"},
+					RuntimeNamespace: "base-oldhash1",
+					Replicas:         1,
+					UpdatedReplicas:  0,
+					ReadyReplicas:    ptr.To(int32(1)),
 				},
 			},
 		})
@@ -1452,9 +1495,9 @@ func TestAggregateOldWorkerServiceStatuses(t *testing.T) {
 		ctx := context.Background()
 
 		rollingUpdateCtx := dynamo.RollingUpdateContext{
-			NewWorkerHash:     testNewWorkerHash,
-			OldWorkerReplicas: map[string]int32{"prefill": 1},
-			NewWorkerReplicas: map[string]int32{"prefill": 2},
+			NewWorkerHash:                      testNewWorkerHash,
+			OldWorkerReplicaTargetsByComponent: map[string]int32{"prefill": 1},
+			NewWorkerReplicaTargetsByComponent: map[string]int32{"prefill": 2},
 		}
 
 		statuses, err := r.aggregateOldWorkerComponentStatuses(ctx, dgd, rollingUpdateCtx)
@@ -1464,6 +1507,102 @@ func TestAggregateOldWorkerServiceStatuses(t *testing.T) {
 		assert.Equal(t, []string{"test-dgd-prefill-oldhash1"}, statuses["prefill"].ComponentNames)
 		assert.Equal(t, int32(1), statuses["prefill"].Replicas)
 		assert.Equal(t, ptr.To(int32(1)), statuses["prefill"].ReadyReplicas)
+		assert.Equal(t, "base-oldhash1", statuses["prefill"].RuntimeNamespace)
+	})
+
+	t.Run("multiple old generations selects newest nonzero target runtime namespace", func(t *testing.T) {
+		dgd := createTestDGD("test-dgd", map[string]*nvidiacomv1alpha1.DynamoComponentDeploymentSharedSpec{
+			"worker": {
+				ComponentType: consts.ComponentTypeWorker,
+				Replicas:      ptr.To(int32(3)),
+			},
+		})
+
+		now := metav1.Now()
+		earlier := metav1.NewTime(now.Add(-1 * 60 * 1e9))
+
+		oldestDCD := betaDCD(t, &nvidiacomv1alpha1.DynamoComponentDeployment{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              "test-dgd-worker-hashaaaa",
+				Namespace:         "default",
+				CreationTimestamp: earlier,
+				Labels: map[string]string{
+					consts.KubeLabelDynamoGraphDeploymentName: "test-dgd",
+					consts.KubeLabelDynamoWorkerHash:          "hashaaaa",
+				},
+			},
+			Spec: nvidiacomv1alpha1.DynamoComponentDeploymentSpec{
+				DynamoComponentDeploymentSharedSpec: nvidiacomv1alpha1.DynamoComponentDeploymentSharedSpec{
+					ComponentType: consts.ComponentTypeWorker,
+					ServiceName:   "worker",
+					Replicas:      ptr.To(int32(0)),
+				},
+			},
+			Status: nvidiacomv1alpha1.DynamoComponentDeploymentStatus{
+				Service: &nvidiacomv1alpha1.ServiceReplicaStatus{
+					ComponentKind:    "Deployment",
+					ComponentNames:   []string{"test-dgd-worker-hashaaaa"},
+					RuntimeNamespace: "base-hashaaaa",
+					Replicas:         0,
+					ReadyReplicas:    ptr.To(int32(0)),
+				},
+			},
+		})
+
+		newerOldDCD := betaDCD(t, &nvidiacomv1alpha1.DynamoComponentDeployment{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              "test-dgd-worker-hashbbbb",
+				Namespace:         "default",
+				CreationTimestamp: now,
+				Labels: map[string]string{
+					consts.KubeLabelDynamoGraphDeploymentName: "test-dgd",
+					consts.KubeLabelDynamoNamespace:           "base",
+					consts.KubeLabelDynamoWorkerHash:          "hashbbbb",
+				},
+			},
+			Spec: nvidiacomv1alpha1.DynamoComponentDeploymentSpec{
+				DynamoComponentDeploymentSharedSpec: nvidiacomv1alpha1.DynamoComponentDeploymentSharedSpec{
+					ComponentType: consts.ComponentTypeWorker,
+					ServiceName:   "worker",
+					Replicas:      ptr.To(int32(2)),
+				},
+			},
+			Status: nvidiacomv1alpha1.DynamoComponentDeploymentStatus{
+				Service: &nvidiacomv1alpha1.ServiceReplicaStatus{
+					ComponentKind:  "Deployment",
+					ComponentNames: []string{"test-dgd-worker-hashbbbb"},
+					Replicas:       2,
+					ReadyReplicas:  ptr.To(int32(2)),
+				},
+			},
+		})
+
+		r := createTestReconcilerWithStatus(dgd, withObjects(oldestDCD, newerOldDCD))
+		ctx := context.Background()
+
+		rollingUpdateCtx := dynamo.RollingUpdateContext{
+			NewWorkerHash:                      "hashcccc",
+			OldWorkerReplicaTargetsByComponent: map[string]int32{"worker": 2},
+			OldWorkerReplicaTargetsByDCD: map[string]int32{
+				"test-dgd-worker-hashaaaa": 0,
+				"test-dgd-worker-hashbbbb": 2,
+			},
+		}
+
+		statuses, err := r.aggregateOldWorkerComponentStatuses(ctx, dgd, rollingUpdateCtx)
+		require.NoError(t, err)
+
+		assert.Equal(t, int32(2), statuses["worker"].Replicas)
+		assert.Equal(t, ptr.To(int32(2)), statuses["worker"].ReadyReplicas)
+		assert.Equal(t, "base-hashbbbb", statuses["worker"].RuntimeNamespace)
+
+		rollingUpdateCtx.OldWorkerReplicaTargetsByDCD = map[string]int32{
+			"test-dgd-worker-hashaaaa": 0,
+			"test-dgd-worker-hashbbbb": 0,
+		}
+		statuses, err = r.aggregateOldWorkerComponentStatuses(ctx, dgd, rollingUpdateCtx)
+		require.NoError(t, err)
+		assert.Equal(t, "base-hashbbbb", statuses["worker"].RuntimeNamespace)
 	})
 
 	t.Run("old DCD not found - skips gracefully", func(t *testing.T) {
@@ -1478,9 +1617,9 @@ func TestAggregateOldWorkerServiceStatuses(t *testing.T) {
 		ctx := context.Background()
 
 		rollingUpdateCtx := dynamo.RollingUpdateContext{
-			NewWorkerHash:     testNewWorkerHash,
-			OldWorkerReplicas: map[string]int32{"prefill": 1},
-			NewWorkerReplicas: map[string]int32{"prefill": 2},
+			NewWorkerHash:                      testNewWorkerHash,
+			OldWorkerReplicaTargetsByComponent: map[string]int32{"prefill": 1},
+			NewWorkerReplicaTargetsByComponent: map[string]int32{"prefill": 2},
 		}
 
 		statuses, err := r.aggregateOldWorkerComponentStatuses(ctx, dgd, rollingUpdateCtx)
@@ -1500,8 +1639,7 @@ func TestGetExistingRestartAnnotationsDCD(t *testing.T) {
 				ComponentType: consts.ComponentTypeWorker,
 			},
 		})
-		// Annotation hash can differ from computed hash — function uses active compatibility hash.
-		computedHash := legacyDGDWorkersSpecHash(t, dgd)
+		computedHash := betaDGDWorkersSpecHash(t, dgd)
 		dgd.Annotations = map[string]string{
 			consts.AnnotationCurrentWorkerHash: "oldhash",
 		}
@@ -1836,6 +1974,14 @@ func TestInitializeWorkerHashIfNeeded_LegacyDCDsMigration(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, consts.LegacyWorkerHash, updatedDCD.Labels[consts.KubeLabelDynamoWorkerHash],
 		"Legacy DCD should have worker hash label backfilled")
+
+	desired, err := r.desiredWorkerHashes(dgd)
+	require.NoError(t, err)
+	require.NoError(t, r.completeRollingUpdate(ctx, dgd, desired.v1))
+
+	trigger, err := r.shouldTriggerRollingUpdate(dgd)
+	require.NoError(t, err)
+	require.False(t, trigger)
 }
 
 func TestInitializeWorkerHashIfNeeded_LegacyMultipleWorkers(t *testing.T) {
@@ -2202,9 +2348,10 @@ func TestScaleOldWorkerDCDs_LegacyDCDs(t *testing.T) {
 		ctx := context.Background()
 
 		rollingUpdateCtx := dynamo.RollingUpdateContext{
-			NewWorkerHash:     "newhash1",
-			OldWorkerReplicas: map[string]int32{"worker": 1},
-			NewWorkerReplicas: map[string]int32{"worker": 3},
+			NewWorkerHash:                      "newhash1",
+			OldWorkerReplicaTargetsByComponent: map[string]int32{"worker": 1},
+			OldWorkerReplicaTargetsByDCD:       map[string]int32{"test-dgd-worker": 1},
+			NewWorkerReplicaTargetsByComponent: map[string]int32{"worker": 3},
 		}
 
 		err := r.scaleOldWorkerDCDs(ctx, dgd, rollingUpdateCtx)
@@ -2225,11 +2372,12 @@ func TestScaleOldWorkerDCDs_LegacyDCDs(t *testing.T) {
 		r := createTestReconcilerWithStatus(dgd)
 		ctx := context.Background()
 
-		// Empty OldWorkerReplicas = not in progress
+		// Empty OldWorkerComponentReplicas = not in progress
 		rollingUpdateCtx := dynamo.RollingUpdateContext{
-			NewWorkerHash:     "samehash",
-			OldWorkerReplicas: map[string]int32{},
-			NewWorkerReplicas: map[string]int32{},
+			NewWorkerHash:                      "samehash",
+			OldWorkerReplicaTargetsByComponent: map[string]int32{},
+			OldWorkerReplicaTargetsByDCD:       map[string]int32{},
+			NewWorkerReplicaTargetsByComponent: map[string]int32{},
 		}
 
 		err := r.scaleOldWorkerDCDs(ctx, dgd, rollingUpdateCtx)
@@ -2266,9 +2414,10 @@ func TestScaleOldWorkerDCDs_LegacyDCDs(t *testing.T) {
 		ctx := context.Background()
 
 		rollingUpdateCtx := dynamo.RollingUpdateContext{
-			NewWorkerHash:     "newhash1",
-			OldWorkerReplicas: map[string]int32{"worker": 1},
-			NewWorkerReplicas: map[string]int32{"worker": 3},
+			NewWorkerHash:                      "newhash1",
+			OldWorkerReplicaTargetsByComponent: map[string]int32{"worker": 1},
+			OldWorkerReplicaTargetsByDCD:       map[string]int32{"test-dgd-worker": 1},
+			NewWorkerReplicaTargetsByComponent: map[string]int32{"worker": 3},
 		}
 
 		err := r.scaleOldWorkerDCDs(ctx, dgd, rollingUpdateCtx)
@@ -2322,9 +2471,9 @@ func TestAggregateOldWorkerServiceStatuses_LegacyDCDs(t *testing.T) {
 		ctx := context.Background()
 
 		rollingUpdateCtx := dynamo.RollingUpdateContext{
-			NewWorkerHash:     "newhash1",
-			OldWorkerReplicas: map[string]int32{"worker": 2},
-			NewWorkerReplicas: map[string]int32{"worker": 3},
+			NewWorkerHash:                      "newhash1",
+			OldWorkerReplicaTargetsByComponent: map[string]int32{"worker": 2},
+			NewWorkerReplicaTargetsByComponent: map[string]int32{"worker": 3},
 		}
 
 		statuses, err := r.aggregateOldWorkerComponentStatuses(ctx, dgd, rollingUpdateCtx)
@@ -2347,9 +2496,9 @@ func TestAggregateOldWorkerServiceStatuses_LegacyDCDs(t *testing.T) {
 		ctx := context.Background()
 
 		rollingUpdateCtx := dynamo.RollingUpdateContext{
-			NewWorkerHash:     "newhash1",
-			OldWorkerReplicas: map[string]int32{"worker": 1},
-			NewWorkerReplicas: map[string]int32{"worker": 1},
+			NewWorkerHash:                      "newhash1",
+			OldWorkerReplicaTargetsByComponent: map[string]int32{"worker": 1},
+			NewWorkerReplicaTargetsByComponent: map[string]int32{"worker": 1},
 		}
 
 		statuses, err := r.aggregateOldWorkerComponentStatuses(ctx, dgd, rollingUpdateCtx)
@@ -2610,9 +2759,13 @@ func TestScaleOldWorkerDCDs_MultipleOldGenerations(t *testing.T) {
 
 	// oldNeeded = 2: newest old (B) should get 2, oldest (A) should get 0
 	rollingUpdateCtx := dynamo.RollingUpdateContext{
-		NewWorkerHash:     "hashcccc",
-		OldWorkerReplicas: map[string]int32{"worker": 2},
-		NewWorkerReplicas: map[string]int32{"worker": 4},
+		NewWorkerHash:                      "hashcccc",
+		OldWorkerReplicaTargetsByComponent: map[string]int32{"worker": 2},
+		OldWorkerReplicaTargetsByDCD: map[string]int32{
+			"test-dgd-worker-hashaaaa": 0,
+			"test-dgd-worker-hashbbbb": 2,
+		},
+		NewWorkerReplicaTargetsByComponent: map[string]int32{"worker": 4},
 	}
 
 	err := r.scaleOldWorkerDCDs(ctx, dgd, rollingUpdateCtx)
@@ -2629,6 +2782,173 @@ func TestScaleOldWorkerDCDs_MultipleOldGenerations(t *testing.T) {
 	err = r.Get(ctx, types.NamespacedName{Name: "test-dgd-worker-hashaaaa", Namespace: "default"}, updatedA)
 	require.NoError(t, err)
 	assert.Equal(t, int32(0), *updatedA.Spec.Replicas, "Oldest old DCD should be drained to 0")
+}
+
+func TestAllocateOldWorkerDCDReplicas(t *testing.T) {
+	now := metav1.Now()
+	earlier := metav1.NewTime(now.Add(-1 * 60 * 1e9))
+
+	dcd := func(name string, createdAt metav1.Time, spec, available int32) *nvidiacomv1beta1.DynamoComponentDeployment {
+		return &nvidiacomv1beta1.DynamoComponentDeployment{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              name,
+				CreationTimestamp: createdAt,
+			},
+			Spec: nvidiacomv1beta1.DynamoComponentDeploymentSpec{
+				DynamoComponentDeploymentSharedSpec: nvidiacomv1beta1.DynamoComponentDeploymentSharedSpec{
+					Replicas: ptr.To(spec),
+				},
+			},
+			Status: nvidiacomv1beta1.DynamoComponentDeploymentStatus{
+				Component: &nvidiacomv1beta1.ComponentReplicaStatus{
+					Replicas:          spec,
+					AvailableReplicas: ptr.To(available),
+				},
+			},
+		}
+	}
+
+	tests := []struct {
+		name      string
+		oldTarget int32
+		dcds      []*nvidiacomv1beta1.DynamoComponentDeployment
+		want      map[string]int32
+	}{
+		{
+			name:      "overlapping update keeps healthy original and drops unavailable intermediate",
+			oldTarget: 15,
+			dcds: []*nvidiacomv1beta1.DynamoComponentDeployment{
+				dcd("test-dgd-worker-hashaaaa", earlier, 15, 15),
+				dcd("test-dgd-worker-hashbbbb", now, 10, 0),
+			},
+			want: map[string]int32{
+				"test-dgd-worker-hashaaaa": 15,
+				"test-dgd-worker-hashbbbb": 0,
+			},
+		},
+		{
+			name:      "available surplus removes replicas from oldest generation first",
+			oldTarget: 3,
+			dcds: []*nvidiacomv1beta1.DynamoComponentDeployment{
+				dcd("test-dgd-worker-hashaaaa", earlier, 3, 3),
+				dcd("test-dgd-worker-hashbbbb", now, 1, 1),
+			},
+			want: map[string]int32{
+				"test-dgd-worker-hashaaaa": 2,
+				"test-dgd-worker-hashbbbb": 1,
+			},
+		},
+		{
+			name:      "degraded original fills remaining target from newest old generation",
+			oldTarget: 15,
+			dcds: []*nvidiacomv1beta1.DynamoComponentDeployment{
+				dcd("test-dgd-worker-hashaaaa", earlier, 15, 12),
+				dcd("test-dgd-worker-hashbbbb", now, 10, 0),
+			},
+			want: map[string]int32{
+				"test-dgd-worker-hashaaaa": 12,
+				"test-dgd-worker-hashbbbb": 3,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := allocateOldWorkerDCDReplicas(tt.dcds, tt.oldTarget)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestScaleOldWorkerDCDs_MultipleOldGenerationsPreservesAvailableReplicas(t *testing.T) {
+	dgd := createTestDGD("test-dgd", map[string]*nvidiacomv1alpha1.DynamoComponentDeploymentSharedSpec{
+		"worker": {
+			ComponentType: consts.ComponentTypeWorker,
+			Replicas:      ptr.To(int32(20)),
+		},
+	})
+
+	now := metav1.Now()
+	earlier := metav1.NewTime(now.Add(-1 * 60 * 1e9)) // 1 minute earlier
+
+	// Generation A (oldest): healthy and serving the minAvailable budget.
+	genADCD := betaDCD(t, &nvidiacomv1alpha1.DynamoComponentDeployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "test-dgd-worker-hashaaaa",
+			Namespace:         "default",
+			CreationTimestamp: earlier,
+			Labels: map[string]string{
+				consts.KubeLabelDynamoGraphDeploymentName: "test-dgd",
+				consts.KubeLabelDynamoWorkerHash:          "hashaaaa",
+			},
+		},
+		Spec: nvidiacomv1alpha1.DynamoComponentDeploymentSpec{
+			DynamoComponentDeploymentSharedSpec: nvidiacomv1alpha1.DynamoComponentDeploymentSharedSpec{
+				ComponentType: consts.ComponentTypeWorker,
+				ServiceName:   "worker",
+				Replicas:      ptr.To(int32(15)),
+			},
+		},
+		Status: nvidiacomv1alpha1.DynamoComponentDeploymentStatus{
+			Service: &nvidiacomv1alpha1.ServiceReplicaStatus{
+				Replicas:          15,
+				AvailableReplicas: ptr.To(int32(15)),
+			},
+		},
+	})
+
+	// Generation B (newer old): spec consumes rollout budget but has no serving replicas.
+	genBDCD := betaDCD(t, &nvidiacomv1alpha1.DynamoComponentDeployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "test-dgd-worker-hashbbbb",
+			Namespace:         "default",
+			CreationTimestamp: now,
+			Labels: map[string]string{
+				consts.KubeLabelDynamoGraphDeploymentName: "test-dgd",
+				consts.KubeLabelDynamoWorkerHash:          "hashbbbb",
+			},
+		},
+		Spec: nvidiacomv1alpha1.DynamoComponentDeploymentSpec{
+			DynamoComponentDeploymentSharedSpec: nvidiacomv1alpha1.DynamoComponentDeploymentSharedSpec{
+				ComponentType: consts.ComponentTypeWorker,
+				ServiceName:   "worker",
+				Replicas:      ptr.To(int32(10)),
+			},
+		},
+		Status: nvidiacomv1alpha1.DynamoComponentDeploymentStatus{
+			Service: &nvidiacomv1alpha1.ServiceReplicaStatus{
+				Replicas:          10,
+				AvailableReplicas: ptr.To(int32(0)),
+			},
+		},
+	})
+
+	dgd.Annotations = map[string]string{
+		consts.AnnotationCurrentWorkerHash: "hashbbbb",
+	}
+
+	r := createTestReconcilerWithStatus(dgd, withObjects(genADCD, genBDCD))
+	ctx := context.Background()
+
+	rollingUpdateCtx, err := r.buildRollingUpdateContext(ctx, dgd)
+	require.NoError(t, err)
+	assert.Equal(t, int32(15), rollingUpdateCtx.OldWorkerReplicaTargetsByComponent["worker"])
+	assert.Equal(t, int32(15), rollingUpdateCtx.OldWorkerReplicaTargetsByDCD["test-dgd-worker-hashaaaa"])
+	assert.Equal(t, int32(0), rollingUpdateCtx.OldWorkerReplicaTargetsByDCD["test-dgd-worker-hashbbbb"])
+	assert.Equal(t, int32(0), rollingUpdateCtx.NewWorkerReplicaTargetsByComponent["worker"])
+
+	err = r.scaleOldWorkerDCDs(ctx, dgd, rollingUpdateCtx)
+	require.NoError(t, err)
+
+	updatedA := betaDCD(t, &nvidiacomv1alpha1.DynamoComponentDeployment{})
+	err = r.Get(ctx, types.NamespacedName{Name: "test-dgd-worker-hashaaaa", Namespace: "default"}, updatedA)
+	require.NoError(t, err)
+	assert.Equal(t, int32(15), *updatedA.Spec.Replicas, "Healthy old DCD should continue serving minAvailable")
+
+	updatedB := betaDCD(t, &nvidiacomv1alpha1.DynamoComponentDeployment{})
+	err = r.Get(ctx, types.NamespacedName{Name: "test-dgd-worker-hashbbbb", Namespace: "default"}, updatedB)
+	require.NoError(t, err)
+	assert.Equal(t, int32(0), *updatedB.Spec.Replicas, "Unavailable newer old DCD should be drained first")
 }
 
 func TestAggregateOldWorkerServiceStatuses_MultipleOldGenerations(t *testing.T) {
@@ -2697,9 +3017,9 @@ func TestAggregateOldWorkerServiceStatuses_MultipleOldGenerations(t *testing.T) 
 	ctx := context.Background()
 
 	rollingUpdateCtx := dynamo.RollingUpdateContext{
-		NewWorkerHash:     "hashcccc",
-		OldWorkerReplicas: map[string]int32{"worker": 3},
-		NewWorkerReplicas: map[string]int32{"worker": 4},
+		NewWorkerHash:                      "hashcccc",
+		OldWorkerReplicaTargetsByComponent: map[string]int32{"worker": 3},
+		NewWorkerReplicaTargetsByComponent: map[string]int32{"worker": 4},
 	}
 
 	statuses, err := r.aggregateOldWorkerComponentStatuses(ctx, dgd, rollingUpdateCtx)
@@ -3052,7 +3372,7 @@ func TestReconcileRollingUpdate_StaleAnnotationRequiresAllNewWorkersReady(t *tes
 	dgd.Status.RollingUpdate = &nvidiacomv1beta1.RollingUpdateStatus{
 		Phase: nvidiacomv1beta1.RollingUpdatePhaseCompleted,
 	}
-	newHash := legacyDGDWorkersSpecHash(t, dgd)
+	newHash := betaDGDWorkersSpecHash(t, dgd)
 	require.NotEqual(t, testOldWorkerHash, newHash)
 
 	newPrefillDCD := betaDCD(t, &nvidiacomv1alpha1.DynamoComponentDeployment{
@@ -3094,7 +3414,7 @@ func TestReconcileRollingUpdate_StaleAnnotationUpdatesAfterAllNewWorkersReady(t 
 	dgd.Status.RollingUpdate = &nvidiacomv1beta1.RollingUpdateStatus{
 		Phase: nvidiacomv1beta1.RollingUpdatePhaseCompleted,
 	}
-	newHash := legacyDGDWorkersSpecHash(t, dgd)
+	newHash := betaDGDWorkersSpecHash(t, dgd)
 	require.NotEqual(t, testOldWorkerHash, newHash)
 
 	makeReadyDCD := func(componentName, componentType string) *nvidiacomv1beta1.DynamoComponentDeployment {
@@ -3131,7 +3451,8 @@ func TestReconcileRollingUpdate_StaleAnnotationUpdatesAfterAllNewWorkersReady(t 
 	err := r.reconcileRollingUpdate(context.Background(), dgd)
 	require.NoError(t, err)
 
-	assert.Equal(t, newHash, dgd.Annotations[consts.AnnotationCurrentWorkerHash])
+	assert.NotContains(t, dgd.Annotations, consts.AnnotationCurrentWorkerHash)
+	assert.Equal(t, newHash, dgd.Annotations[consts.AnnotationCurrentWorkerHashV2])
 	assert.Equal(t, nvidiacomv1beta1.RollingUpdatePhaseCompleted, dgd.Status.RollingUpdate.Phase)
 }
 
@@ -3479,7 +3800,7 @@ func TestBuildRollingUpdateContext(t *testing.T) {
 			}
 
 			// Compute the actual new DCD label hash from the DGD spec.
-			newHash := legacyDGDWorkersSpecHash(t, dgd)
+			newHash := betaDGDWorkersSpecHash(t, dgd)
 			require.NotEqual(t, testOldWorkerHash, newHash, "test setup: computed hash must differ from old hash")
 
 			// Collect all mock objects
@@ -3499,11 +3820,11 @@ func TestBuildRollingUpdateContext(t *testing.T) {
 
 			assert.Equal(t, newHash, result.NewWorkerHash)
 			for svc, expectedOld := range tt.expectedOld {
-				assert.Equal(t, expectedOld, result.OldWorkerReplicas[svc],
+				assert.Equal(t, expectedOld, result.OldWorkerReplicaTargetsByComponent[svc],
 					"old replicas for service %s", svc)
 			}
 			for svc, expectedNew := range tt.expectedNew {
-				assert.Equal(t, expectedNew, result.NewWorkerReplicas[svc],
+				assert.Equal(t, expectedNew, result.NewWorkerReplicaTargetsByComponent[svc],
 					"new replicas for service %s", svc)
 			}
 		})
@@ -3545,7 +3866,7 @@ func TestBuildRollingUpdateContext_NoNewDCDExists(t *testing.T) {
 		},
 	})
 
-	newHash := legacyDGDWorkersSpecHash(t, dgd)
+	newHash := betaDGDWorkersSpecHash(t, dgd)
 	assert.NotEqual(t, testOldWorkerHash, newHash, "test setup: computed hash must differ from old hash")
 
 	r := createTestReconcilerWithStatus(dgd, withObjects(oldDCD))
@@ -3556,8 +3877,8 @@ func TestBuildRollingUpdateContext_NoNewDCDExists(t *testing.T) {
 	assert.NoError(t, err, "IsNotFound on the new-hash DCD must not produce an error")
 	assert.Equal(t, newHash, result.NewWorkerHash)
 	// Math runs with newState={0,0,0}: drain old to minAvailable, surge new from zero.
-	assert.Equal(t, int32(8), result.OldWorkerReplicas["worker"])
-	assert.Equal(t, int32(3), result.NewWorkerReplicas["worker"])
+	assert.Equal(t, int32(8), result.OldWorkerReplicaTargetsByComponent["worker"])
+	assert.Equal(t, int32(3), result.NewWorkerReplicaTargetsByComponent["worker"])
 }
 
 func TestBuildRollingUpdateContext_ListOldDCDsError(t *testing.T) {
@@ -3571,7 +3892,7 @@ func TestBuildRollingUpdateContext_ListOldDCDsError(t *testing.T) {
 		consts.AnnotationCurrentWorkerHash: testOldWorkerHash,
 	}
 
-	assert.NotEqual(t, testOldWorkerHash, legacyDGDWorkersSpecHash(t, dgd),
+	assert.NotEqual(t, testOldWorkerHash, betaDGDWorkersSpecHash(t, dgd),
 		"test setup: computed hash must differ so we proceed past the early-return")
 
 	injectedErr := errors.New("simulated apiserver list failure")

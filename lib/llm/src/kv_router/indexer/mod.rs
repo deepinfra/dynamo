@@ -10,12 +10,9 @@ use dynamo_kv_router::{
     config::KvRouterConfig,
     indexer::{
         KvIndexer, KvIndexerInterface, KvIndexerMetrics, KvRouterError, LowerTierIndexers,
-        MatchDetails, ThreadPoolIndexer, query_lower_tiers,
+        ThreadPoolIndexer,
     },
-    protocols::{
-        DpRank, LocalBlockHash, OverlapScores, RouterEvent, TokensWithHashes, WorkerId,
-        WorkerWithDpRank,
-    },
+    protocols::{DpRank, RouterEvent, WorkerId},
 };
 
 // Re-export tiered-match types so internal callers (`indexer::TieredMatchDetails`)
@@ -23,116 +20,27 @@ use dynamo_kv_router::{
 pub(crate) use dynamo_kv_router::indexer::TieredMatchDetails;
 #[allow(unused_imports)]
 pub(crate) use dynamo_kv_router::indexer::WireTieredMatchDetails;
-use dynamo_runtime::{component::Component, traits::DistributedRuntimeProvider};
-use dynamo_tokens::SequenceHash;
-use tokio::sync::oneshot;
+use dynamo_runtime::component::Component;
+use tokio_util::sync::CancellationToken;
 
-mod jetstream;
+mod embedding_cache;
+mod lookup;
+mod recording;
+mod recovery;
 pub mod remote;
-mod subscriber;
-mod worker_query;
+mod side;
 
+pub use self::embedding_cache::{EmbeddingCacheIndexer, try_build_cache_indexer};
 use self::remote::RemoteIndexer;
 pub use self::remote::{ServedIndexerHandle, ServedIndexerMode, ensure_served_indexer_service};
-pub(crate) use subscriber::start_subscriber;
-pub(crate) use worker_query::start_worker_kv_query_endpoint;
-
-#[derive(Clone)]
-pub enum SideIndexer {
-    KvIndexer(KvIndexer),
-    Concurrent(Arc<ThreadPoolIndexer<ConcurrentRadixTreeCompressed>>),
-}
-
-impl SideIndexer {
-    fn new_predict_on_route(
-        component: &Component,
-        kv_router_config: &KvRouterConfig,
-        block_size: u32,
-    ) -> Option<Self> {
-        let ttl_secs = kv_router_config.router_predicted_ttl_secs?;
-        let prune_config = Some(PruneConfig {
-            ttl: Duration::from_secs_f64(ttl_secs),
-        });
-        let metrics = KvIndexerMetrics::from_component(component);
-        tracing::info!(
-            ttl_secs,
-            "Starting predict-on-route side indexer (short-TTL approximate)"
-        );
-        if kv_router_config.router_event_threads > 1 {
-            return Some(Self::Concurrent(Arc::new(
-                ThreadPoolIndexer::new_with_metrics_and_pruning(
-                    ConcurrentRadixTreeCompressed::new(),
-                    kv_router_config.router_event_threads as usize,
-                    block_size,
-                    Some(metrics),
-                    prune_config,
-                ),
-            )));
-        }
-
-        let cancellation_token = component.drt().primary_token();
-        Some(Self::KvIndexer(KvIndexer::new_with_frequency(
-            cancellation_token,
-            None,
-            block_size,
-            metrics,
-            prune_config,
-        )))
-    }
-
-    async fn find_matches(
-        &self,
-        sequence: Vec<LocalBlockHash>,
-    ) -> Result<OverlapScores, KvRouterError> {
-        match self {
-            Self::KvIndexer(indexer) => indexer.find_matches(sequence).await,
-            Self::Concurrent(indexer) => indexer.find_matches(sequence).await,
-        }
-    }
-
-    async fn process_routing_decision_with_hashes(
-        &self,
-        worker: WorkerWithDpRank,
-        local_hashes: Vec<LocalBlockHash>,
-        sequence_hashes: Vec<SequenceHash>,
-    ) -> Result<(), KvRouterError> {
-        match self {
-            Self::KvIndexer(indexer) => {
-                indexer
-                    .process_routing_decision_with_hashes(worker, local_hashes, sequence_hashes)
-                    .await
-            }
-            Self::Concurrent(indexer) => {
-                indexer
-                    .process_routing_decision_with_hashes(worker, local_hashes, sequence_hashes)
-                    .await
-            }
-        }
-    }
-
-    async fn remove_worker(&self, worker_id: WorkerId) {
-        match self {
-            Self::KvIndexer(indexer) => {
-                KvIndexerInterface::remove_worker(indexer, worker_id).await;
-            }
-            Self::Concurrent(indexer) => {
-                KvIndexerInterface::remove_worker(indexer.as_ref(), worker_id).await;
-            }
-        }
-    }
-
-    async fn remove_worker_dp_rank(&self, worker_id: WorkerId, dp_rank: DpRank) {
-        match self {
-            Self::KvIndexer(indexer) => {
-                KvIndexerInterface::remove_worker_dp_rank(indexer, worker_id, dp_rank).await;
-            }
-            Self::Concurrent(indexer) => {
-                KvIndexerInterface::remove_worker_dp_rank(indexer.as_ref(), worker_id, dp_rank)
-                    .await;
-            }
-        }
-    }
-}
+pub use self::side::SideIndexer;
+#[cfg(feature = "ckf-diagnostics")]
+pub(crate) use recovery::WorkerQueryHealthSnapshot;
+pub(crate) use recovery::{
+    DEFAULT_RECOVERY_ATTEMPT_TIMEOUT, RecoveryResetReason, RecoverySupervisor, RecoveryTarget,
+    SourceEpoch, TargetFaultDisposition, start_target_subscriber,
+};
+pub(crate) use recovery::{start_subscriber, start_worker_kv_query_endpoint};
 
 /// `approx` is the optional predict-on-route side indexer. It is always local
 /// to this router, even when the primary indexer is served or consumed
@@ -149,25 +57,33 @@ pub enum Indexer {
         primary: KvIndexer,
         lower_tier: LowerTierIndexers,
         approx: Option<SideIndexer>,
+        primary_records_routing_decisions: bool,
     },
     Concurrent {
         primary: Arc<ThreadPoolIndexer<ConcurrentRadixTreeCompressed>>,
         lower_tier: LowerTierIndexers,
         approx: Option<SideIndexer>,
+        primary_records_routing_decisions: bool,
     },
     Remote {
         primary: Arc<RemoteIndexer>,
         approx: Option<SideIndexer>,
+        primary_records_routing_decisions: bool,
     },
     None,
 }
 
 impl Indexer {
+    pub(crate) fn supports_overlap_refresh(&self) -> bool {
+        matches!(self, Self::KvIndexer { .. } | Self::Concurrent { .. })
+    }
+
     pub async fn new(
         component: &Component,
         kv_router_config: &KvRouterConfig,
         block_size: u32,
         model_name: Option<&str>,
+        cancellation_token: CancellationToken,
     ) -> Result<Self> {
         if kv_router_config.overlap_score_credit == 0.0 {
             return Ok(Self::None);
@@ -194,10 +110,16 @@ impl Indexer {
             );
             let remote =
                 RemoteIndexer::new(component, model_name, kv_router_config.use_kv_events).await?;
-            let approx = SideIndexer::new_predict_on_route(component, kv_router_config, block_size);
+            let approx = SideIndexer::new_predict_on_route(
+                component,
+                kv_router_config,
+                block_size,
+                cancellation_token.child_token(),
+            );
             return Ok(Self::Remote {
                 primary: Arc::new(remote),
                 approx,
+                primary_records_routing_decisions: !kv_router_config.use_kv_events,
             });
         }
 
@@ -212,32 +134,42 @@ impl Indexer {
                         ConcurrentRadixTreeCompressed::new(),
                         kv_router_config.router_event_threads as usize,
                         block_size,
-                        Some(kv_indexer_metrics),
+                        Some(kv_indexer_metrics.clone()),
                         prune_config,
                     )),
-                    lower_tier: LowerTierIndexers::new(
+                    lower_tier: LowerTierIndexers::new_with_metrics(
                         kv_router_config.router_event_threads as usize,
                         block_size,
+                        Some(kv_indexer_metrics),
                     ),
                     approx: None,
+                    primary_records_routing_decisions: true,
                 });
             }
 
-            let cancellation_token = component.drt().primary_token();
             return Ok(Self::KvIndexer {
-                primary: KvIndexer::new_with_frequency(
-                    cancellation_token,
-                    None,
+                primary: KvIndexer::new_with_pruning(
+                    cancellation_token.child_token(),
                     block_size,
-                    kv_indexer_metrics,
+                    kv_indexer_metrics.clone(),
                     prune_config,
                 ),
-                lower_tier: LowerTierIndexers::new(1, block_size),
+                lower_tier: LowerTierIndexers::new_with_metrics(
+                    1,
+                    block_size,
+                    Some(kv_indexer_metrics),
+                ),
                 approx: None,
+                primary_records_routing_decisions: true,
             });
         }
 
-        let approx = SideIndexer::new_predict_on_route(component, kv_router_config, block_size);
+        let approx = SideIndexer::new_predict_on_route(
+            component,
+            kv_router_config,
+            block_size,
+            cancellation_token.child_token(),
+        );
 
         if kv_router_config.router_event_threads > 1 {
             let kv_indexer_metrics = KvIndexerMetrics::from_component(component);
@@ -246,194 +178,34 @@ impl Indexer {
                     ConcurrentRadixTreeCompressed::new(),
                     kv_router_config.router_event_threads as usize,
                     block_size,
-                    Some(kv_indexer_metrics),
+                    Some(kv_indexer_metrics.clone()),
                 )),
-                lower_tier: LowerTierIndexers::new(
+                lower_tier: LowerTierIndexers::new_with_metrics(
                     kv_router_config.router_event_threads as usize,
                     block_size,
+                    Some(kv_indexer_metrics),
                 ),
                 approx,
+                primary_records_routing_decisions: false,
             });
         }
 
         let kv_indexer_metrics = KvIndexerMetrics::from_component(component);
-        let cancellation_token = component.drt().primary_token();
-
         Ok(Self::KvIndexer {
-            primary: KvIndexer::new_with_frequency(
-                cancellation_token,
-                None,
+            primary: KvIndexer::new_with_pruning(
+                cancellation_token.child_token(),
                 block_size,
-                kv_indexer_metrics,
+                kv_indexer_metrics.clone(),
                 None,
             ),
-            lower_tier: LowerTierIndexers::new(1, block_size),
+            lower_tier: LowerTierIndexers::new_with_metrics(
+                1,
+                block_size,
+                Some(kv_indexer_metrics),
+            ),
             approx,
+            primary_records_routing_decisions: false,
         })
-    }
-
-    #[allow(dead_code)]
-    pub(crate) async fn find_matches(
-        &self,
-        sequence: Vec<LocalBlockHash>,
-    ) -> Result<OverlapScores, KvRouterError> {
-        self.find_match_details(sequence)
-            .await
-            .map(|details| details.overlap_scores)
-    }
-
-    pub(crate) async fn find_match_details(
-        &self,
-        sequence: Vec<LocalBlockHash>,
-    ) -> Result<MatchDetails, KvRouterError> {
-        let primary_details = self.find_primary_match_details(sequence.clone()).await?;
-        let approx = match self {
-            Self::KvIndexer { approx, .. }
-            | Self::Concurrent { approx, .. }
-            | Self::Remote { approx, .. } => approx.as_ref(),
-            Self::None => None,
-        };
-        Ok(merge_side_or_warn(approx, primary_details, sequence).await)
-    }
-
-    pub(crate) async fn find_primary_match_details(
-        &self,
-        sequence: Vec<LocalBlockHash>,
-    ) -> Result<MatchDetails, KvRouterError> {
-        let primary_details = match self {
-            Self::KvIndexer { primary, .. } => primary.find_match_details(sequence.clone()).await?,
-            Self::Concurrent { primary, .. } => {
-                primary.backend().find_match_details_impl(&sequence, false)
-            }
-            Self::Remote { primary, .. } => {
-                let tiered = primary
-                    .find_matches_by_tier(sequence.clone(), true)
-                    .await
-                    .map_err(|e| {
-                        tracing::warn!(error = %e, "Remote indexer query failed");
-                        KvRouterError::IndexerOffline
-                    })?;
-                tiered.device
-            }
-            Self::None => return Ok(MatchDetails::new()),
-        };
-
-        Ok(primary_details)
-    }
-
-    pub(crate) async fn find_matches_by_tier(
-        &self,
-        sequence: Vec<LocalBlockHash>,
-    ) -> Result<TieredMatchDetails, KvRouterError> {
-        match self {
-            Self::KvIndexer {
-                lower_tier, approx, ..
-            }
-            | Self::Concurrent {
-                lower_tier, approx, ..
-            } => {
-                // Seed lower-tier continuations from confirmed primary matches
-                // only. Predict-on-route side scores are unconfirmed; using
-                // them as lower-tier anchors would over-credit host/disk cache
-                // hits and break the score/hash lockstep `query_lower_tiers`
-                // expects.
-                let primary_device = self.find_primary_match_details(sequence.clone()).await?;
-                let lt = query_lower_tiers(lower_tier, &sequence, &primary_device);
-                let device = merge_side_or_warn(approx.as_ref(), primary_device, sequence).await;
-
-                Ok(TieredMatchDetails {
-                    device,
-                    lower_tier: lt,
-                })
-            }
-            Self::Remote { primary, approx } => {
-                let mut tiered = primary
-                    .find_matches_by_tier(sequence.clone(), false)
-                    .await
-                    .map_err(|e| {
-                        tracing::warn!(error = %e, "Remote indexer tiered query failed");
-                        KvRouterError::IndexerOffline
-                    })?;
-                tiered.device = merge_side_or_warn(approx.as_ref(), tiered.device, sequence).await;
-                Ok(tiered)
-            }
-            Self::None => Ok(TieredMatchDetails::default()),
-        }
-    }
-
-    pub(crate) async fn find_primary_matches_by_tier(
-        &self,
-        sequence: Vec<LocalBlockHash>,
-    ) -> Result<TieredMatchDetails, KvRouterError> {
-        match self {
-            Self::KvIndexer { lower_tier, .. } | Self::Concurrent { lower_tier, .. } => {
-                let device = self.find_primary_match_details(sequence.clone()).await?;
-                let lt = query_lower_tiers(lower_tier, &sequence, &device);
-                Ok(TieredMatchDetails {
-                    device,
-                    lower_tier: lt,
-                })
-            }
-            Self::Remote { primary, .. } => primary
-                .find_matches_by_tier(sequence.clone(), false)
-                .await
-                .map_err(|e| {
-                    tracing::warn!(error = %e, "Remote indexer tiered query failed");
-                    KvRouterError::IndexerOffline
-                }),
-            Self::None => Ok(TieredMatchDetails::default()),
-        }
-    }
-
-    pub(crate) async fn record_hashed_routing_decision(
-        &self,
-        worker: WorkerWithDpRank,
-        local_hashes: Vec<LocalBlockHash>,
-        sequence_hashes: Vec<SequenceHash>,
-    ) -> Result<(), KvRouterError> {
-        if let Self::Remote {
-            primary,
-            approx: Some(approx),
-        } = self
-        {
-            debug_assert!(
-                primary.use_kv_events(),
-                "remote side indexer requires an event-driven primary"
-            );
-            return approx
-                .process_routing_decision_with_hashes(worker, local_hashes, sequence_hashes)
-                .await;
-        }
-
-        if let Some(approx) = match self {
-            Self::KvIndexer { approx, .. } | Self::Concurrent { approx, .. } => approx.as_ref(),
-            _ => None,
-        } {
-            return approx
-                .process_routing_decision_with_hashes(worker, local_hashes, sequence_hashes)
-                .await;
-        }
-
-        match self {
-            Self::KvIndexer { primary, .. } => {
-                primary
-                    .process_routing_decision_with_hashes(worker, local_hashes, sequence_hashes)
-                    .await
-            }
-            Self::Concurrent { primary, .. } => {
-                primary
-                    .process_routing_decision_with_hashes(worker, local_hashes, sequence_hashes)
-                    .await
-            }
-            Self::Remote { primary, .. } => primary
-                .record_hashed_routing_decision(worker, local_hashes, sequence_hashes)
-                .await
-                .map_err(|error| {
-                    tracing::warn!(error = %error, "Remote indexer write failed");
-                    KvRouterError::IndexerDroppedRequest
-                }),
-            Self::None => Ok(()),
-        }
     }
 
     pub(crate) async fn dump_events(&self) -> Result<Vec<RouterEvent>, KvRouterError> {
@@ -449,38 +221,7 @@ impl Indexer {
         }
     }
 
-    pub(crate) async fn process_routing_decision_for_request(
-        &self,
-        tokens_with_hashes: &mut TokensWithHashes,
-        worker: WorkerWithDpRank,
-    ) -> Result<(), KvRouterError> {
-        // The Concurrent primary doesn't accept hashed writes, so when there's
-        // no side indexer we hand the request to its native (non-hashed) path.
-        // Every other case routes through `record_hashed_routing_decision`,
-        // which dispatches to the side indexer when enabled and otherwise to
-        // the appropriate primary.
-        if let Self::Concurrent {
-            primary,
-            approx: None,
-            ..
-        } = self
-        {
-            return primary
-                .process_routing_decision_for_request(tokens_with_hashes, worker)
-                .await;
-        }
-        match self {
-            Self::KvIndexer { .. } | Self::Concurrent { .. } | Self::Remote { .. } => {
-                let local_hashes = tokens_with_hashes.get_or_compute_block_hashes().to_vec();
-                let sequence_hashes = tokens_with_hashes.get_or_compute_seq_hashes().to_vec();
-                self.record_hashed_routing_decision(worker, local_hashes, sequence_hashes)
-                    .await
-            }
-            Self::None => Ok(()),
-        }
-    }
-
-    pub(crate) async fn apply_event(&self, event: RouterEvent) {
+    pub(crate) async fn try_apply_event(&self, event: RouterEvent) -> Result<(), KvRouterError> {
         match self {
             Self::KvIndexer {
                 primary,
@@ -488,24 +229,27 @@ impl Indexer {
                 ..
             } => match &event.event.data {
                 dynamo_kv_router::protocols::KvCacheEventData::Cleared => {
-                    if let Err(e) = primary.event_sender().send(event.clone()).await {
-                        tracing::warn!("Failed to send event to indexer: {e}");
-                    }
+                    primary
+                        .event_sender()
+                        .send(event.clone())
+                        .await
+                        .map_err(|_| KvRouterError::IndexerOffline)?;
 
                     for indexer in lower_tier.all() {
-                        indexer.apply_event(event.clone()).await;
+                        indexer.enqueue_event(event.clone())?;
                     }
                 }
                 _ if event.storage_tier.is_gpu() => {
-                    if let Err(e) = primary.event_sender().send(event).await {
-                        tracing::warn!("Failed to send event to indexer: {e}");
-                    }
+                    primary
+                        .event_sender()
+                        .send(event)
+                        .await
+                        .map_err(|_| KvRouterError::IndexerOffline)?;
                 }
                 _ => {
                     lower_tier
                         .get_or_create(event.storage_tier)
-                        .apply_event(event)
-                        .await;
+                        .enqueue_event(event)?;
                 }
             },
             Self::Concurrent {
@@ -514,178 +258,93 @@ impl Indexer {
                 ..
             } => match &event.event.data {
                 dynamo_kv_router::protocols::KvCacheEventData::Cleared => {
-                    primary.apply_event(event.clone()).await;
+                    primary.enqueue_event(event.clone())?;
 
                     for indexer in lower_tier.all() {
-                        indexer.apply_event(event.clone()).await;
+                        indexer.enqueue_event(event.clone())?;
                     }
                 }
                 _ if event.storage_tier.is_gpu() => {
-                    primary.apply_event(event).await;
+                    primary.enqueue_event(event)?;
                 }
                 _ => {
                     lower_tier
                         .get_or_create(event.storage_tier)
-                        .apply_event(event)
-                        .await;
+                        .enqueue_event(event)?;
                 }
             },
             Self::Remote { .. } | Self::None => {}
         }
+        Ok(())
     }
 
-    pub(crate) async fn remove_worker(&self, worker_id: WorkerId) {
+    #[cfg(test)]
+    pub(crate) async fn apply_event(&self, event: RouterEvent) {
+        if let Err(error) = self.try_apply_event(event).await {
+            tracing::error!(%error, "Failed to enqueue KV event");
+        }
+    }
+
+    /// Cold-reset one logical rank and wait until all local index tiers have completed the removal.
+    ///
+    /// NOTE: Unlike ordinary event application, rank removal is an infallible lane operation.
+    /// Its FIFO completion must be visible before source activation or clearing `reset_pending`.
+    pub(crate) async fn reset_worker_dp_rank_and_wait(
+        &self,
+        worker_id: WorkerId,
+        dp_rank: DpRank,
+    ) -> Result<(), KvRouterError> {
         match self {
             Self::KvIndexer {
                 primary,
                 lower_tier,
                 approx,
+                ..
             } => {
+                primary
+                    .reset_worker_dp_rank_and_wait(worker_id, dp_rank)
+                    .await?;
                 for indexer in lower_tier.all() {
-                    indexer.remove_worker(worker_id).await;
-                }
-                if let Err(e) = primary.remove_worker_sender().send(worker_id).await {
-                    tracing::warn!("Failed to send worker removal for {worker_id}: {e}");
+                    indexer
+                        .reset_worker_dp_rank_and_wait(worker_id, dp_rank)
+                        .await?;
                 }
                 if let Some(approx) = approx {
-                    approx.remove_worker(worker_id).await;
+                    approx
+                        .reset_worker_dp_rank_and_wait(worker_id, dp_rank)
+                        .await?;
                 }
             }
             Self::Concurrent {
                 primary,
                 lower_tier,
                 approx,
+                ..
             } => {
+                primary
+                    .reset_worker_dp_rank_and_wait(worker_id, dp_rank)
+                    .await?;
                 for indexer in lower_tier.all() {
-                    indexer.remove_worker(worker_id).await;
+                    indexer
+                        .reset_worker_dp_rank_and_wait(worker_id, dp_rank)
+                        .await?;
                 }
-                KvIndexerInterface::remove_worker(primary.as_ref(), worker_id).await;
                 if let Some(approx) = approx {
-                    approx.remove_worker(worker_id).await;
+                    approx
+                        .reset_worker_dp_rank_and_wait(worker_id, dp_rank)
+                        .await?;
                 }
             }
             Self::Remote { approx, .. } => {
                 if let Some(approx) = approx {
-                    approx.remove_worker(worker_id).await;
+                    approx
+                        .reset_worker_dp_rank_and_wait(worker_id, dp_rank)
+                        .await?;
                 }
             }
             Self::None => {}
         }
-    }
-
-    pub(crate) async fn remove_worker_dp_rank(&self, worker_id: WorkerId, dp_rank: DpRank) {
-        match self {
-            Self::KvIndexer {
-                primary,
-                lower_tier,
-                approx,
-            } => {
-                for indexer in lower_tier.all() {
-                    KvIndexerInterface::remove_worker_dp_rank(&*indexer, worker_id, dp_rank).await;
-                }
-                KvIndexerInterface::remove_worker_dp_rank(primary, worker_id, dp_rank).await;
-                if let Some(approx) = approx {
-                    approx.remove_worker_dp_rank(worker_id, dp_rank).await;
-                }
-            }
-            Self::Concurrent {
-                primary,
-                lower_tier,
-                approx,
-            } => {
-                for indexer in lower_tier.all() {
-                    KvIndexerInterface::remove_worker_dp_rank(&*indexer, worker_id, dp_rank).await;
-                }
-                KvIndexerInterface::remove_worker_dp_rank(primary.as_ref(), worker_id, dp_rank)
-                    .await;
-                if let Some(approx) = approx {
-                    approx.remove_worker_dp_rank(worker_id, dp_rank).await;
-                }
-            }
-            Self::Remote { approx, .. } => {
-                if let Some(approx) = approx {
-                    approx.remove_worker_dp_rank(worker_id, dp_rank).await;
-                }
-            }
-            Self::None => {}
-        }
-    }
-
-    pub(crate) async fn get_workers(&self) -> Vec<WorkerId> {
-        match self {
-            Self::KvIndexer { primary, .. } => {
-                let (resp_tx, resp_rx) = oneshot::channel();
-                let req = dynamo_kv_router::indexer::GetWorkersRequest { resp: resp_tx };
-                if let Err(e) = primary.get_workers_sender().send(req).await {
-                    tracing::warn!("Failed to send get_workers request: {e}");
-                    return Vec::new();
-                }
-                resp_rx.await.unwrap_or_default()
-            }
-            Self::Concurrent { primary, .. } => primary.get_workers().await,
-            Self::Remote { .. } | Self::None => Vec::new(),
-        }
-    }
-}
-
-/// Merge a side-indexer's `OverlapScores` into the primary's `MatchDetails`
-/// by taking the per-worker max overlap. The side indexer covers the window
-/// before the engine's first KV event arrives; for workers it knows about,
-/// we use whichever indexer saw the longer prefix. `last_matched_hashes`,
-/// `frequencies`, and `tree_sizes` come from the primary — the side
-/// indexer's short-TTL view isn't meaningful for those signals.
-///
-/// IMPORTANT: the returned `MatchDetails` is no longer guaranteed to satisfy
-/// `overlap_scores.scores` <-> `last_matched_hashes` lockstep. Side-only
-/// workers gain a score with no paired hash by design. The result is safe
-/// for scheduling / cache-hit signal but MUST NOT be used to seed
-/// `query_lower_tiers`, which assumes the lockstep invariant. The local
-/// arm of `find_matches_by_tier` enforces this by running the lower-tier
-/// query against primary-only `MatchDetails` before merging side scores.
-fn merge_overlap_scores(mut primary: MatchDetails, side: OverlapScores) -> MatchDetails {
-    for (worker, side_score) in side.scores {
-        primary
-            .overlap_scores
-            .scores
-            .entry(worker)
-            .and_modify(|s| {
-                if side_score > *s {
-                    *s = side_score;
-                }
-            })
-            .or_insert(side_score);
-    }
-    primary
-}
-
-/// Query the predict-on-route side indexer (if present) and merge its scores
-/// into `primary`. On query error, log a warning and return `primary` unchanged
-/// so the caller still has a usable scheduling signal. See
-/// [`merge_overlap_scores`] for the lockstep caveat on the returned shape.
-///
-/// NOTE: when this merged `MatchDetails` is combined with lower-tier hits
-/// seeded from the primary-only anchor (e.g. in `find_matches_by_tier`), the
-/// total cached-token signal can in theory overcount: the device score is
-/// raised by the side indexer but the lower-tier walk used the lower primary
-/// depth. Accepted as edge for now since side scores are short-TTL
-/// approximations and the overcount is bounded and rare in practice.
-async fn merge_side_or_warn(
-    approx: Option<&SideIndexer>,
-    primary: MatchDetails,
-    sequence: Vec<LocalBlockHash>,
-) -> MatchDetails {
-    let Some(approx) = approx else {
-        return primary;
-    };
-    match approx.find_matches(sequence).await {
-        Ok(side) => merge_overlap_scores(primary, side),
-        Err(error) => {
-            tracing::warn!(
-                error = %error,
-                "predict-on-route side indexer query failed; using primary only"
-            );
-            primary
-        }
+        Ok(())
     }
 }
 
@@ -758,9 +417,9 @@ mod tests {
     use dynamo_kv_router::{
         ConcurrentRadixTreeCompressed, ThreadPoolIndexer,
         approx::PruneConfig,
-        indexer::{KvIndexer, KvIndexerInterface, KvIndexerMetrics},
+        indexer::{KvIndexer, KvIndexerInterface, KvIndexerMetrics, RoutingDecisionHashes},
         protocols::{
-            BlockHashOptions, LocalBlockHash, StorageTier, WorkerWithDpRank,
+            BlockHashOptions, LocalBlockHash, StorageTier, TokensWithHashes, WorkerWithDpRank,
             compute_block_hash_for_seq, compute_seq_hash_for_block,
         },
     };
@@ -774,6 +433,7 @@ mod tests {
             ),
             lower_tier: LowerTierIndexers::new(1, 4),
             approx: None,
+            primary_records_routing_decisions: false,
         }
     }
 
@@ -786,6 +446,7 @@ mod tests {
             )),
             lower_tier: LowerTierIndexers::new(2, 4),
             approx: None,
+            primary_records_routing_decisions: false,
         }
     }
 
@@ -801,7 +462,15 @@ mod tests {
             )),
             lower_tier: LowerTierIndexers::new(2, 4),
             approx: None,
+            primary_records_routing_decisions: true,
         }
+    }
+
+    #[test]
+    fn overlap_refresh_is_limited_to_local_indexers() {
+        assert!(make_test_indexer().supports_overlap_refresh());
+        assert!(make_test_concurrent_indexer().supports_overlap_refresh());
+        assert!(!Indexer::None.supports_overlap_refresh());
     }
 
     async fn flush_indexer(indexer: &Indexer) {
@@ -828,6 +497,65 @@ mod tests {
             }
             Indexer::Remote { .. } | Indexer::None => {}
         }
+    }
+
+    async fn assert_rank_reset_is_acknowledged(indexer: Indexer) {
+        let reset_rank = WorkerWithDpRank::new(7, 0);
+        let retained_rank = WorkerWithDpRank::new(7, 1);
+
+        for dp_rank in [reset_rank.dp_rank, retained_rank.dp_rank] {
+            indexer
+                .apply_event(store_event(7, dp_rank, 1, &[], &[41], StorageTier::Device))
+                .await;
+            indexer
+                .apply_event(store_event(
+                    7,
+                    dp_rank,
+                    2,
+                    &[41],
+                    &[42],
+                    StorageTier::HostPinned,
+                ))
+                .await;
+        }
+
+        indexer
+            .reset_worker_dp_rank_and_wait(reset_rank.worker_id, reset_rank.dp_rank)
+            .await
+            .unwrap();
+
+        let matches = indexer
+            .find_matches_by_tier(vec![LocalBlockHash(41), LocalBlockHash(42)])
+            .await
+            .unwrap();
+        assert!(
+            !matches
+                .device
+                .overlap_scores
+                .scores
+                .contains_key(&reset_rank)
+        );
+        assert_eq!(
+            matches.device.overlap_scores.scores.get(&retained_rank),
+            Some(&1)
+        );
+        let host_hits = &matches
+            .lower_tier
+            .get(&StorageTier::HostPinned)
+            .unwrap()
+            .hits;
+        assert!(!host_hits.contains_key(&reset_rank));
+        assert_eq!(host_hits.get(&retained_rank), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn single_thread_rank_reset_waits_for_all_local_tiers() {
+        assert_rank_reset_is_acknowledged(make_test_indexer()).await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_rank_reset_waits_for_all_local_tiers() {
+        assert_rank_reset_is_acknowledged(make_test_concurrent_indexer()).await;
     }
 
     #[tokio::test]
@@ -1021,6 +749,8 @@ mod tests {
     #[tokio::test]
     async fn concurrent_records_hashed_routing_decision() {
         let indexer = make_test_concurrent_approx_indexer();
+        assert!(indexer.records_routing_decisions());
+
         let worker = WorkerWithDpRank::new(7, 0);
         let tokens = vec![1, 2, 3, 4];
         let block_hashes = compute_block_hash_for_seq(&tokens, 4, BlockHashOptions::default());
@@ -1034,6 +764,53 @@ mod tests {
 
         let matches = indexer.find_matches_by_tier(block_hashes).await.unwrap();
         assert_eq!(matches.device.overlap_scores.scores.get(&worker), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn concurrent_records_precomputed_routing_hashes() {
+        let indexer = make_test_concurrent_approx_indexer();
+        assert!(indexer.records_routing_decisions());
+
+        let worker = WorkerWithDpRank::new(7, 0);
+        let local_hashes = vec![LocalBlockHash(91), LocalBlockHash(92)];
+        let sequence_hashes = compute_seq_hash_for_block(&local_hashes);
+        indexer
+            .record_routing_decision_hashes(
+                worker,
+                RoutingDecisionHashes {
+                    local_hashes: local_hashes.clone(),
+                    sequence_hashes,
+                },
+            )
+            .await
+            .unwrap();
+        flush_indexer(&indexer).await;
+
+        let matches = indexer.find_matches_by_tier(local_hashes).await.unwrap();
+        assert_eq!(matches.device.overlap_scores.scores.get(&worker), Some(&2));
+    }
+
+    #[tokio::test]
+    async fn event_driven_primary_without_side_skips_route_recording() {
+        let indexer = make_test_indexer();
+        assert!(!indexer.records_routing_decisions());
+
+        let worker = WorkerWithDpRank::new(7, 0);
+        let tokens = vec![1, 2, 3, 4];
+        let block_hashes = compute_block_hash_for_seq(&tokens, 4, BlockHashOptions::default());
+        let mut tokens_with_hashes = TokensWithHashes::new(tokens, 4);
+
+        indexer
+            .process_routing_decision_for_request(&mut tokens_with_hashes, worker)
+            .await
+            .unwrap();
+        flush_indexer(&indexer).await;
+
+        let matches = indexer.find_matches_by_tier(block_hashes).await.unwrap();
+        assert!(
+            !matches.device.overlap_scores.scores.contains_key(&worker),
+            "event-driven primary without side overlay should rely on KV events, not route-time writes"
+        );
     }
 
     #[tokio::test]
@@ -1060,7 +837,9 @@ mod tests {
             primary,
             lower_tier: LowerTierIndexers::new(2, 4),
             approx: Some(super::SideIndexer::Concurrent(side)),
+            primary_records_routing_decisions: false,
         };
+        assert!(indexer.records_routing_decisions());
 
         let primary_worker = WorkerWithDpRank::new(10, 0);
         let side_only_worker = WorkerWithDpRank::new(20, 0);
@@ -1170,6 +949,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn borrowed_tiered_lookup_matches_owned_with_lower_tier_and_side_overlay() {
+        let primary = Arc::new(ThreadPoolIndexer::new(
+            ConcurrentRadixTreeCompressed::new(),
+            2,
+            4,
+        ));
+        let side = Arc::new(ThreadPoolIndexer::new_with_pruning(
+            ConcurrentRadixTreeCompressed::new(),
+            1,
+            4,
+            PruneConfig {
+                ttl: Duration::from_secs(60),
+            },
+        ));
+        let side_for_flush = side.clone();
+        let indexer = Indexer::Concurrent {
+            primary,
+            lower_tier: LowerTierIndexers::new(2, 4),
+            approx: Some(super::SideIndexer::Concurrent(side)),
+            primary_records_routing_decisions: false,
+        };
+
+        let primary_worker = WorkerWithDpRank::new(10, 0);
+        let side_worker = WorkerWithDpRank::new(20, 0);
+        indexer
+            .apply_event(store_event(10, 0, 1, &[], &[11, 12], StorageTier::Device))
+            .await;
+        indexer
+            .apply_event(store_event(
+                10,
+                0,
+                2,
+                &[11, 12],
+                &[13],
+                StorageTier::HostPinned,
+            ))
+            .await;
+
+        let side_hashes = vec![LocalBlockHash(11), LocalBlockHash(12), LocalBlockHash(13)];
+        indexer
+            .record_routing_decision_hashes(
+                side_worker,
+                RoutingDecisionHashes {
+                    local_hashes: side_hashes.clone(),
+                    sequence_hashes: compute_seq_hash_for_block(&side_hashes),
+                },
+            )
+            .await
+            .unwrap();
+        flush_indexer(&indexer).await;
+        side_for_flush.flush().await;
+
+        let query = vec![LocalBlockHash(11), LocalBlockHash(12), LocalBlockHash(13)];
+        let borrowed = indexer.find_matches_by_tier_ref(&query).await.unwrap();
+        let owned = indexer.find_matches_by_tier(query).await.unwrap();
+
+        assert_eq!(
+            borrowed.device.overlap_scores.scores,
+            owned.device.overlap_scores.scores
+        );
+        assert_eq!(
+            borrowed
+                .lower_tier
+                .get(&StorageTier::HostPinned)
+                .map(|tier| &tier.hits),
+            owned
+                .lower_tier
+                .get(&StorageTier::HostPinned)
+                .map(|tier| &tier.hits)
+        );
+        assert_eq!(
+            borrowed
+                .device
+                .overlap_scores
+                .scores
+                .get(&primary_worker)
+                .copied(),
+            Some(2)
+        );
+        assert_eq!(
+            borrowed
+                .device
+                .overlap_scores
+                .scores
+                .get(&side_worker)
+                .copied(),
+            Some(3)
+        );
+    }
+
+    #[tokio::test]
     async fn concurrent_tiered_query_seeds_lower_tier_only_workers_without_affecting_device_scores()
     {
         let indexer = make_test_concurrent_indexer();
@@ -1238,89 +1108,30 @@ mod tests {
         let indexer = make_test_concurrent_indexer();
         let worker = WorkerWithDpRank::new(7, 0);
 
-        // Worker has the same blocks in both device and host-pinned storage.
+        // Device owns the prefix block; host-pinned extends it by one block.
         indexer
-            .apply_event(store_event(
-                7,
-                0,
-                1,
-                &[],
-                &[11, 12, 13],
-                StorageTier::Device,
-            ))
+            .apply_event(store_event(7, 0, 1, &[], &[41], StorageTier::Device))
             .await;
         indexer
-            .apply_event(store_event(
-                7,
-                0,
-                2,
-                &[],
-                &[11, 12, 13],
-                StorageTier::HostPinned,
-            ))
+            .apply_event(store_event(7, 0, 2, &[41], &[42], StorageTier::HostPinned))
             .await;
         flush_indexer(&indexer).await;
 
         let matches = indexer
-            .find_matches_by_tier(vec![
-                LocalBlockHash(11),
-                LocalBlockHash(12),
-                LocalBlockHash(13),
-            ])
+            .find_matches_by_tier(vec![LocalBlockHash(41), LocalBlockHash(42)])
             .await
             .unwrap();
 
-        // Device overlap should be 3 blocks.
-        assert_eq!(matches.device.overlap_scores.scores.get(&worker), Some(&3));
+        assert_eq!(matches.device.overlap_scores.scores.get(&worker), Some(&1));
 
-        // Lower-tier must NOT report additional hits for the same worker
-        // whose blocks are already fully accounted for in the device tier.
         let host_hits = matches
             .lower_tier
             .get(&StorageTier::HostPinned)
             .and_then(|tier| tier.hits.get(&worker).copied())
             .unwrap_or(0);
         assert_eq!(
-            host_hits, 0,
-            "lower-tier should not double-count blocks already matched in device tier \
-             (got {host_hits} host-pinned hits for a worker with full device overlap)"
-        );
-    }
-
-    #[tokio::test]
-    async fn concurrent_remove_worker_removes_lower_tier_state() {
-        let indexer = make_test_concurrent_indexer();
-        let worker = WorkerWithDpRank::new(20, 0);
-
-        indexer
-            .apply_event(store_event(20, 0, 1, &[], &[31], StorageTier::HostPinned))
-            .await;
-        flush_indexer(&indexer).await;
-
-        let before = indexer
-            .find_matches_by_tier(vec![LocalBlockHash(31)])
-            .await
-            .unwrap();
-        assert_eq!(
-            before
-                .lower_tier
-                .get(&StorageTier::HostPinned)
-                .and_then(|tier| tier.hits.get(&worker)),
-            Some(&1)
-        );
-
-        indexer.remove_worker(20).await;
-        flush_indexer(&indexer).await;
-
-        let after = indexer
-            .find_matches_by_tier(vec![LocalBlockHash(31)])
-            .await
-            .unwrap();
-        assert!(
-            !after
-                .lower_tier
-                .get(&StorageTier::HostPinned)
-                .is_some_and(|tier| tier.hits.contains_key(&worker))
+            host_hits, 1,
+            "lower-tier should extend the device prefix without double-counting it"
         );
     }
 }

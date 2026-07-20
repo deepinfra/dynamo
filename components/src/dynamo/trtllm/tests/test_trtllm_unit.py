@@ -4,7 +4,9 @@
 """Unit tests for TRTLLM backend components."""
 
 import asyncio
+import os
 import re
+import warnings
 from pathlib import Path
 from unittest import mock
 
@@ -19,7 +21,7 @@ if not torch.cuda.is_available():
     )
 
 from dynamo.trtllm.args import Config, parse_args
-from dynamo.trtllm.constants import Modality
+from dynamo.trtllm.constants import DisaggregationMode, Modality
 from dynamo.trtllm.tests.conftest import make_cli_args_fixture
 from dynamo.trtllm.utils.trtllm_utils import deep_update, warn_override_collisions
 from dynamo.trtllm.workers.llm_worker import init_llm_worker
@@ -37,6 +39,7 @@ pytestmark = [
     pytest.mark.trtllm,
     pytest.mark.gpu_1,
     pytest.mark.pre_merge,
+    pytest.mark.profiled_vram_gib(0),
 ]
 
 
@@ -114,6 +117,72 @@ def test_config_use_kv_events_derived_from_publish_events(monkeypatch):
     assert config_off.use_kv_events is False
 
 
+def test_deprecated_publish_events_flag_alias_maps_and_logs(monkeypatch, caplog):
+    """The deprecated --publish-events-and-metrics alias must still map to
+    publish_events_and_metrics AND surface its deprecation notice on the log
+    stream, which is visible under CPython's default warning filters (a bare
+    warnings.warn(DeprecationWarning) from library code is not)."""
+    monkeypatch.delenv("DYN_TRTLLM_PUBLISH_KV_EVENTS", raising=False)
+    monkeypatch.delenv("DYN_TRTLLM_PUBLISH_EVENTS_AND_METRICS", raising=False)
+    with caplog.at_level("WARNING"), pytest.warns(
+        DeprecationWarning, match="--publish-events-and-metrics is deprecated"
+    ):
+        config = parse_args(["--publish-events-and-metrics"])
+    assert config.publish_events_and_metrics is True
+    assert config.use_kv_events is True
+    assert any(
+        "--publish-events-and-metrics is deprecated" in r.message
+        for r in caplog.records
+    )
+
+
+def test_deprecated_publish_events_env_alias_maps_and_logs(monkeypatch, caplog):
+    """The deprecated DYN_TRTLLM_PUBLISH_EVENTS_AND_METRICS env var must still
+    map to the new env var AND surface its deprecation notice on the log
+    stream."""
+    # parse_args copies the deprecated env var into the new one via a direct
+    # os.environ write. Swap in a throwaway copy so monkeypatch restores the real
+    # environment on teardown and that write does not leak into later tests.
+    monkeypatch.setattr(os, "environ", os.environ.copy())
+    monkeypatch.delenv("DYN_TRTLLM_PUBLISH_KV_EVENTS", raising=False)
+    monkeypatch.setenv("DYN_TRTLLM_PUBLISH_EVENTS_AND_METRICS", "true")
+    with caplog.at_level("WARNING"), pytest.warns(
+        DeprecationWarning, match="DYN_TRTLLM_PUBLISH_EVENTS_AND_METRICS is deprecated"
+    ):
+        config = parse_args([])
+    assert config.publish_events_and_metrics is True
+    assert config.use_kv_events is True
+    assert os.environ["DYN_TRTLLM_PUBLISH_KV_EVENTS"] == "true"
+    assert any(
+        "DYN_TRTLLM_PUBLISH_EVENTS_AND_METRICS is deprecated" in r.message
+        for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_init_llm_worker_rejects_invalid_kv_cache_config_override(monkeypatch):
+    monkeypatch.delenv("DYN_TRTLLM_OVERRIDE_ENGINE_ARGS", raising=False)
+    monkeypatch.delenv("DYN_TRTLLM_PUBLISH_KV_EVENTS", raising=False)
+    config = parse_args(
+        [
+            "--model",
+            "fake-model",
+            "--publish-kv-events",
+            "--override-engine-args",
+            '{"kv_cache_config": []}',
+        ]
+    )
+
+    with pytest.raises(
+        TypeError, match="kv_cache_config must be a dict or KvCacheConfig, got list"
+    ):
+        await init_llm_worker(
+            runtime=mock.MagicMock(),
+            config=config,
+            shutdown_event=asyncio.Event(),
+        )
+
+
 def test_config_has_connector(monkeypatch):
     """Config.has_connector returns True only for the single configured connector."""
     monkeypatch.delenv("DYN_CONNECTOR", raising=False)
@@ -134,6 +203,84 @@ def test_config_multiple_connectors_fails(monkeypatch):
         match="TRT-LLM supports at most one connector entry. Use `--connector none` or `--connector kvbm`.",
     ):
         parse_args(["--connector", "none", "kvbm"])
+
+
+def test_enable_multimodal_maps_to_multimodal_modality():
+    config = parse_args(["--model", "fake-model", "--enable-multimodal"])
+
+    assert config.enable_multimodal is True
+    assert config.modality == Modality.MULTIMODAL
+
+
+def test_modality_multimodal_alias_does_not_warn():
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        config = parse_args(["--model", "fake-model", "--modality", "multimodal"])
+
+    assert config.enable_multimodal is True
+    assert config.modality == Modality.MULTIMODAL
+    assert not [
+        warning
+        for warning in caught
+        if issubclass(warning.category, DeprecationWarning)
+    ]
+
+
+def test_disaggregation_mode_accepts_canonical_agg():
+    config = parse_args(["--model", "fake-model", "--disaggregation-mode", "agg"])
+
+    assert config.disaggregation_mode == DisaggregationMode.AGGREGATED
+    assert config.component == "backend"
+
+
+def test_disaggregation_mode_accepts_pd_alias():
+    config = parse_args(["--model", "fake-model", "--disaggregation-mode", "pd"])
+
+    assert config.disaggregation_mode == DisaggregationMode.AGGREGATED
+    assert config.component == "backend"
+
+
+def test_disaggregation_mode_legacy_aggregated_value_warns():
+    with pytest.warns(DeprecationWarning, match="prefill_and_decode"):
+        config = parse_args(
+            ["--model", "fake-model", "--disaggregation-mode", "prefill_and_decode"]
+        )
+
+    assert config.disaggregation_mode == DisaggregationMode.AGGREGATED
+
+
+def test_conversation_affinity_cli_flag(monkeypatch):
+    """--conversation-affinity sets conversation_affinity=True in Config."""
+    monkeypatch.delenv("DYN_ENGINE_CONV_AFFINITY", raising=False)
+    config = parse_args(["--model", "fake-model", "--conversation-affinity"])
+    assert config.conversation_affinity is True
+
+
+def test_conversation_affinity_env_var(monkeypatch):
+    """DYN_ENGINE_CONV_AFFINITY=true is read and sets conversation_affinity=True."""
+    monkeypatch.setenv("DYN_ENGINE_CONV_AFFINITY", "true")
+    config = parse_args(["--model", "fake-model"])
+    assert config.conversation_affinity is True
+
+
+def test_conversation_affinity_defaults_false(monkeypatch):
+    """conversation_affinity defaults to False when neither flag nor env var is set."""
+    monkeypatch.delenv("DYN_ENGINE_CONV_AFFINITY", raising=False)
+    config = parse_args(["--model", "fake-model"])
+    assert config.conversation_affinity is False
+
+
+def test_enable_multimodal_rejects_diffusion_modality():
+    with pytest.raises(ValueError, match="--enable-multimodal cannot be combined"):
+        parse_args(
+            [
+                "--model",
+                "fake-model",
+                "--enable-multimodal",
+                "--modality",
+                "video_diffusion",
+            ]
+        )
 
 
 # ---- Tests for trtllm_utils.deep_update ----

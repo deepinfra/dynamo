@@ -25,6 +25,7 @@ import pytest
 import requests
 
 from tests.conftest import EtcdServer, NatsServer
+from tests.utils.gpu_args import build_trtllm_override_args
 from tests.utils.managed_process import ManagedProcess
 from tests.utils.payloads import check_models_api
 from tests.utils.port_utils import allocate_ports
@@ -43,7 +44,6 @@ SINGLE_IMAGE_TOTAL_BLOCKS_RANGE = (20, 260)
 
 pytestmark = [
     pytest.mark.e2e,
-    pytest.mark.pre_merge,
     pytest.mark.trtllm,
     pytest.mark.multimodal,
     pytest.mark.gpu_1,
@@ -115,12 +115,16 @@ class TRTLLMWorkerProcess(ManagedProcess):
                 "--publish-events-and-metrics",
                 "--kv-block-size",
                 str(BLOCK_SIZE),
+                *build_trtllm_override_args(),
             ],
             env=_make_process_env(DYN_SYSTEM_PORT=str(system_port)),
             health_check_urls=[
                 (f"http://localhost:{system_port}/health", _check_ready)
             ],
-            timeout=900,
+            # Worker load + engine warmup is ~150-180s with the token-capped KV
+            # pool; 360 keeps ~2x margin for slow runners without bloating the
+            # test-level timeout budget.
+            timeout=360,
             straggler_commands=["-m dynamo.trtllm"],
             log_dir=_prepare_log_dir(request, "trtllm-worker"),
             **_COMMON_PROCESS_KWARGS,
@@ -279,9 +283,46 @@ def _send_request_get_overlap(
     return overlap, total, recent_logs
 
 
+@pytest.mark.pre_merge
+# Cap the KV pool with the token-based lever (the codebase-standard control for
+# TRT-LLM KV tests; every passing serve/router trtllm test uses it). This bounds
+# the worker's KV allocation to a fixed size independent of free GPU memory,
+# unlike the byte-based requested_trtllm_vram_gib -> max_gpu_total_bytes path,
+# which combines with TRT-LLM's greedy free_gpu_memory_fraction=0.9 default and
+# lets the worker's startup footprint balloon toward the full card. On a 22 GiB
+# GPU shared with concurrently-scheduled fillers that pushed a ~20 GiB peak, that
+# tipped over into an OOM-shaped worker exit during startup (OPS-7716). 32768
+# tokens (1024 blocks) is ~2x the worst-case single request (~520 blocks /
+# 16640 tokens per THREE_IMAGE_TOTAL_BLOCKS_RANGE), leaving ample reuse headroom.
+@pytest.mark.profiled_vram_gib(12.0)  # measured device peak ~11 GiB w/ token cap
+@pytest.mark.requested_trtllm_kv_tokens(32768)
+# ~3x the measured deterministic runtime (~311s w/ the token cap, at 8 and 16
+# slots). Clears the worst-case fixture startup budget (worker 360 + router 240
+# + frontend 240) plus the ~150s of scenarios.
+@pytest.mark.timeout(960)
+def test_trtllm_mm_overlap_all(start_trtllm_mm_services, predownload_models):
+    """Run all TRT-LLM MM overlap scenarios under one worker startup."""
+    _check_text_only_overlap_repeated_prompt(
+        start_trtllm_mm_services, predownload_models
+    )
+    _check_repeated_three_images(start_trtllm_mm_services, predownload_models)
+    _check_repeated_single_image(start_trtllm_mm_services, predownload_models)
+    _check_repeated_two_identical_images(start_trtllm_mm_services, predownload_models)
+    _check_staircase_single_to_double_to_triple_identical_image(
+        start_trtllm_mm_services, predownload_models
+    )
+    _check_diff_images_less_than_same(start_trtllm_mm_services, predownload_models)
+    _check_same_images_different_prompt_less_than_same_prompt(
+        start_trtllm_mm_services, predownload_models
+    )
+    _check_swapped_order_less_than_same_order(
+        start_trtllm_mm_services, predownload_models
+    )
+
+
 @pytest.mark.timeout(1800)
 @pytest.mark.nightly
-def test_trtllm_text_only_overlap_repeated_prompt(
+def _check_text_only_overlap_repeated_prompt(
     start_trtllm_mm_services, predownload_models
 ):
     """Text-only routing should increase overlap on repeat and then stabilize."""
@@ -327,9 +368,7 @@ def test_trtllm_text_only_overlap_repeated_prompt(
 
 @pytest.mark.timeout(1800)
 @pytest.mark.nightly
-def test_trtllm_mm_overlap_repeated_three_images(
-    start_trtllm_mm_services, predownload_models
-):
+def _check_repeated_three_images(start_trtllm_mm_services, predownload_models):
     """For repeated same 3-image request: low first overlap, then increase, then stable."""
     frontend_port, router_proc = start_trtllm_mm_services
 
@@ -370,9 +409,7 @@ def test_trtllm_mm_overlap_repeated_three_images(
 
 @pytest.mark.timeout(1800)
 @pytest.mark.nightly
-def test_trtllm_mm_overlap_repeated_single_image(
-    start_trtllm_mm_services, predownload_models
-):
+def _check_repeated_single_image(start_trtllm_mm_services, predownload_models):
     """For repeated same single-image request: low first overlap, then increase, then stable."""
     frontend_port, router_proc = start_trtllm_mm_services
 
@@ -413,9 +450,7 @@ def test_trtllm_mm_overlap_repeated_single_image(
 
 @pytest.mark.timeout(1800)
 @pytest.mark.nightly
-def test_trtllm_mm_overlap_repeated_two_identical_images(
-    start_trtllm_mm_services, predownload_models
-):
+def _check_repeated_two_identical_images(start_trtllm_mm_services, predownload_models):
     """For repeated same two-identical-image request: low first overlap, then increase, then stable."""
     frontend_port, router_proc = start_trtllm_mm_services
 
@@ -454,7 +489,7 @@ def test_trtllm_mm_overlap_repeated_two_identical_images(
 
 @pytest.mark.timeout(1800)
 @pytest.mark.nightly
-def test_trtllm_mm_overlap_staircase_single_to_double_to_triple_identical_image(
+def _check_staircase_single_to_double_to_triple_identical_image(
     start_trtllm_mm_services, predownload_models
 ):
     """Single->double->triple identical image requests follow prefix-overlap semantics."""
@@ -509,9 +544,7 @@ def test_trtllm_mm_overlap_staircase_single_to_double_to_triple_identical_image(
 
 @pytest.mark.timeout(1800)
 @pytest.mark.nightly
-def test_trtllm_mm_overlap_diff_images_less_than_same(
-    start_trtllm_mm_services, predownload_models
-):
+def _check_diff_images_less_than_same(start_trtllm_mm_services, predownload_models):
     """Different images should produce lower overlap than repeated identical images."""
     frontend_port, router_proc = start_trtllm_mm_services
     baseline_payload = _build_payload(
@@ -565,7 +598,7 @@ def test_trtllm_mm_overlap_diff_images_less_than_same(
 
 @pytest.mark.timeout(1800)
 @pytest.mark.nightly
-def test_trtllm_mm_overlap_same_images_different_prompt_less_than_same_prompt(
+def _check_same_images_different_prompt_less_than_same_prompt(
     start_trtllm_mm_services, predownload_models
 ):
     """Same images but different prompt should produce lower overlap than repeated same prompt."""
@@ -627,7 +660,7 @@ def test_trtllm_mm_overlap_same_images_different_prompt_less_than_same_prompt(
 
 @pytest.mark.timeout(1800)
 @pytest.mark.nightly
-def test_trtllm_mm_overlap_swapped_order_less_than_same_order(
+def _check_swapped_order_less_than_same_order(
     start_trtllm_mm_services, predownload_models
 ):
     """Swapping order of three distinct images should result in near-zero overlap."""

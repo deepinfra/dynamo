@@ -16,6 +16,7 @@
 """Tests for ImageLoader in-flight dedup, cancellation, and error contract."""
 
 import asyncio
+import base64
 from io import BytesIO
 from unittest.mock import AsyncMock, patch
 
@@ -23,8 +24,8 @@ import pytest
 from PIL import Image
 
 from dynamo.common.http import HttpStatusError, HttpTimeoutError
-from dynamo.common.http.url_validator import UrlValidationPolicy
-from dynamo.common.multimodal.image_loader import ImageLoader
+from dynamo.common.http.url_validator import UrlValidationError, UrlValidationPolicy
+from dynamo.common.multimodal.image_loader import URL_VARIANT_KEY, ImageLoader
 
 pytestmark = [
     pytest.mark.asyncio,
@@ -222,6 +223,86 @@ async def test_cache_hit_skips_fetch(loader: ImageLoader) -> None:
 
     result = await loader.load_image("https://example.com/img.png")
     assert result is img
+
+
+def _make_svg_bytes() -> bytes:
+    return b"<svg xmlns='http://www.w3.org/2000/svg' width='10' height='10'/>"
+
+
+async def test_unsupported_format_url_raises_415(loader: ImageLoader) -> None:
+    """Fetching a URL that returns an unsupported image format (e.g. SVG) should raise
+    HttpStatusError with status 415, not 500."""
+    mock_fetch = _mock_fetch_bytes(content=_make_svg_bytes())
+    with patch(_FETCH_BYTES_PATH, mock_fetch):
+        with pytest.raises(HttpStatusError) as exc_info:
+            await loader.load_image("https://example.com/image.svg")
+        assert exc_info.value.status == 415
+
+
+async def test_unsupported_format_data_url_raises_415(loader: ImageLoader) -> None:
+    """A data: URL carrying an SVG payload should raise HttpStatusError 415."""
+    svg_b64 = base64.b64encode(_make_svg_bytes()).decode()
+    with pytest.raises(HttpStatusError) as exc_info:
+        await loader.load_image(f"data:image/svg+xml;base64,{svg_b64}")
+    assert exc_info.value.status == 415
+
+
+async def test_unsupported_format_batch_url_raises_415(loader: ImageLoader) -> None:
+    """The batch path must preserve the 415 status instead of collapsing it into a
+    generic Exception. This is the path the frontend actually drives, so the status
+    has to survive load_image_batch's exception aggregation."""
+    mock_fetch = _mock_fetch_bytes(content=_make_svg_bytes())
+    with patch(_FETCH_BYTES_PATH, mock_fetch):
+        with pytest.raises(HttpStatusError) as exc_info:
+            await loader.load_image_batch(
+                [{URL_VARIANT_KEY: "https://example.com/image.svg"}]
+            )
+        assert exc_info.value.status == 415
+
+
+async def test_unsupported_format_batch_data_url_raises_415(
+    loader: ImageLoader,
+) -> None:
+    """The batch path must preserve the 415 status for data: URLs as well."""
+    svg_b64 = base64.b64encode(_make_svg_bytes()).decode()
+    with pytest.raises(HttpStatusError) as exc_info:
+        await loader.load_image_batch(
+            [{URL_VARIANT_KEY: f"data:image/svg+xml;base64,{svg_b64}"}]
+        )
+    assert exc_info.value.status == 415
+
+
+# --- SSRF / URL-validation error contract ---
+
+
+# Cloud metadata IP (link-local) -- the canonical SSRF target; rejected as a
+# blocked IP literal before any DNS/connect, so this test makes no network call.
+_METADATA_IP_URL = "https://169.254.169.254/latest/meta-data/"
+
+
+async def test_ssrf_blocked_batch_url_raises_url_validation_error() -> None:
+    """An SSRF-blocked URL must escape load_image_batch as UrlValidationError (a
+    ValueError -> 4xx), not the bare Exception the aggregator used to raise (500)."""
+    strict_loader = ImageLoader(
+        cache_size=4, http_timeout=30.0, url_policy=UrlValidationPolicy()
+    )
+    with pytest.raises(UrlValidationError, match="blocked range"):
+        await strict_loader.load_image_batch([{URL_VARIANT_KEY: _METADATA_IP_URL}])
+
+
+async def test_url_validation_error_from_fetch_preserved(
+    loader: ImageLoader,
+) -> None:
+    """A UrlValidationError raised mid-fetch (redirect revalidation) must survive
+    _fetch_and_process's except branch, not be flattened to a plain ValueError."""
+    mock_fetch = _mock_fetch_bytes(
+        side_effect=UrlValidationError("Too many redirects (max=3)")
+    )
+    with patch(_FETCH_BYTES_PATH, mock_fetch):
+        with pytest.raises(UrlValidationError, match="Too many redirects"):
+            await loader.load_image_batch(
+                [{URL_VARIANT_KEY: "https://example.com/img.png"}]
+            )
 
 
 async def test_cache_is_lru_not_fifo(loader: ImageLoader) -> None:

@@ -220,6 +220,9 @@ impl PerfModel {
     /// - Aiconfigurator: passes (batch_size, isl - prefix, prefix) to the AIC SDK
     pub fn predict_prefill_time(&self, batch_size: usize, isl: usize, prefix: usize) -> f64 {
         let new_tokens_per_req = isl.saturating_sub(prefix);
+        if batch_size == 0 || new_tokens_per_req == 0 {
+            return 0.0;
+        }
         let time = match self {
             PerfModel::Polynomial => {
                 // Total tokens across the batch — GPU processes them in parallel
@@ -276,5 +279,36 @@ impl PerfModel {
             "Decode time prediction: batch_size={batch_size}, active_kv_tokens={active_kv_tokens}, context_length={context_length}, time={result:.2}ms"
         );
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AicCallback, PerfModel};
+    use std::sync::Arc;
+
+    struct EchoBatchCallback;
+
+    impl AicCallback for EchoBatchCallback {
+        fn predict_prefill(&self, batch_size: usize, _effective_isl: usize, _prefix: usize) -> f64 {
+            batch_size as f64
+        }
+
+        fn predict_decode(&self, batch_size: usize, _isl: usize, _osl: usize) -> f64 {
+            batch_size as f64
+        }
+    }
+
+    #[test]
+    fn fully_cached_prompt_skips_prefill() {
+        assert_eq!(PerfModel::default().predict_prefill_time(1, 128, 128), 0.0);
+    }
+
+    #[test]
+    fn aic_forwards_scheduler_local_batch() {
+        let model = PerfModel::from_aic_callback(Arc::new(EchoBatchCallback));
+
+        assert_eq!(model.predict_prefill_time(7, 128, 0), 7.0);
+        assert_eq!(model.predict_decode_time(9, 0, 128, 0), 9.0);
     }
 }

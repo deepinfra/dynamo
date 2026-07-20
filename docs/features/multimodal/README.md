@@ -36,15 +36,16 @@ Dynamo provides support for improving latency and throughput for vision-and-lang
 |---------|-------------|
 | **[Embedding Cache](embedding-cache.md)** | CPU-side LRU cache that skips re-encoding repeated images |
 | **[Encoder Disaggregation](encoder-disaggregation.md)** | Separate vision encoder worker for independent scaling |
+| **[Custom Vision Encoders](custom-vision-encoder.md)** | In-process author-provided vision towers with cross-request batching |
 | **[Multimodal KV Routing](multimodal-kv-routing.md)** | MM-aware KV cache routing for optimal worker selection |
 
 ## Support Matrix
 
 | Stack | Image | Video | Audio |
 |-------|-------|-------|-------|
-| **[vLLM](https://github.com/ai-dynamo/dynamo/blob/main/docs/features/multimodal/multimodal-vllm.md)** | ✅ | 🧪  | 🧪 |
-| **[TRT-LLM](https://github.com/ai-dynamo/dynamo/blob/main/docs/features/multimodal/multimodal-trtllm.md)** | ✅ | ❌ | ❌ |
-| **[SGLang](https://github.com/ai-dynamo/dynamo/blob/main/docs/features/multimodal/multimodal-sglang.md)** | ✅ | 🧪 | ❌ |
+| **[vLLM](multimodal-vllm.md)** | ✅ | 🧪  | 🧪 |
+| **[TRT-LLM](multimodal-trtllm.md)** | ✅ | ❌ | ❌ |
+| **[SGLang](multimodal-sglang.md)** | ✅ | 🧪 | ❌ |
 
 **Status:** ✅ Supported | 🧪 Experimental | ❌ Not supported
 
@@ -79,6 +80,6 @@ Reference implementations for deploying multimodal models:
 
 Detailed deployment guides, configuration, and examples for each backend:
 
-- **[vLLM Multimodal](https://github.com/ai-dynamo/dynamo/blob/main/docs/features/multimodal/multimodal-vllm.md)**
-- **[TensorRT-LLM Multimodal](https://github.com/ai-dynamo/dynamo/blob/main/docs/features/multimodal/multimodal-trtllm.md)**
-- **[SGLang Multimodal](https://github.com/ai-dynamo/dynamo/blob/main/docs/features/multimodal/multimodal-sglang.md)**
+- **[vLLM Multimodal](multimodal-vllm.md)**
+- **[TensorRT-LLM Multimodal](multimodal-trtllm.md)**
+- **[SGLang Multimodal](multimodal-sglang.md)**

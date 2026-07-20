@@ -19,7 +19,7 @@ The request plane is the transport layer that handles communication between Dyna
 
 | Request Plane | Suitable For | Characteristics |
 |--------------|----------|-----------------|
-| **NATS** | Production deployments with KV routing | Requires NATS infrastructure, provides pub/sub patterns, highest flexibility |
+| **NATS** | Deployments that choose brokered request transport | Requires NATS infrastructure, provides pub/sub patterns, highest flexibility |
 | **TCP** | Low-latency direct communication | Direct connections, minimal overhead |
 
 ## Request Plane vs KV Event Plane
@@ -27,16 +27,16 @@ The request plane is the transport layer that handles communication between Dyna
 Dynamo has **two independent communication planes**:
 
 - **Request plane** (**`DYN_REQUEST_PLANE`**): how **RPC requests** flow between components (frontend → router → worker), via `tcp`, or `nats`.
-- **KV event plane** (currently only **NATS** is supported): how **KV cache events** (and optional router replica sync) are distributed/persisted for KV-aware routing.
+- **KV event plane** (**`DYN_EVENT_PLANE`**): how **KV cache events** (and optional router replica sync) are distributed for KV-aware routing, via `nats` or `zmq`.
 
-**Note:** If you are using `tcp` request plane with KV events enabled on the router (the default router-side setting), NATS is automatically initialized. SGLang requires explicit `--kv-events-config` and TRT-LLM requires `--publish-events-and-metrics` to publish events. For vLLM, KV events are currently auto-configured when prefix caching is active (deprecated — use `--kv-events-config` explicitly to prepare for a future release where all backends will default to off). You can optionally configure `NATS_SERVER` environment variable (e.g., `NATS_SERVER=nats://nats-hostname:port`) to specify a custom NATS server; otherwise, it defaults to `localhost:4222`. To disable the router's KV event listener, use `--no-router-kv-events` on the frontend.
+**Note:** If you are using `tcp` request plane with KV events enabled on the router (the default router-side setting), the configured event plane is initialized independently. NATS-based event transport uses `NATS_SERVER` (default `nats://localhost:4222`), while ZMQ avoids external NATS infrastructure. SGLang requires explicit `--kv-events-config` and TRT-LLM requires `--publish-events-and-metrics` to publish events. For vLLM, KV events are currently auto-configured when prefix caching is active (deprecated — use `--kv-events-config` explicitly to prepare for a future release where all backends will default to off). To disable the router's KV event listener, use `--no-router-kv-events` on the frontend.
 
 Because they are independent, you can mix them.
 
 For example, a deployment with TCP request plane can use different KV event planes:
-- **JetStream KV events**: requests use TCP, KV routing still uses NATS JetStream + object store for persistence.
 - **NATS Core KV events (local indexer)**: requests use TCP, KV events use NATS Core pub/sub and persistence lives on workers.
-- **no KV events**: requests use TCP and KV routing runs without events (no NATS required, but no event-backed persistence).
+- **ZMQ KV events (local indexer)**: requests use TCP, KV events use direct ZMQ pub/sub, and persistence lives on workers.
+- **No KV events**: requests use TCP and KV routing predicts cache state from routing decisions.
 
 ## Configuration
 
@@ -101,7 +101,7 @@ Additional TCP-specific environment variables:
 
 ### Using NATS
 
-NATS provides durable jetstream messaging for request plane and can be used for KV events (and router replica sync).
+NATS provides a brokered request plane and can also carry KV events and router replica synchronization over NATS Core.
 
 **Prerequisites:**
 - NATS server must be running and accessible
@@ -118,8 +118,8 @@ DYN_REQUEST_PLANE=nats python -m dynamo.vllm --model Qwen/Qwen3-0.6B
 
 **When to use NATS:**
 - Production deployments with service discovery
-- KV-aware routing with accurate cache state tracking (requires NATS for event transport). Note: approximate mode (`--no-router-kv-events`) provides KV routing without NATS but with reduced accuracy.
-- Need for message replay and persistence features
+- Event-backed KV-aware routing when using NATS as the event transport. Note: ZMQ event transport and approximate mode (`--no-router-kv-events`) both provide KV routing without NATS, with approximate mode using predicted cache state.
+- Environments where brokered request routing is preferred
 
 Limitations:
 - NATS does not support payloads beyond 16MB (use TCP for larger payloads)
@@ -230,10 +230,10 @@ curl http://localhost:8000/v1/chat/completions \
 ### Latency
 
 - **TCP**: Lowest latency due to direct connections and binary serialization
-- **NATS**: Moderate latency due to nats jet stream persistence
+- **NATS**: Additional broker-hop latency
 
 
 ### Resource Usage
 
-- **TCP**: Minimal infrastructure (NATS required only if using KV events, disable router-side with `--no-router-kv-events`)
+- **TCP**: Minimal request-plane infrastructure. KV events use the configured event plane; NATS is needed only when `DYN_EVENT_PLANE=nats`, and router-side event consumption can be disabled with `--no-router-kv-events`.
 - **NATS**: Requires running NATS server (additional memory/CPU)

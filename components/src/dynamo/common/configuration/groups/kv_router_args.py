@@ -27,20 +27,21 @@ from dynamo.common.configuration.utils import (
 _KV_ROUTER_FIELDS: tuple[str, ...] = (
     "overlap_score_weight",
     "overlap_score_credit",
+    "overlap_score_credit_decay",
     "prefill_load_scale",
+    "host_cache_hit_weight",
+    "disk_cache_hit_weight",
     "router_temperature",
     "use_kv_events",
-    "durable_kv_events",
     "router_replica_sync",
     "router_track_active_blocks",
     "router_track_output_blocks",
     "router_assume_kv_reuse",
     "router_track_prefill_tokens",
     "router_prefill_load_model",
-    "router_snapshot_threshold",
-    "router_reset_states",
     "router_ttl_secs",
     "router_queue_threshold",
+    "router_policy_config",
     "router_event_threads",
     "router_queue_policy",
     "use_remote_indexer",
@@ -57,7 +58,6 @@ _DEPRECATED_OVERLAP_WEIGHT_MESSAGE = (
 _LOAD_AWARE_KWARG_OVERRIDES = {
     "overlap_score_credit": 0.0,
     "use_kv_events": False,
-    "durable_kv_events": False,
     "router_track_active_blocks": True,
     "router_assume_kv_reuse": False,
     "router_track_prefill_tokens": True,
@@ -106,20 +106,21 @@ class KvRouterConfigBase(ConfigBase):
 
     overlap_score_weight: Optional[float] = None
     overlap_score_credit: float
+    overlap_score_credit_decay: float
     prefill_load_scale: float
+    host_cache_hit_weight: float
+    disk_cache_hit_weight: float
     router_temperature: float
     use_kv_events: bool
-    durable_kv_events: bool
     router_replica_sync: bool
     router_track_active_blocks: bool
     router_track_output_blocks: bool
     router_assume_kv_reuse: bool
     router_track_prefill_tokens: bool
     router_prefill_load_model: str
-    router_snapshot_threshold: int
-    router_reset_states: bool
     router_ttl_secs: float
     router_queue_threshold: Optional[float]
+    router_policy_config: Optional[str] = None
     router_event_threads: int
     router_queue_policy: str
     use_remote_indexer: bool = False
@@ -158,7 +159,7 @@ class KvRouterArgGroup(ArgGroup):
                 "KV Router: Enable load-aware routing without cache-reuse signals. "
                 "On the frontend, this implies --router-mode kv. "
                 "This preset sets overlap_score_credit=0, disables KV events and "
-                "durable KV events, disables KV-reuse assumptions, enables active-block "
+                "KV-reuse assumptions, enables active-block "
                 "and prefill-token load tracking, and disables remote/shared cache indexers."
             ),
         )
@@ -169,11 +170,25 @@ class KvRouterArgGroup(ArgGroup):
             default=1.0,
             help=(
                 "KV Router: Credit multiplier for device-local prefix overlap. "
-                "Range: 0.0 to 1.0; higher values more strongly prefer KV cache reuse. "
-                "Use router-prefill-load-scale above 1.0 to weigh TTFT/prompt-side load more heavily."
+                "Must be finite and non-negative; values above 1.0 give device "
+                "overlap extra credit and can make the adjusted prefill cost negative."
             ),
             arg_type=float,
             dest="overlap_score_credit",
+        )
+        add_argument(
+            g,
+            flag_name="--router-kv-overlap-score-credit-decay",
+            env_var="DYN_ROUTER_KV_OVERLAP_SCORE_CREDIT_DECAY",
+            default=0.0,
+            help=(
+                "KV Router: Decay rate for device-local overlap credit as active "
+                "prefill load rises above the least-loaded eligible worker. "
+                "0 disables decay; 1 halves credit at one request-equivalent "
+                "of excess active prefill load."
+            ),
+            arg_type=float,
+            dest="overlap_score_credit_decay",
         )
         g.add_argument(
             "--router-kv-overlap-score-weight",
@@ -195,6 +210,33 @@ class KvRouterArgGroup(ArgGroup):
             ),
             arg_type=float,
             dest="prefill_load_scale",
+        )
+        add_argument(
+            g,
+            flag_name="--router-host-cache-hit-weight",
+            env_var="DYN_ROUTER_HOST_CACHE_HIT_WEIGHT",
+            default=0.75,
+            help=(
+                "KV Router: Credit multiplier for host-pinned (CPU offload) prefix overlap. "
+                "Range: 0.0 to 1.0; higher values more strongly prefer workers holding the "
+                "prefix in CPU-tier KV cache. Symmetric to --router-kv-overlap-score-credit "
+                "but applied to host_pinned tier overlap."
+            ),
+            arg_type=float,
+            dest="host_cache_hit_weight",
+        )
+        add_argument(
+            g,
+            flag_name="--router-disk-cache-hit-weight",
+            env_var="DYN_ROUTER_DISK_CACHE_HIT_WEIGHT",
+            default=0.25,
+            help=(
+                "KV Router: Credit multiplier for disk/lower-tier (e.g. NVMe-backed) prefix overlap. "
+                "Range: 0.0 to 1.0. Same semantics as --router-host-cache-hit-weight applied to "
+                "the disk tier."
+            ),
+            arg_type=float,
+            dest="disk_cache_hit_weight",
         )
         add_argument(
             g,
@@ -222,26 +264,12 @@ class KvRouterArgGroup(ArgGroup):
         )
         add_negatable_bool_argument(
             g,
-            flag_name="--router-durable-kv-events",
-            env_var="DYN_ROUTER_DURABLE_KV_EVENTS",
-            default=False,
-            help=(
-                "[Deprecated] KV Router: Enable durable KV events using NATS JetStream. "
-                "This option will be removed in a future release. The event-plane subscriber "
-                "(local_indexer mode) is now the recommended path."
-            ),
-            dest="durable_kv_events",
-            obsolete_flag="--durable-kv-events",
-        )
-        add_negatable_bool_argument(
-            g,
             flag_name="--router-replica-sync",
             env_var="DYN_ROUTER_REPLICA_SYNC",
             default=False,
             help=(
-                "KV Router: Enable replica synchronization across multiple router instances. "
-                "When true, routers will publish and subscribe to events to maintain "
-                "consistent state."
+                "KV Router: Enable best-effort active-sequence synchronization through "
+                "the Runtime event plane."
             ),
         )
         add_negatable_bool_argument(
@@ -308,24 +336,6 @@ class KvRouterArgGroup(ArgGroup):
         )
         add_argument(
             g,
-            flag_name="--router-snapshot-threshold",
-            env_var="DYN_ROUTER_SNAPSHOT_THRESHOLD",
-            default=1000000,
-            help="KV Router: Number of messages in stream before triggering a snapshot.",
-            arg_type=int,
-        )
-        add_negatable_bool_argument(
-            g,
-            flag_name="--router-reset-states",
-            env_var="DYN_ROUTER_RESET_STATES",
-            default=False,
-            help=(
-                "KV Router: Reset router state on startup, purging stream and object store. "
-                "WARNING: This can affect existing router replicas."
-            ),
-        )
-        add_argument(
-            g,
             flag_name="--router-ttl-secs",
             env_var="DYN_ROUTER_TTL_SECS",
             default=120.0,
@@ -339,13 +349,14 @@ class KvRouterArgGroup(ArgGroup):
             g,
             flag_name="--router-queue-threshold",
             env_var="DYN_ROUTER_QUEUE_THRESHOLD",
-            default=16.0,
+            default=None,
             help=(
                 "KV Router: Queue threshold fraction for prefill token capacity. "
                 "Requests are queued if all workers exceed this fraction of "
                 "max_num_batched_tokens. Must be >= 0. Use 0.0 for maximum "
-                "queueing sensitivity (queue as soon as any tokens are active). "
-                "Pass 'None' to disable router queueing. "
+                "queueing sensitivity (queue once every eligible worker has active "
+                "prefill load). "
+                "Unset by default; setting a numeric value enables router queueing. "
                 "Note (SGLang backend): when --max-prefill-tokens is not set, MDC's "
                 "max_num_batched_tokens falls back to max_total_num_tokens (the KV "
                 "cache pool size), not the per-step prefill window, which inflates "
@@ -353,6 +364,20 @@ class KvRouterArgGroup(ArgGroup):
                 "explicitly for predictable semantics, or use a smaller threshold."
             ),
             arg_type=nullable_float,
+        )
+        add_argument(
+            g,
+            flag_name="--router-policy-config",
+            env_var="DYN_ROUTER_POLICY_CONFIG",
+            default=None,
+            help=(
+                "KV Router: Startup-only YAML policy-family and cache-bucket "
+                "queue configuration. "
+                "When omitted, router_queue_threshold and router_queue_policy define "
+                "one synthetic policy class; queueing remains disabled unless "
+                "router_queue_threshold is set."
+            ),
+            arg_type=str,
         )
         add_argument(
             g,
