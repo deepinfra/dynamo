@@ -70,6 +70,11 @@ class DiffusionConfig:
     default_seconds: int = 4  # Default video duration when only fps is specified
     default_num_inference_steps: int = 50
     default_guidance_scale: float = 5.0
+    # Second-stage guidance (Wan 2.2 MoE low-noise expert) + the timestep boundary at
+    # which guidance switches from stage-1 to stage-2. None → pipeline/model default
+    # (i.e. single guidance). Set both to run Wan 2.2 dual guidance (e.g. 4.0 / 3.0 @ 0.875).
+    default_guidance_scale_2: Optional[float] = None
+    default_boundary_ratio: Optional[float] = None
 
     # ── Pipeline optimization config (maps to PipelineConfig) ──
     disable_torch_compile: bool = False

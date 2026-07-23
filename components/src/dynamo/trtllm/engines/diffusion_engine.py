@@ -224,6 +224,8 @@ class DiffusionEngine:
         num_images_per_prompt: int = 1,
         num_inference_steps: int = 50,
         guidance_scale: float = 5.0,
+        guidance_scale_2: Optional[float] = None,
+        boundary_ratio: Optional[float] = None,
         seed: Optional[int] = None,
     ) -> "MediaOutput":
         """Generate video/image frames from text prompt.
@@ -285,6 +287,18 @@ class DiffusionEngine:
             prompt=[prompt],
             params=params,
         )
+
+        # Wan 2.2 dual-guidance overrides. guidance_scale_2 / boundary_ratio are
+        # extra_param_specs that default to None (single guidance); set them explicitly
+        # here — before the spec-default merge below (setdefault won't clobber a value
+        # already present) — so goff (e.g. 4.0/3.0 @ boundary 0.875) actually takes effect.
+        if guidance_scale_2 is not None or boundary_ratio is not None:
+            if req.params.extra_params is None:
+                req.params.extra_params = {}
+            if guidance_scale_2 is not None:
+                req.params.extra_params["guidance_scale_2"] = guidance_scale_2
+            if boundary_ratio is not None:
+                req.params.extra_params["boundary_ratio"] = boundary_ratio
 
         # Replicate the TRTLLM's visual_gen executor's _merge_defaults: fill None fields in
         # req.params with pipeline-specific defaults (universal + extra_param
