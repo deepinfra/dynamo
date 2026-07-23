@@ -48,6 +48,20 @@ impl TcpClient {
             match TcpStream::connect(address).await {
                 Ok(socket) => {
                     socket.set_nodelay(true)?;
+                    // Keepalive + user-timeout so a stream whose peer vanishes
+                    // (pod killed, HTTP task aborted without closing) is reaped
+                    // by the kernel instead of sitting ESTABLISHED forever.
+                    // Leaked response-stream sockets exhaust the node-wide
+                    // ephemeral port range under hostNetwork (~28k tuples per
+                    // frontend endpoint) -> EADDRNOTAVAIL for all new streams.
+                    let sock_ref = socket2::SockRef::from(&socket);
+                    let keepalive = socket2::TcpKeepalive::new()
+                        .with_time(Duration::from_secs(60))
+                        .with_interval(Duration::from_secs(10))
+                        .with_retries(3);
+                    sock_ref.set_tcp_keepalive(&keepalive)?;
+                    #[cfg(target_os = "linux")]
+                    sock_ref.set_tcp_user_timeout(Some(Duration::from_secs(30)))?;
                     return Ok(socket);
                 }
                 Err(e) => {
@@ -588,13 +602,43 @@ async fn handle_writer(
             }
         };
 
-        if let Err(e) = framed_writer.send(msg).await {
-            tracing::trace!(
-                "failed to send message to network; possible disconnect: {:?}",
-                e
-            );
-            send_sentinel = false;
-            break;
+        // A peer that stops draining (cancelled HTTP task that keeps the
+        // socket open) fills the TCP window and parks this send forever,
+        // leaking the connection: keep it preemptible by cancellation and
+        // bound it with a hard timeout as a backstop.
+        tokio::select! {
+            biased;
+
+            _ = &mut killed => {
+                tracing::trace!("context kill signal received mid-send; shutting down");
+                send_sentinel = false;
+                break;
+            }
+
+            _ = &mut stopped => {
+                tracing::trace!("context stop signal received mid-send; shutting down");
+                send_sentinel = false;
+                break;
+            }
+
+            res = time::timeout(Duration::from_secs(60), framed_writer.send(msg)) => {
+                match res {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        tracing::trace!(
+                            "failed to send message to network; possible disconnect: {:?}",
+                            e
+                        );
+                        send_sentinel = false;
+                        break;
+                    }
+                    Err(_) => {
+                        tracing::warn!("send stalled for 60s; peer not draining, closing connection");
+                        send_sentinel = false;
+                        break;
+                    }
+                }
+            }
         }
     }
 
