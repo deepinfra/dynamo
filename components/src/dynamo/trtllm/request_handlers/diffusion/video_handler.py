@@ -240,7 +240,11 @@ class VideoGenerationHandler(BaseGenerativeHandler):
                 raise RuntimeError("Pipeline returned no output (MediaOutput is None)")
 
             # Determine output format
-            response_format = req.response_format or "url"
+            # Default to inline b64_json: deepinfra's deepapi consumer reads the video from
+            # data[0].b64_json and never sends response_format, so a "url" default would return
+            # a file reference it can't read (-> ERR_MODEL "No video data"). Callers that want a
+            # hosted URL can still pass response_format="url" explicitly.
+            response_format = req.response_format or "b64_json"
             if response_format not in ("url", "b64_json"):
                 raise ValueError(
                     f"Unsupported response_format: {response_format!r}; expected 'url' or 'b64_json'"
