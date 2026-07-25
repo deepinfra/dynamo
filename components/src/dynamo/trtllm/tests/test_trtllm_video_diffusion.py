@@ -846,8 +846,10 @@ class TestVideoHandlerResponseFormats:
         assert decoded == b"fake_mp4_bytes"
 
     @pytest.mark.asyncio
-    async def test_default_response_format_is_url(self):
-        """Test that generate() defaults to url response format."""
+    async def test_default_response_format_is_b64_json(self):
+        """generate() defaults to b64_json: deepinfra's deepapi reads the clip from
+        data[0].b64_json and never sends response_format, so a "url" default returned a
+        reference it couldn't read (-> ERR_MODEL "No video data")."""
         handler = self._make_handler()
 
         request = {
@@ -868,9 +870,46 @@ class TestVideoHandlerResponseFormats:
                 results.append(result)
 
         assert len(results) == 1
-        # Default should be "url" format, so upload_to_fs should be called
-        mock_upload.assert_called_once()
-        assert results[0]["data"][0]["url"] is not None
+        # Default is b64_json now: no upload, clip returned inline.
+        mock_upload.assert_not_called()
+        assert results[0]["data"][0]["b64_json"] is not None
+        assert results[0]["data"][0].get("url") is None
+
+    @pytest.mark.asyncio
+    async def test_guidance_defaults_forwarded_to_engine(self):
+        """The handler forwards config default_guidance_scale_2 / default_boundary_ratio
+        to engine.generate() -- dual guidance isn't carried in the /v1/videos nvext."""
+        from dynamo.trtllm.request_handlers.diffusion.video_handler import (
+            VideoGenerationHandler,
+        )
+
+        mock_output = SimpleNamespace(
+            video=torch.zeros((1, 4, 64, 64, 3), dtype=torch.uint8), image=None, audio=None,
+        )
+        mock_engine = MagicMock()
+        mock_engine.generate = MagicMock(return_value=mock_output)
+        config = DiffusionConfig(
+            media_output_fs_url="file:///tmp/test_media",
+            default_guidance_scale_2=3.0,
+            default_boundary_ratio=0.875,
+        )
+        with patch(
+            "dynamo.trtllm.request_handlers.diffusion.video_handler.get_fs",
+            return_value=MagicMock(),
+        ):
+            handler = VideoGenerationHandler(engine=mock_engine, config=config)
+
+        with patch(
+            "dynamo.trtllm.request_handlers.diffusion.video_handler.encode_to_video_bytes",
+            return_value=b"fake_mp4",
+        ):
+            async for _ in handler.generate(
+                {"prompt": "p", "model": "m", "response_format": "b64_json"}, MagicMock()
+            ):
+                pass
+
+        assert mock_engine.generate.call_args.kwargs["guidance_scale_2"] == 3.0
+        assert mock_engine.generate.call_args.kwargs["boundary_ratio"] == 0.875
 
     @pytest.mark.asyncio
     async def test_error_response_on_failure(self):
