@@ -884,7 +884,9 @@ class TestVideoHandlerResponseFormats:
         )
 
         mock_output = SimpleNamespace(
-            video=torch.zeros((1, 4, 64, 64, 3), dtype=torch.uint8), image=None, audio=None,
+            video=torch.zeros((1, 4, 64, 64, 3), dtype=torch.uint8),
+            image=None,
+            audio=None,
         )
         mock_engine = MagicMock()
         mock_engine.generate = MagicMock(return_value=mock_output)
@@ -904,7 +906,8 @@ class TestVideoHandlerResponseFormats:
             return_value=b"fake_mp4",
         ):
             async for _ in handler.generate(
-                {"prompt": "p", "model": "m", "response_format": "b64_json"}, MagicMock()
+                {"prompt": "p", "model": "m", "response_format": "b64_json"},
+                MagicMock(),
             ):
                 pass
 

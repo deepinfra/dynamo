@@ -464,7 +464,7 @@ class DynamoTrtllmArgGroup(ArgGroup):
             default=None,
             arg_type=float,
             help="Default second-stage CFG guidance scale (Wan 2.2 MoE low-noise "
-                 "expert). None = use the pipeline default (single guidance).",
+            "expert). None = use the pipeline default (single guidance).",
         )
         add_argument(
             diffusion_request_group,
@@ -473,7 +473,7 @@ class DynamoTrtllmArgGroup(ArgGroup):
             default=None,
             arg_type=float,
             help="Default timestep boundary ratio for switching guidance scales "
-                 "(Wan 2.2). None = use the pipeline/model default.",
+            "(Wan 2.2). None = use the pipeline/model default.",
         )
         # Video specific args
         add_argument(

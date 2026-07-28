@@ -159,7 +159,10 @@ class DiffusionEngine:
             TorchCompileConfig,
             VisualGenArgs,
         )
-        from tensorrt_llm._torch.visual_gen.config import AttentionConfig, CacheDiTConfig
+        from tensorrt_llm._torch.visual_gen.config import (
+            AttentionConfig,
+            CacheDiTConfig,
+        )
 
         # Build quant_config dict if quantization is requested
         # VisualGenArgs accepts a dict in ModelOpt format and parses it via model_validator
