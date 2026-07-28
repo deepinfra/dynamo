@@ -33,6 +33,12 @@ async def init_video_diffusion_worker(
         shutdown_event: Event to signal shutdown.
         shutdown_endpoints: Optional list to populate with endpoints for graceful shutdown.
     """
+    from dynamo.common.utils.video_utils import limit_video_worker_threads
+
+    # Good-neighbor CPU budget on shared GPU nodes (bounds torch's intra-op pool; the
+    # encoder is bounded via the same budget). Set before the engine/torch load.
+    limit_video_worker_threads()
+
     # Check tensorrt_llm visual_gen availability early with a clear error message.
     # visual_gen is part of TensorRT-LLM (tensorrt_llm._torch.visual_gen).
     # Without this check, users would get a cryptic ImportError deep inside

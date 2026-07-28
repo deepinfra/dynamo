@@ -175,6 +175,61 @@ def encode_to_mp4(
         raise RuntimeError(f"Video encoding failed: {e}") from e
 
 
+# Video workers have three distinct CPU consumers that peak in different phases and want
+# different thread counts, so each gets its own env-overridable knob (defaults below):
+#   - Inductor compile pool (boot / first request: parallel Triton kernel compilation)
+#   - torch intra-op pool   (generation: CPU-side ops around a GPU-bound diffusion)
+#   - libx264 encode        (encode: ~12 is the measured PyAV sweet spot for 720p)
+# On shared GPU nodes an uncapped worker is a noisy neighbor: torch sizes its pool to the
+# physical core count (~112 on a 224-thread box) and libx264 grabs every core, which both
+# thrashes (a 720p/81f encode took 244s vs ~1s) and starves co-located pods. The three
+# phases are sequential, so with OMP_WAIT_POLICY=PASSIVE / KMP_BLOCKTIME=0 an idle pool
+# sleeps and hands its cores to the active phase instead of spinning — they don't sum.
+DEFAULT_VIDEO_TORCH_THREADS = 12
+DEFAULT_VIDEO_ENCODE_THREADS = 12
+DEFAULT_VIDEO_COMPILE_THREADS = 32
+
+
+def video_encode_threads() -> int:
+    """CPU threads for the libx264 software encode (env: DI_VIDEO_ENCODE_THREADS)."""
+    return int(os.getenv("DI_VIDEO_ENCODE_THREADS", str(DEFAULT_VIDEO_ENCODE_THREADS)))
+
+
+def limit_video_worker_threads() -> None:
+    """Cap a video worker's CPU threads so it stays a good neighbor on shared nodes.
+
+    Call once at the very top of a video worker's startup, before torch loads. Sets the
+    OpenMP wait policy (idle pools sleep between the sequential compile -> generate ->
+    encode phases rather than spinning), bounds the Inductor compile pool, and caps
+    torch's intra-op pool. The encoder is capped separately via video_encode_threads().
+    Every video worker entry calls this once — that is the general pattern. No-op if
+    torch is unavailable.
+    """
+    # Import-time knobs: set before torch imports so OpenMP / Inductor pick them up. Idle
+    # pools then sleep instead of spin (covers both libgomp and Intel OpenMP / MKL).
+    os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
+    os.environ.setdefault("KMP_BLOCKTIME", "0")
+    os.environ.setdefault(
+        "TORCHINDUCTOR_COMPILE_THREADS",
+        os.getenv("DI_VIDEO_COMPILE_THREADS", str(DEFAULT_VIDEO_COMPILE_THREADS)),
+    )
+    torch_threads = int(
+        os.getenv("DI_VIDEO_TORCH_THREADS", str(DEFAULT_VIDEO_TORCH_THREADS))
+    )
+    try:
+        import torch
+
+        torch.set_num_threads(torch_threads)
+    except Exception:  # noqa: BLE001
+        logger.warning("could not cap torch CPU threads to %s", torch_threads)
+    logger.info(
+        "video worker CPU budget: torch=%s encode=%s compile=%s (OMP_WAIT_POLICY=PASSIVE)",
+        torch_threads,
+        video_encode_threads(),
+        os.environ.get("TORCHINDUCTOR_COMPILE_THREADS"),
+    )
+
+
 def encode_to_video_bytes(
     frames: np.ndarray,
     fps: int = 16,
@@ -229,6 +284,7 @@ def encode_to_video_bytes(
             stream.width = width
             stream.height = height
             stream.pix_fmt = "yuv420p"
+            stream.codec_context.thread_count = video_encode_threads()
             if codec == "libx264":
                 stream.options = {"crf": "18", "preset": "veryfast"}
             # BT.709 color tags so players don't render the clip washed-out.
