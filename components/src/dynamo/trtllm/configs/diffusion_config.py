@@ -102,6 +102,13 @@ class DiffusionConfig:
     # Enable dynamic weight quantization (quantize BF16 weights on-the-fly during loading)
     quant_dynamic: bool = True
 
+    # ── Cache-acceleration backend ──
+    # Step-caching backend: "none" (default), "teacache", or "cache_dit". cache_dit
+    # (DBCache/TaylorSeer/SCM) is the ~2x step-skip Wan 2.2 supports -- it REJECTS
+    # teacache -- and VisualGen's CacheDiTConfig defaults are already tuned for
+    # few-step runs, so no extra knobs are needed here.
+    cache_backend: str = "none"
+
     # ── TeaCache optimization config (maps to TeaCacheConfig) ──
     enable_teacache: bool = False
     teacache_use_ret_steps: bool = True

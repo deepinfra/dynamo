@@ -159,7 +159,7 @@ class DiffusionEngine:
             TorchCompileConfig,
             VisualGenArgs,
         )
-        from tensorrt_llm._torch.visual_gen.config import AttentionConfig
+        from tensorrt_llm._torch.visual_gen.config import AttentionConfig, CacheDiTConfig
 
         # Build quant_config dict if quantization is requested
         # VisualGenArgs accepts a dict in ModelOpt format and parses it via model_validator
@@ -202,7 +202,12 @@ class DiffusionEngine:
         )
 
         # Add optional fields
-        if self.config.enable_teacache:
+        if self.config.cache_backend == "cache_dit":
+            # DBCache/TaylorSeer/SCM step-skip. VisualGen's CacheDiTConfig defaults
+            # are tuned for few-step runs (warmup 4, L1 thresh 0.24, <=3 continuous
+            # cached) -> ~2x skip. Wan 2.2 supports cache_dit and rejects teacache.
+            args_kwargs["cache"] = CacheDiTConfig()
+        elif self.config.enable_teacache or self.config.cache_backend == "teacache":
             args_kwargs["cache"] = TeaCacheConfig(
                 use_ret_steps=self.config.teacache_use_ret_steps,
                 teacache_thresh=self.config.teacache_thresh,

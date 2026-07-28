@@ -279,6 +279,14 @@ class DynamoTrtllmArgGroup(ArgGroup):
         )
         add_argument(
             diffusion_group,
+            flag_name="--cache-backend",
+            env_var="DYN_TRTLLM_CACHE_BACKEND",
+            default="none",
+            arg_type=str,
+            help="Step-caching backend: none, teacache, or cache_dit (Wan 2.2 supports cache_dit, not teacache).",
+        )
+        add_argument(
+            diffusion_group,
             flag_name="--torch-dtype",
             env_var="DYN_TRTLLM_TORCH_DTYPE",
             default="bfloat16",
@@ -528,6 +536,7 @@ class DynamoTrtllmConfig(ConfigBase):
     default_boundary_ratio: Optional[float] = None
     torch_dtype: str
     revision: Optional[str] = None
+    cache_backend: str
     enable_teacache: bool
     teacache_use_ret_steps: bool
     teacache_thresh: float
