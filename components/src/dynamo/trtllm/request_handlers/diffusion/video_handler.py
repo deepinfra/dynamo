@@ -210,9 +210,15 @@ class VideoGenerationHandler(BaseGenerativeHandler):
             guidance_scale_2 = self.config.default_guidance_scale_2
             boundary_ratio = self.config.default_boundary_ratio
 
+            guidance_desc = (
+                f"{guidance_scale}/{guidance_scale_2}@{boundary_ratio}"
+                if guidance_scale_2 is not None
+                else f"{guidance_scale} (single)"
+            )
             logger.info(
                 f"Request {request_id}: prompt='{req.prompt[:50]}...', "
-                f"size={width}x{height}, frames={num_frames}, steps={num_inference_steps}"
+                f"size={width}x{height}, frames={num_frames}, steps={num_inference_steps}, "
+                f"guidance={guidance_desc}"
             )
 
             # Run generation in thread pool (blocking operation).
@@ -258,13 +264,18 @@ class VideoGenerationHandler(BaseGenerativeHandler):
 
             # Encode media based on what the pipeline returned
             if output.video is not None:
-                # MediaOutput.video is (B, T, H, W, C) uint8 since TRT-LLM rc9;
-                # squeeze the batch dim to get (T, H, W, C) for MP4 encoding.
+                # MediaOutput.video is (B, T, H, W, C) since TRT-LLM rc9; accept the
+                # batch-1 5D form or a bare 4D (T, H, W, C). Explicit error (not a bare
+                # assert, which -O strips) on anything unexpected.
                 video = output.video
-                assert (
-                    video.ndim == 5 and video.shape[0] == 1
-                ), f"Expected video shape (1, T, H, W, C), got {video.shape}"
-                frames_np = video[0].cpu().numpy()
+                if video.ndim == 5 and video.shape[0] == 1:
+                    video = video[0]
+                elif video.ndim != 4:
+                    raise RuntimeError(
+                        f"Unexpected video tensor shape {tuple(video.shape)}; "
+                        "expected (T, H, W, C) or (1, T, H, W, C)"
+                    )
+                frames_np = video.cpu().numpy()
                 logger.info(
                     f"Request {request_id}: encoding video output "
                     f"(shape={frames_np.shape}) to MP4 at {fps} fps"

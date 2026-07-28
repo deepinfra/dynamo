@@ -283,6 +283,7 @@ class DynamoTrtllmArgGroup(ArgGroup):
             env_var="DYN_TRTLLM_CACHE_BACKEND",
             default="none",
             arg_type=str,
+            choices=["none", "teacache", "cache_dit"],
             help="Step-caching backend: none, teacache, or cache_dit (Wan 2.2 supports cache_dit, not teacache).",
         )
         add_argument(

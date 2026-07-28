@@ -197,13 +197,25 @@ def video_encode_threads() -> int:
 def limit_video_worker_threads() -> None:
     """Cap a video worker's CPU threads so it stays a good neighbor on shared nodes.
 
-    Call once at the very top of a video worker's startup, before torch loads. Sets the
-    OpenMP wait policy (idle pools sleep between the sequential compile -> generate ->
-    encode phases rather than spinning), bounds the Inductor compile pool, and caps
-    torch's intra-op pool. The encoder is capped separately via video_encode_threads().
-    Every video worker entry calls this once — that is the general pattern. No-op if
-    torch is unavailable.
+    Call once at the very top of a video worker's startup, before torch loads. Caps
+    torch's intra-op pool (via torch.set_num_threads, which always applies), bounds the
+    Inductor compile pool, and sets the OpenMP wait policy so idle pools sleep between
+    the sequential compile -> generate -> encode phases rather than spinning. The encoder
+    is capped separately via video_encode_threads(). Every video worker entry calls this
+    once — that is the general pattern. No-op if torch is unavailable.
+
+    Caveat: OMP_WAIT_POLICY / KMP_BLOCKTIME only bind if set before the OpenMP runtime
+    initializes (≈ first torch import), so for guaranteed effect set them in the launch
+    env. torch.set_num_threads and TORCHINDUCTOR_COMPILE_THREADS apply regardless.
     """
+    import sys
+
+    if "torch" in sys.modules:
+        logger.warning(
+            "limit_video_worker_threads() ran after torch was already imported — "
+            "OMP_WAIT_POLICY/KMP_BLOCKTIME may not take effect; set them in the launch "
+            "env for reliability (torch.set_num_threads still applies)."
+        )
     # Import-time knobs: set before torch imports so OpenMP / Inductor pick them up. Idle
     # pools then sleep instead of spin (covers both libgomp and Intel OpenMP / MKL).
     os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
@@ -246,7 +258,8 @@ def encode_to_video_bytes(
         Encoded video as bytes.
 
     Raises:
-        ImportError: If imageio is not available.
+        ImportError: If PyAV (``av``) is not available.
+        ValueError: If output_format has no known codec.
         RuntimeError: If encoding fails.
     """
     import tempfile
