@@ -195,48 +195,68 @@ def encode_to_video_bytes(
         ImportError: If imageio is not available.
         RuntimeError: If encoding fails.
     """
+    import tempfile
+
+    import av
+
+    # Defensive squeeze: MediaOutput.video is (B, T, H, W, C) since TRT-LLM rc9.
+    if frames.ndim == 5 and frames.shape[0] == 1:
+        frames = frames[0]
+    frames = np.ascontiguousarray(frames, dtype=np.uint8)
+    num_frames, height, width, _ = frames.shape
+
+    if output_format == "mp4":
+        codec = "libx264"
+    elif output_format == "webm":
+        codec = "libvpx-vp9"
+    else:
+        raise ValueError(f"No codec specified for response format: {output_format}")
+
+    logger.info(
+        f"Encoding {num_frames} frames to {output_format} ({codec}, software) at {fps} fps"
+    )
+
+    # Software encode via PyAV: the worker runs on NVENC-less datacenter GPUs
+    # (B200/H100/A100) where h264_nvenc has no capable device, and the in-tree
+    # imageio ffmpeg has no software h264. PyAV bundles libx264. Encode to a temp
+    # file (not an in-memory pipe) for reliability, then read the bytes back.
+    tmp = tempfile.NamedTemporaryFile(suffix=f".{output_format}", delete=False)
+    tmp.close()
     try:
-        import imageio.v3 as iio
-    except ImportError:
+        container = av.open(tmp.name, mode="w")
         try:
-            import imageio as iio  # type: ignore[no-redef]
-        except ImportError:
-            raise ImportError(
-                "imageio is required for video encoding. "
-                "Install with: pip install imageio[ffmpeg]"
-            )
-
-    logger.info(f"Encoding {len(frames)} frames to {output_format} bytes at {fps} fps")
-
-    try:
-        buffer = io.BytesIO()
-
-        kwargs: dict = {"fps": fps}
-        if output_format == "webm":
-            kwargs["codec"] = "libvpx-vp9"
-        elif output_format == "mp4":
-            kwargs["codec"] = "libx264"
-        else:
-            raise ValueError(f"No codec specified for response format: {output_format}")
-
-        if hasattr(iio, "imwrite"):
-            # v3 API
-            iio.imwrite(buffer, frames, extension=f".{output_format}", **kwargs)
-        else:
-            # v2 API
-            writer = iio.get_writer(  # type: ignore[attr-defined]
-                buffer, format="FFMPEG", mode="I", **kwargs
-            )
+            stream = container.add_stream(codec, rate=fps)
+            stream.width = width
+            stream.height = height
+            stream.pix_fmt = "yuv420p"
+            if codec == "libx264":
+                stream.options = {"crf": "18", "preset": "veryfast"}
+            # BT.709 color tags so players don't render the clip washed-out.
             try:
-                for frame in frames:
-                    writer.append_data(frame)
-            finally:
-                writer.close()
-
-        video_bytes = buffer.getvalue()
+                cc = stream.codec_context
+                cc.color_primaries = 1  # AVCOL_PRI_BT709
+                cc.color_trc = 1        # AVCOL_TRC_BT709
+                cc.colorspace = 1       # AVCOL_SPC_BT709
+                cc.color_range = 1      # AVCOL_RANGE_MPEG (limited / "tv")
+            except Exception:  # noqa: BLE001
+                logger.warning("could not set BT.709 color tags on the stream")
+            for i in range(num_frames):
+                frame = av.VideoFrame.from_ndarray(frames[i], format="rgb24")
+                for packet in stream.encode(frame):
+                    container.mux(packet)
+            for packet in stream.encode():  # flush encoder
+                container.mux(packet)
+        finally:
+            container.close()
+        with open(tmp.name, "rb") as fh:
+            video_bytes = fh.read()
         logger.info(f"Encoded video to {len(video_bytes)} bytes")
         return video_bytes
-
     except Exception as e:
         logger.error(f"Failed to encode video to bytes: {e}")
         raise RuntimeError(f"Video encoding to bytes failed: {e}") from e
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
