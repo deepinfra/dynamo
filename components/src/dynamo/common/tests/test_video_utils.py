@@ -47,7 +47,10 @@ class TestEncodeToVideoBytes:
         out = encode_to_video_bytes(make_frames(n=5), fps=8, output_format="webm")
         assert isinstance(out, bytes) and len(out) > 0
         with av.open(io.BytesIO(out)) as container:
-            assert container.streams.video[0].codec_context.name in ("vp9", "libvpx-vp9")
+            assert container.streams.video[0].codec_context.name in (
+                "vp9",
+                "libvpx-vp9",
+            )
 
     def test_mp4_tags_bt709(self):
         av = pytest.importorskip("av")

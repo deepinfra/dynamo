@@ -7,7 +7,6 @@ Provides helpers for parsing video request parameters and encoding numpy
 video frames to MP4 format.
 """
 
-import io
 import logging
 import os
 from typing import Tuple
@@ -291,9 +290,9 @@ def encode_to_video_bytes(
             try:
                 cc = stream.codec_context
                 cc.color_primaries = 1  # AVCOL_PRI_BT709
-                cc.color_trc = 1        # AVCOL_TRC_BT709
-                cc.colorspace = 1       # AVCOL_SPC_BT709
-                cc.color_range = 1      # AVCOL_RANGE_MPEG (limited / "tv")
+                cc.color_trc = 1  # AVCOL_TRC_BT709
+                cc.colorspace = 1  # AVCOL_SPC_BT709
+                cc.color_range = 1  # AVCOL_RANGE_MPEG (limited / "tv")
             except Exception:  # noqa: BLE001
                 logger.warning("could not set BT.709 color tags on the stream")
             for i in range(num_frames):
