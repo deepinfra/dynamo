@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Bake + bench driver for the LTX-2.3 SPEED image (see RUNBOOK.md).
 
   python3 ltx23/bake_bench.py t2v   # pass 1: t2v compile + Mega-Cache blob + warm bench
@@ -7,12 +10,16 @@
 Exits non-zero if a warm generation exceeds MAX_WARM_S: a silently-slowed bake
 (wrong preset, package drift, upstream change) must fail here, not reach prod.
 """
-import asyncio, logging, os, sys, time
+import asyncio
+import logging
+import os
+import sys
+import time
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from lib.pool import SubprocessPool
-from ltx23.config import profile_attention_backend
+from lib.pool import SubprocessPool  # noqa: E402
+from ltx23.config import profile_attention_backend  # noqa: E402
 
 OUT = os.environ.get("BENCH_OUT", "/tmp/bench-out")
 os.makedirs(OUT, exist_ok=True)
@@ -28,16 +35,29 @@ ATTENTION_BACKEND = os.environ.get(
 MAX_WARM_S = float(os.environ.get("LTX23_MAX_WARM_S", "10"))
 I2V_IMAGE = os.environ.get("LTX23_I2V_IMAGE", "/work/joy_nordic_woman_mid.png")
 T2V_PROMPTS = [
-    ("musician", "A street musician in her thirties sings and strums an acoustic guitar on a sunny city sidewalk, natural human face, photorealistic, sharp focus."),
-    ("dog", "A close-up tracking shot of a golden retriever sprinting through a sunlit alpine meadow at golden hour, photorealistic"),
+    (
+        "musician",
+        "A street musician in her thirties sings and strums an acoustic guitar on a sunny city sidewalk, natural human face, photorealistic, sharp focus.",
+    ),
+    (
+        "dog",
+        "A close-up tracking shot of a golden retriever sprinting through a sunlit alpine meadow at golden hour, photorealistic",
+    ),
 ]
 
 
 def req(tag: str, prompt: str, **extra) -> dict:
     d = {
-        "request_id": "bake_" + tag, "prompt": prompt, "width": W, "height": H,
-        "num_frames": NF, "fps": FPS, "num_inference_steps": STEPS,
-        "guidance_scale": GS, "seed": 42, "negative_prompt": None,
+        "request_id": "bake_" + tag,
+        "prompt": prompt,
+        "width": W,
+        "height": H,
+        "num_frames": NF,
+        "fps": FPS,
+        "num_inference_steps": STEPS,
+        "guidance_scale": GS,
+        "seed": 42,
+        "negative_prompt": None,
         "output_path": os.path.join(OUT, tag + ".mp4"),
     }
     d.update(extra)
@@ -46,21 +66,37 @@ def req(tag: str, prompt: str, **extra) -> dict:
 
 async def main(mode: str) -> int:
     pool = SubprocessPool(
-        model_path=os.environ.get("LTX23_MODEL_PATH", "/models/ltx-2.3-distilled-diffusers"),
-        num_gpus=1, enable_optimizations=True, attention_backend=ATTENTION_BACKEND,
-        model_factory_dotted="ltx23.factory:load_model", model_label="ltx23-bake",
+        model_path=os.environ.get(
+            "LTX23_MODEL_PATH", "/models/ltx-2.3-distilled-diffusers"
+        ),
+        num_gpus=1,
+        enable_optimizations=True,
+        attention_backend=ATTENTION_BACKEND,
+        model_factory_dotted="ltx23.factory:load_model",
+        model_label="ltx23-bake",
     )
     warm_times: list[tuple[str, float]] = []
     try:
         t = time.perf_counter()
         r = await pool.route(SHAPE, req("warm", "a calm test warmup clip"))
-        print("BOOT_WARM_S=%.1f status=%s" % (time.perf_counter() - t, r.get("status")), flush=True)
+        print(
+            "BOOT_WARM_S=%.1f status=%s" % (time.perf_counter() - t, r.get("status")),
+            flush=True,
+        )
         if mode == "t2v":
             gens = [(tag, req(tag, prompt)) for tag, prompt in T2V_PROMPTS]
         else:
-            gens = [("i2v", req(
-                "i2v", "The scene comes alive with gentle natural motion and a slow cinematic push-in.",
-                ltx2_images=[(I2V_IMAGE, 0, 1.0)], ltx2_image_crf=0.0))]
+            gens = [
+                (
+                    "i2v",
+                    req(
+                        "i2v",
+                        "The scene comes alive with gentle natural motion and a slow cinematic push-in.",
+                        ltx2_images=[(I2V_IMAGE, 0, 1.0)],
+                        ltx2_image_crf=0.0,
+                    ),
+                )
+            ]
         for tag, r_ in gens:
             t = time.perf_counter()
             r = await pool.route(SHAPE, r_)
@@ -78,8 +114,12 @@ async def main(mode: str) -> int:
     if mode == "t2v":
         slow = [(tag, dt) for tag, dt in warm_times[1:] if dt > MAX_WARM_S]
         if slow:
-            print("LATENCY GATE FAILED (> %.0fs warm): %s -- do NOT ship this bake; "
-                  "check the preset boot log and recent env/package changes." % (MAX_WARM_S, slow), flush=True)
+            print(
+                "LATENCY GATE FAILED (> %.0fs warm): %s -- do NOT ship this bake; "
+                "check the preset boot log and recent env/package changes."
+                % (MAX_WARM_S, slow),
+                flush=True,
+            )
             return 1
     return 0
 
