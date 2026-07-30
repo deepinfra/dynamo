@@ -70,6 +70,11 @@ class DiffusionConfig:
     default_seconds: int = 4  # Default video duration when only fps is specified
     default_num_inference_steps: int = 50
     default_guidance_scale: float = 5.0
+    # Second-stage guidance (Wan 2.2 MoE low-noise expert) + the timestep boundary at
+    # which guidance switches from stage-1 to stage-2. None → pipeline/model default
+    # (i.e. single guidance). Set both to run Wan 2.2 dual guidance (e.g. 4.0 / 3.0 @ 0.875).
+    default_guidance_scale_2: Optional[float] = None
+    default_boundary_ratio: Optional[float] = None
 
     # ── Pipeline optimization config (maps to PipelineConfig) ──
     disable_torch_compile: bool = False
@@ -96,6 +101,13 @@ class DiffusionConfig:
     quant_algo: Optional[str] = None
     # Enable dynamic weight quantization (quantize BF16 weights on-the-fly during loading)
     quant_dynamic: bool = True
+
+    # ── Cache-acceleration backend ──
+    # Step-caching backend: "none" (default), "teacache", or "cache_dit". cache_dit
+    # (DBCache/TaylorSeer/SCM) is the ~2x step-skip Wan 2.2 supports -- it REJECTS
+    # teacache -- and VisualGen's CacheDiTConfig defaults are already tuned for
+    # few-step runs, so no extra knobs are needed here.
+    cache_backend: str = "none"
 
     # ── TeaCache optimization config (maps to TeaCacheConfig) ──
     enable_teacache: bool = False
@@ -149,6 +161,10 @@ class DiffusionConfig:
             f"default_num_frames={self.default_num_frames}, "
             f"default_num_images_per_prompt={self.default_num_images_per_prompt}, "
             f"default_num_inference_steps={self.default_num_inference_steps}, "
+            f"default_guidance_scale={self.default_guidance_scale}, "
+            f"default_guidance_scale_2={self.default_guidance_scale_2}, "
+            f"default_boundary_ratio={self.default_boundary_ratio}, "
+            f"cache_backend={self.cache_backend}, "
             f"enable_teacache={self.enable_teacache}, "
             f"attn_backend={self.attn_backend}, "
             f"quant_algo={self.quant_algo}, "

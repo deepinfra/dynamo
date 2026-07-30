@@ -205,10 +205,20 @@ class VideoGenerationHandler(BaseGenerativeHandler):
                 if nvext.guidance_scale is not None
                 else self.config.default_guidance_scale
             )
+            # Dual-guidance / boundary are config-only (not carried in the /v1/videos
+            # nvext); None → engine/pipeline default (single guidance).
+            guidance_scale_2 = self.config.default_guidance_scale_2
+            boundary_ratio = self.config.default_boundary_ratio
 
+            guidance_desc = (
+                f"{guidance_scale}/{guidance_scale_2}@{boundary_ratio}"
+                if guidance_scale_2 is not None
+                else f"{guidance_scale} (single)"
+            )
             logger.info(
                 f"Request {request_id}: prompt='{req.prompt[:50]}...', "
-                f"size={width}x{height}, frames={num_frames}, steps={num_inference_steps}"
+                f"size={width}x{height}, frames={num_frames}, steps={num_inference_steps}, "
+                f"guidance={guidance_desc}"
             )
 
             # Run generation in thread pool (blocking operation).
@@ -227,6 +237,8 @@ class VideoGenerationHandler(BaseGenerativeHandler):
                     num_frames=num_frames,
                     num_inference_steps=num_inference_steps,
                     guidance_scale=guidance_scale,
+                    guidance_scale_2=guidance_scale_2,
+                    boundary_ratio=boundary_ratio,
                     seed=nvext.seed,
                 )
 
@@ -234,7 +246,11 @@ class VideoGenerationHandler(BaseGenerativeHandler):
                 raise RuntimeError("Pipeline returned no output (MediaOutput is None)")
 
             # Determine output format
-            response_format = req.response_format or "url"
+            # Default to inline b64_json: deepinfra's deepapi consumer reads the video from
+            # data[0].b64_json and never sends response_format, so a "url" default would return
+            # a file reference it can't read (-> ERR_MODEL "No video data"). Callers that want a
+            # hosted URL can still pass response_format="url" explicitly.
+            response_format = req.response_format or "b64_json"
             if response_format not in ("url", "b64_json"):
                 raise ValueError(
                     f"Unsupported response_format: {response_format!r}; expected 'url' or 'b64_json'"
@@ -248,13 +264,18 @@ class VideoGenerationHandler(BaseGenerativeHandler):
 
             # Encode media based on what the pipeline returned
             if output.video is not None:
-                # MediaOutput.video is (B, T, H, W, C) uint8 since TRT-LLM rc9;
-                # squeeze the batch dim to get (T, H, W, C) for MP4 encoding.
+                # MediaOutput.video is (B, T, H, W, C) since TRT-LLM rc9; accept the
+                # batch-1 5D form or a bare 4D (T, H, W, C). Explicit error (not a bare
+                # assert, which -O strips) on anything unexpected.
                 video = output.video
-                assert (
-                    video.ndim == 5 and video.shape[0] == 1
-                ), f"Expected video shape (1, T, H, W, C), got {video.shape}"
-                frames_np = video[0].cpu().numpy()
+                if video.ndim == 5 and video.shape[0] == 1:
+                    video = video[0]
+                elif video.ndim != 4:
+                    raise RuntimeError(
+                        f"Unexpected video tensor shape {tuple(video.shape)}; "
+                        "expected (T, H, W, C) or (1, T, H, W, C)"
+                    )
+                frames_np = video.cpu().numpy()
                 logger.info(
                     f"Request {request_id}: encoding video output "
                     f"(shape={frames_np.shape}) to MP4 at {fps} fps"

@@ -3,6 +3,7 @@
 
 """Unit tests for dynamo.common.utils.video_utils module."""
 
+import io
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -15,142 +16,127 @@ pytestmark = [
 ]
 
 
-def make_frames(n=3, h=8, w=8) -> np.ndarray:
-    """Return a small uint8 frame array (n, h, w, 3)."""
+def make_frames(n=3, h=16, w=16) -> np.ndarray:
+    """Return a small uint8 frame array (n, h, w, 3). Even dims for libx264."""
     return np.zeros((n, h, w, 3), dtype=np.uint8)
 
 
 # ---------------------------------------------------------------------------
-# encode_to_video_bytes
+# encode_to_video_bytes — PyAV/libx264 software encode (no NVENC, no imageio)
 # ---------------------------------------------------------------------------
 
 
 class TestEncodeToVideoBytes:
-    """Tests for encode_to_video_bytes()."""
+    """Tests for encode_to_video_bytes(): software-encodes via PyAV so it works on
+    NVENC-less datacenter GPUs. These exercise the real encoder (skipped if PyAV is
+    unavailable) rather than mocking, since the whole point is that the bytes decode."""
 
-    def _mock_iio_v3(self):
-        """Return a mock that looks like imageio.v3 (has imwrite)."""
-        iio = MagicMock()
-        iio.imwrite = MagicMock()
-        return iio
-
-    def _mock_iio_v2(self):
-        """Return a mock that looks like imageio v2 (no imwrite, has get_writer)."""
-        iio = MagicMock(spec=[])  # no attributes by default
-        writer = MagicMock()
-        iio.get_writer = MagicMock(return_value=writer)
-        return iio, writer
-
-    def test_mp4_selects_libx264_codec(self):
+    def test_mp4_returns_h264_bytes(self):
+        av = pytest.importorskip("av")
         from dynamo.common.utils.video_utils import encode_to_video_bytes
 
-        iio = self._mock_iio_v3()
-        with patch("dynamo.common.utils.video_utils.io") as mock_io, patch(
-            "imageio.v3", iio, create=True
-        ), patch.dict("sys.modules", {"imageio.v3": iio}):
-            buf = MagicMock()
-            buf.getvalue.return_value = b"fake-mp4"
-            mock_io.BytesIO.return_value = buf
+        out = encode_to_video_bytes(make_frames(n=5), fps=8, output_format="mp4")
+        assert isinstance(out, bytes) and len(out) > 0
+        with av.open(io.BytesIO(out)) as container:
+            assert container.streams.video[0].codec_context.name == "h264"
 
-            encode_to_video_bytes(make_frames(), fps=8, output_format="mp4")
-
-            iio.imwrite.assert_called_once()
-            _, kwargs = iio.imwrite.call_args
-            assert kwargs.get("codec") == "libx264"
-            assert kwargs.get("fps") == 8
-
-    def test_webm_selects_libvpx_vp9_codec(self):
+    def test_webm_returns_vp9_bytes(self):
+        av = pytest.importorskip("av")
         from dynamo.common.utils.video_utils import encode_to_video_bytes
 
-        iio = self._mock_iio_v3()
-        with patch("dynamo.common.utils.video_utils.io") as mock_io, patch(
-            "imageio.v3", iio, create=True
-        ), patch.dict("sys.modules", {"imageio.v3": iio}):
-            buf = MagicMock()
-            buf.getvalue.return_value = b"fake-webm"
-            mock_io.BytesIO.return_value = buf
+        out = encode_to_video_bytes(make_frames(n=5), fps=8, output_format="webm")
+        assert isinstance(out, bytes) and len(out) > 0
+        with av.open(io.BytesIO(out)) as container:
+            assert container.streams.video[0].codec_context.name in (
+                "vp9",
+                "libvpx-vp9",
+            )
 
-            encode_to_video_bytes(make_frames(), fps=16, output_format="webm")
-
-            iio.imwrite.assert_called_once()
-            _, kwargs = iio.imwrite.call_args
-            assert kwargs.get("codec") == "libvpx-vp9"
-
-    def test_mp4_passes_extension_to_imwrite(self):
+    def test_mp4_tags_bt709(self):
+        av = pytest.importorskip("av")
         from dynamo.common.utils.video_utils import encode_to_video_bytes
 
-        iio = self._mock_iio_v3()
-        with patch("dynamo.common.utils.video_utils.io") as mock_io, patch(
-            "imageio.v3", iio, create=True
-        ), patch.dict("sys.modules", {"imageio.v3": iio}):
-            buf = MagicMock()
-            buf.getvalue.return_value = b"bytes"
-            mock_io.BytesIO.return_value = buf
+        out = encode_to_video_bytes(make_frames(n=5), fps=16, output_format="mp4")
+        with av.open(io.BytesIO(out)) as container:
+            cc = container.streams.video[0].codec_context
+            # BT.709 primaries/transfer/colorspace so players don't render washed-out.
+            assert int(cc.color_primaries) == 1
+            assert int(cc.color_trc) == 1
+            assert int(cc.colorspace) == 1
 
-            encode_to_video_bytes(make_frames(), output_format="mp4")
-
-            _, kwargs = iio.imwrite.call_args
-            assert kwargs.get("extension") == ".mp4"
-
-    def test_webm_passes_extension_to_imwrite(self):
+    def test_squeezes_5d_batch_dim(self):
+        av = pytest.importorskip("av")
         from dynamo.common.utils.video_utils import encode_to_video_bytes
 
-        iio = self._mock_iio_v3()
-        with patch("dynamo.common.utils.video_utils.io") as mock_io, patch(
-            "imageio.v3", iio, create=True
-        ), patch.dict("sys.modules", {"imageio.v3": iio}):
-            buf = MagicMock()
-            buf.getvalue.return_value = b"bytes"
-            mock_io.BytesIO.return_value = buf
-
-            encode_to_video_bytes(make_frames(), output_format="webm")
-
-            _, kwargs = iio.imwrite.call_args
-            assert kwargs.get("extension") == ".webm"
+        # MediaOutput.video is (B, T, H, W, C) since TRT-LLM rc9; encode must squeeze B=1.
+        frames_5d = make_frames(n=5)[None]  # (1, 5, 16, 16, 3)
+        out = encode_to_video_bytes(frames_5d, fps=8, output_format="mp4")
+        with av.open(io.BytesIO(out)) as container:
+            assert container.streams.video[0].codec_context.name == "h264"
 
     def test_unsupported_format_raises_value_error(self):
+        pytest.importorskip("av")
         from dynamo.common.utils.video_utils import encode_to_video_bytes
 
-        iio = self._mock_iio_v3()
-        with patch("dynamo.common.utils.video_utils.io") as mock_io, patch(
-            "imageio.v3", iio, create=True
-        ), patch.dict("sys.modules", {"imageio.v3": iio}):
-            mock_io.BytesIO.return_value = MagicMock()
+        with pytest.raises(ValueError):
+            encode_to_video_bytes(make_frames(), output_format="avi")
 
-            # ValueError is wrapped into RuntimeError by the except block
-            with pytest.raises(RuntimeError, match="Video encoding to bytes failed"):
-                encode_to_video_bytes(make_frames(), output_format="avi")
 
-    def test_returns_bytes_from_buffer(self):
-        from dynamo.common.utils.video_utils import encode_to_video_bytes
+# ---------------------------------------------------------------------------
+# limit_video_worker_threads / video_encode_threads — shared video-worker caps
+# ---------------------------------------------------------------------------
 
-        expected = b"\x00\x01\x02"
-        iio = self._mock_iio_v3()
-        with patch("dynamo.common.utils.video_utils.io") as mock_io, patch(
-            "imageio.v3", iio, create=True
-        ), patch.dict("sys.modules", {"imageio.v3": iio}):
-            buf = MagicMock()
-            buf.getvalue.return_value = expected
-            mock_io.BytesIO.return_value = buf
 
-            result = encode_to_video_bytes(make_frames(), output_format="mp4")
+class TestVideoWorkerThreadCaps:
+    """The three env-overridable CPU-thread knobs + the OpenMP wait policy."""
 
-        assert result == expected
+    def test_encode_threads_default(self, monkeypatch):
+        monkeypatch.delenv("DI_VIDEO_ENCODE_THREADS", raising=False)
+        from dynamo.common.utils.video_utils import (
+            DEFAULT_VIDEO_ENCODE_THREADS,
+            video_encode_threads,
+        )
 
-    def test_v2_api_fallback_writes_all_frames(self):
-        """When imageio.v3.imwrite is absent, falls back to get_writer loop."""
-        from dynamo.common.utils.video_utils import encode_to_video_bytes
+        assert video_encode_threads() == DEFAULT_VIDEO_ENCODE_THREADS
 
-        iio_v2, writer = self._mock_iio_v2()
-        with patch("dynamo.common.utils.video_utils.io") as mock_io, patch(
-            "imageio.v3", iio_v2, create=True
-        ), patch.dict("sys.modules", {"imageio.v3": iio_v2}):
-            buf = MagicMock()
-            buf.getvalue.return_value = b"v2-bytes"
-            mock_io.BytesIO.return_value = buf
+    def test_encode_threads_env_override(self, monkeypatch):
+        monkeypatch.setenv("DI_VIDEO_ENCODE_THREADS", "7")
+        from dynamo.common.utils.video_utils import video_encode_threads
 
-            frames = make_frames(n=4)
-            encode_to_video_bytes(frames, output_format="mp4")
+        assert video_encode_threads() == 7
 
-            assert writer.append_data.call_count == 4
-            writer.close.assert_called_once()
+    def test_limit_sets_wait_policy_compile_and_torch(self, monkeypatch):
+        import os
+
+        for k in (
+            "OMP_WAIT_POLICY",
+            "KMP_BLOCKTIME",
+            "TORCHINDUCTOR_COMPILE_THREADS",
+            "DI_VIDEO_COMPILE_THREADS",
+            "DI_VIDEO_TORCH_THREADS",
+        ):
+            monkeypatch.delenv(k, raising=False)
+        from dynamo.common.utils import video_utils
+
+        fake_torch = MagicMock()
+        with patch.dict("sys.modules", {"torch": fake_torch}):
+            video_utils.limit_video_worker_threads()
+
+        assert os.environ["OMP_WAIT_POLICY"] == "PASSIVE"
+        assert os.environ["KMP_BLOCKTIME"] == "0"
+        assert os.environ["TORCHINDUCTOR_COMPILE_THREADS"] == str(
+            video_utils.DEFAULT_VIDEO_COMPILE_THREADS
+        )
+        fake_torch.set_num_threads.assert_called_once_with(
+            video_utils.DEFAULT_VIDEO_TORCH_THREADS
+        )
+
+    def test_limit_torch_threads_env_override(self, monkeypatch):
+        monkeypatch.setenv("DI_VIDEO_TORCH_THREADS", "9")
+        from dynamo.common.utils import video_utils
+
+        fake_torch = MagicMock()
+        with patch.dict("sys.modules", {"torch": fake_torch}):
+            video_utils.limit_video_worker_threads()
+
+        fake_torch.set_num_threads.assert_called_once_with(9)

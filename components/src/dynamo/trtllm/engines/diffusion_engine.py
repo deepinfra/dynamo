@@ -159,7 +159,10 @@ class DiffusionEngine:
             TorchCompileConfig,
             VisualGenArgs,
         )
-        from tensorrt_llm._torch.visual_gen.config import AttentionConfig
+        from tensorrt_llm._torch.visual_gen.config import (
+            AttentionConfig,
+            CacheDiTConfig,
+        )
 
         # Build quant_config dict if quantization is requested
         # VisualGenArgs accepts a dict in ModelOpt format and parses it via model_validator
@@ -202,7 +205,12 @@ class DiffusionEngine:
         )
 
         # Add optional fields
-        if self.config.enable_teacache:
+        if self.config.cache_backend == "cache_dit":
+            # DBCache/TaylorSeer/SCM step-skip. VisualGen's CacheDiTConfig defaults
+            # are tuned for few-step runs (warmup 4, L1 thresh 0.24, <=3 continuous
+            # cached) -> ~2x skip. Wan 2.2 supports cache_dit and rejects teacache.
+            args_kwargs["cache"] = CacheDiTConfig()
+        elif self.config.enable_teacache or self.config.cache_backend == "teacache":
             args_kwargs["cache"] = TeaCacheConfig(
                 use_ret_steps=self.config.teacache_use_ret_steps,
                 teacache_thresh=self.config.teacache_thresh,
@@ -224,6 +232,8 @@ class DiffusionEngine:
         num_images_per_prompt: int = 1,
         num_inference_steps: int = 50,
         guidance_scale: float = 5.0,
+        guidance_scale_2: Optional[float] = None,
+        boundary_ratio: Optional[float] = None,
         seed: Optional[int] = None,
     ) -> "MediaOutput":
         """Generate video/image frames from text prompt.
@@ -285,6 +295,18 @@ class DiffusionEngine:
             prompt=[prompt],
             params=params,
         )
+
+        # Wan 2.2 dual-guidance overrides. guidance_scale_2 / boundary_ratio are
+        # extra_param_specs that default to None (single guidance); set them explicitly
+        # here — before the spec-default merge below (setdefault won't clobber a value
+        # already present) — so goff (e.g. 4.0/3.0 @ boundary 0.875) actually takes effect.
+        if guidance_scale_2 is not None or boundary_ratio is not None:
+            if req.params.extra_params is None:
+                req.params.extra_params = {}
+            if guidance_scale_2 is not None:
+                req.params.extra_params["guidance_scale_2"] = guidance_scale_2
+            if boundary_ratio is not None:
+                req.params.extra_params["boundary_ratio"] = boundary_ratio
 
         # Replicate the TRTLLM's visual_gen executor's _merge_defaults: fill None fields in
         # req.params with pipeline-specific defaults (universal + extra_param

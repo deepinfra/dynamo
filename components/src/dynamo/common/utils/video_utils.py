@@ -7,7 +7,6 @@ Provides helpers for parsing video request parameters and encoding numpy
 video frames to MP4 format.
 """
 
-import io
 import logging
 import os
 from typing import Tuple
@@ -175,6 +174,73 @@ def encode_to_mp4(
         raise RuntimeError(f"Video encoding failed: {e}") from e
 
 
+# Video workers have three distinct CPU consumers that peak in different phases and want
+# different thread counts, so each gets its own env-overridable knob (defaults below):
+#   - Inductor compile pool (boot / first request: parallel Triton kernel compilation)
+#   - torch intra-op pool   (generation: CPU-side ops around a GPU-bound diffusion)
+#   - libx264 encode        (encode: ~12 is the measured PyAV sweet spot for 720p)
+# On shared GPU nodes an uncapped worker is a noisy neighbor: torch sizes its pool to the
+# physical core count (~112 on a 224-thread box) and libx264 grabs every core, which both
+# thrashes (a 720p/81f encode took 244s vs ~1s) and starves co-located pods. The three
+# phases are sequential, so with OMP_WAIT_POLICY=PASSIVE / KMP_BLOCKTIME=0 an idle pool
+# sleeps and hands its cores to the active phase instead of spinning — they don't sum.
+DEFAULT_VIDEO_TORCH_THREADS = 12
+DEFAULT_VIDEO_ENCODE_THREADS = 12
+DEFAULT_VIDEO_COMPILE_THREADS = 32
+
+
+def video_encode_threads() -> int:
+    """CPU threads for the libx264 software encode (env: DI_VIDEO_ENCODE_THREADS)."""
+    return int(os.getenv("DI_VIDEO_ENCODE_THREADS", str(DEFAULT_VIDEO_ENCODE_THREADS)))
+
+
+def limit_video_worker_threads() -> None:
+    """Cap a video worker's CPU threads so it stays a good neighbor on shared nodes.
+
+    Call once at the very top of a video worker's startup, before torch loads. Caps
+    torch's intra-op pool (via torch.set_num_threads, which always applies), bounds the
+    Inductor compile pool, and sets the OpenMP wait policy so idle pools sleep between
+    the sequential compile -> generate -> encode phases rather than spinning. The encoder
+    is capped separately via video_encode_threads(). Every video worker entry calls this
+    once — that is the general pattern. No-op if torch is unavailable.
+
+    Caveat: OMP_WAIT_POLICY / KMP_BLOCKTIME only bind if set before the OpenMP runtime
+    initializes (≈ first torch import), so for guaranteed effect set them in the launch
+    env. torch.set_num_threads and TORCHINDUCTOR_COMPILE_THREADS apply regardless.
+    """
+    import sys
+
+    if "torch" in sys.modules:
+        logger.warning(
+            "limit_video_worker_threads() ran after torch was already imported — "
+            "OMP_WAIT_POLICY/KMP_BLOCKTIME may not take effect; set them in the launch "
+            "env for reliability (torch.set_num_threads still applies)."
+        )
+    # Import-time knobs: set before torch imports so OpenMP / Inductor pick them up. Idle
+    # pools then sleep instead of spin (covers both libgomp and Intel OpenMP / MKL).
+    os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
+    os.environ.setdefault("KMP_BLOCKTIME", "0")
+    os.environ.setdefault(
+        "TORCHINDUCTOR_COMPILE_THREADS",
+        os.getenv("DI_VIDEO_COMPILE_THREADS", str(DEFAULT_VIDEO_COMPILE_THREADS)),
+    )
+    torch_threads = int(
+        os.getenv("DI_VIDEO_TORCH_THREADS", str(DEFAULT_VIDEO_TORCH_THREADS))
+    )
+    try:
+        import torch
+
+        torch.set_num_threads(torch_threads)
+    except Exception:  # noqa: BLE001
+        logger.warning("could not cap torch CPU threads to %s", torch_threads)
+    logger.info(
+        "video worker CPU budget: torch=%s encode=%s compile=%s (OMP_WAIT_POLICY=PASSIVE)",
+        torch_threads,
+        video_encode_threads(),
+        os.environ.get("TORCHINDUCTOR_COMPILE_THREADS"),
+    )
+
+
 def encode_to_video_bytes(
     frames: np.ndarray,
     fps: int = 16,
@@ -192,51 +258,73 @@ def encode_to_video_bytes(
         Encoded video as bytes.
 
     Raises:
-        ImportError: If imageio is not available.
+        ImportError: If PyAV (``av``) is not available.
+        ValueError: If output_format has no known codec.
         RuntimeError: If encoding fails.
     """
+    import tempfile
+
+    import av
+
+    # Defensive squeeze: MediaOutput.video is (B, T, H, W, C) since TRT-LLM rc9.
+    if frames.ndim == 5 and frames.shape[0] == 1:
+        frames = frames[0]
+    frames = np.ascontiguousarray(frames, dtype=np.uint8)
+    num_frames, height, width, _ = frames.shape
+
+    if output_format == "mp4":
+        codec = "libx264"
+    elif output_format == "webm":
+        codec = "libvpx-vp9"
+    else:
+        raise ValueError(f"No codec specified for response format: {output_format}")
+
+    logger.info(
+        f"Encoding {num_frames} frames to {output_format} ({codec}, software) at {fps} fps"
+    )
+
+    # Software encode via PyAV: the worker runs on NVENC-less datacenter GPUs
+    # (B200/H100/A100) where h264_nvenc has no capable device, and the in-tree
+    # imageio ffmpeg has no software h264. PyAV bundles libx264. Encode to a temp
+    # file (not an in-memory pipe) for reliability, then read the bytes back.
+    tmp = tempfile.NamedTemporaryFile(suffix=f".{output_format}", delete=False)
+    tmp.close()
     try:
-        import imageio.v3 as iio
-    except ImportError:
+        container = av.open(tmp.name, mode="w")
         try:
-            import imageio as iio  # type: ignore[no-redef]
-        except ImportError:
-            raise ImportError(
-                "imageio is required for video encoding. "
-                "Install with: pip install imageio[ffmpeg]"
-            )
-
-    logger.info(f"Encoding {len(frames)} frames to {output_format} bytes at {fps} fps")
-
-    try:
-        buffer = io.BytesIO()
-
-        kwargs: dict = {"fps": fps}
-        if output_format == "webm":
-            kwargs["codec"] = "libvpx-vp9"
-        elif output_format == "mp4":
-            kwargs["codec"] = "libx264"
-        else:
-            raise ValueError(f"No codec specified for response format: {output_format}")
-
-        if hasattr(iio, "imwrite"):
-            # v3 API
-            iio.imwrite(buffer, frames, extension=f".{output_format}", **kwargs)
-        else:
-            # v2 API
-            writer = iio.get_writer(  # type: ignore[attr-defined]
-                buffer, format="FFMPEG", mode="I", **kwargs
-            )
+            stream = container.add_stream(codec, rate=fps)
+            stream.width = width
+            stream.height = height
+            stream.pix_fmt = "yuv420p"
+            stream.codec_context.thread_count = video_encode_threads()
+            if codec == "libx264":
+                stream.options = {"crf": "18", "preset": "veryfast"}
+            # BT.709 color tags so players don't render the clip washed-out.
             try:
-                for frame in frames:
-                    writer.append_data(frame)
-            finally:
-                writer.close()
-
-        video_bytes = buffer.getvalue()
+                cc = stream.codec_context
+                cc.color_primaries = 1  # AVCOL_PRI_BT709
+                cc.color_trc = 1  # AVCOL_TRC_BT709
+                cc.colorspace = 1  # AVCOL_SPC_BT709
+                cc.color_range = 1  # AVCOL_RANGE_MPEG (limited / "tv")
+            except Exception:  # noqa: BLE001
+                logger.warning("could not set BT.709 color tags on the stream")
+            for i in range(num_frames):
+                frame = av.VideoFrame.from_ndarray(frames[i], format="rgb24")
+                for packet in stream.encode(frame):
+                    container.mux(packet)
+            for packet in stream.encode():  # flush encoder
+                container.mux(packet)
+        finally:
+            container.close()
+        with open(tmp.name, "rb") as fh:
+            video_bytes = fh.read()
         logger.info(f"Encoded video to {len(video_bytes)} bytes")
         return video_bytes
-
     except Exception as e:
         logger.error(f"Failed to encode video to bytes: {e}")
         raise RuntimeError(f"Video encoding to bytes failed: {e}") from e
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass

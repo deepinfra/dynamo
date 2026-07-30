@@ -279,6 +279,15 @@ class DynamoTrtllmArgGroup(ArgGroup):
         )
         add_argument(
             diffusion_group,
+            flag_name="--cache-backend",
+            env_var="DYN_TRTLLM_CACHE_BACKEND",
+            default="none",
+            arg_type=str,
+            choices=["none", "teacache", "cache_dit"],
+            help="Step-caching backend: none, teacache, or cache_dit (Wan 2.2 supports cache_dit, not teacache).",
+        )
+        add_argument(
+            diffusion_group,
             flag_name="--torch-dtype",
             env_var="DYN_TRTLLM_TORCH_DTYPE",
             default="bfloat16",
@@ -449,6 +458,24 @@ class DynamoTrtllmArgGroup(ArgGroup):
             arg_type=float,
             help="Default CFG guidance scale.",
         )
+        add_argument(
+            diffusion_request_group,
+            flag_name="--default-guidance-scale-2",
+            env_var="DYN_TRTLLM_DEFAULT_GUIDANCE_SCALE_2",
+            default=None,
+            arg_type=float,
+            help="Default second-stage CFG guidance scale (Wan 2.2 MoE low-noise "
+            "expert). None = use the pipeline default (single guidance).",
+        )
+        add_argument(
+            diffusion_request_group,
+            flag_name="--default-boundary-ratio",
+            env_var="DYN_TRTLLM_DEFAULT_BOUNDARY_RATIO",
+            default=None,
+            arg_type=float,
+            help="Default timestep boundary ratio for switching guidance scales "
+            "(Wan 2.2). None = use the pipeline/model default.",
+        )
         # Video specific args
         add_argument(
             diffusion_request_group,
@@ -506,8 +533,11 @@ class DynamoTrtllmConfig(ConfigBase):
     default_num_images_per_prompt: int
     default_num_inference_steps: int
     default_guidance_scale: float
+    default_guidance_scale_2: Optional[float] = None
+    default_boundary_ratio: Optional[float] = None
     torch_dtype: str
     revision: Optional[str] = None
+    cache_backend: str
     enable_teacache: bool
     teacache_use_ret_steps: bool
     teacache_thresh: float

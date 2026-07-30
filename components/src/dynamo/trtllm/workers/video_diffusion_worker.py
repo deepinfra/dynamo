@@ -33,6 +33,12 @@ async def init_video_diffusion_worker(
         shutdown_event: Event to signal shutdown.
         shutdown_endpoints: Optional list to populate with endpoints for graceful shutdown.
     """
+    from dynamo.common.utils.video_utils import limit_video_worker_threads
+
+    # Good-neighbor CPU budget on shared GPU nodes (bounds torch's intra-op pool; the
+    # encoder is bounded via the same budget). Set before the engine/torch load.
+    limit_video_worker_threads()
+
     # Check tensorrt_llm visual_gen availability early with a clear error message.
     # visual_gen is part of TensorRT-LLM (tensorrt_llm._torch.visual_gen).
     # Without this check, users would get a cryptic ImportError deep inside
@@ -66,6 +72,19 @@ async def init_video_diffusion_worker(
 
     # Build DiffusionConfig from the main Config
     diffusion_config = DiffusionConfig.from_config(config, skip_components)
+
+    # Make the guidance mode explicit in the logs: dual-guidance (goff) is driven by
+    # config-only flags (nvext can't carry them), so a missing --default-guidance-scale-2
+    # silently falls back to single guidance. Log it prominently instead of hiding it in
+    # the full config dump.
+    logging.info(
+        "Video guidance: %s (g=%s, g2=%s, boundary=%s); cache_backend=%s",
+        "DUAL" if diffusion_config.default_guidance_scale_2 is not None else "SINGLE",
+        diffusion_config.default_guidance_scale,
+        diffusion_config.default_guidance_scale_2,
+        diffusion_config.default_boundary_ratio,
+        diffusion_config.cache_backend,
+    )
 
     # Get the endpoint from the runtime
     endpoint = runtime.endpoint(
