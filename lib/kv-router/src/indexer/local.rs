@@ -548,6 +548,7 @@ impl LocalKvIndexer {
         last_event_id: u64,
     ) -> tokio::task::JoinHandle<BuildTaskResult> {
         let indexer = self.indexer.clone();
+        let lower_tiers = self.lower_tier_entries();
         let recovery_cache = self.recovery_cache.clone();
         #[cfg(test)]
         let build_delay = *self.dump_build_delay.lock().unwrap();
@@ -560,7 +561,7 @@ impl LocalKvIndexer {
                 tokio::time::sleep(delay).await;
             }
 
-            let build_output = Self::build_fresh_dump(indexer, last_event_id).await;
+            let build_output = Self::build_fresh_dump(indexer, lower_tiers, last_event_id).await;
             let notify = build.notify.clone();
             let result = recovery_cache.finish_build(&build, build_output).await;
 
@@ -569,19 +570,26 @@ impl LocalKvIndexer {
         })
     }
 
-    async fn build_fresh_dump(indexer: KvIndexer, last_event_id: u64) -> FreshDumpOutput {
+    async fn build_fresh_dump(
+        indexer: KvIndexer,
+        lower_tiers: Vec<(StorageTier, Arc<ThreadPoolIndexer<LowerTierIndexer>>)>,
+        last_event_id: u64,
+    ) -> FreshDumpOutput {
         match indexer.dump_events().await {
-            Ok(events) => FreshDumpOutput {
-                response: WorkerKvQueryResponse::TreeDump {
-                    events: events.clone(),
-                    last_event_id,
-                },
-                snapshot: Some(CachedRecoverySnapshot {
-                    events: Arc::new(events),
-                    base_last_event_id: last_event_id,
-                    last_event_id,
-                }),
-            },
+            Ok(mut events) => {
+                Self::append_lower_tier_events(lower_tiers, &mut events).await;
+                FreshDumpOutput {
+                    response: WorkerKvQueryResponse::TreeDump {
+                        events: events.clone(),
+                        last_event_id,
+                    },
+                    snapshot: Some(CachedRecoverySnapshot {
+                        events: Arc::new(events),
+                        base_last_event_id: last_event_id,
+                        last_event_id,
+                    }),
+                }
+            }
             Err(error) => {
                 tracing::warn!("Failed to build recovery dump: {error}");
                 FreshDumpOutput {
@@ -682,6 +690,41 @@ impl LocalKvIndexer {
         let indexers = self.lower_tier_indexers.lock().unwrap();
         indexers.values().cloned().collect()
     }
+
+    /// Currently allocated lower-tier indexers paired with the tier each holds.
+    /// Cloned out so a spawned dump build can outlive the lock.
+    fn lower_tier_entries(&self) -> Vec<(StorageTier, Arc<ThreadPoolIndexer<LowerTierIndexer>>)> {
+        let indexers = self.lower_tier_indexers.lock().unwrap();
+        indexers
+            .iter()
+            .map(|(&tier, idx)| (tier, idx.clone()))
+            .collect()
+    }
+
+    /// Append lower-tier state to a primary-tier dump so recovery consumers
+    /// receive host-pinned / disk blocks too.
+    ///
+    /// `LowerTierIndexer::dump_events` builds its events with
+    /// `RouterEvent::new`, which stamps `StorageTier::Device`, so retagging here
+    /// is required -- without it a host dump would be applied to the consumer's
+    /// device index. Shared by [`KvIndexerInterface::dump_events`] and the
+    /// `/kv_recover` snapshot builder so the two can never diverge again.
+    async fn append_lower_tier_events(
+        lower_tiers: Vec<(StorageTier, Arc<ThreadPoolIndexer<LowerTierIndexer>>)>,
+        events: &mut Vec<RouterEvent>,
+    ) {
+        for (tier, indexer) in lower_tiers {
+            match indexer.dump_events().await {
+                Ok(tier_events) => events.extend(tier_events.into_iter().map(|mut event| {
+                    event.storage_tier = tier;
+                    event
+                })),
+                Err(error) => {
+                    tracing::warn!(?tier, "Failed to dump lower-tier state: {error}");
+                }
+            }
+        }
+    }
 }
 
 // Implement KvIndexerInterface by delegating to the underlying indexer
@@ -730,25 +773,7 @@ impl KvIndexerInterface for LocalKvIndexer {
 
     async fn dump_events(&self) -> Result<Vec<RouterEvent>, KvRouterError> {
         let mut events = self.indexer.dump_events().await?;
-
-        // Also dump lower-tier indexer state so the router receives
-        // host-pinned / disk block information during recovery.
-        let lower_tiers: Vec<(StorageTier, Arc<ThreadPoolIndexer<LowerTierIndexer>>)> = {
-            let indexers = self.lower_tier_indexers.lock().unwrap();
-            indexers
-                .iter()
-                .map(|(&tier, idx)| (tier, idx.clone()))
-                .collect()
-        };
-        for (tier, indexer) in lower_tiers {
-            if let Ok(tier_events) = indexer.dump_events().await {
-                for mut event in tier_events {
-                    event.storage_tier = tier;
-                    events.push(event);
-                }
-            }
-        }
-
+        Self::append_lower_tier_events(self.lower_tier_entries(), &mut events).await;
         Ok(events)
     }
 
@@ -781,7 +806,9 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::LocalKvIndexer;
-    use crate::indexer::{KvIndexerInterface, KvIndexerMetrics, LowerTierContinuation};
+    use crate::indexer::{
+        KvIndexerInterface, KvIndexerMetrics, LowerTierContinuation, WorkerKvQueryResponse,
+    };
     use crate::protocols::{
         ExternalSequenceBlockHash, KvCacheEvent, KvCacheEventData, KvCacheStoreData,
         KvCacheStoredBlockData, LocalBlockHash, RouterEvent, StorageTier, WorkerWithDpRank,
@@ -844,6 +871,54 @@ mod tests {
             .get(&WorkerWithDpRank::new(worker_id, dp_rank))
             .copied()
             .unwrap_or(0)
+    }
+
+    /// The `/kv_recover` snapshot must carry lower tiers, not just the primary
+    /// index. Regression: `build_fresh_dump` used to take only the inner
+    /// `KvIndexer`, so cold-joining consumers silently lost every host-pinned
+    /// block while the live path kept tagging them correctly.
+    #[tokio::test]
+    async fn tree_dump_snapshot_includes_lower_tier_state() {
+        let indexer = LocalKvIndexer::new(
+            CancellationToken::new(),
+            4,
+            Arc::new(KvIndexerMetrics::new_unregistered()),
+            16,
+        );
+
+        indexer
+            .apply_event_with_buffer(lower_tier_store_event(
+                7,
+                0,
+                1,
+                900,
+                11,
+                101,
+                StorageTier::HostPinned,
+            ))
+            .await
+            .unwrap();
+        let _ = indexer.flush().await;
+
+        // No start_id -> full snapshot (the cold-join path).
+        let response = indexer.get_events_in_id_range(None, None).await;
+        let WorkerKvQueryResponse::TreeDump { events, .. } = response else {
+            panic!("expected a TreeDump for a full-snapshot request");
+        };
+
+        let host_events: Vec<_> = events
+            .iter()
+            .filter(|event| event.storage_tier == StorageTier::HostPinned)
+            .collect();
+        assert_eq!(
+            host_events.len(),
+            1,
+            "host-pinned state missing from the snapshot: {events:?}"
+        );
+        assert!(
+            events.iter().all(|event| event.storage_tier != StorageTier::Device),
+            "lower-tier events must stay retagged, never fall back to Device: {events:?}"
+        );
     }
 
     #[tokio::test]
