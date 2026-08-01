@@ -1,0 +1,20 @@
+{
+  "_comment": "FastWan2.2-TI2V-5B-FullAttn v1 shape menu (deepinfra). TWO 720p-class/5s shapes: landscape 1280x704 and portrait 704x1280, both @ 121 frames / 24 fps, 3 denoise steps, guidance 1.0 (no CFG) -- FastVideo's recommended recipe for this DMD distill (the model's exact training shape; the distillation dataset is literally 121x704x1280). Text-to-video ONLY: the base Wan2.2-TI2V-5B is a T2V+I2V model but FastVideo's distill card documents no I2V path and the base 5B's I2V mode has acknowledged quality issues, so no i2v shapes and no 'warm_i2v'. Dims are multiples of 32 (Wan2.2 high-compression VAE stride); 121 = 4*30+1 (temporal stride 4k+1). Adding/removing shapes changes IMAGE_SHAPE_HASH and requires a new image tag + a matching per-model menu in backend ttv.py (CI-checked). VRAM NOTE: each pool subprocess holds its own ~25-30GB weights copy plus 720p x 121f full-VAE decode activation peaks; the K=2 pool on one 80GB H100 must be validated at bake -- fall back to a single landscape shape if it does not fit.",
+  "model": "/data/default",
+  "fps": 24,
+  "num_inference_steps": 3,
+  "guidance_scale": 1.0,
+  "seed": 42,
+  "shapes": [
+    {
+      "width": 1280,
+      "height": 704,
+      "num_frames": 121
+    },
+    {
+      "width": 704,
+      "height": 1280,
+      "num_frames": 121
+    }
+  ]
+}
