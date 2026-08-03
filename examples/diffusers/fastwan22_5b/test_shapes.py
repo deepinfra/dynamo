@@ -36,8 +36,8 @@ SHAPES_JSON = os.path.join(HERE, "shapes.json")
 # (landscape 832x480 + portrait 480x832, both @ 81 frames). Updating
 # shapes.json -- adding, removing, or renaming a shape -- changes this
 # value, requires a new image bake, and requires updating this fixture.
-EXPECTED_HASH = "e0c0ed3c"
-EXPECTED_SHAPE_COUNT = 2
+EXPECTED_HASH = "4fbb8f99"
+EXPECTED_SHAPE_COUNT = 4
 
 # Per-shape activation budget. A shape whose width*height*frames is too
 # large makes the decoder's intermediate tensor exceed 2^31 elements,
