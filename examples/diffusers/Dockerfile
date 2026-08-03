@@ -92,8 +92,11 @@ RUN . /opt/dynamo/venv/bin/activate \
  && git clone https://github.com/Dao-AILab/flash-attention.git /tmp/fa-upstream \
  && cd /tmp/fa-upstream && git checkout ${FA4_CUTE_REF} \
  && cd / \
- && uv pip install --no-build-isolation /tmp/fa-upstream/flash_attn/cute \
+ && uv pip install --no-deps --no-build-isolation /tmp/fa-upstream/flash_attn/cute \
  && rm -rf /tmp/fa-upstream
+# --no-deps: the pin declares nvidia-cutlass-dsl==4.6.0.dev0 (pre-release),
+# which uv refuses and which would needlessly downgrade the venv's 4.6.0
+# release; the environment already satisfies the real requirement.
 
 # Install Dynamo with /v1/videos support (our serving layer).
 RUN uv pip install ai-dynamo==1.1.1
