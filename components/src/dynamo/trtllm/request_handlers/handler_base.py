@@ -64,12 +64,6 @@ configure_dynamo_logging()
 
 logger = logging.getLogger(__name__)
 
-# deepapi scales the engine's [0.0, 1.0] priority to an integer before putting
-# it on the x-dynamo-request-priority header, because the frontend types
-# nvext.agent_hints.priority as an i32. Divide it back before TRT-LLM, which
-# rejects anything outside [0.0, 1.0].
-DEEPINFRA_PRIORITY_SCALE = 10
-
 
 class TRTLLMEnginePauseController:
     """Adapts TRT-LLM sleep/wake to the standard pause controller interface.
@@ -1120,17 +1114,16 @@ class HandlerBase(BaseGenerativeHandler):
                 f"Using dynamo router dp_rank={dp_rank} for TRTLLM attention DP scheduling"
             )
 
-        # Priority is a float in [0.0, 1.0]; health checks use 1.0. Default is 0.5.
-        # Real requests carry it in the routing hints, scaled to an integer by
-        # DEEPINFRA_PRIORITY_SCALE because agent_hints.priority (and the
-        # x-dynamo-request-priority header feeding it) is typed as an i32.
+        # Priority is a float in [0.0, 1.0]; health checks use 1.0. Default is
+        # 0.5. Real requests carry it in the routing hints. Clamp rather than
+        # let TRT-LLM reject the request outright on an out-of-range value.
         priority = request.get("priority")
         if priority is None:
-            scaled = routing.get("priority") if routing else None
+            routed = routing.get("priority") if routing else None
             priority = (
                 DEFAULT_REQUEST_PRIORITY
-                if scaled is None
-                else min(1.0, max(0.0, scaled / DEEPINFRA_PRIORITY_SCALE))
+                if routed is None
+                else min(1.0, max(0.0, float(routed)))
             )
         cache_salt = request_cache_salt(request)
 

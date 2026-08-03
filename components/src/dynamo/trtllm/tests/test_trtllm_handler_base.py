@@ -717,8 +717,8 @@ class TestHealthCheckPriority:
 
     Health check requests (built by TrtllmHealthCheckPayload) must reach
     the TRT-LLM engine at priority=1.0.  Regular inference requests carry it
-    in routing hints, scaled by DEEPINFRA_PRIORITY_SCALE; with no routing
-    priority at all they fall back to DEFAULT_REQUEST_PRIORITY (0.5).
+    in routing hints; with no routing priority at all they fall back to
+    DEFAULT_REQUEST_PRIORITY (0.5).
     """
 
     def _make_handler(self) -> HandlerBase:
@@ -804,11 +804,9 @@ class TestHealthCheckPriority:
         assert kwargs["priority"] == DEFAULT_REQUEST_PRIORITY
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        "scaled,expected", [(6, 0.6), (10, 1.0), (5, 0.5), (0, 0.0)]
-    )
-    async def test_routing_priority_is_unscaled(self, scaled, expected):
-        """routing.priority is an integer 0-10; TRT-LLM wants [0.0, 1.0]."""
+    @pytest.mark.parametrize("routed,expected", [(1, 1.0), (0, 0.0)])
+    async def test_routing_priority_forwarded(self, routed, expected):
+        """The header is integer-typed, so only the [0, 1] rails arrive."""
         handler = self._make_handler()
         generation_result = self._make_mock_generation_result()
         handler.engine.llm.generate_async = MagicMock(return_value=generation_result)
@@ -817,7 +815,7 @@ class TestHealthCheckPriority:
             "token_ids": [1, 2, 3],
             "stop_conditions": {"max_tokens": 10},
             "sampling_options": {"temperature": 0.7},
-            "routing": {"priority": scaled},
+            "routing": {"priority": routed},
         }
 
         chunks = [
