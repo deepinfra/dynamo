@@ -155,6 +155,21 @@ COPY . /opt/app/
 # checkpoint into the fastwan family dir; fastwan.factory loads them. Gated so
 # LTX images (which use the full VAE) don't carry it. Build the FastWan image
 # with --build-arg INCLUDE_FASTWAN_TAEHV=1.
+# FastWan2.2-5B decodes with the taew2_2_super TAEHV tiny autoencoder (the
+# ~3s path on B200) instead of the full Wan2.2 VAE. Pinned to a taehv commit
+# because the HF mirror went private and main is a moving ref. Gated so
+# other-family images don't carry it; build with --build-arg
+# INCLUDE_FASTWAN22_5B_TAEHV=1.
+ARG INCLUDE_FASTWAN22_5B_TAEHV=0
+ARG TAEHV_REF=093b918971d59001a0bad6dfd6e0409b5e1752cf
+RUN if [ "$INCLUDE_FASTWAN22_5B_TAEHV" = "1" ]; then \
+      curl -fsSL "https://raw.githubusercontent.com/madebyollin/taehv/${TAEHV_REF}/taehv.py" \
+        -o /opt/app/fastwan22_5b/taehv.py && \
+      curl -fsSL "https://raw.githubusercontent.com/madebyollin/taehv/${TAEHV_REF}/taew2_2_super.pth" \
+        -o /opt/app/fastwan22_5b/taew2_2_super.pth && \
+      test -s /opt/app/fastwan22_5b/taew2_2_super.pth ; \
+    fi
+
 ARG INCLUDE_FASTWAN_TAEHV=0
 RUN if [ "$INCLUDE_FASTWAN_TAEHV" = "1" ]; then \
       . /opt/dynamo/venv/bin/activate && \
