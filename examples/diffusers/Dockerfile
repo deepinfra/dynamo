@@ -79,6 +79,25 @@ RUN export FLASH_ATTN_CUDA_ARCHS=$(echo "${TORCH_CUDA_ARCH_LIST}" | sed 's/ /;/g
  && uv pip install ./flash_attn/cute \
  && rm -rf ../flash-attention
 
+# FA4 (flash-attn-cute) source swap: the XOR-op fork installed above is stale
+# against cutlass-dsl 4.5+ (cute.core.ThrMma renamed away -> AttributeError at
+# import, which kills any worker that selects FLASH_ATTN). FastVideo hit the
+# same break and fixed it upstream (hao-ai-lab/FastVideo#1564) by pinning
+# flash-attn-4 from Dao-AILab/flash-attention at a CuTe-DSL-4.6-compatible
+# commit. Reproduce that exact pin (same as Dockerfile.dreamverse); do not
+# bump the ref without re-validating.
+ARG FA4_CUTE_REF=82d6441eec5d4dfec120153db2c0145ae855a083
+RUN . /opt/dynamo/venv/bin/activate \
+ && uv pip uninstall flash-attn-cute \
+ && git clone https://github.com/Dao-AILab/flash-attention.git /tmp/fa-upstream \
+ && cd /tmp/fa-upstream && git checkout ${FA4_CUTE_REF} \
+ && cd / \
+ && uv pip install --no-deps --no-build-isolation /tmp/fa-upstream/flash_attn/cute \
+ && rm -rf /tmp/fa-upstream
+# --no-deps: the pin declares nvidia-cutlass-dsl==4.6.0.dev0 (pre-release),
+# which uv refuses and which would needlessly downgrade the venv's 4.6.0
+# release; the environment already satisfies the real requirement.
+
 # Install Dynamo with /v1/videos support (our serving layer).
 RUN uv pip install ai-dynamo==1.1.1
 
@@ -98,6 +117,12 @@ COPY patches/ltx23_gpu_worker_megacache.patch /tmp/megacache.patch
 # default 32, env-overridable via FASTVIDEO_X264_THREADS. See PR description.
 COPY patches/x264-threads-cap.patch /tmp/x264-threads-cap.patch
 
+# The upstream FA4 pin returns 4-tuples from _flash_attn_fwd; fastvideo's
+# wrapper unpacks 2. Same [:2] fix FastVideo ships today (see
+# Dockerfile.dreamverse, where this patch has been applied since the LTX-2.3
+# FA4 work).
+COPY patches/flash-attn-cute-fa4-tuple-fix.patch /tmp/flash-attn-cute-fa4-tuple-fix.patch
+
 # Install FastVideo at the pinned SHA. No pyproject sed needed: the base is now
 # cu128, which is exactly what FastVideo's [tool.uv.sources] targets, so the
 # torch family resolves natively without any index gymnastics.
@@ -110,6 +135,7 @@ RUN echo "Building FastVideo @ ${FASTVIDEO_SHA} for TORCH_CUDA_ARCH_LIST=${TORCH
  && git submodule update --init --recursive \
  && git apply --verbose /tmp/megacache.patch \
  && git apply --verbose /tmp/x264-threads-cap.patch \
+ && git apply --verbose /tmp/flash-attn-cute-fa4-tuple-fix.patch \
  && cd / \
  && uv pip install --no-build-isolation /tmp/FastVideo \
  && rm -rf /tmp/FastVideo
@@ -129,6 +155,21 @@ COPY . /opt/app/
 # checkpoint into the fastwan family dir; fastwan.factory loads them. Gated so
 # LTX images (which use the full VAE) don't carry it. Build the FastWan image
 # with --build-arg INCLUDE_FASTWAN_TAEHV=1.
+# FastWan2.2-5B decodes with the taew2_2_super TAEHV tiny autoencoder (the
+# ~3s path on B200) instead of the full Wan2.2 VAE. Pinned to a taehv commit
+# because the HF mirror went private and main is a moving ref. Gated so
+# other-family images don't carry it; build with --build-arg
+# INCLUDE_FASTWAN22_5B_TAEHV=1.
+ARG INCLUDE_FASTWAN22_5B_TAEHV=0
+ARG TAEHV_REF=093b918971d59001a0bad6dfd6e0409b5e1752cf
+RUN if [ "$INCLUDE_FASTWAN22_5B_TAEHV" = "1" ]; then \
+      curl -fsSL "https://raw.githubusercontent.com/madebyollin/taehv/${TAEHV_REF}/taehv.py" \
+        -o /opt/app/fastwan22_5b/taehv.py && \
+      curl -fsSL "https://raw.githubusercontent.com/madebyollin/taehv/${TAEHV_REF}/taew2_2_super.pth" \
+        -o /opt/app/fastwan22_5b/taew2_2_super.pth && \
+      test -s /opt/app/fastwan22_5b/taew2_2_super.pth ; \
+    fi
+
 ARG INCLUDE_FASTWAN_TAEHV=0
 RUN if [ "$INCLUDE_FASTWAN_TAEHV" = "1" ]; then \
       . /opt/dynamo/venv/bin/activate && \
