@@ -75,6 +75,10 @@ pub struct UnregisterRequest {
 pub struct QueryRequest {
     pub token_ids: Vec<u32>,
     pub model_name: String,
+    /// Accepted for wire back-compat but ignored for tree selection: queries
+    /// fan out across every tenant tree of `model_name` and the results are
+    /// merged. Tenants are hash-regime namespaces (pod `engine_hash`), not
+    /// caller-visible partitions.
     #[serde(default = "default_tenant")]
     pub tenant_id: String,
     #[serde(default)]
@@ -89,6 +93,10 @@ pub struct QueryRequest {
 pub struct QueryByHashRequest {
     pub block_hashes: Vec<i64>,
     pub model_name: String,
+    /// Accepted for wire back-compat but ignored for tree selection: queries
+    /// fan out across every tenant tree of `model_name` and the results are
+    /// merged. Tenants are hash-regime namespaces (pod `engine_hash`), not
+    /// caller-visible partitions.
     #[serde(default = "default_tenant")]
     pub tenant_id: String,
     /// Optional per-request cache salt (Mooncake RFC #1403). Currently accepted
@@ -319,41 +327,96 @@ fn build_score_response(
     }
 }
 
-/// Context carried through [`run_tiered_query`] solely for audit logging.
-/// Holds borrows of the request's model/tenant so the `kv_audit` line can
-/// identify which indexer served the query.
+/// Context carried through [`run_fanout_query`] solely for audit logging.
 struct QueryAudit<'a> {
     model_name: &'a str,
-    tenant_id: &'a str,
+    /// The tenant the caller asked for. Tree selection ignores it — queries
+    /// fan out across every tenant of the model — but it is logged so audit
+    /// lines stay comparable with older captures.
+    requested_tenant: &'a str,
 }
 
-/// Run a tiered query and serialize the result, returning the appropriate
-/// HTTP status. Shared between `/query` and `/query_by_hash`.
+/// Merge one tree's response into the accumulator.
+///
+/// Worker sets are disjoint across trees — a worker registers into exactly
+/// one `(model, tenant)` key — so `scores` and `instances` merge by plain
+/// union. `frequencies[i]` counts workers holding block `i`, so it sums
+/// element-wise.
+fn merge_score_responses(acc: &mut ScoreResponse, other: ScoreResponse) {
+    acc.scores.extend(other.scores);
+    acc.instances.extend(other.instances);
+    if acc.frequencies.len() < other.frequencies.len() {
+        acc.frequencies.resize(other.frequencies.len(), 0);
+    }
+    for (slot, f) in acc.frequencies.iter_mut().zip(other.frequencies) {
+        *slot += f;
+    }
+}
+
+/// Run a tiered query against every tree of the requested model and merge the
+/// results into one response. Shared between `/query` and `/query_by_hash`.
+///
+/// Tenants are hash-regime namespaces (the pod watcher keys each pod's tree by
+/// its `engine_hash`), so a model-level query spans all of them: probes hash in
+/// one regime and simply score 0 against trees of another, which makes the
+/// merged response converge on the pods that can actually reuse the cache.
+///
+/// `hashes_for(block_size)` supplies the probe hashes per tree; `/query`
+/// hashing depends on the tree's block size, `/query_by_hash` ignores it.
+///
+/// A tree that fails is skipped (logged) as long as at least one tree
+/// answers; the response is 500 only when every tree fails. Callers must pass
+/// a non-empty `trees` (they 404 before calling).
 ///
 /// When `kv_audit` logging is enabled (see [`super::logging_enabled`]), emits a
 /// single `QUERY` line per request, before returning to the client, carrying a
-/// timestamp, the queried block hashes, and the full JSON response (including
-/// `longest_matched` and the per-tier `instances` breakdown).
-async fn run_tiered_query(
-    indexer: &Indexer,
-    block_hashes: Vec<LocalBlockHash>,
-    block_size: u32,
+/// timestamp, the queried block hashes, and the full merged JSON response.
+async fn run_fanout_query(
+    trees: Vec<(IndexerKey, Indexer, u32)>,
+    mut hashes_for: impl FnMut(u32) -> Vec<LocalBlockHash>,
     pod_names: &HashMap<WorkerId, String>,
     audit: QueryAudit<'_>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    // Snapshot the raw hashes for logging up front (find_tiered_matches takes
-    // ownership). Skip the allocation entirely when logging is off.
-    let logged_hashes: Option<Vec<u64>> =
-        super::logging_enabled().then(|| block_hashes.iter().map(|h| h.0).collect());
+    let logging = super::logging_enabled();
+    let mut logged_hashes: Option<Vec<u64>> = None;
 
-    let (status, body) = match indexer.find_tiered_matches(block_hashes).await {
-        Ok(tiered) => (
-            StatusCode::OK,
-            serde_json::json!(build_score_response(&tiered, block_size, pod_names)),
-        ),
-        Err(e) => (
+    let mut merged: Option<ScoreResponse> = None;
+    let mut last_error: Option<String> = None;
+    let mut queried_tenants: Vec<String> = Vec::with_capacity(trees.len());
+
+    for (key, indexer, block_size) in trees {
+        let block_hashes = hashes_for(block_size);
+        if logging && logged_hashes.is_none() {
+            logged_hashes = Some(block_hashes.iter().map(|h| h.0).collect());
+        }
+        match indexer.find_tiered_matches(block_hashes).await {
+            Ok(tiered) => {
+                let response = build_score_response(&tiered, block_size, pod_names);
+                match merged.as_mut() {
+                    Some(acc) => merge_score_responses(acc, response),
+                    None => merged = Some(response),
+                }
+                queried_tenants.push(key.tenant_id);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    model_name = %key.model_name,
+                    tenant_id = %key.tenant_id,
+                    error = %error,
+                    "Tenant tree query failed; continuing fan-out"
+                );
+                last_error = Some(error.to_string());
+            }
+        }
+    }
+
+    let (status, body) = match merged {
+        Some(response) => (StatusCode::OK, serde_json::json!(response)),
+        None => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            serde_json::json!({"error": e.to_string()}),
+            serde_json::json!({
+                "error": last_error.unwrap_or_else(|| "no trees queried".to_string())
+            }),
         ),
     };
 
@@ -363,7 +426,8 @@ async fn run_tiered_query(
             kind = "QUERY",
             ts_ms = super::now_unix_millis(),
             model_name = audit.model_name,
-            tenant_id = audit.tenant_id,
+            tenant_id = audit.requested_tenant,
+            fanout_tenants = ?queried_tenants,
             status = status.as_u16(),
             num_blocks = block_hashes.len(),
             block_hashes = ?block_hashes,
@@ -379,38 +443,40 @@ async fn query(
     State(state): State<Arc<AppState>>,
     Json(req): Json<QueryRequest>,
 ) -> impl IntoResponse {
-    let key = IndexerKey {
-        model_name: req.model_name,
-        tenant_id: req.tenant_id,
-    };
-    let Some(ie) = state.registry.get_indexer(&key) else {
+    let trees = state.registry.indexers_for_model(&req.model_name);
+    if trees.is_empty() {
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({
-                "error": format!("no indexer for model={} tenant={}", key.model_name, key.tenant_id)
+                "error": format!("no indexer for model={}", req.model_name)
             })),
         );
-    };
-    let block_size = ie.block_size;
-    let indexer = ie.indexer.clone();
-    drop(ie);
+    }
 
-    let block_hashes = compute_block_hash_for_seq(
-        &req.token_ids,
-        block_size,
-        BlockHashOptions {
-            lora_name: req.lora_name.as_deref(),
-            ..Default::default()
+    // Hashing depends on the tree's block size; trees of one model normally
+    // share it, so cache per size instead of rehashing per tree.
+    let mut hash_cache: HashMap<u32, Vec<LocalBlockHash>> = HashMap::new();
+    run_fanout_query(
+        trees,
+        |block_size| {
+            hash_cache
+                .entry(block_size)
+                .or_insert_with(|| {
+                    compute_block_hash_for_seq(
+                        &req.token_ids,
+                        block_size,
+                        BlockHashOptions {
+                            lora_name: req.lora_name.as_deref(),
+                            ..Default::default()
+                        },
+                    )
+                })
+                .clone()
         },
-    );
-    run_tiered_query(
-        &indexer,
-        block_hashes,
-        block_size,
         &state.registry.pod_names(),
         QueryAudit {
-            model_name: &key.model_name,
-            tenant_id: &key.tenant_id,
+            model_name: &req.model_name,
+            requested_tenant: &req.tenant_id,
         },
     )
     .await
@@ -420,35 +486,28 @@ async fn query_by_hash(
     State(state): State<Arc<AppState>>,
     Json(req): Json<QueryByHashRequest>,
 ) -> impl IntoResponse {
-    let key = IndexerKey {
-        model_name: req.model_name,
-        tenant_id: req.tenant_id,
-    };
-    let Some(ie) = state.registry.get_indexer(&key) else {
+    let trees = state.registry.indexers_for_model(&req.model_name);
+    if trees.is_empty() {
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({
-                "error": format!("no indexer for model={} tenant={}", key.model_name, key.tenant_id)
+                "error": format!("no indexer for model={}", req.model_name)
             })),
         );
-    };
-    let block_size = ie.block_size;
-    let indexer = ie.indexer.clone();
-    drop(ie);
+    }
 
     let block_hashes: Vec<LocalBlockHash> = req
         .block_hashes
         .iter()
         .map(|h| LocalBlockHash(*h as u64))
         .collect();
-    run_tiered_query(
-        &indexer,
-        block_hashes,
-        block_size,
+    run_fanout_query(
+        trees,
+        |_| block_hashes.clone(),
         &state.registry.pod_names(),
         QueryAudit {
-            model_name: &key.model_name,
-            tenant_id: &key.tenant_id,
+            model_name: &req.model_name,
+            requested_tenant: &req.tenant_id,
         },
     )
     .await
@@ -902,5 +961,257 @@ mod tests {
             .unwrap();
         let empty: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
         assert!(empty.is_empty());
+    }
+
+    // ── query fan-out across tenant trees ─────────────────────────────────────
+
+    #[test]
+    fn merge_score_responses_unions_workers_and_sums_frequencies() {
+        let mut acc = ScoreResponse {
+            scores: HashMap::from([(
+                "7".to_string(),
+                HashMap::from([("0".to_string(), 8u32)]),
+            )]),
+            frequencies: vec![2, 1],
+            instances: HashMap::from([(
+                "7".to_string(),
+                InstanceTierBreakdown {
+                    longest_matched: 8,
+                    ..Default::default()
+                },
+            )]),
+        };
+        let other = ScoreResponse {
+            scores: HashMap::from([(
+                "8".to_string(),
+                HashMap::from([("0".to_string(), 4u32)]),
+            )]),
+            frequencies: vec![1, 1, 1],
+            instances: HashMap::from([(
+                "8".to_string(),
+                InstanceTierBreakdown {
+                    longest_matched: 4,
+                    ..Default::default()
+                },
+            )]),
+        };
+
+        merge_score_responses(&mut acc, other);
+
+        assert_eq!(acc.scores.len(), 2, "disjoint worker sets union");
+        assert_eq!(acc.instances.len(), 2);
+        assert_eq!(acc.instances["7"].longest_matched, 8);
+        assert_eq!(acc.instances["8"].longest_matched, 4);
+        assert_eq!(acc.frequencies, vec![3, 2, 1], "element-wise sum");
+    }
+
+    async fn flush_single(indexer: &Indexer) {
+        if let Indexer::Single { primary, .. } = indexer {
+            let _ = primary.flush().await;
+        }
+    }
+
+    /// One model, two tenant trees (two engine_hash regimes) + an unrelated
+    /// model. A `/query_by_hash` naming only the model must span both tenant
+    /// trees, merge their disjoint worker sets, and exclude the other model —
+    /// regardless of the request's `tenant_id`.
+    #[tokio::test]
+    async fn query_by_hash_fans_out_across_tenant_trees() {
+        let block_size: u32 = 4;
+        let registry = Arc::new(WorkerRegistry::new(1));
+        registry.signal_ready();
+
+        for (id, model, tenant, pod, port) in [
+            (7u64, "m", "hash-a", "pod-a", 15600),
+            (8, "m", "hash-b", "pod-b", 15601),
+            (9, "other", "hash-a", "pod-c", 15602),
+        ] {
+            registry
+                .register(
+                    id,
+                    format!("tcp://127.0.0.1:{port}"),
+                    0,
+                    model.to_string(),
+                    tenant.to_string(),
+                    block_size,
+                    None,
+                    Some(pod.to_string()),
+                )
+                .await
+                .unwrap();
+        }
+
+        // Worker 7 (regime hash-a) caches blocks [11, 12]; worker 8 (regime
+        // hash-b) caches only [11]; worker 9 caches both but on another model.
+        for (worker_id, model, tenant, blocks) in [
+            (7u64, "m", "hash-a", &[11u64, 12][..]),
+            (8, "m", "hash-b", &[11]),
+            (9, "other", "hash-a", &[11, 12]),
+        ] {
+            let key = IndexerKey {
+                model_name: model.to_string(),
+                tenant_id: tenant.to_string(),
+            };
+            let indexer = registry.get_indexer(&key).unwrap().indexer.clone();
+            indexer
+                .apply_event_routed(store_event(
+                    worker_id,
+                    0,
+                    1,
+                    &[],
+                    blocks,
+                    StorageTier::Device,
+                ))
+                .await;
+            flush_single(&indexer).await;
+        }
+
+        let app = create_router(Arc::new(AppState {
+            registry,
+            #[cfg(feature = "metrics")]
+            prom_registry: prometheus::Registry::new(),
+        }));
+
+        // tenant_id omitted -> serde default "default", which matches no tree;
+        // the fan-out must ignore it and answer from all of model m's trees.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/query_by_hash")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"block_hashes":[11,12],"model_name":"m"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        let instances = body["instances"].as_object().unwrap();
+        assert_eq!(
+            instances.len(),
+            2,
+            "both tenant trees of model m, nothing from model other: {body}"
+        );
+        assert_eq!(instances["7"]["longest_matched"], 2 * block_size);
+        assert_eq!(instances["7"]["pod_name"], "pod-a");
+        assert_eq!(instances["8"]["longest_matched"], block_size);
+        assert_eq!(instances["8"]["pod_name"], "pod-b");
+        assert!(instances.get("9").is_none());
+
+        let scores = body["scores"].as_object().unwrap();
+        assert_eq!(scores.len(), 2);
+        assert_eq!(scores["7"]["0"], 2 * block_size);
+        assert_eq!(scores["8"]["0"], block_size);
+
+        // Unknown model still 404s.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/query_by_hash")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"block_hashes":[11],"model_name":"nonexistent"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// `/query` (token path) must fan out the same way: hashes computed once
+    /// per block size and matched against every tenant tree of the model.
+    #[tokio::test]
+    async fn query_by_tokens_fans_out_across_tenant_trees() {
+        let block_size: u32 = 4;
+        let registry = Arc::new(WorkerRegistry::new(1));
+        registry.signal_ready();
+
+        for (id, tenant, port) in [(7u64, "hash-a", 15603), (8, "hash-b", 15604)] {
+            registry
+                .register(
+                    id,
+                    format!("tcp://127.0.0.1:{port}"),
+                    0,
+                    "m".to_string(),
+                    tenant.to_string(),
+                    block_size,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+
+        // Store under the same hashes /query will derive from the tokens.
+        let token_ids: Vec<u32> = (0..8).collect(); // two full blocks
+        let expected_hashes = compute_block_hash_for_seq(
+            &token_ids,
+            block_size,
+            BlockHashOptions::default(),
+        );
+        assert_eq!(expected_hashes.len(), 2);
+        let raw: Vec<u64> = expected_hashes.iter().map(|h| h.0).collect();
+
+        for (worker_id, tenant, blocks) in
+            [(7u64, "hash-a", &raw[..]), (8, "hash-b", &raw[..1])]
+        {
+            let key = IndexerKey {
+                model_name: "m".to_string(),
+                tenant_id: tenant.to_string(),
+            };
+            let indexer = registry.get_indexer(&key).unwrap().indexer.clone();
+            indexer
+                .apply_event_routed(store_event(
+                    worker_id,
+                    0,
+                    1,
+                    &[],
+                    blocks,
+                    StorageTier::Device,
+                ))
+                .await;
+            flush_single(&indexer).await;
+        }
+
+        let app = create_router(Arc::new(AppState {
+            registry,
+            #[cfg(feature = "metrics")]
+            prom_registry: prometheus::Registry::new(),
+        }));
+
+        let body = serde_json::json!({"token_ids": token_ids, "model_name": "m"});
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/query")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        let instances = body["instances"].as_object().unwrap();
+        assert_eq!(instances.len(), 2, "{body}");
+        assert_eq!(instances["7"]["longest_matched"], 2 * block_size);
+        assert_eq!(instances["8"]["longest_matched"], block_size);
     }
 }

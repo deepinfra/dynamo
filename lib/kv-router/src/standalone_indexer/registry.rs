@@ -765,6 +765,23 @@ impl WorkerRegistry {
             .collect()
     }
 
+    /// Every tree belonging to `model_name`, across all tenants. Tenants are
+    /// hash-regime namespaces (the pod watcher registers each pod under its
+    /// `engine_hash`), so a model-level query fans out over these and merges.
+    pub fn indexers_for_model(&self, model_name: &str) -> Vec<(IndexerKey, Indexer, u32)> {
+        self.indexers
+            .iter()
+            .filter(|entry| entry.key().model_name == model_name)
+            .map(|entry| {
+                (
+                    entry.key().clone(),
+                    entry.value().indexer.clone(),
+                    entry.value().block_size,
+                )
+            })
+            .collect()
+    }
+
     /// Known pod names by worker id, for enriching query responses.
     pub fn pod_names(&self) -> HashMap<WorkerId, String> {
         self.workers
@@ -1086,6 +1103,53 @@ mod tests {
 
         let empty = registry.list_filtered(Some("nonexistent"), None);
         assert!(empty.is_empty());
+    }
+
+    #[tokio::test]
+    async fn indexers_for_model_spans_tenants_but_not_models() {
+        let registry = test_registry();
+        registry.signal_ready();
+
+        // Same model under two tenants (two hash regimes)...
+        for (id, tenant, port) in [(10, "hash-a", 15576), (11, "hash-b", 15577)] {
+            registry
+                .register(
+                    id,
+                    format!("tcp://127.0.0.1:{port}"),
+                    0,
+                    "llama3".to_string(),
+                    tenant.to_string(),
+                    4,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        // ...and an unrelated model that must not leak into the fan-out.
+        registry
+            .register(
+                12,
+                "tcp://127.0.0.1:15578".to_string(),
+                0,
+                "mistral".to_string(),
+                "hash-a".to_string(),
+                4,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let mut tenants: Vec<String> = registry
+            .indexers_for_model("llama3")
+            .into_iter()
+            .map(|(key, _, _)| key.tenant_id)
+            .collect();
+        tenants.sort();
+        assert_eq!(tenants, ["hash-a", "hash-b"]);
+
+        assert!(registry.indexers_for_model("nonexistent").is_empty());
     }
 
     #[tokio::test]

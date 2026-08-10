@@ -72,10 +72,36 @@ use crate::protocols::WorkerId;
 use super::KubeDiscoveryConfig;
 use super::registry::WorkerRegistry;
 
+/// Label the backend stamps on every engine pod with a hash of the exact
+/// deployment (image, env, args). Pods with different values may hash KV
+/// blocks differently, so each value gets its own tree via `tenant_id`.
+const ENGINE_HASH_LABEL: &str = "engine_hash";
+
 /// A pod we have an active subscription for, keyed by pod name.
 struct Subscribed {
     instance_id: WorkerId,
     ip: String,
+    tenant_id: String,
+}
+
+/// A Ready engine pod as extracted from the watch store.
+#[derive(Debug, PartialEq)]
+struct DiscoveredPod {
+    name: String,
+    ip: String,
+    /// Value of the pod's `engine_hash` label, when present.
+    engine_hash: Option<String>,
+}
+
+impl DiscoveredPod {
+    /// The tenant this pod's tree lives under: its `engine_hash`, so
+    /// hash-incompatible engine generations never share a tree during
+    /// migrations. Falls back to the configured tenant for unlabeled pods.
+    fn tenant_id(&self, fallback: &str) -> String {
+        self.engine_hash
+            .clone()
+            .unwrap_or_else(|| fallback.to_string())
+    }
 }
 
 /// Spawn the pod watcher as a detached background task.
@@ -180,21 +206,59 @@ async fn reconcile(
     registry: &WorkerRegistry,
     config: &KubeDiscoveryConfig,
 ) {
-    // Desired state: name -> ip for every Ready, non-terminating pod.
-    let mut desired: HashMap<String, String> = HashMap::new();
+    // Desired state: every Ready, non-terminating pod, keyed by name.
+    let mut desired: HashMap<String, DiscoveredPod> = HashMap::new();
     for pod in store.state() {
-        if let Some((name, ip)) = ready_pod_endpoint(pod.as_ref()) {
-            desired.insert(name, ip);
+        if let Some(discovered) = ready_pod_endpoint(pod.as_ref()) {
+            desired.insert(discovered.name.clone(), discovered);
         }
     }
 
-    // Subscribe to pods that are newly Ready.
-    for (name, ip) in &desired {
+    // Unsubscribe first: pods that are gone, no longer Ready, or whose
+    // engine_hash changed (the same pod name must re-register under its new
+    // tenant, and register() rejects a worker that switches keys in place).
+    let vanished: Vec<String> = subscribed
+        .iter()
+        .filter(|(name, entry)| {
+            desired
+                .get(*name)
+                .is_none_or(|pod| pod.tenant_id(&config.tenant_id) != entry.tenant_id)
+        })
+        .map(|(name, _)| name.clone())
+        .collect();
+    for name in vanished {
+        let entry = subscribed
+            .remove(&name)
+            .expect("name came from subscribed keys");
+        match registry
+            .deregister(entry.instance_id, &config.model_name, &entry.tenant_id)
+            .await
+        {
+            Ok(()) => tracing::info!(
+                pod = %name,
+                ip = %entry.ip,
+                instance_id = entry.instance_id,
+                tenant_id = %entry.tenant_id,
+                "Unsubscribed from engine pod"
+            ),
+            // Already gone from the registry — an idempotent no-op.
+            Err(error) => tracing::debug!(
+                pod = %name,
+                error = %error,
+                "Deregister was a no-op"
+            ),
+        }
+    }
+
+    // Subscribe to pods that are newly Ready (or re-tenanted above).
+    for (name, pod) in &desired {
         if subscribed.contains_key(name) {
             continue; // already subscribed — idempotent no-op
         }
 
         let instance_id = instance_id_for(name);
+        let ip = &pod.ip;
+        let tenant_id = pod.tenant_id(&config.tenant_id);
         let endpoint = format!("tcp://{ip}:{}", config.zmq_port);
         let recover_endpoint = config
             .recover_port
@@ -206,7 +270,7 @@ async fn reconcile(
                 endpoint,
                 0, // dp_rank: single-rank engines
                 config.model_name.clone(),
-                config.tenant_id.clone(),
+                tenant_id.clone(),
                 config.block_size,
                 recover_endpoint,
                 Some(name.clone()),
@@ -218,6 +282,7 @@ async fn reconcile(
                     pod = %name,
                     ip = %ip,
                     instance_id,
+                    tenant_id = %tenant_id,
                     "Subscribed to engine pod"
                 );
                 subscribed.insert(
@@ -225,6 +290,7 @@ async fn reconcile(
                     Subscribed {
                         instance_id,
                         ip: ip.clone(),
+                        tenant_id,
                     },
                 );
             }
@@ -239,35 +305,6 @@ async fn reconcile(
             }
         }
     }
-
-    // Unsubscribe from pods that are gone or no longer Ready.
-    let vanished: Vec<String> = subscribed
-        .keys()
-        .filter(|name| !desired.contains_key(*name))
-        .cloned()
-        .collect();
-    for name in vanished {
-        let entry = subscribed
-            .remove(&name)
-            .expect("name came from subscribed keys");
-        match registry
-            .deregister(entry.instance_id, &config.model_name, &config.tenant_id)
-            .await
-        {
-            Ok(()) => tracing::info!(
-                pod = %name,
-                ip = %entry.ip,
-                instance_id = entry.instance_id,
-                "Unsubscribed from engine pod"
-            ),
-            // Already gone from the registry — an idempotent no-op.
-            Err(error) => tracing::debug!(
-                pod = %name,
-                error = %error,
-                "Deregister was a no-op"
-            ),
-        }
-    }
 }
 
 /// Derive a stable `WorkerId` from the pod name so the same pod always maps to
@@ -276,9 +313,9 @@ fn instance_id_for(pod_name: &str) -> WorkerId {
     xxh3::xxh3_64(pod_name.as_bytes())
 }
 
-/// Return `(pod_name, pod_ip)` if the pod is Ready, has an IP, and is not
-/// terminating; otherwise `None`.
-fn ready_pod_endpoint(pod: &Pod) -> Option<(String, String)> {
+/// Return the pod's name, IP, and `engine_hash` label if it is Ready, has an
+/// IP, and is not terminating; otherwise `None`.
+fn ready_pod_endpoint(pod: &Pod) -> Option<DiscoveredPod> {
     // A pod with a deletion timestamp is shutting down — treat it as gone.
     if pod.metadata.deletion_timestamp.is_some() {
         return None;
@@ -292,8 +329,22 @@ fn ready_pod_endpoint(pod: &Pod) -> Option<(String, String)> {
             .iter()
             .any(|c| c.type_ == "Ready" && c.status == "True")
     });
+    if !ready {
+        return None;
+    }
 
-    if ready { Some((name, ip)) } else { None }
+    let engine_hash = pod
+        .metadata
+        .labels
+        .as_ref()
+        .and_then(|labels| labels.get(ENGINE_HASH_LABEL))
+        .cloned();
+
+    Some(DiscoveredPod {
+        name,
+        ip,
+        engine_hash,
+    })
 }
 
 #[cfg(test)]
@@ -304,10 +355,26 @@ mod tests {
     use k8s_openapi::chrono::Utc;
 
     fn pod(name: &str, ip: Option<&str>, ready: Option<&str>, terminating: bool) -> Pod {
+        pod_with_labels(name, ip, ready, terminating, &[])
+    }
+
+    fn pod_with_labels(
+        name: &str,
+        ip: Option<&str>,
+        ready: Option<&str>,
+        terminating: bool,
+        labels: &[(&str, &str)],
+    ) -> Pod {
         Pod {
             metadata: ObjectMeta {
                 name: Some(name.to_string()),
                 deletion_timestamp: terminating.then(|| Time(Utc::now())),
+                labels: (!labels.is_empty()).then(|| {
+                    labels
+                        .iter()
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .collect()
+                }),
                 ..Default::default()
             },
             status: Some(PodStatus {
@@ -330,8 +397,40 @@ mod tests {
         let p = pod("engine-abc", Some("10.0.0.1"), Some("True"), false);
         assert_eq!(
             ready_pod_endpoint(&p),
-            Some(("engine-abc".to_string(), "10.0.0.1".to_string()))
+            Some(DiscoveredPod {
+                name: "engine-abc".to_string(),
+                ip: "10.0.0.1".to_string(),
+                engine_hash: None,
+            })
         );
+    }
+
+    #[test]
+    fn engine_hash_label_becomes_tenant() {
+        let p = pod_with_labels(
+            "engine-abc",
+            Some("10.0.0.1"),
+            Some("True"),
+            false,
+            &[("engine_hash", "975d72d83374a79b"), ("engine", "pytrtllm")],
+        );
+        let discovered = ready_pod_endpoint(&p).unwrap();
+        assert_eq!(discovered.engine_hash.as_deref(), Some("975d72d83374a79b"));
+        assert_eq!(discovered.tenant_id("default"), "975d72d83374a79b");
+    }
+
+    #[test]
+    fn missing_engine_hash_falls_back_to_configured_tenant() {
+        let p = pod_with_labels(
+            "engine-abc",
+            Some("10.0.0.1"),
+            Some("True"),
+            false,
+            &[("engine", "pytrtllm")],
+        );
+        let discovered = ready_pod_endpoint(&p).unwrap();
+        assert_eq!(discovered.engine_hash, None);
+        assert_eq!(discovered.tenant_id("default"), "default");
     }
 
     #[test]
