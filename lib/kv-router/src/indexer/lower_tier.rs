@@ -253,6 +253,10 @@ impl LowerTierIndexer {
         worker: WorkerWithDpRank,
         block_hashes: &[ExternalSequenceBlockHash],
     ) -> Result<(), KvCacheEventError> {
+        // Unknown hashes are expected (store-side conflict truncation drops
+        // blocks): skip them so one miss can't abort the rest of the event.
+        // A single eviction event can carry an entire watermark burst.
+        let mut missing = 0usize;
         let remove_worker_entry = {
             let Some(worker_map) = worker_blocks.get_mut(&worker) else {
                 return Err(KvCacheEventError::BlockNotFound);
@@ -260,7 +264,8 @@ impl LowerTierIndexer {
 
             for block_hash in block_hashes {
                 let Some(key) = worker_map.remove(block_hash) else {
-                    return Err(KvCacheEventError::BlockNotFound);
+                    missing += 1;
+                    continue;
                 };
 
                 self.remove_worker_from_edge(key, worker);
@@ -271,6 +276,18 @@ impl LowerTierIndexer {
 
         if remove_worker_entry {
             worker_blocks.remove(&worker);
+        }
+
+        if missing > 0 {
+            tracing::debug!(
+                missing,
+                total = block_hashes.len(),
+                worker_id = worker.worker_id,
+                "lower-tier remove: skipped unknown block hashes"
+            );
+            if missing == block_hashes.len() {
+                return Err(KvCacheEventError::BlockNotFound);
+            }
         }
 
         Ok(())
@@ -1186,6 +1203,64 @@ mod tests {
             after_one_remove.get(&WorkerWithDpRank::new(13, 0)),
             Some(&0)
         );
+    }
+
+    #[test]
+    fn remove_skips_unknown_hashes_and_applies_the_rest() {
+        // A store-side conflict can leave the index missing blocks the engine
+        // holds; an eviction event citing one must still remove the others.
+        let mut index = TestLowerTierIndex::new();
+        index
+            .apply_event(store_event(7, 0, 0, None, &[11, 12, 13], &[101, 102, 103]))
+            .unwrap();
+
+        index
+            .apply_event(remove_event(
+                7,
+                1,
+                0,
+                vec![
+                    ExternalSequenceBlockHash(999), // unknown, first in list
+                    ExternalSequenceBlockHash(101),
+                    ExternalSequenceBlockHash(888), // unknown, mid list
+                    ExternalSequenceBlockHash(102),
+                    ExternalSequenceBlockHash(103),
+                ],
+            ))
+            .unwrap();
+
+        let mut continuations = FxHashMap::default();
+        continuations.insert(
+            WorkerWithDpRank::new(7, 0),
+            LowerTierContinuation::from_root(0),
+        );
+        let hits = index.query_contiguous_hits(&local_hashes(&[11, 12, 13]), &continuations);
+        assert_eq!(hits.get(&WorkerWithDpRank::new(7, 0)), Some(&0));
+    }
+
+    #[test]
+    fn remove_with_only_unknown_hashes_reports_block_not_found() {
+        let mut index = TestLowerTierIndex::new();
+        index
+            .apply_event(store_event(7, 0, 0, None, &[11], &[101]))
+            .unwrap();
+
+        let result = index.apply_event(remove_event(
+            7,
+            1,
+            0,
+            vec![ExternalSequenceBlockHash(999)],
+        ));
+        assert!(result.is_err());
+
+        // The stored block is untouched.
+        let mut continuations = FxHashMap::default();
+        continuations.insert(
+            WorkerWithDpRank::new(7, 0),
+            LowerTierContinuation::from_root(0),
+        );
+        let hits = index.query_contiguous_hits(&local_hashes(&[11]), &continuations);
+        assert_eq!(hits.get(&WorkerWithDpRank::new(7, 0)), Some(&1));
     }
 
     #[test]
