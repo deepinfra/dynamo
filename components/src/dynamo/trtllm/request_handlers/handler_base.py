@@ -1114,8 +1114,18 @@ class HandlerBase(BaseGenerativeHandler):
                 f"Using dynamo router dp_rank={dp_rank} for TRTLLM attention DP scheduling"
             )
 
-        # Priority is a float in [0.0, 1.0]; health checks use 1.0. Default is 0.5.
-        priority = request.get("priority", DEFAULT_REQUEST_PRIORITY)
+        # Priority is a float in [0.0, 1.0]; default 0.5. The top-level key is
+        # the canary health-check pin and takes precedence. Real requests carry
+        # it in the routing hints on dynamo's unbounded higher-is-urgent scale,
+        # so map that into the range TRT-LLM validates.
+        priority = request.get("priority")
+        if priority is None:
+            routed = routing.get("priority") if routing else None
+            priority = (
+                DEFAULT_REQUEST_PRIORITY
+                if routed is None
+                else min(1.0, max(0.0, 0.5 + 0.1 * float(routed)))
+            )
         cache_salt = request_cache_salt(request)
 
         try:

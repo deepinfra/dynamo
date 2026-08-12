@@ -684,7 +684,9 @@ class Publisher:
         """
         if self._fpm_paused:
             return
-        logging.info("Pausing FPM emission for drain (Python gate; publisher stays bound)")
+        logging.info(
+            "Pausing FPM emission for drain (Python gate; publisher stays bound)"
+        )
         self._fpm_paused = True
 
     def resume_fpm(self) -> None:

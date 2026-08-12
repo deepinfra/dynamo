@@ -14,9 +14,9 @@ from __future__ import annotations
 import json
 import logging
 import math
-from dataclasses import dataclass
 import statistics
 from collections import deque
+from dataclasses import dataclass
 from typing import Any, Optional
 
 from dynamo.common.forward_pass_metrics import (
@@ -664,7 +664,8 @@ class PlannerEnginePerfModel:
             # silently refuses to answer; debugging the 1e9 prefill sentinel.
             logger.info(
                 "RUST_CAPACITY[%s]: req=%s -> None",
-                self._worker_type, request_kwargs,
+                self._worker_type,
+                request_kwargs,
             )
             return None
         # DEEPINFRA: per-query I/O log for the Rust shim. Surfaces the exact
@@ -672,9 +673,13 @@ class PlannerEnginePerfModel:
         # so we can map where the 1e9 sentinel kicks in.
         logger.info(
             "RUST_CAPACITY[%s]: req=%s -> rps=%s ttft_ms=%s itl_ms=%s e2e_ms=%s eligible=%s",
-            self._worker_type, request_kwargs,
-            result.rps, result.ttft_ms, result.itl_ms,
-            result.e2e_latency_ms, result.eligible,
+            self._worker_type,
+            request_kwargs,
+            result.rps,
+            result.ttft_ms,
+            result.itl_ms,
+            result.e2e_latency_ms,
+            result.eligible,
         )
         rps = result.rps
         itl_ms = result.itl_ms
@@ -691,8 +696,10 @@ class PlannerEnginePerfModel:
                 logger.info(
                     "RUST_CAPACITY[%s]: FALLBACK_OVERRIDE shim_rps=%s -> "
                     "rps=%.2f ttft_ms=%.2f (min_wt_s=%s slope=%s)",
-                    self._worker_type, rps,
-                    fallback.rps, fallback.ttft_ms or 0,
+                    self._worker_type,
+                    rps,
+                    fallback.rps,
+                    fallback.ttft_ms or 0,
                     self._fallback_min_wt_s,
                     self._fallback_per_token_slope_s(),
                 )
@@ -706,9 +713,7 @@ class PlannerEnginePerfModel:
             # single-request iter latency, then rps = 1 / iter_ttft.
             effective_isl = max(
                 1,
-                int(math.ceil(
-                    isl * (1.0 - _clamp_kv_hit_rate(kv_hit_rate))
-                )),
+                int(math.ceil(isl * (1.0 - _clamp_kv_hit_rate(kv_hit_rate)))),
             )
             synth_fpm = ForwardPassMetrics(
                 version=FPM_VERSION,
@@ -723,13 +728,13 @@ class PlannerEnginePerfModel:
                 ),
             )
             try:
-                ttft_batch1_s = self._rust_model.get_queued_prefill_time(
-                    [synth_fpm]
-                )
+                ttft_batch1_s = self._rust_model.get_queued_prefill_time([synth_fpm])
             except _RUST_SHIM_FALLBACK_EXCEPTIONS as e:
                 logger.warning(
                     "RUST_CAPACITY[prefill]: batch-1 query failed: %s "
-                    "(keeping shim rps=%.2f)", e, rps,
+                    "(keeping shim rps=%.2f)",
+                    e,
+                    rps,
                 )
                 ttft_batch1_s = None
             if ttft_batch1_s is not None and ttft_batch1_s > 0:
@@ -739,8 +744,12 @@ class PlannerEnginePerfModel:
                     "RUST_CAPACITY[prefill]: batch-1 override: "
                     "shim rps=%.2f (batch≈%.1f, ttft=%.2fms) -> "
                     "rps=%.2f (effective_isl=%d, ttft=%.2fms)",
-                    rps, rps * result.ttft_ms / 1000.0, result.ttft_ms,
-                    rps_batch1, effective_isl, ttft_batch1_ms,
+                    rps,
+                    rps * result.ttft_ms / 1000.0,
+                    result.ttft_ms,
+                    rps_batch1,
+                    effective_isl,
+                    ttft_batch1_ms,
                 )
                 rps = rps_batch1
                 # keep result.ttft_ms as the SLA-eligibility signal (unchanged)

@@ -716,9 +716,11 @@ class TestHealthCheckPriority:
     """Verify generate_locally forwards the correct priority to generate_async.
 
     Health check requests (built by TrtllmHealthCheckPayload) must reach
-    the TRT-LLM engine at priority=1.0.  Regular inference requests
-    (built by the Rust frontend as PreprocessedRequest, which has no
-    priority field) must fall back to DEFAULT_REQUEST_PRIORITY (0.5).
+    the TRT-LLM engine at priority=1.0, and that top-level pin wins over any
+    routing hint.  Regular inference requests carry priority in the routing
+    hints on dynamo's unbounded higher-is-urgent scale, mapped into the
+    [0.0, 1.0] range TRT-LLM validates; with no hint at all they fall back to
+    DEFAULT_REQUEST_PRIORITY (0.5).
     """
 
     def _make_handler(self) -> HandlerBase:
@@ -802,6 +804,55 @@ class TestHealthCheckPriority:
         handler.engine.llm.generate_async.assert_called_once()
         _, kwargs = handler.engine.llm.generate_async.call_args
         assert kwargs["priority"] == DEFAULT_REQUEST_PRIORITY
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "routed,expected",
+        [(1, 0.6), (2, 0.7), (5, 1.0), (50, 1.0), (0, 0.5)],
+    )
+    async def test_routing_priority_mapped_into_engine_range(self, routed, expected):
+        """routing.priority is unbounded and higher-is-urgent; TRT-LLM takes
+        [0.0, 1.0]. Values at or above 5 saturate."""
+        handler = self._make_handler()
+        generation_result = self._make_mock_generation_result()
+        handler.engine.llm.generate_async = MagicMock(return_value=generation_result)
+
+        request = {
+            "token_ids": [1, 2, 3],
+            "stop_conditions": {"max_tokens": 10},
+            "sampling_options": {"temperature": 0.7},
+            "routing": {"priority": routed},
+        }
+
+        chunks = [
+            c async for c in handler.generate_locally(request, self._make_context())
+        ]
+        assert len(chunks) > 0
+
+        handler.engine.llm.generate_async.assert_called_once()
+        _, kwargs = handler.engine.llm.generate_async.call_args
+        assert kwargs["priority"] == pytest.approx(expected)
+
+    @pytest.mark.asyncio
+    async def test_health_check_priority_beats_routing_hint(self):
+        """The canary pin is top-level and must not be overridden by routing."""
+        handler = self._make_handler()
+        generation_result = self._make_mock_generation_result()
+        handler.engine.llm.generate_async = MagicMock(return_value=generation_result)
+
+        request = TrtllmHealthCheckPayload(
+            disaggregation_mode=DisaggregationMode.AGGREGATED,
+        ).to_dict()
+        request["routing"] = {"priority": 0}
+
+        chunks = [
+            c async for c in handler.generate_locally(request, self._make_context())
+        ]
+        assert len(chunks) > 0
+
+        handler.engine.llm.generate_async.assert_called_once()
+        _, kwargs = handler.engine.llm.generate_async.call_args
+        assert kwargs["priority"] == 1.0
 
     @pytest.mark.asyncio
     async def test_routing_cache_salt_forwarded_to_generate_async(self):

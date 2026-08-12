@@ -8,16 +8,23 @@ Guards the 2026-07-08 00:23-00:25Z incident (VM pod reschedule -> num_req read
 surge — a real 3x+ spike arrives with a full complement of scrape samples.
 """
 
+import pytest
+
 from dynamo import prometheus_names
 
 # Local dev envs may carry an older prometheus_names than the repo bindings
 # (which define REQUESTS_STARTED_TOTAL = "requests_started_total").
 if not hasattr(prometheus_names.frontend_service, "REQUESTS_STARTED_TOTAL"):
-    prometheus_names.frontend_service.REQUESTS_STARTED_TOTAL = (
-        "requests_started_total"
-    )
+    prometheus_names.frontend_service.REQUESTS_STARTED_TOTAL = "requests_started_total"
 
 from dynamo.planner.monitoring.traffic_metrics import PrometheusAPIClient
+
+pytestmark = [
+    pytest.mark.gpu_0,
+    pytest.mark.pre_merge,
+    pytest.mark.unit,
+    pytest.mark.planner,
+]
 
 
 def _client(query_result=None, raises=False):
