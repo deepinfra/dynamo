@@ -164,9 +164,7 @@ class PlannerScalingState(LoadScalingMixin, ThroughputScalingMixin):
         # logic. Substituted in by LoadScalingMixin before each tick's
         # decision; expired after _FPM_REAL_TTL_SECONDS so a genuinely
         # drained worker eventually surfaces as idle.
-        self._last_real_fpm: dict[
-            tuple[str, int], tuple[Any, float]
-        ] = {}
+        self._last_real_fpm: dict[tuple[str, int], tuple[Any, float]] = {}
 
         # Most recent observed KV hit rate from the router. Runtime metadata like
         # this is intentionally last-value only, not fed through the traffic load

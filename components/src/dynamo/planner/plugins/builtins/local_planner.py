@@ -256,10 +256,11 @@ class BuiltinThroughputPropose:
         model handle hasn't been built.
         """
         import json as _json
+
         for name, attr in (
             ("prefill", "_prefill_regression"),
-            ("decode",  "_decode_regression"),
-            ("agg",     "_agg_regression"),
+            ("decode", "_decode_regression"),
+            ("agg", "_agg_regression"),
         ):
             model = getattr(self._state, attr, None)
             if model is None:
@@ -274,7 +275,8 @@ class BuiltinThroughputPropose:
             try:
                 log.info(
                     "RUST_DIAG[%s]: %s",
-                    name, _json.dumps(diag, default=str, sort_keys=True),
+                    name,
+                    _json.dumps(diag, default=str, sort_keys=True),
                 )
             except (TypeError, ValueError) as e:
                 log.warning("RUST_DIAG[%s]: serialize failed: %s", name, e)

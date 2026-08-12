@@ -227,8 +227,13 @@ class LoadScalingMixin:
             logger.info(
                 "Confirmation buffer [%s]: last %d proposals=%s commit=%d "
                 "observed=%d -> CONFIRMED %d (up, min of last %d)",
-                label, len(buffer), list(buffer), last_suggested, observed,
-                confirmed, ticks_up,
+                label,
+                len(buffer),
+                list(buffer),
+                last_suggested,
+                observed,
+                confirmed,
+                ticks_up,
             )
             setattr(self, last_suggested_attr, confirmed)
             self._last_up_tick[last_suggested_attr] = tick
@@ -238,8 +243,13 @@ class LoadScalingMixin:
             logger.info(
                 "Confirmation buffer [%s]: last %d proposals=%s commit=%d "
                 "observed=%d -> HOLD (filling %d/%d)",
-                label, len(buffer), list(buffer), last_suggested, observed,
-                len(buffer), buffer.maxlen,
+                label,
+                len(buffer),
+                list(buffer),
+                last_suggested,
+                observed,
+                len(buffer),
+                buffer.maxlen,
             )
             return last_suggested
 
@@ -256,15 +266,24 @@ class LoadScalingMixin:
                     "Confirmation buffer [%s]: last %d proposals=%s commit=%d "
                     "observed=%d -> HOLD (down suppressed, cooldown %d/%d "
                     "ticks since scale-up)",
-                    label, buffer.maxlen, list(buffer), last_suggested,
-                    observed, tick - last_up, cooldown,
+                    label,
+                    buffer.maxlen,
+                    list(buffer),
+                    last_suggested,
+                    observed,
+                    tick - last_up,
+                    cooldown,
                 )
                 return last_suggested
             confirmed = max(buffer)
             logger.info(
                 "Confirmation buffer [%s]: last %d proposals=%s commit=%d "
                 "observed=%d -> CONFIRMED %d (down, max of buffer)",
-                label, buffer.maxlen, list(buffer), last_suggested, observed,
+                label,
+                buffer.maxlen,
+                list(buffer),
+                last_suggested,
+                observed,
                 confirmed,
             )
             setattr(self, last_suggested_attr, confirmed)
@@ -280,7 +299,12 @@ class LoadScalingMixin:
         logger.info(
             "Confirmation buffer [%s]: last %d proposals=%s commit=%d "
             "observed=%d -> HOLD (%s)",
-            label, buffer.maxlen, list(buffer), last_suggested, observed, detail,
+            label,
+            buffer.maxlen,
+            list(buffer),
+            last_suggested,
+            observed,
+            detail,
         )
         return last_suggested
 
@@ -493,7 +517,8 @@ class LoadScalingMixin:
             self._reactive_floor_bump_tick = self._load_tick_counter
             logger.info(
                 "Reactive prefill floor decayed to %d (no force-up for %d ticks)",
-                self._reactive_floor_p, decay,
+                self._reactive_floor_p,
+                decay,
             )
 
     def _advance_load_disagg(self, obs: FpmObservations) -> Optional[ScalingDecision]:
@@ -1070,10 +1095,12 @@ class LoadScalingMixin:
                     # Unpadded projection (pure N/(N-1) redistribution of
                     # CURRENT demand) — input to the K* residency fixed point,
                     # which must not compound with the spike pad (see check 3).
-                    post_itl_raw = self._decode_regression.estimate_scheduled_decode_itl(
-                        group,
-                        decode_scale=consolidation,
-                        include_queued_decode=True,
+                    post_itl_raw = (
+                        self._decode_regression.estimate_scheduled_decode_itl(
+                            group,
+                            decode_scale=consolidation,
+                            include_queued_decode=True,
+                        )
                     )
                     if post_itl_raw is not None:
                         sum_post_itl_raw_s += post_itl_raw
@@ -1209,10 +1236,12 @@ class LoadScalingMixin:
                         sum_itl_2_s = 0.0
                         n_2 = 0
                         for _, group in groups_list:
-                            itl_2 = self._decode_regression.estimate_scheduled_decode_itl(
-                                group,
-                                decode_scale=scale_2,
-                                include_queued_decode=True,
+                            itl_2 = (
+                                self._decode_regression.estimate_scheduled_decode_itl(
+                                    group,
+                                    decode_scale=scale_2,
+                                    include_queued_decode=True,
+                                )
                             )
                             if itl_2 is not None:
                                 sum_itl_2_s += itl_2

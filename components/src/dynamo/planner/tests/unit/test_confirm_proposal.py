@@ -16,6 +16,13 @@ import pytest
 
 from dynamo.planner.core.load_scaling import LoadScalingMixin
 
+pytestmark = [
+    pytest.mark.gpu_0,
+    pytest.mark.pre_merge,
+    pytest.mark.unit,
+    pytest.mark.planner,
+]
+
 
 class _Gate(LoadScalingMixin):
     """Minimal host for the mixin: only the fields the gate touches."""
@@ -187,7 +194,9 @@ def test_reactive_floor_disabled_with_zero():
 class _Trend(LoadScalingMixin):
     """Minimal host for the decode consolidation peak/trend pad."""
 
-    def __init__(self, horizon: int = 360, pad_max: float = 2.0, peak_window: int = 360):
+    def __init__(
+        self, horizon: int = 360, pad_max: float = 2.0, peak_window: int = 360
+    ):
         from collections import deque as _deque
 
         self._config = SimpleNamespace(
@@ -251,7 +260,7 @@ def test_peak_pad_covers_wave():
 
 def test_peak_pad_expires_outside_window():
     t = _Trend(horizon=0, peak_window=50, pad_max=5.0)
-    t.feed([3_000_000] * 10)   # old peak
+    t.feed([3_000_000] * 10)  # old peak
     t.feed([1_000_000] * 100)  # peak now outside the 50-tick window
     assert t._decode_consolidation_pad() == 1.0
 
@@ -359,9 +368,7 @@ def test_guards_combine_by_max_not_product():
 
 
 class _Tolerator(LoadScalingMixin):
-    from dynamo.planner.core.state_machine import (
-        PlannerScalingState as _PSS,
-    )
+    from dynamo.planner.core.state_machine import PlannerScalingState as _PSS
 
     _reconcile_fpm_worker_count = staticmethod(
         _PSS.__dict__["_reconcile_fpm_worker_count"].__func__

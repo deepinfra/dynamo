@@ -21,6 +21,13 @@ from dynamo.planner.core.throughput_scaling import (
 from dynamo.planner.core.types import TrafficShape
 from dynamo.planner.monitoring.traffic_metrics import _histogram_moments
 
+pytestmark = [
+    pytest.mark.gpu_0,
+    pytest.mark.pre_merge,
+    pytest.mark.unit,
+    pytest.mark.planner,
+]
+
 # ---------------------------------------------------------------------------
 # erlang_c
 # ---------------------------------------------------------------------------
@@ -76,7 +83,9 @@ def test_histogram_moments_calibration_scales_mean():
     assert mean == pytest.approx(200.0)
     # SCV is scale-invariant: matches the uncalibrated shape
     mean0, m20, _ = _histogram_moments(buckets, log_spaced=True)
-    assert (m2 - mean**2) / mean**2 == pytest.approx((m20 - mean0**2) / mean0**2)
+    assert (m2 - mean**2) / mean**2 == pytest.approx(
+        (m20 - mean0**2) / mean0**2
+    )
 
 
 def test_histogram_moments_empty_and_degenerate():
@@ -163,14 +172,17 @@ def test_erlang_path_infeasible_budget_uses_rho_ceiling():
 
 
 def test_erlang_path_min_endpoint_floor():
-    state = _make_state(slope_service=0.01, shape=None, min_endpoint=3, measure_shape=False)
+    state = _make_state(
+        slope_service=0.01, shape=None, min_endpoint=3, measure_shape=False
+    )
     n = state._prefill_replicas_erlang(1.0, 500.0, 0.0, aic_engine_rps=100.0)
     assert n >= 3
 
 
 def test_down_hysteresis_holds_boundary_dither():
-    state = _make_state(slope_service=0.0636, shape=None, measure_shape=False,
-                        down_pad=1.25)
+    state = _make_state(
+        slope_service=0.0636, shape=None, measure_shape=False, down_pad=1.25
+    )
     # demand oscillating a few percent around an integer boundary
     n_high = state._prefill_replicas_erlang(46.0, 5724.0, 0.484, 37.0)
     dithered = [
@@ -185,8 +197,9 @@ def test_down_hysteresis_holds_boundary_dither():
 
 
 def test_down_hysteresis_disabled_with_pad_one():
-    state = _make_state(slope_service=0.0636, shape=None, measure_shape=False,
-                        down_pad=1.0)
+    state = _make_state(
+        slope_service=0.0636, shape=None, measure_shape=False, down_pad=1.0
+    )
     n_high = state._prefill_replicas_erlang(46.0, 5724.0, 0.484, 37.0)
     n_dip = state._prefill_replicas_erlang(40.0, 5724.0, 0.484, 37.0)
     # pad=1.0: padded run equals the plain run, so any strictly lower
