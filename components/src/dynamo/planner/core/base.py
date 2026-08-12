@@ -725,7 +725,8 @@ class NativePlannerBase:
         if self.prometheus_traffic_client.scrape_gap_recent(self.model_name):
             logger.warning(
                 "Metrics gap detected around the request counter "
-                "(raw num_req=%.1f); skipping throughput tick", m.num_req
+                "(raw num_req=%.1f); skipping throughput tick",
+                m.num_req,
             )
             return None
         m.request_duration = self.prometheus_traffic_client.get_avg_request_duration(

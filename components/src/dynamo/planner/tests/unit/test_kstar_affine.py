@@ -9,6 +9,13 @@ import pytest
 
 from dynamo.planner.core.load_scaling import _kstar_affine
 
+pytestmark = [
+    pytest.mark.gpu_0,
+    pytest.mark.pre_merge,
+    pytest.mark.unit,
+    pytest.mark.planner,
+]
+
 
 def _itl(alpha, beta, k):
     return alpha + beta * k
@@ -42,9 +49,7 @@ def test_divergence_detected():
     k_curr, k_naive = 500_000.0, 900_000.0
     itl_curr = _itl(alpha, beta, k_curr)  # 21ms
     q_expected = k_naive * beta / itl_curr  # ~1.71
-    k_star, q = _kstar_affine(
-        k_curr, k_naive, itl_curr, _itl(alpha, beta, k_naive)
-    )
+    k_star, q = _kstar_affine(k_curr, k_naive, itl_curr, _itl(alpha, beta, k_naive))
     assert math.isinf(k_star)
     assert q == pytest.approx(q_expected)
 
@@ -56,9 +61,7 @@ def test_closed_form_exceeds_truncated_iteration():
     itl_curr = _itl(alpha, beta, k_curr)
     k1 = k_naive * _itl(alpha, beta, k_naive) / itl_curr
     k2 = k_naive * _itl(alpha, beta, k1) / itl_curr  # 2-iter estimate
-    k_star, q = _kstar_affine(
-        k_curr, k_naive, itl_curr, _itl(alpha, beta, k_naive)
-    )
+    k_star, q = _kstar_affine(k_curr, k_naive, itl_curr, _itl(alpha, beta, k_naive))
     assert k_star > k2 > k_naive
 
 

@@ -527,7 +527,9 @@ class PrometheusAPIClient:
             logger.warning(
                 "Scrape-gap check: series has %.0f/%.0f expected samples in "
                 "the last %ds — metrics gap in progress or just ended",
-                worst, expected, lookback_s,
+                worst,
+                expected,
+                lookback_s,
             )
             return True
         return False
@@ -651,9 +653,7 @@ class PrometheusAPIClient:
         buckets = self._filtered_bucket_sums(f"{metric}_bucket", window, match)
         exact_sum = self._filtered_scalar_sum(f"{metric}_sum", window, match)
         exact_count = self._filtered_scalar_sum(f"{metric}_count", window, match)
-        exact_mean = (
-            exact_sum / exact_count if exact_sum and exact_count else None
-        )
+        exact_mean = exact_sum / exact_count if exact_sum and exact_count else None
         moments = _histogram_moments(
             buckets, log_spaced=True, calibrate_mean=exact_mean
         )
