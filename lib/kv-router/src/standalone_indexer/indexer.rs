@@ -17,9 +17,10 @@ use crate::protocols::{KvCacheEventData, LocalBlockHash, OverlapScores, RouterEv
 /// Block-content indexer wrapping a primary device-tier backend plus a
 /// per-tier registry of lower-tier indexers (host-pinned, disk, …).
 ///
-/// Both standalone-indexer variants own a `lower_tier: LowerTierIndexers` so
+/// Both tree-backed variants own a `lower_tier: LowerTierIndexers` so
 /// tier-tagged events get routed alongside device events and tier-aware
-/// queries can return per-tier hit counts.
+/// queries can return per-tier hit counts. The `H24` variant is the flat
+/// counterfactual indexer (`--h24`): no workers, no evictions, no tiers.
 #[derive(Clone)]
 pub enum Indexer {
     Single {
@@ -30,6 +31,7 @@ pub enum Indexer {
         primary: Arc<ThreadPoolIndexer<ConcurrentRadixTreeCompressed>>,
         lower_tier: LowerTierIndexers,
     },
+    H24(Arc<super::h24::H24Indexer>),
 }
 
 impl Indexer {
@@ -40,6 +42,7 @@ impl Indexer {
         match self {
             Indexer::Single { primary, .. } => primary.apply_event(event).await,
             Indexer::Concurrent { primary, .. } => primary.apply_event(event).await,
+            Indexer::H24(h24) => h24_apply(h24, &event),
         }
     }
 
@@ -49,6 +52,9 @@ impl Indexer {
     /// state stays consistent with the primary.
     pub async fn apply_event_routed(&self, event: RouterEvent) {
         match self {
+            // Tier-agnostic on purpose: in the counterfactual, a store on ANY
+            // tier means the content existed.
+            Indexer::H24(h24) => h24_apply(h24, &event),
             Indexer::Single {
                 primary,
                 lower_tier,
@@ -94,6 +100,8 @@ impl Indexer {
 
     pub async fn remove_worker(&self, worker_id: WorkerId) {
         match self {
+            // Counterfactual keeps content regardless of worker lifecycle.
+            Indexer::H24(_) => {}
             Indexer::Single {
                 primary,
                 lower_tier,
@@ -117,6 +125,7 @@ impl Indexer {
 
     pub async fn remove_worker_dp_rank(&self, worker_id: WorkerId, dp_rank: u32) {
         match self {
+            Indexer::H24(_) => {}
             Indexer::Single {
                 primary,
                 lower_tier,
@@ -148,6 +157,7 @@ impl Indexer {
             Indexer::Concurrent { primary, .. } => {
                 primary.find_matches(hashes).await.map_err(Into::into)
             }
+            Indexer::H24(h24) => Ok(h24.find_matches(&hashes)),
         }
     }
 
@@ -158,6 +168,13 @@ impl Indexer {
         sequence: Vec<LocalBlockHash>,
     ) -> Result<TieredMatchDetails> {
         match self {
+            Indexer::H24(h24) => Ok(TieredMatchDetails {
+                device: MatchDetails {
+                    overlap_scores: h24.find_matches(&sequence),
+                    last_matched_hashes: Default::default(),
+                },
+                lower_tier: Default::default(),
+            }),
             Indexer::Single {
                 primary,
                 lower_tier,
@@ -194,6 +211,12 @@ impl Indexer {
     /// would replay them into the wrong slot.
     pub async fn dump_events(&self) -> Result<Vec<RouterEvent>> {
         let (primary_events, lower_tier_entries) = match self {
+            // Flat maps cannot reconstruct chains; peer recovery and /dump
+            // are unsupported in h24 mode.
+            Indexer::H24(_) => {
+                tracing::warn!("h24 indexer does not support dump_events; returning empty");
+                return Ok(Vec::new());
+            }
             Indexer::Single {
                 primary,
                 lower_tier,
@@ -467,6 +490,19 @@ mod tests {
             "disk should report 1 additional block after replay"
         );
     }
+}
+
+/// Apply an event to the flat h24 backend: stores chain in, everything else
+/// (evictions, clears) is the counterfactual's no-op and is only counted.
+fn h24_apply(h24: &super::h24::H24Indexer, event: &RouterEvent) {
+    match &event.event.data {
+        KvCacheEventData::Stored(data) => h24.apply_store(data),
+        KvCacheEventData::Removed(_) | KvCacheEventData::Cleared => h24.note_ignored_event(),
+    }
+}
+
+pub fn create_h24_indexer() -> Indexer {
+    Indexer::H24(Arc::new(super::h24::H24Indexer::new()))
 }
 
 pub fn create_indexer(block_size: u32, num_threads: usize) -> Indexer {

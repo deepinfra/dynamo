@@ -376,6 +376,7 @@ async fn run_fanout_query(
     mut hashes_for: impl FnMut(u32) -> Vec<LocalBlockHash>,
     pod_names: &HashMap<WorkerId, String>,
     audit: QueryAudit<'_>,
+    h24_enabled: bool,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let logging = super::logging_enabled();
     let mut logged_hashes: Option<Vec<u64>> = None;
@@ -383,9 +384,11 @@ async fn run_fanout_query(
     let mut merged: Option<ScoreResponse> = None;
     let mut last_error: Option<String> = None;
     let mut queried_tenants: Vec<String> = Vec::with_capacity(trees.len());
+    let mut num_blocks = 0usize;
 
     for (key, indexer, block_size) in trees {
         let block_hashes = hashes_for(block_size);
+        num_blocks = num_blocks.max(block_hashes.len());
         if logging && logged_hashes.is_none() {
             logged_hashes = Some(block_hashes.iter().map(|h| h.0).collect());
         }
@@ -408,6 +411,12 @@ async fn run_fanout_query(
                 last_error = Some(error.to_string());
             }
         }
+    }
+
+    // Counted once per request (not per fan-out tree): this is the
+    // denominator of the h24 retention curve.
+    if h24_enabled {
+        super::metrics::h24_add_queried_blocks(num_blocks);
     }
 
     let (status, body) = match merged {
@@ -478,6 +487,7 @@ async fn query(
             model_name: &req.model_name,
             requested_tenant: &req.tenant_id,
         },
+        state.registry.h24_enabled(),
     )
     .await
 }
@@ -509,6 +519,7 @@ async fn query_by_hash(
             model_name: &req.model_name,
             requested_tenant: &req.tenant_id,
         },
+        state.registry.h24_enabled(),
     )
     .await
 }

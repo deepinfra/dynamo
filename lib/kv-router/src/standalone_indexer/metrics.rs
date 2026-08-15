@@ -10,7 +10,8 @@ use std::time::Instant;
 use axum::{extract::MatchedPath, http::Request, middleware::Next, response::Response};
 #[cfg(feature = "metrics")]
 use prometheus::{
-    HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, Opts, exponential_buckets, histogram_opts,
+    HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts, exponential_buckets,
+    histogram_opts,
 };
 
 #[cfg(feature = "metrics")]
@@ -39,6 +40,15 @@ pub struct StandaloneIndexerMetrics {
     pub models: IntGauge,
     pub workers: IntGauge,
     pub listeners: IntGaugeVec,
+    /// h24 mode: age of each matched block at query time, labeled by
+    /// kind = since_stored | since_touched. The bucket CDF over queried
+    /// blocks IS the hit-rate-vs-retention curve.
+    pub h24_age_seconds: HistogramVec,
+    pub h24_queried_blocks: IntCounter,
+    pub h24_matched_blocks: IntCounter,
+    pub h24_parent_miss: IntCounter,
+    pub h24_seen_blocks: IntGauge,
+    pub h24_attach_entries: IntGauge,
 }
 
 #[cfg(feature = "metrics")]
@@ -86,6 +96,43 @@ static METRICS: LazyLock<StandaloneIndexerMetrics> = LazyLock::new(|| Standalone
         &["status"],
     )
     .expect("valid gauge"),
+    h24_age_seconds: HistogramVec::new(
+        histogram_opts!(
+            format!("{METRICS_PREFIX}_h24_age_seconds"),
+            "h24: age of each matched block at query time",
+            vec![
+                60.0, 300.0, 900.0, 1800.0, 3600.0, 10800.0, 21600.0, 43200.0, 86400.0, 129600.0,
+                172800.0
+            ]
+        ),
+        &["kind"],
+    )
+    .expect("valid histogram"),
+    h24_queried_blocks: IntCounter::new(
+        format!("{METRICS_PREFIX}_h24_queried_blocks_total"),
+        "h24: blocks in incoming queries (denominator of the retention curve)",
+    )
+    .expect("valid counter"),
+    h24_matched_blocks: IntCounter::new(
+        format!("{METRICS_PREFIX}_h24_matched_blocks_total"),
+        "h24: matched prefix blocks across queries",
+    )
+    .expect("valid counter"),
+    h24_parent_miss: IntCounter::new(
+        format!("{METRICS_PREFIX}_h24_parent_miss_total"),
+        "h24: store events dropped because the parent hash was unknown",
+    )
+    .expect("valid counter"),
+    h24_seen_blocks: IntGauge::new(
+        format!("{METRICS_PREFIX}_h24_seen_blocks"),
+        "h24: unique prefix blocks currently tracked",
+    )
+    .expect("valid gauge"),
+    h24_attach_entries: IntGauge::new(
+        format!("{METRICS_PREFIX}_h24_attach_entries"),
+        "h24: engine-hash attach aliases currently tracked",
+    )
+    .expect("valid gauge"),
 });
 
 #[cfg(feature = "metrics")]
@@ -97,8 +144,58 @@ pub fn register(registry: &prometheus::Registry) -> Result<(), prometheus::Error
     registry.register(Box::new(m.models.clone()))?;
     registry.register(Box::new(m.workers.clone()))?;
     registry.register(Box::new(m.listeners.clone()))?;
+    registry.register(Box::new(m.h24_age_seconds.clone()))?;
+    registry.register(Box::new(m.h24_queried_blocks.clone()))?;
+    registry.register(Box::new(m.h24_matched_blocks.clone()))?;
+    registry.register(Box::new(m.h24_parent_miss.clone()))?;
+    registry.register(Box::new(m.h24_seen_blocks.clone()))?;
+    registry.register(Box::new(m.h24_attach_entries.clone()))?;
     Ok(())
 }
+
+#[cfg(feature = "metrics")]
+pub fn h24_observe_age(kind: &str, secs: u32) {
+    METRICS
+        .h24_age_seconds
+        .with_label_values(&[kind])
+        .observe(secs as f64);
+}
+
+#[cfg(not(feature = "metrics"))]
+pub fn h24_observe_age(_kind: &str, _secs: u32) {}
+
+#[cfg(feature = "metrics")]
+pub fn h24_add_queried_blocks(n: usize) {
+    METRICS.h24_queried_blocks.inc_by(n as u64);
+}
+
+#[cfg(not(feature = "metrics"))]
+pub fn h24_add_queried_blocks(_n: usize) {}
+
+#[cfg(feature = "metrics")]
+pub fn h24_add_matched_blocks(n: usize) {
+    METRICS.h24_matched_blocks.inc_by(n as u64);
+}
+
+#[cfg(not(feature = "metrics"))]
+pub fn h24_add_matched_blocks(_n: usize) {}
+
+#[cfg(feature = "metrics")]
+pub fn h24_inc_parent_miss() {
+    METRICS.h24_parent_miss.inc();
+}
+
+#[cfg(not(feature = "metrics"))]
+pub fn h24_inc_parent_miss() {}
+
+#[cfg(feature = "metrics")]
+pub fn h24_set_sizes(seen: usize, attach: usize) {
+    METRICS.h24_seen_blocks.set(seen as i64);
+    METRICS.h24_attach_entries.set(attach as i64);
+}
+
+#[cfg(not(feature = "metrics"))]
+pub fn h24_set_sizes(_seen: usize, _attach: usize) {}
 
 #[cfg(feature = "metrics")]
 pub async fn metrics_middleware(req: Request<axum::body::Body>, next: Next) -> Response {
@@ -155,6 +252,26 @@ mod tests {
         register(&registry).expect("registration should succeed");
 
         set_worker_state(1, 2, [1, 1, 0, 0]);
+        // Vec metrics encode nothing until they have at least one child, and
+        // the process-global METRICS is shared across tests — populate them
+        // here instead of depending on sibling-test scheduling.
+        METRICS
+            .request_duration
+            .with_label_values(&["/test"])
+            .observe(0.001);
+        METRICS
+            .requests_total
+            .with_label_values(&["/test", "GET"])
+            .inc();
+        METRICS
+            .errors_total
+            .with_label_values(&["/test", "4xx"])
+            .inc();
+        h24_observe_age("since_stored", 60);
+        h24_add_queried_blocks(4);
+        h24_add_matched_blocks(2);
+        h24_inc_parent_miss();
+        h24_set_sizes(10, 12);
 
         let encoder = prometheus::TextEncoder::new();
         let mut buf = Vec::new();
@@ -168,5 +285,11 @@ mod tests {
         assert!(output.contains("dynamo_kvindexer_workers 2"));
         assert!(output.contains("dynamo_kvindexer_listeners{status=\"pending\"} 1"));
         assert!(output.contains("dynamo_kvindexer_listeners{status=\"active\"} 1"));
+        assert!(output.contains("dynamo_kvindexer_h24_age_seconds"));
+        assert!(output.contains("dynamo_kvindexer_h24_queried_blocks_total"));
+        assert!(output.contains("dynamo_kvindexer_h24_matched_blocks_total"));
+        assert!(output.contains("dynamo_kvindexer_h24_parent_miss_total"));
+        assert!(output.contains("dynamo_kvindexer_h24_seen_blocks 10"));
+        assert!(output.contains("dynamo_kvindexer_h24_attach_entries 12"));
     }
 }

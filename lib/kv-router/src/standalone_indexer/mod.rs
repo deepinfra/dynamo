@@ -24,6 +24,7 @@
 //! response struct in [`server`] for the exact semantics.
 
 pub mod evictions;
+pub mod h24;
 pub mod indexer;
 pub mod listener;
 pub mod metrics;
@@ -163,6 +164,15 @@ pub struct IndexerConfig {
     /// Emit verbose per-query and per-event audit logs on the `kv_audit`
     /// tracing target. See [`logging_enabled`].
     pub enable_logging: bool,
+    /// Run every indexer as the flat h24 counterfactual backend: ignore
+    /// evictions and worker identity, track per-block last-seen timestamps,
+    /// and report matches under a single synthetic worker. Mutually
+    /// exclusive with `keep_evictions`.
+    pub h24: bool,
+    /// Retention horizon for the h24 expiry sweep (seconds). Entries not
+    /// stored or touched within this window are dropped. Only meaningful
+    /// with `h24`.
+    pub h24_horizon_secs: u64,
 }
 
 pub(super) fn validate_zmq_endpoint(endpoint: &str) -> anyhow::Result<()> {
@@ -307,6 +317,27 @@ pub async fn run_server(config: IndexerConfig) -> anyhow::Result<()> {
     );
 
     let registry = Arc::new(WorkerRegistry::new(config.threads));
+
+    if config.h24 {
+        anyhow::ensure!(
+            !config.keep_evictions,
+            "--h24 and --keep-evictions are mutually exclusive"
+        );
+        anyhow::ensure!(
+            config.h24_horizon_secs > 0,
+            "--h24-horizon-secs must be positive"
+        );
+        registry.enable_h24();
+        h24::spawn_expiry_loop(
+            registry.clone(),
+            config.h24_horizon_secs,
+            cancel_token.clone(),
+        );
+        tracing::info!(
+            horizon_secs = config.h24_horizon_secs,
+            "h24 mode enabled: flat counterfactual indexer, evictions ignored"
+        );
+    }
 
     if config.keep_evictions {
         anyhow::ensure!(

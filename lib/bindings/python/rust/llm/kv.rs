@@ -96,6 +96,20 @@ struct KvIndexerCli {
     #[arg(long, default_value_t = false)]
     enable_logging: bool,
 
+    /// Run as the flat h24 counterfactual indexer: ignore evictions and
+    /// worker identity, track per-block last-seen timestamps, and answer
+    /// queries under a single synthetic worker. Measures "what would the hit
+    /// rate be if blocks were kept for the retention horizon". Mutually
+    /// exclusive with --keep-evictions.
+    #[arg(long, default_value_t = false, conflicts_with = "keep_evictions")]
+    h24: bool,
+
+    /// Retention horizon (seconds) for the h24 expiry sweep. Entries not
+    /// stored or touched within this window are dropped. Only meaningful
+    /// with --h24. Default 172800 (48h) so the 24h point sits mid-curve.
+    #[arg(long, default_value_t = 172_800)]
+    h24_horizon_secs: u64,
+
     /// Kubernetes namespace to watch for engine pods. Providing this together
     /// with --watch-model-name (or --watch-label) enables pod auto-discovery
     /// (subscribe on Ready, unsubscribe on delete).
@@ -193,6 +207,8 @@ where
             evict_retention_secs: cli.evict_retention_secs,
             evict_memory_threshold: cli.evict_memory_threshold,
             enable_logging: cli.enable_logging,
+            h24: cli.h24,
+            h24_horizon_secs: cli.h24_horizon_secs,
             kube_discovery,
         }))
     }

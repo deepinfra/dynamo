@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use anyhow::{Result, bail};
 use dashmap::DashMap;
@@ -17,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 use crate::protocols::WorkerId;
 
 use super::evictions::PendingEvictions;
-use super::indexer::{Indexer, create_indexer};
+use super::indexer::{Indexer, create_h24_indexer, create_indexer};
 use super::listener::spawn_zmq_listener;
 
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
@@ -334,6 +334,9 @@ pub struct WorkerRegistry {
     peers: DashMap<String, ()>,
     watermarks: DashMap<(WorkerId, u32), Arc<AtomicU64>>,
     num_threads: usize,
+    /// When set (before any registration), new indexers are flat h24
+    /// counterfactual indexers instead of radix trees.
+    h24: AtomicBool,
     ready_tx: watch::Sender<bool>,
     ready_rx: watch::Receiver<bool>,
 }
@@ -347,8 +350,25 @@ impl WorkerRegistry {
             peers: DashMap::new(),
             watermarks: DashMap::new(),
             num_threads,
+            h24: AtomicBool::new(false),
             ready_tx,
             ready_rx,
+        }
+    }
+
+    pub fn enable_h24(&self) {
+        self.h24.store(true, Ordering::Relaxed);
+    }
+
+    pub fn h24_enabled(&self) -> bool {
+        self.h24.load(Ordering::Relaxed)
+    }
+
+    fn new_indexer(&self, block_size: u32) -> Indexer {
+        if self.h24_enabled() {
+            create_h24_indexer()
+        } else {
+            create_indexer(block_size, self.num_threads)
         }
     }
 
@@ -426,7 +446,7 @@ impl WorkerRegistry {
                 "Creating new indexer"
             );
             IndexerEntry {
-                indexer: create_indexer(block_size, self.num_threads),
+                indexer: self.new_indexer(block_size),
                 block_size,
             }
         });
@@ -736,7 +756,7 @@ impl WorkerRegistry {
                 "Creating indexer from recovery dump"
             );
             IndexerEntry {
-                indexer: create_indexer(block_size, self.num_threads),
+                indexer: self.new_indexer(block_size),
                 block_size,
             }
         });
