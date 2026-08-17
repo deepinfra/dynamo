@@ -194,7 +194,7 @@ impl
         next: ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>>,
     ) -> Result<ManyOut<Annotated<LLMEngineOutput>>> {
         // Extract request data while preserving context
-        let (mut req, context) = request.into_parts();
+        let (mut req, mut context) = request.into_parts();
         let request_id = context.id().to_string();
         let metadata = context.metadata().clone();
         let engine_ctx = context.context();
@@ -223,6 +223,40 @@ impl
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0)
         });
+
+        // Derive a session-affinity key from the prompt's leading tokens when
+        // the caller did not send one. A conversation's rendered history grows
+        // by appending, so its first N tokens are identical across turns; the
+        // affinity map then pins every turn to the same decode worker, which
+        // is what makes its prefix cache reusable. Overlap-credit scoring
+        // cannot do this at high load: the decode-load term (thousands of
+        // blocks) dwarfs any per-request overlap credit. 0 (default) disables.
+        static SESSION_FROM_PREFIX_TOKENS: std::sync::OnceLock<usize> =
+            std::sync::OnceLock::new();
+        let prefix_key_tokens = *SESSION_FROM_PREFIX_TOKENS.get_or_init(|| {
+            std::env::var("DYN_SESSION_FROM_PREFIX_TOKENS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0)
+        });
+        if prefix_key_tokens > 0
+            && !req.token_ids.is_empty()
+            && context
+                .get_optional::<SessionAffinityId>(SESSION_AFFINITY_CONTEXT_KEY)
+                .ok()
+                .flatten()
+                .is_none()
+        {
+            use std::hash::{Hash, Hasher};
+            let take = req.token_ids.len().min(prefix_key_tokens);
+            let mut hasher = std::hash::DefaultHasher::new();
+            req.token_ids[..take].hash(&mut hasher);
+            context.insert(
+                SESSION_AFFINITY_CONTEXT_KEY,
+                SessionAffinityId::new(format!("prefix-{:016x}", hasher.finish())),
+            );
+        }
+
         if min_remote > 0 && req.token_ids.len() < min_remote {
             return next.generate(context.map(|_| req)).await;
         }
