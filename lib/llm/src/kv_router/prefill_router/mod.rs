@@ -324,10 +324,23 @@ impl
                         error = %error,
                         "request rejected by prefill worker (at capacity)"
                     );
-                } else {
-                    tracing::error!(error = %error, "Remote prefill failed, failing request");
+                    return Err(error);
                 }
-                return Err(error);
+                // Transient dispatch failures (e.g. the selected instance
+                // missing from the transport map during a discovery re-list)
+                // must not fail the request: the decode worker can always run
+                // the prefill locally, exactly like the passthrough taken when
+                // the prefill router is inactive.
+                tracing::warn!(
+                    error = %error,
+                    "Remote prefill dispatch failed, falling back to local prefill"
+                );
+                if let Some(ref tracker) = req.tracker {
+                    let _decode_permit = tracker.set_phase(RequestPhase::Decode).await;
+                }
+                let mut local_req = req;
+                local_req.stop_conditions.max_tokens = original_max_tokens;
+                return next.generate(context.map(|_| local_req)).await;
             }
         };
 
