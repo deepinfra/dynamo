@@ -209,6 +209,24 @@ impl
             return next.generate(context.map(|_| req)).await;
         }
 
+        // Conditional disaggregation: prompts below DYN_MIN_REMOTE_PREFILL_TOKENS
+        // are served entirely on the decode worker (aggregate-style local
+        // prefill). Remote prefill only pays for itself when the prefill
+        // compute exceeds the handoff cost (route + prefill queue + KV
+        // transfer + decode admission); below that the handoff dominates
+        // TTFT. 0 (default) disables the gate.
+        static MIN_REMOTE_PREFILL_TOKENS: std::sync::OnceLock<usize> =
+            std::sync::OnceLock::new();
+        let min_remote = *MIN_REMOTE_PREFILL_TOKENS.get_or_init(|| {
+            std::env::var("DYN_MIN_REMOTE_PREFILL_TOKENS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0)
+        });
+        if min_remote > 0 && req.token_ids.len() < min_remote {
+            return next.generate(context.map(|_| req)).await;
+        }
+
         let session_affinity = context
             .get_optional::<SessionAffinityId>(SESSION_AFFINITY_CONTEXT_KEY)
             .map_err(|message| anyhow::anyhow!("invalid session affinity context: {message}"))?;
