@@ -20,6 +20,7 @@ use crate::{
     kv_router::{KvRouter, metrics::RouterRequestMetrics},
     preprocessor::PreprocessedRequest,
     protocols::common::{
+        extensions::SessionAffinityId,
         llm_backend::LLMEngineOutput,
         timing::{RequestPhase, RoutingData},
     },
@@ -168,7 +169,10 @@ impl KvPushRouter {
         let operation = affinity
             .acquire_with_context(&session_id, explicit, request_context.as_ref())
             .await?;
-        let worker = operation.target().and_then(affinity_worker);
+        let worker = operation
+            .target()
+            .and_then(affinity_worker)
+            .or_else(|| self.rendezvous_session_worker(&session_id));
         match self.select_request(request, phase, false, worker).await {
             Ok(selection) => Ok((selection, Some(operation))),
             Err(error) if is_cancelled(&error) => Err(error),
@@ -570,6 +574,38 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
             Some(operation) => operation.into_stream(selected_target, stream),
             None => Ok(stream),
         }
+    }
+}
+
+impl KvPushRouter {
+    /// Stateless session-to-worker pinning: rendezvous-hash the session id
+    /// onto the live instance set when the affinity map has no binding yet.
+    /// The same session then rebinds to the same worker across frontend
+    /// restarts and affinity-TTL expiries, which is what lets each worker's
+    /// prefix cache accumulate a conversation's history the way a
+    /// statically sharded fleet does. Opt-in via DYN_SESSION_RENDEZVOUS=1.
+    fn rendezvous_session_worker(&self, session_id: &SessionAffinityId) -> Option<WorkerWithDpRank> {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let enabled = *ENABLED.get_or_init(|| {
+            std::env::var("DYN_SESSION_RENDEZVOUS")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false)
+        });
+        if !enabled {
+            return None;
+        }
+        use std::hash::{Hash, Hasher};
+        self.chooser
+            .client()
+            .instance_ids()
+            .into_iter()
+            .max_by_key(|id| {
+                let mut hasher = std::hash::DefaultHasher::new();
+                session_id.as_str().hash(&mut hasher);
+                id.hash(&mut hasher);
+                hasher.finish()
+            })
+            .map(WorkerWithDpRank::from_worker_id)
     }
 }
 
