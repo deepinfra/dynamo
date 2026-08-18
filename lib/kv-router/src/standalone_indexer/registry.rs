@@ -372,6 +372,23 @@ impl WorkerRegistry {
         }
     }
 
+    /// h24 mode is worker-less and regime-agnostic ("stored by ANYONE"), so
+    /// every tenant of a model shares ONE flat map. With per-tenant maps the
+    /// model-level query fan-out counts a block matched in N regimes N times
+    /// against a once-per-request denominator (live incident: 120% hit rate).
+    /// Requires a uniform block size across the model's regimes.
+    fn indexer_key(&self, model_name: String, tenant_id: String) -> IndexerKey {
+        let tenant_id = if self.h24_enabled() {
+            "h24".to_string()
+        } else {
+            tenant_id
+        };
+        IndexerKey {
+            model_name,
+            tenant_id,
+        }
+    }
+
     pub fn signal_ready(&self) {
         let _ = self.ready_tx.send(true);
     }
@@ -419,10 +436,7 @@ impl WorkerRegistry {
         recover_endpoint: Option<String>,
         pod_name: Option<String>,
     ) -> Result<()> {
-        let key = IndexerKey {
-            model_name,
-            tenant_id,
-        };
+        let key = self.indexer_key(model_name, tenant_id);
 
         if let Some(entry) = self.workers.get(&instance_id) {
             if entry.key != key {
@@ -505,10 +519,7 @@ impl WorkerRegistry {
         model_name: &str,
         tenant_id: &str,
     ) -> Result<()> {
-        let key = IndexerKey {
-            model_name: model_name.to_string(),
-            tenant_id: tenant_id.to_string(),
-        };
+        let key = self.indexer_key(model_name.to_string(), tenant_id.to_string());
 
         if let Some(entry) = self.workers.get(&instance_id) {
             if entry.key != key {
@@ -547,10 +558,7 @@ impl WorkerRegistry {
         model_name: &str,
         tenant_id: &str,
     ) -> Result<()> {
-        let key = IndexerKey {
-            model_name: model_name.to_string(),
-            tenant_id: tenant_id.to_string(),
-        };
+        let key = self.indexer_key(model_name.to_string(), tenant_id.to_string());
 
         let (record, remove_worker) = {
             let mut entry = self
@@ -748,6 +756,7 @@ impl WorkerRegistry {
     }
 
     pub fn get_or_create_indexer(&self, key: IndexerKey, block_size: u32) -> Indexer {
+        let key = self.indexer_key(key.model_name, key.tenant_id);
         let entry = self.indexers.entry(key.clone()).or_insert_with(|| {
             tracing::info!(
                 model_name = %key.model_name,
@@ -866,6 +875,43 @@ mod tests {
 
     fn test_registry() -> WorkerRegistry {
         WorkerRegistry::new(1)
+    }
+
+    /// In h24 mode every tenant regime of a model must share ONE indexer:
+    /// per-tenant maps double-count fan-out matches against a once-per-request
+    /// denominator (the 120%-hit-rate incident). Deregistration must accept
+    /// the caller's original tenant id.
+    #[tokio::test]
+    async fn h24_collapses_tenants_into_one_indexer() {
+        let registry = test_registry();
+        registry.enable_h24();
+        registry.signal_ready();
+
+        for (instance, tenant) in [(1u64, "regime-a"), (2u64, "regime-b")] {
+            registry
+                .register(
+                    instance,
+                    format!("tcp://127.0.0.1:1556{instance}"),
+                    0,
+                    "test-model".to_string(),
+                    tenant.to_string(),
+                    1,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+
+        let trees = registry.indexers_for_model("test-model");
+        assert_eq!(trees.len(), 1, "h24 must keep one tree per model");
+        assert_eq!(trees[0].0.tenant_id, "h24");
+        assert!(matches!(trees[0].1, Indexer::H24(_)));
+
+        // Pod-watcher deregisters with the pod's real tenant; must still work.
+        registry.deregister(1, "test-model", "regime-a").await.unwrap();
+        registry.deregister(2, "test-model", "regime-b").await.unwrap();
+        assert!(registry.list().is_empty());
     }
 
     #[tokio::test]
