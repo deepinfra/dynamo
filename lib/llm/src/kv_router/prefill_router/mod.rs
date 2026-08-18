@@ -224,7 +224,46 @@ impl
             );
         }
 
-        if min_remote > 0 && req.token_ids.len() < min_remote {
+        // Uncached-length gating (DYN_LOCAL_CONTINUATIONS=1): a conversation
+        // continuation's history is already cached on its pinned decode
+        // worker, so only its NEW tail needs prefill -- serve it locally no
+        // matter how long the raw prompt is; only cold large prefills gain
+        // from a dedicated prefill worker. Approximated with a bounded
+        // recently-seen set keyed by the session prefix hash. Loss on restart
+        // is benign: a continuation goes remote once, then re-registers.
+        static LOCAL_CONTINUATIONS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static SEEN_SESSIONS: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<u64, std::time::Instant>>,
+        > = std::sync::OnceLock::new();
+        let local_continuations = *LOCAL_CONTINUATIONS.get_or_init(|| {
+            std::env::var("DYN_LOCAL_CONTINUATIONS")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false)
+        });
+        let session_seen = if local_continuations && prefix_key_tokens > 0 {
+            match context.get_optional::<SessionAffinityId>(SESSION_AFFINITY_CONTEXT_KEY) {
+                Ok(Some(sid)) => {
+                    use std::hash::{Hash, Hasher};
+                    let mut hasher = std::hash::DefaultHasher::new();
+                    sid.as_str().hash(&mut hasher);
+                    let key = hasher.finish();
+                    let now = std::time::Instant::now();
+                    let mut seen = SEEN_SESSIONS
+                        .get_or_init(Default::default)
+                        .lock()
+                        .expect("seen-session map poisoned");
+                    if seen.len() > 4_000_000 {
+                        seen.clear();
+                    }
+                    seen.insert(key, now)
+                        .is_some_and(|t| now.duration_since(t).as_secs() < 3600)
+                }
+                _ => false,
+            }
+        } else {
+            false
+        };
+        if min_remote > 0 && (req.token_ids.len() < min_remote || session_seen) {
             return next.generate(context.map(|_| req)).await;
         }
 
