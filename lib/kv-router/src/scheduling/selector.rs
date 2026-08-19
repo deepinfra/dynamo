@@ -313,21 +313,62 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
             let effective_overlap_blocks = request.effective_overlap_blocks_for(worker);
             let cached_tokens = request.effective_cached_tokens_for(worker);
 
-            tracing::info!(
-                "Selected pinned worker: worker_type={}, worker_id={} dp_rank={:?}, logit: {:.3}, effective cached blocks: {:.2}",
-                self.worker_type,
-                worker.worker_id,
-                worker.dp_rank,
-                logit,
-                effective_overlap_blocks,
-            );
-
-            return Ok(WorkerSelectionResult {
-                worker,
-                required_blocks: request_blocks,
-                effective_overlap_blocks,
-                cached_tokens,
+            // Soft pin (DYN_PIN_LOAD_MARGIN_BLOCKS > 0): when the pinned
+            // worker's cost exceeds the best alternative's by more than the
+            // margin, break the pin for this request and reselect. The
+            // request pays one cache miss; the conversation's future turns
+            // still rendezvous back once load equalizes.
+            static PIN_LOAD_MARGIN: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+            let pin_margin = *PIN_LOAD_MARGIN.get_or_init(|| {
+                std::env::var("DYN_PIN_LOAD_MARGIN_BLOCKS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0.0)
             });
+            let mut bypass_pin = false;
+            if pin_margin > 0.0 {
+                let mut best_alt = f64::INFINITY;
+                eligibility.for_each_eligible_worker_rank(workers, |candidate, _| {
+                    if candidate != worker {
+                        best_alt = best_alt.min(self.worker_logit(
+                            request,
+                            candidate,
+                            block_size,
+                            min_active_prefill_tokens,
+                            weights,
+                            "Pin-alternative formula",
+                        ));
+                    }
+                });
+                if best_alt.is_finite() && logit - best_alt > pin_margin {
+                    tracing::info!(
+                        "Pinned worker {} over margin (logit {:.1} vs best alt {:.1}, margin {:.0}); reselecting",
+                        worker.worker_id,
+                        logit,
+                        best_alt,
+                        pin_margin,
+                    );
+                    bypass_pin = true;
+                }
+            }
+
+            if !bypass_pin {
+                tracing::info!(
+                    "Selected pinned worker: worker_type={}, worker_id={} dp_rank={:?}, logit: {:.3}, effective cached blocks: {:.2}",
+                    self.worker_type,
+                    worker.worker_id,
+                    worker.dp_rank,
+                    logit,
+                    effective_overlap_blocks,
+                );
+
+                return Ok(WorkerSelectionResult {
+                    worker,
+                    required_blocks: request_blocks,
+                    effective_overlap_blocks,
+                    cached_tokens,
+                });
+            }
         }
 
         let temperature = request
