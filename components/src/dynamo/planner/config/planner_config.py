@@ -359,7 +359,7 @@ class PlannerConfig(BaseModel):
     )
 
     environment: Literal[
-        "kubernetes", "virtual", "global-planner"
+        "kubernetes", "virtual", "global-planner", "redis"
     ] = SLAPlannerDefaults.environment
     namespace: str = Field(
         default_factory=lambda: os.environ.get("DYN_NAMESPACE", "dynamo"),

@@ -31,6 +31,7 @@ from dynamo.planner.config.defaults import SubComponentType, TargetReplica
 from dynamo.planner.config.planner_config import PlannerConfig
 from dynamo.planner.connectors.global_planner import GlobalPlannerConnector
 from dynamo.planner.connectors.kubernetes import KubernetesConnector
+from dynamo.planner.connectors.redis_connector import RedisConnector
 from dynamo.planner.connectors.virtual import VirtualConnector
 from dynamo.planner.core.budget import _initialize_gpu_counts
 from dynamo.planner.core.engine_protocol import EngineProtocol
@@ -60,7 +61,9 @@ if TYPE_CHECKING:
 from dynamo.runtime import DistributedRuntime
 from dynamo.runtime.logging import configure_dynamo_logging
 
-ConnectorType = Union[GlobalPlannerConnector, KubernetesConnector, VirtualConnector]
+ConnectorType = Union[
+    GlobalPlannerConnector, KubernetesConnector, VirtualConnector, RedisConnector
+]
 
 configure_dynamo_logging()
 logger = logging.getLogger(__name__)
@@ -143,6 +146,8 @@ class NativePlannerBase:
             self.connector = VirtualConnector(
                 runtime, self.namespace, config.model_name
             )
+        elif config.environment == "redis":
+            self.connector = RedisConnector(self.namespace, config.model_name)
         else:
             raise ValueError(f"Invalid environment: {config.environment}")
 
