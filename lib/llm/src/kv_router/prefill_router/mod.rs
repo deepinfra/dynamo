@@ -263,6 +263,36 @@ impl
         } else {
             false
         };
+        // KV migration (DYN_KV_MIGRATION_SAMPLE > 0): for a sampled fraction
+        // of continuation requests, run the prefill leg on the session's OLD
+        // pinned decode worker (whose prefix cache makes it nearly free) and
+        // decode on a different worker, moving the conversation's KV via the
+        // existing bidirectional NIXL path. Mechanism validation for
+        // load-relief-that-preserves-cache; production distress wiring
+        // replaces the random sample once the mechanism is proven.
+        static MIGRATION_SAMPLE: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+        let migration_sample = *MIGRATION_SAMPLE.get_or_init(|| {
+            std::env::var("DYN_KV_MIGRATION_SAMPLE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.0)
+        });
+        let migrate = migration_sample > 0.0
+            && session_seen
+            && self.lifecycle_state() == PrefillLifecycleState::Active
+            && rand::random::<f64>() < migration_sample;
+        if migrate {
+            // Telemetry-only for now: the D->D dispatch leg lands in the next
+            // increment (needs backend-instance targeting for the bootstrap
+            // handshake); this quantifies migration rate and candidate shape
+            // in production traffic without touching the data path.
+            tracing::info!(
+                request_id = %request_id,
+                tokens = req.token_ids.len(),
+                "KVMIGRATE_CANDIDATE: continuation would migrate (prefill on pinned worker, decode elsewhere)"
+            );
+        }
+
         if min_remote > 0 && (req.token_ids.len() < min_remote || session_seen) {
             return next.generate(context.map(|_| req)).await;
         }
