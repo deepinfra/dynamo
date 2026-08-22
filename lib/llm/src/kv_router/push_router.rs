@@ -581,7 +581,21 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
                 _ => 0,
             }
         });
-        let request = if migration_mode > 0 && phase != RequestPhase::Prefill {
+        // Migration only pays above a prompt-length threshold: the producer step
+        // plus NIXL round trip costs more than a short prefill. Measured on
+        // B300/TP=1: 0.49x at 4.5k tokens, 0.46x at 9k, 1.29x at 24k, 2.54x at
+        // 64k -- so the crossover sits between 9k and 24k.
+        static KV_MIGRATION_MIN_TOKENS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let migration_min_tokens = *KV_MIGRATION_MIN_TOKENS.get_or_init(|| {
+            std::env::var("DYN_KV_MIGRATION_MIN_TOKENS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(16384)
+        });
+        let request = if migration_mode > 0
+            && phase != RequestPhase::Prefill
+            && request.token_ids.len() >= migration_min_tokens
+        {
             let session_key = affinity_id(&request).ok().flatten();
             // kv_home is consulted first on purpose: it records where this
             // session's blocks were actually placed, which is what a migration
