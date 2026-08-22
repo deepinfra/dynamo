@@ -560,6 +560,49 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
             worker_id: selection.instance_id,
             dp_rank: Some(selection.dp_rank),
         };
+        // KV migration (DYN_KV_MIGRATION=1): the router picked a worker other
+        // than the one holding this conversation's prefix -- i.e. its cached
+        // worker was loaded and we spilled over. Instead of letting the target
+        // recompute the prefix, take one producer step on the cached worker and
+        // hand the NIXL handshake to the target so it pulls the blocks.
+        static KV_MIGRATION: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let migration_on = *KV_MIGRATION.get_or_init(|| {
+            std::env::var("DYN_KV_MIGRATION")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false)
+        });
+        let request = if migration_on && phase != RequestPhase::Prefill {
+            let cached_worker = affinity_id(&request)
+                .ok()
+                .flatten()
+                .and_then(|sid| self.rendezvous_session_worker(&sid))
+                .map(|w| w.worker_id)
+                .filter(|w| *w != selection.instance_id);
+            match cached_worker {
+                Some(source) => {
+                    let ctx_id = request.context().id().to_string();
+                    let metadata = request.metadata().clone();
+                    let (mut req, ctx) = request.into_parts();
+                    if req.prefill_result.is_none() {
+                        if let Some(result) = self
+                            .kv_migration_handshake(&req, &ctx_id, metadata, source)
+                            .await
+                        {
+                            tracing::info!(
+                                request_id = %ctx_id, source, target = selection.instance_id,
+                                "KVMIGRATE: decoding on target with migrated KV"
+                            );
+                            req.prefill_result = Some(result);
+                        }
+                    }
+                    ctx.map(|_| req)
+                }
+                None => request,
+            }
+        } else {
+            request
+        };
+
         let stream = match self
             .dispatch_selection(request, selection, guard, operation.is_some())
             .await
@@ -584,6 +627,42 @@ impl KvPushRouter {
     /// restarts and affinity-TTL expiries, which is what lets each worker's
     /// prefix cache accumulate a conversation's history the way a
     /// statically sharded fleet does. Opt-in via DYN_SESSION_RENDEZVOUS=1.
+    /// Run one producer step on `source` so it publishes a NIXL handshake for
+    /// this conversation's blocks. The caller hands the result to the worker
+    /// that will actually decode, which then pulls the blocks instead of
+    /// recomputing the prefix. Returns None if the source cannot produce one.
+    async fn kv_migration_handshake(
+        &self,
+        req: &PreprocessedRequest,
+        ctx_id: &str,
+        metadata: std::collections::BTreeMap<String, String>,
+        source: u64,
+    ) -> Option<crate::protocols::common::preprocessor::PrefillResult> {
+        let mut src_req = req.clone();
+        src_req.kv_migration_source = Some(true);
+        src_req.stop_conditions.max_tokens = Some(1);
+        let src_ctx = dynamo_runtime::pipeline::Context::with_id_and_metadata(
+            src_req,
+            format!("{ctx_id}-kvmig"),
+            metadata,
+        );
+        let mut stream = match self.inner.direct(src_ctx, source).await {
+            Ok(stream) => stream,
+            Err(error) => {
+                tracing::warn!(%error, source, "KVMIGRATE: producer dispatch failed");
+                return None;
+            }
+        };
+        let first = stream.next().await?;
+        let data = first.data.as_ref()?;
+        let disaggregated_params = data.disaggregated_params.clone()?;
+        tracing::info!(source, "KVMIGRATE: producer handshake obtained");
+        Some(crate::protocols::common::preprocessor::PrefillResult {
+            disaggregated_params,
+            prompt_tokens_details: None,
+        })
+    }
+
     fn rendezvous_session_worker(&self, session_id: &SessionAffinityId) -> Option<WorkerWithDpRank> {
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let enabled = *ENABLED.get_or_init(|| {
