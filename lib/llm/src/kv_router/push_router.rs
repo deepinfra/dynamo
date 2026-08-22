@@ -572,10 +572,16 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
                 .unwrap_or(false)
         });
         let request = if migration_on && phase != RequestPhase::Prefill {
-            let cached_worker = affinity_id(&request)
-                .ok()
-                .flatten()
-                .and_then(|sid| self.rendezvous_session_worker(&sid))
+            let cached_worker = operation
+                .as_ref()
+                .and_then(|op| op.target())
+                .and_then(affinity_worker)
+                .or_else(|| {
+                    affinity_id(&request)
+                        .ok()
+                        .flatten()
+                        .and_then(|sid| self.rendezvous_session_worker(&sid))
+                })
                 .map(|w| w.worker_id)
                 .filter(|w| *w != selection.instance_id);
             match cached_worker {
