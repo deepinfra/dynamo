@@ -57,6 +57,10 @@ pub struct KvPushRouter {
     inner: PushRouter<PreprocessedRequest, Annotated<LLMEngineOutput>>,
     pub chooser: Arc<KvRouter>,
     affinity: Option<AffinityCoordinator>,
+    /// session_id -> (worker that last served it, when). Observational only:
+    /// it never influences selection, it only tells us where a conversation's
+    /// KV blocks are so we can migrate them when the router picks elsewhere.
+    kv_home: Arc<dashmap::DashMap<String, (u64, std::time::Instant)>>,
 }
 
 impl KvPushRouter {
@@ -78,6 +82,7 @@ impl KvPushRouter {
             inner,
             chooser,
             affinity,
+            kv_home: Arc::new(dashmap::DashMap::new()),
         })
     }
 
@@ -560,48 +565,73 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
             worker_id: selection.instance_id,
             dp_rank: Some(selection.dp_rank),
         };
-        // KV migration (DYN_KV_MIGRATION=1): the router picked a worker other
-        // than the one holding this conversation's prefix -- i.e. its cached
-        // worker was loaded and we spilled over. Instead of letting the target
-        // recompute the prefix, take one producer step on the cached worker and
-        // hand the NIXL handshake to the target so it pulls the blocks.
-        static KV_MIGRATION: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let migration_on = *KV_MIGRATION.get_or_init(|| {
-            std::env::var("DYN_KV_MIGRATION")
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false)
+        // KV migration: when the router picks a worker other than the one that
+        // last served this conversation, that worker still holds the prefix. Take
+        // one producer step there to publish a NIXL handshake and hand it to the
+        // selected target, which pulls the blocks instead of recomputing.
+        // DYN_KV_MIGRATION: "1" migrates, "dry" only logs the opportunity.
+        static KV_MIGRATION: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+        let migration_mode = *KV_MIGRATION.get_or_init(|| {
+            match std::env::var("DYN_KV_MIGRATION")
+                .unwrap_or_default()
+                .as_str()
+            {
+                "1" | "true" | "TRUE" => 2,
+                "dry" | "DRY" => 1,
+                _ => 0,
+            }
         });
-        let request = if migration_on && phase != RequestPhase::Prefill {
+        let request = if migration_mode > 0 && phase != RequestPhase::Prefill {
+            let session_key = affinity_id(&request).ok().flatten();
             let cached_worker = operation
                 .as_ref()
                 .and_then(|op| op.target())
                 .and_then(affinity_worker)
                 .or_else(|| {
-                    affinity_id(&request)
-                        .ok()
-                        .flatten()
-                        .and_then(|sid| self.rendezvous_session_worker(&sid))
+                    session_key
+                        .as_ref()
+                        .and_then(|sid| self.rendezvous_session_worker(sid))
                 })
                 .map(|w| w.worker_id)
+                .or_else(|| {
+                    session_key
+                        .as_ref()
+                        .and_then(|sid| self.kv_home.get(sid.as_str()))
+                        .map(|e| e.value().0)
+                })
                 .filter(|w| *w != selection.instance_id);
+            if let Some(sid) = session_key.as_ref() {
+                self.remember_kv_home(sid.as_str(), selection.instance_id);
+            }
             match cached_worker {
                 Some(source) => {
                     let ctx_id = request.context().id().to_string();
-                    let metadata = request.metadata().clone();
-                    let (mut req, ctx) = request.into_parts();
-                    if req.prefill_result.is_none() {
-                        if let Some(result) = self
-                            .kv_migration_handshake(&req, &ctx_id, metadata, source)
-                            .await
-                        {
-                            tracing::info!(
-                                request_id = %ctx_id, source, target = selection.instance_id,
-                                "KVMIGRATE: decoding on target with migrated KV"
-                            );
-                            req.prefill_result = Some(result);
+                    tracing::info!(
+                        request_id = %ctx_id,
+                        source,
+                        target = selection.instance_id,
+                        tokens = request.token_ids.len(),
+                        "KVMIGRATE_SPILL: session routed off the worker holding its KV"
+                    );
+                    if migration_mode < 2 {
+                        request
+                    } else {
+                        let metadata = request.metadata().clone();
+                        let (mut req, ctx) = request.into_parts();
+                        if req.prefill_result.is_none() {
+                            if let Some(result) = self
+                                .kv_migration_handshake(&req, &ctx_id, metadata, source)
+                                .await
+                            {
+                                tracing::info!(
+                                    request_id = %ctx_id, source, target = selection.instance_id,
+                                    "KVMIGRATE: decoding on target with migrated KV"
+                                );
+                                req.prefill_result = Some(result);
+                            }
                         }
+                        ctx.map(|_| req)
                     }
-                    ctx.map(|_| req)
                 }
                 None => request,
             }
@@ -633,6 +663,20 @@ impl KvPushRouter {
     /// restarts and affinity-TTL expiries, which is what lets each worker's
     /// prefix cache accumulate a conversation's history the way a
     /// statically sharded fleet does. Opt-in via DYN_SESSION_RENDEZVOUS=1.
+    /// Record which worker just served this session, so a later turn that lands
+    /// elsewhere knows where the blocks are. Bounded: swept back to entries seen
+    /// in the last 15 minutes whenever it grows past the cap.
+    fn remember_kv_home(&self, session_id: &str, worker_id: u64) {
+        const KV_HOME_TTL: std::time::Duration = std::time::Duration::from_secs(900);
+        const KV_HOME_CAP: usize = 200_000;
+        let now = std::time::Instant::now();
+        self.kv_home.insert(session_id.to_string(), (worker_id, now));
+        if self.kv_home.len() > KV_HOME_CAP {
+            self.kv_home
+                .retain(|_, (_, seen)| now.duration_since(*seen) < KV_HOME_TTL);
+        }
+    }
+
     /// Run one producer step on `source` so it publishes a NIXL handshake for
     /// this conversation's blocks. The caller hands the result to the worker
     /// that will actually decode, which then pulls the blocks instead of
