@@ -2740,6 +2740,8 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
         request_id,
         data_parallel_rank=None,
         lora_request=None,
+        emit_kv_transfer_params: bool = False,
+        embedding_sequence_length=None,
         trace_headers=None,
         priority=0,
         reasoning_ended=None,
@@ -2848,6 +2850,14 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
 
                     if finish_reason:
                         out["finish_reason"] = normalize_finish_reason(finish_reason)
+                        # KV migration source: publish the producer handshake so
+                        # the target decode worker can pull these blocks.
+                        if emit_kv_transfer_params:
+                            kv_tp = getattr(res, "kv_transfer_params", None)
+                            if kv_tp is not None:
+                                out["disaggregated_params"] = {
+                                    "kv_transfer_params": kv_tp
+                                }
                         out[
                             "completion_usage"
                         ] = BaseWorkerHandler._build_completion_usage(
@@ -3150,6 +3160,31 @@ class DecodeWorkerHandler(BaseWorkerHandler):
             logger.debug(
                 f"Using disaggregated params from prefill for request {request_id}"
             )
+
+        # KV migration source (frontend sets kv_migration_source): this worker
+        # already holds the conversation's prefix, so when the router picks it
+        # as a migration SOURCE we behave like a prefill worker for one step --
+        # emit producer kv_transfer_params and generate a single token -- so the
+        # TARGET decode worker can pull the blocks over NIXL instead of
+        # recomputing them. Requires kv_role=kv_both, which our decode workers
+        # already run.
+        if request.get("kv_migration_source"):
+            if sampling_params.extra_args is None:
+                sampling_params.extra_args = {}
+            sampling_params.extra_args["kv_transfer_params"] = {
+                "do_remote_decode": True,
+                "do_remote_prefill": False,
+                "remote_engine_id": None,
+                "remote_block_ids": None,
+                "remote_host": None,
+                "remote_port": None,
+            }
+            sampling_params.max_tokens = 1
+            sampling_params.min_tokens = 1
+            logger.info(
+                f"KV migration source: serving {request_id} as producer "
+                f"(1 token, blocks offered over NIXL)"
+            )
         prefill_prompt_tokens_details = (
             prefill_result.get("prompt_tokens_details") if prefill_result else None
         )
@@ -3215,6 +3250,8 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                         request_id,
                         data_parallel_rank=dp_rank,
                         lora_request=lora_request,
+                        emit_kv_transfer_params=bool(request.get("kv_migration_source")),
+                        embedding_sequence_length=embedding_sequence_length,
                         trace_headers=trace_headers,
                         priority=priority,
                         reasoning_ended=reasoning_ended,
