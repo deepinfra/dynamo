@@ -592,30 +592,25 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(16384)
         });
+        // Source is whichever worker holds the most of THIS request's blocks,
+        // read straight from the router's KV index. No session id is involved,
+        // so any request can migrate -- including one sharing a prefix with an
+        // unrelated conversation. kv_home stays only as a fallback for when the
+        // index has not yet caught up with a recent placement.
+        let migratable_tokens =
+            (selection.best_overlap_blocks * self.chooser.block_size() as f64) as usize;
         let request = if migration_mode > 0
             && phase != RequestPhase::Prefill
-            && request.token_ids.len() >= migration_min_tokens
+            && migratable_tokens >= migration_min_tokens
         {
             let session_key = affinity_id(&request).ok().flatten();
-            // kv_home is consulted first on purpose: it records where this
-            // session's blocks were actually placed, which is what a migration
-            // source has to be. The coordinator's target is a binding, and an
-            // explicit worker header can make it disagree with block reality.
-            let cached_worker = session_key
-                .as_ref()
-                .and_then(|sid| self.kv_home.get(sid.as_str()))
-                .map(|e| e.value().0)
+            let cached_worker = selection
+                .best_overlap_worker
                 .or_else(|| {
-                    operation
+                    session_key
                         .as_ref()
-                        .and_then(|op| op.target())
-                        .and_then(affinity_worker)
-                        .or_else(|| {
-                            session_key
-                                .as_ref()
-                                .and_then(|sid| self.rendezvous_session_worker(sid))
-                        })
-                        .map(|w| w.worker_id)
+                        .and_then(|sid| self.kv_home.get(sid.as_str()))
+                        .map(|e| e.value().0)
                 })
                 .filter(|w| *w != selection.instance_id);
             if let Some(sid) = session_key.as_ref() {
@@ -629,7 +624,8 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
                         source,
                         target = selection.instance_id,
                         tokens = request.token_ids.len(),
-                        "KVMIGRATE_SPILL: session routed off the worker holding its KV"
+                        migratable_tokens,
+                        "KVMIGRATE_SPILL: request routed off the worker holding its KV"
                     );
                     if migration_mode < 2 {
                         request

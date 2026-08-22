@@ -28,6 +28,10 @@ pub(super) struct WorkerSelection {
     pub(super) cached_tokens: usize,
     pub(super) routing_hashes: Option<RoutingDecisionHashes>,
     pub(super) scheduler_tracked: bool,
+    /// Worker holding the most of this request's blocks, selected or not, and
+    /// how many. Drives KV migration with no session concept involved.
+    pub(super) best_overlap_worker: Option<u64>,
+    pub(super) best_overlap_blocks: f64,
 }
 
 #[derive(Clone, Copy)]
@@ -102,7 +106,11 @@ impl KvPushRouter {
                 effective_overlap_blocks,
                 cached_tokens,
                 routing_hashes,
+                best_overlap_worker,
+                best_overlap_blocks,
             } => Ok(WorkerSelection {
+                best_overlap_worker: best_overlap_worker.map(|w| w.worker_id),
+                best_overlap_blocks,
                 instance_id: worker.worker_id,
                 dp_rank: worker.dp_rank,
                 overlap_amount: overlap_blocks,
