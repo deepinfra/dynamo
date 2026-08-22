@@ -234,6 +234,13 @@ pub struct PreprocessedRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefill_result: Option<PrefillResult>,
 
+    /// Ask this worker to act as a KV migration SOURCE: serve one token as a
+    /// producer and publish the NIXL handshake, so another decode worker can
+    /// pull the conversation's blocks instead of recomputing them.
+    #[builder(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_migration_source: Option<bool>,
+
     /// Multimodal encoder handoff payload, set by the frontend when
     /// forwarding a request from an Encode worker to a downstream
     /// Prefill/Aggregated peer. Engine-opaque JSON object;
