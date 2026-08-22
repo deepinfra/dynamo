@@ -583,21 +583,25 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
         });
         let request = if migration_mode > 0 && phase != RequestPhase::Prefill {
             let session_key = affinity_id(&request).ok().flatten();
-            let cached_worker = operation
+            // kv_home is consulted first on purpose: it records where this
+            // session's blocks were actually placed, which is what a migration
+            // source has to be. The coordinator's target is a binding, and an
+            // explicit worker header can make it disagree with block reality.
+            let cached_worker = session_key
                 .as_ref()
-                .and_then(|op| op.target())
-                .and_then(affinity_worker)
+                .and_then(|sid| self.kv_home.get(sid.as_str()))
+                .map(|e| e.value().0)
                 .or_else(|| {
-                    session_key
+                    operation
                         .as_ref()
-                        .and_then(|sid| self.rendezvous_session_worker(sid))
-                })
-                .map(|w| w.worker_id)
-                .or_else(|| {
-                    session_key
-                        .as_ref()
-                        .and_then(|sid| self.kv_home.get(sid.as_str()))
-                        .map(|e| e.value().0)
+                        .and_then(|op| op.target())
+                        .and_then(affinity_worker)
+                        .or_else(|| {
+                            session_key
+                                .as_ref()
+                                .and_then(|sid| self.rendezvous_session_worker(sid))
+                        })
+                        .map(|w| w.worker_id)
                 })
                 .filter(|w| *w != selection.instance_id);
             if let Some(sid) = session_key.as_ref() {
