@@ -3251,7 +3251,6 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                         data_parallel_rank=dp_rank,
                         lora_request=lora_request,
                         emit_kv_transfer_params=bool(request.get("kv_migration_source")),
-                        embedding_sequence_length=embedding_sequence_length,
                         trace_headers=trace_headers,
                         priority=priority,
                         reasoning_ended=reasoning_ended,
