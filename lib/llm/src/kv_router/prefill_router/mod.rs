@@ -239,8 +239,13 @@ impl
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0)
         });
+        // Hash a fixed-length prefix window, never `min(len, N)`: a shorter
+        // window would change as the conversation grows, so every turn would
+        // look like a brand new session and land on a worker that has none of
+        // its blocks. Requests below the window get no session id and fall back
+        // to plain KV-overlap routing.
         if prefix_key_tokens > 0
-            && !req.token_ids.is_empty()
+            && req.token_ids.len() >= prefix_key_tokens
             && context
                 .get_optional::<SessionAffinityId>(SESSION_AFFINITY_CONTEXT_KEY)
                 .ok()
@@ -248,9 +253,8 @@ impl
                 .is_none()
         {
             use std::hash::{Hash, Hasher};
-            let take = req.token_ids.len().min(prefix_key_tokens);
             let mut hasher = std::hash::DefaultHasher::new();
-            req.token_ids[..take].hash(&mut hasher);
+            req.token_ids[..prefix_key_tokens].hash(&mut hasher);
             context.insert(
                 SESSION_AFFINITY_CONTEXT_KEY,
                 SessionAffinityId::new(format!("prefix-{:016x}", hasher.finish())),
