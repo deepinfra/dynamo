@@ -24,6 +24,7 @@ use dynamo_llm::{
 use dynamo_runtime::metrics::prometheus_names::{frontend_service, name_prefix};
 use dynamo_runtime::{
     CancellationToken,
+    error::DynamoError,
     pipeline::{
         AsyncEngine, AsyncEngineContextProvider, ManyOut, ResponseStream, SingleIn, async_trait,
     },
@@ -209,6 +210,8 @@ fn compute_index(endpoint: &Endpoint, request_type: &RequestType, status: &Statu
         Endpoint::Completions => 0,
         Endpoint::ChatCompletions => 1,
         Endpoint::Embeddings => todo!(),
+        Endpoint::Classify => todo!(),
+        Endpoint::Pooling => todo!(),
         Endpoint::Responses => todo!(),
         Endpoint::AnthropicMessages => todo!(),
         Endpoint::Tensor => todo!(),
@@ -419,8 +422,8 @@ async fn test_http_service() {
     // ==== ChatCompletions / Unary / Success ====
     request.stream = Some(false);
 
-    // ALLOW: max_tokens is deprecated in favor of completion_usage_tokens
-    request.max_tokens = Some(0);
+    // Use the smallest valid value to keep the CounterEngine delay minimal.
+    request.max_tokens = Some(1);
 
     let future = client
         .post(format!("http://localhost:{}/v1/chat/completions", port))
@@ -443,8 +446,8 @@ async fn test_http_service() {
     // ==== ChatCompletions / Stream / Error ====
     request.model = "bar".to_string();
 
-    // ALLOW: max_tokens is deprecated in favor of completion_usage_tokens
-    request.max_tokens = Some(0);
+    // Keep this request valid so authorization, rather than validation, rejects it.
+    request.max_tokens = Some(1);
     request.stream = Some(true);
 
     let response = client
@@ -574,6 +577,152 @@ async fn wait_for_service_ready(port: u16) {
             Err(e) => panic!("Service failed to start within timeout: {}", e),
         }
     }
+}
+
+#[tokio::test]
+async fn test_disabled_batch_api_routes_are_hidden() {
+    let (listener, port) = bind_random_port().await;
+    let service = HttpService::builder().port(port).build().unwrap();
+
+    let token = CancellationToken::new();
+    let cancel_token = token.clone();
+    let task = tokio::spawn(async move { service.run_with_listener(token, listener).await });
+    wait_for_service_ready(port).await;
+
+    let client = reqwest::Client::new();
+    let base = format!("http://localhost:{port}");
+    let openapi: serde_json::Value = client
+        .get(format!("{base}/openapi.json"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    for path in [
+        "/v1/files",
+        "/v1/files/{file_id}/content",
+        "/v1/batches",
+        "/v1/batches/{batch_id}",
+    ] {
+        assert!(
+            openapi["paths"].get(path).is_none(),
+            "disabled Batch API route is documented: {path}"
+        );
+    }
+
+    for (method, path) in [
+        (reqwest::Method::POST, "/v1/files"),
+        (reqwest::Method::GET, "/v1/files/file-123/content"),
+        (reqwest::Method::POST, "/v1/batches"),
+        (reqwest::Method::GET, "/v1/batches/batch-123"),
+    ] {
+        let response = client
+            .request(method, format!("{base}{path}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+    }
+
+    cancel_token.cancel();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn test_enabled_batch_api_routes_are_documented_and_return_not_implemented() {
+    let (listener, port) = bind_random_port().await;
+    let service = HttpService::builder()
+        .port(port)
+        .enable_batch_endpoints(true)
+        .build()
+        .unwrap();
+
+    let token = CancellationToken::new();
+    let cancel_token = token.clone();
+    let task = tokio::spawn(async move { service.run_with_listener(token, listener).await });
+    wait_for_service_ready(port).await;
+
+    let client = reqwest::Client::new();
+    let base = format!("http://localhost:{port}");
+    let openapi: serde_json::Value = client
+        .get(format!("{base}/openapi.json"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    for path in [
+        "/v1/files",
+        "/v1/files/{file_id}/content",
+        "/v1/batches",
+        "/v1/batches/{batch_id}",
+    ] {
+        assert!(
+            openapi["paths"].get(path).is_some(),
+            "enabled Batch API route is missing from OpenAPI: {path}"
+        );
+    }
+
+    let response = client
+        .post(format!("{base}/v1/files"))
+        .body("{\"custom_id\":\"r1\"}\n")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["code"], 501);
+    assert_eq!(
+        body["message"],
+        "Batch file storage is not implemented yet."
+    );
+
+    let response = client
+        .post(format!("{base}/v1/batches"))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body("not valid JSON")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["code"], 501);
+    assert_eq!(
+        body["message"],
+        "Batch job lifecycle persistence is not implemented yet."
+    );
+
+    let response = client
+        .get(format!("{base}/v1/batches/batch-123"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["code"], 501);
+    assert_eq!(
+        body["message"],
+        "Batch job lifecycle persistence is not implemented yet."
+    );
+
+    let response = client
+        .get(format!("{base}/v1/files/file-123/content"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(
+        body["message"],
+        "Batch output file retrieval is not implemented yet."
+    );
+
+    cancel_token.cancel();
+    task.await.unwrap().unwrap();
 }
 
 // NOTE: BYOT (Bring Your Own Type) client tests were removed during the
@@ -1133,6 +1282,367 @@ async fn test_nvext_disabled_strips_request_and_response() {
     assert!(
         !body.contains("\"nvext\""),
         "nvext gate off: response must not contain an `nvext` field, got: {body}"
+    );
+
+    cancel_token.cancel();
+    task.await.unwrap().unwrap();
+}
+
+/// Audio engine whose only response frame is a `Backend(InvalidArgument)`
+/// error — models a worker rejecting the request during deserialization
+/// (e.g. a `task_type` value outside the backend's accepted set).
+struct InvalidArgumentAudiosEngine {}
+
+#[async_trait]
+impl
+    AsyncEngine<
+        SingleIn<dynamo_llm::protocols::openai::audios::NvCreateAudioSpeechRequest>,
+        ManyOut<Annotated<dynamo_llm::protocols::openai::audios::NvAudioSpeechResponse>>,
+        Error,
+    > for InvalidArgumentAudiosEngine
+{
+    async fn generate(
+        &self,
+        request: SingleIn<dynamo_llm::protocols::openai::audios::NvCreateAudioSpeechRequest>,
+    ) -> Result<
+        ManyOut<Annotated<dynamo_llm::protocols::openai::audios::NvAudioSpeechResponse>>,
+        Error,
+    > {
+        use dynamo_runtime::error::{BackendError, ErrorType as DynErrorType};
+        let (_request, context) = request.transfer(());
+        let ctx = context.context();
+        let stream = stream! {
+            yield Annotated::<dynamo_llm::protocols::openai::audios::NvAudioSpeechResponse> {
+                data: None,
+                id: None,
+                event: Some("error".to_string()),
+                comment: None,
+                error: Some(
+                    DynamoError::builder()
+                        .error_type(DynErrorType::Backend(BackendError::InvalidArgument))
+                        .message(
+                            "ValidationError: 1 validation error for NvCreateAudioSpeechRequest \
+                             task_type Input should be 'CustomVoice', 'VoiceDesign', 'Base'",
+                        )
+                        .build(),
+                ),
+            };
+        };
+        Ok(ResponseStream::new(Box::pin(stream), ctx))
+    }
+}
+
+/// The `/v1/audio/speech` request schema is looser in the frontend than in the
+/// worker (the worker constrains e.g. `task_type` to a model-specific set), so
+/// out-of-range values can only be rejected worker-side. That rejection must
+/// reach the caller as a 4xx carrying the backend's message, not as a 500
+/// about folding the audio stream.
+#[tokio::test]
+async fn test_audio_speech_backend_invalid_argument_returns_4xx() {
+    let (listener, port) = bind_random_port().await;
+    let service = HttpService::builder().port(port).build().unwrap();
+    service
+        .enable_model_endpoint(dynamo_llm::endpoint_type::EndpointType::Audios, true)
+        .unwrap();
+
+    let state = service.state_clone();
+    let manager = state.manager();
+
+    let token = CancellationToken::new();
+    let cancel_token = token.clone();
+    let task =
+        tokio::spawn(async move { service.run_with_listener(token.clone(), listener).await });
+    wait_for_service_ready(port).await;
+
+    let registry = Registry::new();
+    let card = ModelDeploymentCard::with_name_only("tts-model");
+    manager
+        .add_audios_model(
+            "tts-model",
+            card.mdcsum(),
+            Arc::new(InvalidArgumentAudiosEngine {}),
+        )
+        .unwrap();
+
+    let metrics = state.metrics_clone();
+    metrics.register(&registry).unwrap();
+
+    let response = reqwest::Client::new()
+        .post(format!("http://localhost:{port}/v1/audio/speech"))
+        .json(&serde_json::json!({
+            "model": "tts-model",
+            "input": "The quick brown fox jumps over the lazy dog.",
+            "voice": "vivian",
+            "language": "English",
+            "task_type": "NotARealTaskType",
+        }))
+        .send()
+        .await
+        .expect("POST /v1/audio/speech");
+
+    let status = response.status();
+    let text = response.text().await.unwrap_or_default();
+
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "Backend(InvalidArgument) on /v1/audio/speech must land as HTTP 400; got {status}, body: {text}"
+    );
+    assert!(
+        text.contains("task_type"),
+        "expected the backend validation message to name the offending field; got: {text}"
+    );
+
+    // Backport divergence from main, which asserts `Validation` here.
+    // `ErrorMessage::metric_error_type` arrived with #12092 and is not on this
+    // release branch, so the label falls back to `classify_error_for_metrics`,
+    // which maps 400 to `Internal` unless the message begins with
+    // "Validation:" — the backend's text begins with "ValidationError:".
+    // The status code and message the caller sees are unaffected.
+    // If #12092 is ever backported, restore the `Validation` assertion.
+    compare_counter(
+        &metrics,
+        "tts-model",
+        &Endpoint::Audios,
+        &RequestType::Unary,
+        &Status::Error,
+        &ErrorType::Internal,
+        1,
+    );
+
+    cancel_token.cancel();
+    task.await.unwrap().unwrap();
+}
+
+/// Audio engine that completes normally but reports `status: "failed"`, the
+/// shape a worker uses to signal it could not produce audio.
+struct FailedStatusAudiosEngine {}
+
+#[async_trait]
+impl
+    AsyncEngine<
+        SingleIn<dynamo_llm::protocols::openai::audios::NvCreateAudioSpeechRequest>,
+        ManyOut<Annotated<dynamo_llm::protocols::openai::audios::NvAudioSpeechResponse>>,
+        Error,
+    > for FailedStatusAudiosEngine
+{
+    async fn generate(
+        &self,
+        request: SingleIn<dynamo_llm::protocols::openai::audios::NvCreateAudioSpeechRequest>,
+    ) -> Result<
+        ManyOut<Annotated<dynamo_llm::protocols::openai::audios::NvAudioSpeechResponse>>,
+        Error,
+    > {
+        use dynamo_llm::protocols::openai::audios::NvAudioSpeechResponse;
+        let (_request, context) = request.transfer(());
+        let ctx = context.context();
+        let stream = stream! {
+            yield Annotated::from_data(NvAudioSpeechResponse {
+                status: "failed".to_string(),
+                error: Some("voice cloning failed".to_string()),
+                ..NvAudioSpeechResponse::empty()
+            });
+        };
+        Ok(ResponseStream::new(Box::pin(stream), ctx))
+    }
+}
+
+/// A worker-reported `status: "failed"` returns 400, so it must meter as a
+/// client error too. The inflight guard defaults to `internal` when unmarked,
+/// which would book this 400 as a server fault.
+#[tokio::test]
+async fn test_audio_speech_failed_status_meters_as_client_error() {
+    let (listener, port) = bind_random_port().await;
+    let service = HttpService::builder().port(port).build().unwrap();
+    service
+        .enable_model_endpoint(dynamo_llm::endpoint_type::EndpointType::Audios, true)
+        .unwrap();
+
+    let state = service.state_clone();
+    let manager = state.manager();
+
+    let token = CancellationToken::new();
+    let cancel_token = token.clone();
+    let task =
+        tokio::spawn(async move { service.run_with_listener(token.clone(), listener).await });
+    wait_for_service_ready(port).await;
+
+    let registry = Registry::new();
+    let card = ModelDeploymentCard::with_name_only("tts-model");
+    manager
+        .add_audios_model(
+            "tts-model",
+            card.mdcsum(),
+            Arc::new(FailedStatusAudiosEngine {}),
+        )
+        .unwrap();
+
+    let metrics = state.metrics_clone();
+    metrics.register(&registry).unwrap();
+
+    let response = reqwest::Client::new()
+        .post(format!("http://localhost:{port}/v1/audio/speech"))
+        .json(&serde_json::json!({"model": "tts-model", "input": "hello"}))
+        .send()
+        .await
+        .expect("POST /v1/audio/speech");
+
+    let status = response.status();
+    let text = response.text().await.unwrap_or_default();
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {text}");
+    assert!(
+        text.contains("voice cloning failed"),
+        "the worker's failure reason must reach the caller; got: {text}"
+    );
+
+    compare_counter(
+        &metrics,
+        "tts-model",
+        &Endpoint::Audios,
+        &RequestType::Unary,
+        &Status::Error,
+        &ErrorType::Validation,
+        1,
+    );
+
+    cancel_token.cancel();
+    task.await.unwrap().unwrap();
+}
+
+/// Engine registered only so the classify/pooling routes resolve a model; the
+/// validation errors under test are rejected before the engine is reached.
+struct UncalledPoolingFamilyEngine {}
+
+#[async_trait]
+impl
+    AsyncEngine<
+        SingleIn<dynamo_llm::protocols::openai::classify::NvCreateClassifyRequest>,
+        ManyOut<Annotated<dynamo_llm::protocols::openai::classify::NvCreateClassifyResponse>>,
+        Error,
+    > for UncalledPoolingFamilyEngine
+{
+    async fn generate(
+        &self,
+        _request: SingleIn<dynamo_llm::protocols::openai::classify::NvCreateClassifyRequest>,
+    ) -> Result<
+        ManyOut<Annotated<dynamo_llm::protocols::openai::classify::NvCreateClassifyResponse>>,
+        Error,
+    > {
+        anyhow::bail!("engine must not be reached by a rejected request")
+    }
+}
+
+#[async_trait]
+impl
+    AsyncEngine<
+        SingleIn<dynamo_llm::protocols::openai::pooling::NvCreatePoolingRequest>,
+        ManyOut<Annotated<dynamo_llm::protocols::openai::pooling::NvCreatePoolingResponse>>,
+        Error,
+    > for UncalledPoolingFamilyEngine
+{
+    async fn generate(
+        &self,
+        _request: SingleIn<dynamo_llm::protocols::openai::pooling::NvCreatePoolingRequest>,
+    ) -> Result<
+        ManyOut<Annotated<dynamo_llm::protocols::openai::pooling::NvCreatePoolingResponse>>,
+        Error,
+    > {
+        anyhow::bail!("engine must not be reached by a rejected request")
+    }
+}
+
+/// A request rejected by handler-local validation must still be counted in
+/// `requests_total` with `error_type=validation`, like `chat_completions`.
+/// Validating before the inflight guard would drop these 400s from metrics
+/// (and from the "request completed" log the guard emits on drop).
+#[tokio::test]
+async fn test_classify_and_pooling_validation_errors_are_metered() {
+    let (listener, port) = bind_random_port().await;
+    let service = HttpService::builder().port(port).build().unwrap();
+    service
+        .enable_model_endpoint(dynamo_llm::endpoint_type::EndpointType::Classify, true)
+        .unwrap();
+    service
+        .enable_model_endpoint(dynamo_llm::endpoint_type::EndpointType::Pooling, true)
+        .unwrap();
+
+    let state = service.state_clone();
+    let manager = state.manager();
+
+    let token = CancellationToken::new();
+    let cancel_token = token.clone();
+    let task =
+        tokio::spawn(async move { service.run_with_listener(token.clone(), listener).await });
+    wait_for_service_ready(port).await;
+
+    let registry = Registry::new();
+    let card = ModelDeploymentCard::with_name_only("foo");
+    let engine = Arc::new(UncalledPoolingFamilyEngine {});
+    manager
+        .add_classify_model("foo", card.mdcsum(), engine.clone())
+        .unwrap();
+    manager
+        .add_pooling_model("foo", card.mdcsum(), engine)
+        .unwrap();
+
+    let metrics = state.metrics_clone();
+    metrics.register(&registry).unwrap();
+
+    let client = reqwest::Client::new();
+
+    // ==== /v1/classify: empty cache_salt ====
+    let response = client
+        .post(format!("http://localhost:{port}/v1/classify"))
+        .json(&serde_json::json!({"model": "foo", "input": "hi", "cache_salt": ""}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    compare_counter(
+        &metrics,
+        "foo",
+        &Endpoint::Classify,
+        &RequestType::Unary,
+        &Status::Error,
+        &ErrorType::Validation,
+        1,
+    );
+
+    // ==== /v1/pooling: empty cache_salt ====
+    let response = client
+        .post(format!("http://localhost:{port}/v1/pooling"))
+        .json(&serde_json::json!({"model": "foo", "input": "hi", "cache_salt": ""}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    compare_counter(
+        &metrics,
+        "foo",
+        &Endpoint::Pooling,
+        &RequestType::Unary,
+        &Status::Error,
+        &ErrorType::Validation,
+        1,
+    );
+
+    // ==== /v1/pooling: unsupported dimensions ====
+    let response = client
+        .post(format!("http://localhost:{port}/v1/pooling"))
+        .json(&serde_json::json!({"model": "foo", "input": "hi", "dimensions": 8}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    compare_counter(
+        &metrics,
+        "foo",
+        &Endpoint::Pooling,
+        &RequestType::Unary,
+        &Status::Error,
+        &ErrorType::Validation,
+        2,
     );
 
     cancel_token.cancel();

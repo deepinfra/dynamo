@@ -1,28 +1,65 @@
 # SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Third-party Python dependencies for the trtllm runtime image. Installed
-# with --no-deps so upstream nvcr.io/nvidia/tensorrt-llm/release's solve
-# stays intact. Sorted alphabetically per pre-commit requirements-txt-fixer.
+# Third-party Python dependencies for the trtllm runtime image. Installed with
+# --no-deps, so pip does not re-resolve upstream
+# nvcr.io/nvidia/tensorrt-llm/release's dependency graph.
+#
+# A floor here does NOT refresh a copy the base image bundles. This install runs
+# with VIRTUAL_ENV set, so it lands in /opt/dynamo/venv; the base image's copy
+# stays under /usr/local/lib/python3.12/dist-packages, which is what an image
+# inventory reads. Because the venv is --system-site-packages, the newer copy
+# shadows the older one at import time, so the gap is invisible from inside the
+# container. Raising the floors here for aiohttp, gitpython, jupyter-server,
+# jupyterlab, mistune, pillow, soupsieve and tornado left every one of those
+# packages shipping at the base image's version.
+#
+# For a package the base image bundles, a floor here is necessary but not
+# sufficient: it must ALSO be added to the system-interpreter install and the
+# pre_runtime whiteout in container/templates/trtllm_runtime.Dockerfile, which
+# is where the shipped copy is actually replaced. Packages upstream does not
+# bundle (imageio, imageio-ffmpeg, msgspec, PyNvVideoCodec, uvloop) need only
+# the floor.
+#
+# Sorted alphabetically per pre-commit requirements-txt-fixer.
 
 # Force a source install of imageio-ffmpeg. The PyPI wheel bundles a prebuilt,
 # GPL-encumbered ffmpeg binary that has CVE exposure; we point imageio at the
 # in-tree LGPL ffmpeg CLI via IMAGEIO_FFMPEG_EXE instead.
 --no-binary imageio-ffmpeg
+# The upstream tensorrt-llm/release image bundles the JupyterLab developer stack
+# (jupyterlab/notebook -> jupyter-server -> tornado; nbconvert -> mistune;
+# beautifulsoup4 -> soupsieve) at older releases than PyPI currently publishes.
+# These are base-bundled, so the floor alone does not reach the shipped copy --
+# they are also installed through the system interpreter and whited out in
+# trtllm_runtime.Dockerfile (see the header note above).
+aiohttp>=3.14.3
+gitpython>=3.1.58
 
 # Used by the trtllm video_diffusion handler to encode generated frames to MP4.
 # Upstream tensorrt-llm/release does not ship them.
 imageio>=2.37.0
 imageio-ffmpeg>=0.6.0  # binary skipped per --no-binary directive at top of file
+jupyter-server>=2.20.0
+jupyterlab>=4.5.10
+mistune>=3.3.0  # JupyterLab stack; see note above jupyter-server
 # Required by ai_dynamo_runtime + gpu_memory_service. Upstream tensorrt-llm/release
 # does not ship them; vllm/vllm-openai does (which is why DYN-2204's vllm path
 # does not need this).
 msgspec>=0.19.0
-# KVBM uses `import nixl` to load libnixl.so via DT_RPATH (matching its
-# nixl-sys ABI). Upstream's NIXL at /opt/nvidia/nvda_nixl coexists
-# unused because Dynamo's --connector kvbm bypasses TRT-LLM's native NIXL
-# transceiver. The nixl-cu13 wheel is harmless if KVBM is disabled.
-nixl==1.0.1
-nixl-cu13==1.0.1
+# NIXL is unpinned here; trtllm_runtime.Dockerfile installs it from NIXL_REF.
+# Bundled by the upstream image at an older patch release. Base-bundled, so the
+# shipped copy is replaced by the system-interpreter install in
+# trtllm_runtime.Dockerfile; this floor governs the venv copy only.
+pillow>=12.3.0
+# NVDEC hardware decode for H.264/H.265 video input (dynamo common.multimodal.
+# nvdec_decoder). Pin >=2.2.0: it bundles only libavutil + libavformat (container
+# demux, no software codec); older 2.0.x bundles a full FFmpeg incl. libavcodec
+# that the codec gate rejects. Links libnvcuvid at runtime. Upstream
+# tensorrt-llm/release does not bundle it. Requires NVIDIA_DRIVER_CAPABILITIES to
+# include "video" (set in trtllm_runtime.Dockerfile) or it cannot import.
+PyNvVideoCodec>=2.2.0
+soupsieve>=2.8.4  # JupyterLab stack; see note above jupyter-server
+tornado>=6.5.6  # JupyterLab stack; see note above jupyter-server
 # Required by ai_dynamo_runtime (companion to msgspec above).
 uvloop>=0.21.0

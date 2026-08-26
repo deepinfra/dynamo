@@ -4,7 +4,7 @@
 # Base stage - Common setup for all stages
 ARG DOCKER_PROXY
 ARG BASE_IMAGE="library/golang"
-ARG BASE_IMAGE_TAG="1.26.3"
+ARG BASE_IMAGE_TAG="1.26.6"
 FROM ${DOCKER_PROXY}${BASE_IMAGE}:${BASE_IMAGE_TAG} AS base
 
 # Docker buildx automatically provides these
@@ -42,6 +42,10 @@ FROM base AS tester
 
 # Install make if not present
 RUN apt-get update && apt-get install -y --no-install-recommends make && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Make the production Helm configuration available to operatorenv tests.
+COPY --from=operator-chart . /helm/charts/platform/components/operator/
+ENV OPERATOR_CHART_DIR=/helm/charts/platform/components/operator
 
 # Run tests using Makefile
 RUN make test
@@ -202,7 +206,7 @@ COPY --from=sources_collect /sources.zip /sources.zip
 
 
 # Runtime stage
-FROM nvcr.io/nvidia/distroless/go:v4.0.3
+FROM nvcr.io/nvidia/distroless/go:v4.0.9
 WORKDIR /
 COPY --from=builder /workspace/manager .
 COPY --from=builder /workspace/crd-apply .

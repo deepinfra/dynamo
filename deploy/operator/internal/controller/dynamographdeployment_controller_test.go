@@ -45,6 +45,7 @@ import (
 	networkingv1 "k8s.io/api/networking/v1"
 	resourcev1 "k8s.io/api/resource/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -54,6 +55,7 @@ import (
 	"k8s.io/client-go/scale"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/ptr"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -138,6 +140,7 @@ func TestDynamoGraphDeploymentReconciler_reconcileScalingAdapters(t *testing.T) 
 		expectedAdapterCount int
 		expectedAdapters     map[string]int32 // map of adapter name to expected replicas
 		expectDeleted        []string         // adapter names that should be deleted
+		assertNoReplicaPatch bool
 	}{
 		{
 			name: "creates adapters for services with scalingAdapter.enabled=true",
@@ -190,6 +193,66 @@ func TestDynamoGraphDeploymentReconciler_reconcileScalingAdapters(t *testing.T) 
 			expectedAdapters: map[string]int32{
 				"test-dgd-worker": 1, // default replicas
 			},
+		},
+		{
+			name: "preserves existing adapter replicas across components",
+			dgd: betaDGD(t, &v1alpha1.DynamoGraphDeployment{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-dgd",
+					Namespace: "default",
+					UID:       "test-uid",
+				},
+				Spec: v1alpha1.DynamoGraphDeploymentSpec{
+					Services: map[string]*v1alpha1.DynamoComponentDeploymentSharedSpec{
+						"Frontend": {
+							Replicas: ptr.To(int32(2)),
+							ScalingAdapter: &v1alpha1.ScalingAdapter{
+								Enabled: true,
+							},
+						},
+						"decode": {
+							Replicas: ptr.To(int32(3)),
+							ScalingAdapter: &v1alpha1.ScalingAdapter{
+								Enabled: true,
+							},
+						},
+					},
+				},
+			}),
+			existingAdapters: []v1alpha1.DynamoGraphDeploymentScalingAdapter{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "test-dgd-frontend",
+						Namespace: "default",
+					},
+					Spec: v1alpha1.DynamoGraphDeploymentScalingAdapterSpec{
+						Replicas: 5,
+						DGDRef: v1alpha1.DynamoGraphDeploymentServiceRef{
+							Name:        "test-dgd",
+							ServiceName: "Frontend",
+						},
+					},
+				},
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "test-dgd-decode",
+						Namespace: "default",
+					},
+					Spec: v1alpha1.DynamoGraphDeploymentScalingAdapterSpec{
+						Replicas: 0,
+						DGDRef: v1alpha1.DynamoGraphDeploymentServiceRef{
+							Name:        "test-dgd",
+							ServiceName: "decode",
+						},
+					},
+				},
+			},
+			expectedAdapterCount: 2,
+			expectedAdapters: map[string]int32{
+				"test-dgd-frontend": 5,
+				"test-dgd-decode":   0,
+			},
+			assertNoReplicaPatch: true,
 		},
 		{
 			name: "skips adapter creation when not enabled",
@@ -375,10 +438,22 @@ func TestDynamoGraphDeploymentReconciler_reconcileScalingAdapters(t *testing.T) 
 			}
 
 			// Create fake client
-			fakeClient := fake.NewClientBuilder().
+			clientBuilder := fake.NewClientBuilder().
 				WithScheme(testScheme).
-				WithObjects(initObjs...).
-				Build()
+				WithObjects(initObjs...)
+			if tt.assertNoReplicaPatch {
+				t.Log("Intercept adapter patches and verify they exclude replicas")
+				clientBuilder = clientBuilder.WithInterceptorFuncs(interceptor.Funcs{
+					Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+						data, err := patch.Data(obj)
+						require.NoError(t, err)
+						assert.NotContains(t, string(data), `"replicas"`,
+							"existing adapter patches must never include spec.replicas")
+						return c.Patch(ctx, obj, patch, opts...)
+					},
+				})
+			}
+			fakeClient := clientBuilder.Build()
 
 			// Create reconciler
 			r := &DynamoGraphDeploymentReconciler{
@@ -591,6 +666,71 @@ func TestDynamoGraphDeploymentReconciler_reconcileResources_ValidatesGMSResource
 	g.Expect(err).To(gomega.HaveOccurred())
 	g.Expect(err.Error()).To(gomega.ContainSubstring("requires DRA"))
 	g.Expect(err.Error()).To(gomega.ContainSubstring("explicitly disabled"))
+}
+
+func TestDynamoGraphDeploymentReconciler_ReconcileReportsInvalidLegacyGMSClient(t *testing.T) {
+	t.Log("Set up an already-admitted DGD with an unresolved GMS client")
+	ctx := context.Background()
+	testScheme := newDynamoGraphDeploymentControllerTestScheme(t)
+	dgd := &v1beta1.DynamoGraphDeployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-dgd",
+			Namespace: "default",
+		},
+		Spec: v1beta1.DynamoGraphDeploymentSpec{
+			BackendFramework: "vllm",
+			Components: []v1beta1.DynamoComponentDeploymentSharedSpec{{
+				ComponentName: "worker",
+				ComponentType: v1beta1.ComponentTypeWorker,
+				PodTemplate: &corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{{
+					Name:  commonconsts.MainContainerName,
+					Image: "registry.example/runtime:1.1.0",
+					Resources: corev1.ResourceRequirements{Limits: corev1.ResourceList{
+						corev1.ResourceName(commonconsts.KubeResourceGPUNvidia): resource.MustParse("1"),
+					}},
+				}}}},
+				Experimental: &v1beta1.ExperimentalSpec{GPUMemoryService: &v1beta1.GPUMemoryServiceSpec{
+					Mode:                  v1beta1.GMSModeIntraPod,
+					ExtraClientContainers: []string{"missing-client"},
+				}},
+			}},
+		},
+	}
+	controller_common.AddFinalizer(dgd)
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(testScheme).
+		WithObjects(dgd).
+		WithStatusSubresource(dgd).
+		Build()
+	reconciler := &DynamoGraphDeploymentReconciler{
+		Client:   fakeClient,
+		Recorder: record.NewFakeRecorder(100),
+		Config: &configv1alpha1.OperatorConfiguration{
+			Namespace: configv1alpha1.NamespaceConfiguration{Restricted: "default"},
+		},
+		RuntimeConfig: &controller_common.RuntimeConfig{Gate: features.Gates{DRA: true}},
+	}
+
+	t.Log("Reconcile the legacy object without passing it through admission")
+	_, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(dgd)})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "gpuMemoryService.extraClientContainers")
+	require.Contains(t, err.Error(), "missing-client")
+
+	t.Log("Verify status reports a bounded failure and no DCD workload is rendered")
+	updated := &v1beta1.DynamoGraphDeployment{}
+	require.NoError(t, fakeClient.Get(ctx, client.ObjectKeyFromObject(dgd), updated))
+	assert.Equal(t, v1beta1.DGDStateFailed, updated.Status.State)
+	ready := meta.FindStatusCondition(updated.Status.Conditions, "Ready")
+	require.NotNil(t, ready)
+	assert.Equal(t, metav1.ConditionFalse, ready.Status)
+	assert.Equal(t, string(reasonFailedToInitializeWorkerHash), ready.Reason)
+	assert.Contains(t, ready.Message, "gpuMemoryService.extraClientContainers")
+	assert.Contains(t, ready.Message, "missing-client")
+
+	dcds := &v1beta1.DynamoComponentDeploymentList{}
+	require.NoError(t, fakeClient.List(ctx, dcds, client.InNamespace(dgd.Namespace)))
+	assert.Empty(t, dcds.Items)
 }
 
 func TestDynamoGraphDeploymentReconciler_reconcileGMSResourceClaimTemplates_ToleratesNonGMSComponents(t *testing.T) {
@@ -5161,7 +5301,7 @@ func TestPCSGStatusChangeIsSignificant(t *testing.T) {
 				pcsg.Status.Conditions = []metav1.Condition{{
 					Type:               groveconstants.ConditionTypeMinAvailableBreached,
 					Status:             metav1.ConditionFalse,
-					Reason:             groveconstants.ConditionReasonInsufficientScheduledPCSGReplicas,
+					Reason:             groveconstants.ConditionReasonInsufficientAvailablePCSGReplicas,
 					LastTransitionTime: metav1.Now(),
 				}}
 			},

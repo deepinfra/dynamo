@@ -56,7 +56,6 @@ from .capacity import (
     get_spec_decode_runtime_data,
     per_rank_kv_blocks,
 )
-from .constants import DisaggregationMode
 from .handlers import get_dp_range_for_worker
 from .headless import run_dynamo_headless
 from .instrumented_scheduler import ENV_FPM_BENCHMARK_OUTPUT_PATH, ENV_FPM_WORKER_ID
@@ -365,11 +364,6 @@ def setup_kv_event_publisher(
         List of KvEventPublisher instances (one per dp_rank) if prefix caching is enabled, None otherwise.
     """
     if not config.engine_args.enable_prefix_caching:
-        return None
-
-    # Skip KV event publishing for decode workers
-    if config.disaggregation_mode == DisaggregationMode.DECODE:
-        logger.info("Skipping KV event publisher setup for decode worker")
         return None
 
     if config.engine_args.kv_events_config is None:
@@ -696,11 +690,8 @@ async def register_vllm_model(
     runtime_config.total_kv_blocks = per_rank_kv_blocks(num_gpu_blocks, dp_range[1])
     runtime_config.max_num_seqs = runtime_values["max_num_seqs"]
     runtime_config.max_num_batched_tokens = runtime_values["max_num_batched_tokens"]
-    # Decode workers don't create the WorkerKvQuery endpoint, so don't advertise local indexer
-    runtime_config.enable_local_indexer = (
-        config.enable_local_indexer
-        and config.disaggregation_mode != DisaggregationMode.DECODE
-    )
+    runtime_config.enable_local_indexer = config.enable_local_indexer
+    runtime_config.kv_event_publishing_enabled = config.use_kv_events
     runtime_config.kv_state_endpoint = config.kv_state_endpoint
 
     # Add tool/reasoning parsers for decode/aggregated workers. Prefill
@@ -709,6 +700,11 @@ async def register_vllm_model(
     if worker_type != WorkerType.Prefill:
         runtime_config.tool_call_parser = config.dyn_tool_call_parser
         runtime_config.reasoning_parser = config.dyn_reasoning_parser
+        if config.dyn_default_thinking_mode is not None:
+            runtime_config.set_engine_specific(
+                "default_thinking_mode",
+                json.dumps(config.dyn_default_thinking_mode),
+            )
     runtime_config.exclude_tools_when_tool_choice_none = (
         config.exclude_tools_when_tool_choice_none
     )
@@ -758,9 +754,10 @@ async def register_vllm_model(
         worker_type=worker_type,
         needs=needs,
         ignore_weights=should_register_model_ignore_weights(config),
+        model_aliases=config.served_model_aliases or None,
         # Advertise LoRA capacity on the BASE card so the frontend can place the first
         # adapter onto an idle worker. Decode, aggregated, and prefill workers all serve
-        # lifecycle registration; embeddings still do not.
+        # lifecycle registration; embeddings and classify still do not.
         max_gpu_lora_count=_base_model_lora_capacity(config, model_type),
     )
 
@@ -768,7 +765,15 @@ async def register_vllm_model(
 def _base_model_lora_capacity(config: Config, model_type: ModelType) -> int | None:
     if not getattr(config.engine_args, "enable_lora", False):
         return None
-    if model_type == ModelType.Embedding:
+    # Pooling-family workers (embedding, classify|pooling) do not serve the
+    # LoRA load endpoints, so they must not advertise adapter capacity. Use
+    # capability checks, not identity: the classify worker registers the
+    # combined ModelType.Classify | ModelType.Pooling bits.
+    if (
+        model_type.supports_embedding()
+        or model_type.supports_classify()
+        or model_type.supports_pooling()
+    ):
         return None
     return config.engine_args.max_loras
 

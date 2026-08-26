@@ -26,13 +26,14 @@ use super::{
 use dynamo_runtime::{
     component::{Endpoint, build_transport_type},
     discovery::{Discovery, DiscoverySpec},
+    pipeline::network::RequestPlanePayloadCodec,
     prelude::DistributedRuntimeProvider,
     protocols::EndpointId,
 };
 
 use crate::{
     kv_router::{
-        KvRouter, router_endpoint_id, scheduler::DefaultWorkerSelector,
+        KvEventSourceRequirement, KvRouter, router_endpoint_id, scheduler::DefaultWorkerSelector,
         shared_cache::HicacheSharedKvCache,
     },
     local_model::runtime_config::{DisaggregatedEndpoint, ModelRuntimeConfig, topology_taint},
@@ -44,11 +45,13 @@ use crate::{
         openai::{
             audios::OpenAIAudiosStreamingEngine,
             chat_completions::OpenAIChatCompletionsStreamingEngine,
-            completions::OpenAICompletionsStreamingEngine,
+            classify::OpenAIClassifyStreamingEngine, completions::OpenAICompletionsStreamingEngine,
             embeddings::OpenAIEmbeddingsStreamingEngine, generate::GenerateStreamingEngine,
-            images::OpenAIImagesStreamingEngine, videos::OpenAIVideosStreamingEngine,
+            images::OpenAIImagesStreamingEngine, pooling::OpenAIPoolingStreamingEngine,
+            videos::OpenAIVideosStreamingEngine,
         },
     },
+    worker_type::WorkerType,
 };
 
 /// State for prefill router activation rendezvous.
@@ -305,6 +308,54 @@ impl ModelManager {
         true
     }
 
+    /// Register a LoRA model as a lightweight view of an existing base WorkerSet.
+    pub(crate) fn add_adapter_view(
+        &self,
+        card_key: &str,
+        base_model_name: &str,
+        worker_set_key: &str,
+        adapter_card: ModelDeploymentCard,
+    ) -> anyhow::Result<()> {
+        let _reservation = self.reservation_lock.lock();
+        let adapter_name = adapter_card.name().to_string();
+        anyhow::ensure!(
+            adapter_card.lora.is_some(),
+            "adapter view requires LoRA metadata"
+        );
+        anyhow::ensure!(
+            adapter_name != base_model_name,
+            "LoRA adapter name collides with its base model"
+        );
+        anyhow::ensure!(
+            !self.alias_to_primary.contains_key(&adapter_name),
+            "LoRA adapter name is reserved as a model alias"
+        );
+        if let Some(existing) = self.models.get(&adapter_name) {
+            anyhow::ensure!(
+                existing
+                    .worker_sets()
+                    .iter()
+                    .all(|worker_set| worker_set.card().lora.is_some()),
+                "LoRA adapter name collides with a registered base model"
+            );
+        }
+
+        let base_worker_set = self
+            .models
+            .get(base_model_name)
+            .and_then(|model| model.get_worker_set(worker_set_key))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "base WorkerSet for LoRA adapter {adapter_name:?} is not registered"
+                )
+            })?;
+        let adapter_view = Arc::new(base_worker_set.adapter_view(adapter_card.clone()));
+        self.cards.insert(card_key.to_string(), adapter_card);
+        self.get_or_create_model(&adapter_name)
+            .add_worker_set(worker_set_key.to_string(), adapter_view);
+        Ok(())
+    }
+
     /// Record that `alias` is an alternate name for `primary`. Used to normalize metrics labels.
     ///
     /// The claim is taken atomically through the map entry so two concurrent
@@ -547,6 +598,22 @@ impl ModelManager {
             .collect()
     }
 
+    pub fn list_classify_models(&self) -> Vec<String> {
+        self.models
+            .iter()
+            .filter(|entry| entry.value().has_classify_engine())
+            .map(|entry| entry.key().clone())
+            .collect()
+    }
+
+    pub fn list_pooling_models(&self) -> Vec<String> {
+        self.models
+            .iter()
+            .filter(|entry| entry.value().has_pooling_engine())
+            .map(|entry| entry.key().clone())
+            .collect()
+    }
+
     pub fn list_tensor_models(&self) -> Vec<String> {
         self.models
             .iter()
@@ -611,6 +678,26 @@ impl ModelManager {
             .get(model)
             .ok_or_else(|| ModelManagerError::ModelNotFound(model.to_string()))?
             .get_embeddings_engine()
+    }
+
+    pub fn get_classify_engine(
+        &self,
+        model: &str,
+    ) -> Result<OpenAIClassifyStreamingEngine, ModelManagerError> {
+        self.models
+            .get(model)
+            .ok_or_else(|| ModelManagerError::ModelNotFound(model.to_string()))?
+            .get_classify_engine()
+    }
+
+    pub fn get_pooling_engine(
+        &self,
+        model: &str,
+    ) -> Result<OpenAIPoolingStreamingEngine, ModelManagerError> {
+        self.models
+            .get(model)
+            .ok_or_else(|| ModelManagerError::ModelNotFound(model.to_string()))?
+            .get_pooling_engine()
     }
 
     pub fn get_completions_engine(
@@ -824,6 +911,48 @@ impl ModelManager {
         Ok(())
     }
 
+    pub fn add_classify_model(
+        &self,
+        model: &str,
+        card_checksum: &str,
+        engine: OpenAIClassifyStreamingEngine,
+    ) -> Result<(), ModelManagerError> {
+        let model_entry = self.get_or_create_model(model);
+        if model_entry.has_classify_engine() {
+            return Err(ModelManagerError::ModelAlreadyExists(model.to_string()));
+        }
+        let namespace = format!("__local_classify_{}", model);
+        let mut ws = WorkerSet::new(
+            namespace.clone(),
+            card_checksum.to_string(),
+            Self::aggregated_local_card(),
+        );
+        ws.classify_engine = Some(engine);
+        model_entry.add_worker_set(namespace, Arc::new(ws));
+        Ok(())
+    }
+
+    pub fn add_pooling_model(
+        &self,
+        model: &str,
+        card_checksum: &str,
+        engine: OpenAIPoolingStreamingEngine,
+    ) -> Result<(), ModelManagerError> {
+        let model_entry = self.get_or_create_model(model);
+        if model_entry.has_pooling_engine() {
+            return Err(ModelManagerError::ModelAlreadyExists(model.to_string()));
+        }
+        let namespace = format!("__local_pooling_{}", model);
+        let mut ws = WorkerSet::new(
+            namespace.clone(),
+            card_checksum.to_string(),
+            Self::aggregated_local_card(),
+        );
+        ws.pooling_engine = Some(engine);
+        model_entry.add_worker_set(namespace, Arc::new(ws));
+        Ok(())
+    }
+
     pub fn add_tensor_model(
         &self,
         model: &str,
@@ -1007,6 +1136,20 @@ impl ModelManager {
             .ok_or_else(|| ModelManagerError::ModelNotFound(model.to_string()))
     }
 
+    pub fn remove_classify_model(&self, model: &str) -> Result<(), ModelManagerError> {
+        let namespace = format!("__local_classify_{}", model);
+        self.remove_worker_set(model, &namespace)
+            .map(|_| ())
+            .ok_or_else(|| ModelManagerError::ModelNotFound(model.to_string()))
+    }
+
+    pub fn remove_pooling_model(&self, model: &str) -> Result<(), ModelManagerError> {
+        let namespace = format!("__local_pooling_{}", model);
+        self.remove_worker_set(model, &namespace)
+            .map(|_| ())
+            .ok_or_else(|| ModelManagerError::ModelNotFound(model.to_string()))
+    }
+
     pub fn remove_images_model(&self, model: &str) -> Result<(), ModelManagerError> {
         let namespace = format!("__local_images_{}", model);
         self.remove_worker_set(model, &namespace)
@@ -1037,7 +1180,7 @@ impl ModelManager {
 
     // -- KV Router creation --
 
-    /// Whether to start the LoRA load-estimator feed for a KV router being built for `worker_type`.
+    /// Whether to start the LoRA load-estimator feed for a KV router's metric worker type.
     ///
     /// The feed must run for the worker mode that carries the routable request load. In dynamo's
     /// KV path that is `WORKER_TYPE_DECODE`, which the binding assigns to BOTH aggregated and
@@ -1056,7 +1199,32 @@ impl ModelManager {
         kv_cache_block_size: u32,
         kv_router_config: Option<KvRouterConfig>,
         prefill_load_estimator: Option<Arc<dyn PrefillLoadEstimator>>,
-        worker_type: &'static str,
+        metric_worker_type: &'static str,
+        model_name: Option<String>,
+        is_eagle: bool,
+    ) -> anyhow::Result<Arc<KvRouter>> {
+        self.kv_chooser_for_with_worker_role(
+            endpoint,
+            kv_cache_block_size,
+            kv_router_config,
+            prefill_load_estimator,
+            None,
+            metric_worker_type,
+            model_name,
+            is_eagle,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn kv_chooser_for_with_worker_role(
+        &self,
+        endpoint: &Endpoint,
+        kv_cache_block_size: u32,
+        kv_router_config: Option<KvRouterConfig>,
+        prefill_load_estimator: Option<Arc<dyn PrefillLoadEstimator>>,
+        worker_role: Option<WorkerType>,
+        metric_worker_type: &'static str,
         model_name: Option<String>,
         is_eagle: bool,
     ) -> anyhow::Result<Arc<KvRouter>> {
@@ -1064,8 +1232,8 @@ impl ModelManager {
         let lora_domain = self.lora_domain(&endpoint.id());
 
         // Register router via discovery mechanism.
-        let discovery = endpoint.component().drt().discovery();
-        let instance_id = discovery.instance_id();
+        let drt = endpoint.component().drt();
+        let instance_id = drt.discovery().instance_id();
 
         // Build transport for router endpoint based on request plane mode
         // Use the worker's component name so each target pool gets its own router discovery group
@@ -1079,14 +1247,15 @@ impl ModelManager {
             endpoint: router_endpoint_id.name.clone(),
             transport,
             device_type: None,
+            request_plane_codec: Some(RequestPlanePayloadCodec::configured()),
         };
 
-        discovery.register(discovery_spec).await?;
+        let registration = drt.register_endpoint_lease(discovery_spec).await?;
 
         // Get of create runtime config watcher for this endpoint
         let workers_with_configs = self.get_or_create_runtime_config_watcher(endpoint).await?;
 
-        let selector = DefaultWorkerSelector::new(kv_router_config.clone(), worker_type);
+        let selector = DefaultWorkerSelector::new(kv_router_config.clone(), metric_worker_type);
 
         // Build shared cache client based on shared_cache_type.
         let shared_cache: Option<Box<dyn dynamo_kv_router::SharedKvCache>> = match kv_router_config
@@ -1108,18 +1277,19 @@ impl ModelManager {
         };
 
         let effective_kv_router_config = kv_router_config.clone().unwrap_or_default();
-        let kv_source_membership = if !effective_kv_router_config.use_remote_indexer
-            && effective_kv_router_config.should_subscribe_to_kv_events()
-        {
-            Some(
-                self.get_or_create_kv_source_membership_watch(endpoint)
-                    .await?,
-            )
-        } else {
-            None
-        };
+        let kv_event_source_requirement =
+            KvEventSourceRequirement::derive(worker_role, &effective_kv_router_config);
+        let kv_source_membership =
+            if kv_event_source_requirement.should_subscribe(&effective_kv_router_config) {
+                Some(
+                    self.get_or_create_kv_source_membership_watch(endpoint)
+                        .await?,
+                )
+            } else {
+                None
+            };
 
-        let chooser = KvRouter::new(
+        let mut chooser = KvRouter::new_with_worker_role(
             endpoint.clone(),
             client,
             workers_with_configs,
@@ -1128,13 +1298,15 @@ impl ModelManager {
             selector,
             kv_router_config,
             prefill_load_estimator,
-            worker_type,
+            worker_role,
+            metric_worker_type,
             model_name,
             is_eagle,
             shared_cache,
             self.lora_enabled.then(|| lora_domain.filter.clone()),
         )
         .await?;
+        chooser.set_endpoint_registration(registration);
 
         // F2: feed the LoRA LoadEstimator in KV mode. Start exactly one active-sequence
         // subscription per decode endpoint. WORKER_TYPE_DECODE is the routing path for BOTH
@@ -1149,7 +1321,7 @@ impl ModelManager {
         // routing is not load-aware — dynamic LoRA allocation then degrades to cold-start pins while
         // the filter still routes by loaded worker. Constructors that pass WORKER_TYPE_DECODE
         // directly, e.g. the watcher / C bindings, are unaffected.)
-        if Self::should_start_lora_load_feed(self.lora_enabled, worker_type) {
+        if Self::should_start_lora_load_feed(self.lora_enabled, metric_worker_type) {
             let feed_key = endpoint.id().to_string();
             // Start a feed if none runs for this endpoint yet, or restart it if the previous
             // one exited (so a dead subscription does not permanently disable load tracking).
@@ -2008,7 +2180,7 @@ mod tests {
     use dynamo_kv_router::protocols::{KV_EVENT_SUBJECT, WorkerWithDpRank};
     use dynamo_runtime::{
         DistributedRuntime, Runtime,
-        discovery::{Discovery, DiscoverySpec, MockDiscovery, SharedMockRegistry},
+        discovery::{Discovery, MockDiscovery, SharedMockRegistry},
         distributed::DistributedConfig,
         transports::event_plane::EventScope,
     };

@@ -24,14 +24,17 @@ use anyhow::{Result, bail};
 
 use dynamo_protocols::types::{
     ChatCompletionMessageContent, ChatCompletionRequestMessage,
+    ChatCompletionRequestToolMessageContent, ChatCompletionRequestToolMessageContentPart,
     ChatCompletionRequestUserMessageContent, ChatCompletionRequestUserMessageContentPart,
     ChatCompletionToolChoiceOption, EncodingFormat,
 };
 use dynamo_renderer::OAIPromptFormatter;
 use dynamo_runtime::config::is_truthy;
 use dynamo_runtime::error::{DynamoError, ErrorType};
+use either::Either;
 use futures::Stream;
 use futures::stream::{self, StreamExt};
+use std::borrow::Cow;
 use std::time::Instant;
 
 use dynamo_runtime::dynamo_nvtx_range;
@@ -47,7 +50,7 @@ use crate::model_card::ModelInfoType;
 use crate::model_card::{ModelDeploymentCard, ModelInfo};
 use crate::preprocessor::media::MediaLoader;
 use crate::protocols::common::preprocessor::{
-    MultimodalData, MultimodalDataMap, PreprocessedRequestBuilder, RoutingHints,
+    MultimodalData, MultimodalDataMap, MultimodalUuidMap, PreprocessedRequestBuilder, RoutingHints,
 };
 use crate::protocols::common::timing::RequestTracker;
 use crate::tokenizers::Encoding;
@@ -98,6 +101,118 @@ fn routing_priorities(hints: Option<&AgentHints>) -> (Option<f64>, Option<u32>, 
     (priority_jump, strict_priority, priority)
 }
 
+fn invalid_argument_error(message: impl Into<String>) -> anyhow::Error {
+    DynamoError::builder()
+        .error_type(ErrorType::InvalidArgument)
+        .message(message.into())
+        .build()
+        .into()
+}
+
+fn tool_content_part_as_user(
+    part: &ChatCompletionRequestToolMessageContentPart,
+) -> Cow<'_, ChatCompletionRequestUserMessageContentPart> {
+    Cow::Owned(match part {
+        ChatCompletionRequestToolMessageContentPart::Text(part) => {
+            ChatCompletionRequestUserMessageContentPart::Text(part.clone())
+        }
+        ChatCompletionRequestToolMessageContentPart::ImageUrl(part) => {
+            ChatCompletionRequestUserMessageContentPart::ImageUrl(part.clone())
+        }
+        ChatCompletionRequestToolMessageContentPart::VideoUrl(part) => {
+            ChatCompletionRequestUserMessageContentPart::VideoUrl(part.clone())
+        }
+        ChatCompletionRequestToolMessageContentPart::AudioUrl(part) => {
+            ChatCompletionRequestUserMessageContentPart::AudioUrl(part.clone())
+        }
+    })
+}
+
+enum MultimodalContentPart<'a> {
+    User(&'a ChatCompletionRequestUserMessageContentPart),
+    Tool(&'a ChatCompletionRequestToolMessageContentPart),
+}
+
+impl<'a> MultimodalContentPart<'a> {
+    fn as_user(&self) -> Cow<'a, ChatCompletionRequestUserMessageContentPart> {
+        match self {
+            Self::User(part) => Cow::Borrowed(part),
+            Self::Tool(part) => tool_content_part_as_user(part),
+        }
+    }
+
+    fn media_info(&self) -> Option<(&'static str, Option<url::Url>, Option<String>)> {
+        match self {
+            Self::User(part) => match *part {
+                ChatCompletionRequestUserMessageContentPart::ImageUrl(part) => Some((
+                    "image_url",
+                    part.image_url.as_ref().map(|media| media.url.clone()),
+                    part.uuid.clone(),
+                )),
+                ChatCompletionRequestUserMessageContentPart::VideoUrl(part) => Some((
+                    "video_url",
+                    part.video_url.as_ref().map(|media| media.url.clone()),
+                    part.uuid.clone(),
+                )),
+                ChatCompletionRequestUserMessageContentPart::AudioUrl(part) => Some((
+                    "audio_url",
+                    part.audio_url.as_ref().map(|media| media.url.clone()),
+                    part.uuid.clone(),
+                )),
+                _ => None,
+            },
+            Self::Tool(part) => match *part {
+                ChatCompletionRequestToolMessageContentPart::ImageUrl(part) => Some((
+                    "image_url",
+                    part.image_url.as_ref().map(|media| media.url.clone()),
+                    part.uuid.clone(),
+                )),
+                ChatCompletionRequestToolMessageContentPart::VideoUrl(part) => Some((
+                    "video_url",
+                    part.video_url.as_ref().map(|media| media.url.clone()),
+                    part.uuid.clone(),
+                )),
+                ChatCompletionRequestToolMessageContentPart::AudioUrl(part) => Some((
+                    "audio_url",
+                    part.audio_url.as_ref().map(|media| media.url.clone()),
+                    part.uuid.clone(),
+                )),
+                _ => None,
+            },
+        }
+    }
+}
+
+fn multimodal_content_parts(
+    message: &ChatCompletionRequestMessage,
+) -> Option<impl Iterator<Item = MultimodalContentPart<'_>>> {
+    match message {
+        ChatCompletionRequestMessage::User(user) => match &user.content {
+            ChatCompletionRequestUserMessageContent::Array(parts) => {
+                Some(Either::Left(parts.iter().map(MultimodalContentPart::User)))
+            }
+            ChatCompletionRequestUserMessageContent::Text(_) => None,
+        },
+        ChatCompletionRequestMessage::Tool(tool) => match &tool.content {
+            ChatCompletionRequestToolMessageContent::Array(parts) => {
+                Some(Either::Right(parts.iter().map(MultimodalContentPart::Tool)))
+            }
+            ChatCompletionRequestToolMessageContent::Text(_) => None,
+        },
+        _ => None,
+    }
+}
+
+#[cfg(feature = "mm-routing")]
+fn image_content_part_url(
+    content_part: &ChatCompletionRequestUserMessageContentPart,
+) -> Option<&str> {
+    let ChatCompletionRequestUserMessageContentPart::ImageUrl(part) = content_part else {
+        return None;
+    };
+    part.image_url.as_ref().map(|image| image.url.as_str())
+}
+
 /// Encode a slice of `f32` values as a base64 string per the OpenAI
 /// `encoding_format=base64` spec: the raw little-endian byte
 /// representation of each `f32` is concatenated and the resulting byte
@@ -113,6 +228,7 @@ fn encode_floats_to_base64(floats: &[f32]) -> String {
 
 pub const ANNOTATION_FORMATTED_PROMPT: &str = "formatted_prompt";
 pub const ANNOTATION_TOKEN_IDS: &str = "token_ids";
+const DEFAULT_THINKING_MODE_RUNTIME_KEY: &str = "default_thinking_mode";
 
 /// Drain a standalone router's forwarded `routing_data` onto this request's tracker so the
 /// frontend's timing/worker/token surfaces populate, then drop the field to keep it off the
@@ -187,6 +303,12 @@ pub struct MmImageEntry {
     pub height: u32,
 }
 
+struct MediaFetchTask<'a> {
+    modality: &'static str,
+    slot_idx: usize,
+    content_part: Cow<'a, ChatCompletionRequestUserMessageContentPart>,
+}
+
 /// Per-request media content-part counts, carried to the metrics annotation.
 /// Derived from `multi_modal_data`, so independent of the `mm-routing` feature.
 #[derive(Debug, Clone, Copy, Default)]
@@ -214,6 +336,37 @@ impl MultimodalCounts {
     }
 }
 
+#[cfg(feature = "mm-routing")]
+fn checked_add_image_tokens(total: Option<usize>, next: usize) -> Option<usize> {
+    total?.checked_add(next)
+}
+
+#[cfg(feature = "mm-routing")]
+fn has_image_token_processor_override(value: Option<&serde_json::Value>) -> bool {
+    value.is_some_and(|value| match value {
+        serde_json::Value::Null => false,
+        serde_json::Value::Object(map) => !map.is_empty(),
+        // The schema expects an object. Fail closed for every other JSON shape
+        // because its processor semantics are unknown here.
+        _ => true,
+    })
+}
+
+#[cfg(feature = "mm-routing")]
+fn aggregate_image_tokens(
+    image_tokens: Option<usize>,
+    resolved_image_count: usize,
+    total_image_count: usize,
+    has_processor_override: bool,
+) -> Option<usize> {
+    if total_image_count == 0 || has_processor_override || resolved_image_count != total_image_count
+    {
+        return None;
+    }
+
+    image_tokens
+}
+
 /// Derive the model's local directory from the MDC. The directory is the
 /// parent of `config.json` (which lives in `mdc.model_info` as `HfConfigJson`)
 /// and contains the other artifacts MM-aware routing reads at startup
@@ -226,12 +379,13 @@ fn mdc_model_dir(mdc: &ModelDeploymentCard) -> Option<std::path::PathBuf> {
 }
 
 /// Shared SSRF-aware `MediaFetcher` + `reqwest::Client` for the dim-fetch
-/// path used by MM-aware routing. Inherits the same policy contract as the
-/// frontend-decode path (`MediaLoader`): blocklist DNS resolver, redirect
-/// revalidation, hostname/IP blocklist, `DYN_MM_ALLOW_INTERNAL` opt-in.
+/// path used by MM-aware routing and image-token metrics. Inherits the same
+/// policy contract as the frontend-decode path (`MediaLoader`): blocklist DNS
+/// resolver, redirect revalidation, hostname/IP blocklist,
+/// `DYN_MM_ALLOW_INTERNAL` opt-in.
 ///
 /// **Lifecycle:** `LazyLock` so the closure runs on first access. For MM-
-/// routable preprocessors, `OpenAIPreprocessor::new_with_parts` calls
+/// countable or routable preprocessors, `OpenAIPreprocessor::new_with_parts` calls
 /// `LazyLock::force(...)` at startup — that surfaces TLS-root / reqwest-
 /// init / env-misconfig failures at deployment time, not on the first MM
 /// request 20 minutes in. Text-only deployments skip the force, leaving
@@ -306,6 +460,8 @@ pub struct OpenAIPreprocessor {
     routing_prepend_bos: Option<crate::protocols::TokenIdType>,
 }
 
+pub(crate) const LORA_NAME_CONTEXT_KEY: &str = "discovery.lora_name";
+
 impl OpenAIPreprocessor {
     fn omitted_max_tokens_default(
         prompt_len: usize,
@@ -371,7 +527,12 @@ impl OpenAIPreprocessor {
         let mut sampling_passthrough = serde_json::Map::new();
 
         if let Some(fields) = request.unsupported_fields() {
-            for key in ["detokenize", "allowed_token_ids", "bad_words_token_ids"] {
+            for key in [
+                "detokenize",
+                "allowed_token_ids",
+                "bad_words_token_ids",
+                "logprob_token_ids",
+            ] {
                 if let Some(value) = fields.get(key) {
                     sampling_passthrough.insert(key.to_string(), value.clone());
                 }
@@ -427,6 +588,67 @@ impl OpenAIPreprocessor {
         } else {
             Some(serde_json::Value::Object(extra_args))
         }
+    }
+
+    fn has_request_thinking_control(
+        chat_template_args: Option<&HashMap<String, serde_json::Value>>,
+    ) -> bool {
+        chat_template_args.is_some_and(|args| {
+            [
+                "thinking",
+                "enable_thinking",
+                "thinking_mode",
+                "reasoning_effort",
+            ]
+            .iter()
+            .any(|key| args.contains_key(*key))
+        })
+    }
+
+    fn apply_default_thinking_mode_from_runtime_config(
+        runtime_config: &crate::local_model::runtime_config::ModelRuntimeConfig,
+        request: &mut NvCreateChatCompletionRequest,
+    ) {
+        if request.thinking.is_some()
+            || Self::has_request_thinking_control(request.chat_template_args.as_ref())
+        {
+            return;
+        }
+
+        let Some(default_mode) = runtime_config
+            .runtime_data
+            .get(DEFAULT_THINKING_MODE_RUNTIME_KEY)
+            .and_then(|value| value.as_str())
+        else {
+            return;
+        };
+
+        let enabled = match default_mode {
+            "enabled" => true,
+            "disabled" => false,
+            other => {
+                tracing::warn!(
+                    default_thinking_mode = other,
+                    "Ignoring invalid runtime_config default_thinking_mode; expected 'enabled' or 'disabled'"
+                );
+                return;
+            }
+        };
+
+        let args = request.chat_template_args.get_or_insert_with(HashMap::new);
+        args.insert("thinking".to_string(), serde_json::Value::Bool(enabled));
+        args.insert(
+            "enable_thinking".to_string(),
+            serde_json::Value::Bool(enabled),
+        );
+        args.insert(
+            "thinking_mode".to_string(),
+            serde_json::Value::String(if enabled { "enabled" } else { "disabled" }.to_string()),
+        );
+    }
+
+    fn apply_default_thinking_mode(&self, request: &mut NvCreateChatCompletionRequest) {
+        Self::apply_default_thinking_mode_from_runtime_config(&self.runtime_config, request);
     }
 
     fn guided_output_requires_reasoning<R: OAIChatLikeRequest>(
@@ -625,29 +847,30 @@ impl OpenAIPreprocessor {
         // custom-named directories where the family substring isn't in the path.
         #[cfg(feature = "mm-routing")]
         let model_dir_for_routing: Option<std::path::PathBuf> = mdc_model_dir(&mdc);
+        #[cfg(feature = "mm-routing")]
+        let fastokens_active = runtime_config.effective_tokenizer_backend().is_fastokens();
         // TODO(mm-routing): fastokens lacks a special-token mutator, so it
         // can't merge tokenizer_config.json specials and would BPE-shatter
         // placeholders (e.g. Qwen2-VL `<|image_pad|>`). Disable MM-routing
-        // here; remove once fastokens upstream exposes the mutator.
+        // token resolution here, but keep SMG image-token counting enabled.
+        // Remove this split once fastokens upstream exposes the mutator.
+        #[cfg(feature = "mm-routing")]
+        if fastokens_active && model_dir_for_routing.is_some() {
+            tracing::warn!(
+                target: "mm_routing",
+                "fastokens tokenizer backend is active; MM-aware KV routing disabled. \
+                 Image-token metrics remain enabled when SMG supports the model."
+            );
+        }
         #[cfg(feature = "mm-routing")]
         let image_token_inputs: Option<(String, String, std::path::PathBuf)> = {
-            let fastokens_active = runtime_config.effective_tokenizer_backend().is_fastokens();
-            if fastokens_active && model_dir_for_routing.is_some() {
-                tracing::warn!(
-                    target: "mm_routing",
-                    "fastokens tokenizer backend is active; MM-aware KV routing disabled. \
-                     Use the default tokenizer backend to re-enable."
-                );
-                None
-            } else {
-                model_dir_for_routing.as_ref().map(|p| {
-                    (
-                        mdc.source_path().to_string(),
-                        model_info.model_type(),
-                        p.clone(),
-                    )
-                })
-            }
+            model_dir_for_routing.as_ref().map(|p| {
+                (
+                    mdc.source_path().to_string(),
+                    model_info.model_type(),
+                    p.clone(),
+                )
+            })
         };
 
         let context_length = mdc.effective_context_length();
@@ -674,17 +897,23 @@ impl OpenAIPreprocessor {
                         Ok(c) => (Some(c), None),
                         Err(e) => (None, Some(e.to_string())),
                     };
-                    // One-shot config/tokenizer_config read for all
-                    // routing-side token info. Parsing lives next to the
-                    // spec resolution in the MM-routing module.
-                    let routing_tokens =
-                        lightseek_mm::resolve_routing_tokens(&model_id, &model_dir);
-                    // `chat_placeholder_token_id` already prefers config.json's
-                    // explicit field and falls back to the spec value, so it's
-                    // the single id used both for the engagement gate and the
-                    // routing-fill below.
-                    let img_tok = routing_tokens.chat_placeholder_token_id;
-                    let bos_tok_string = routing_tokens.bos_token_string;
+                    let (img_tok, bos_tok_string) = if fastokens_active {
+                        (None, None)
+                    } else {
+                        // One-shot config/tokenizer_config read for all
+                        // routing-side token info. Parsing lives next to the
+                        // spec resolution in the MM-routing module.
+                        let routing_tokens =
+                            lightseek_mm::resolve_routing_tokens(&model_id, &model_dir);
+                        // `chat_placeholder_token_id` already prefers
+                        // config.json's explicit field and falls back to the
+                        // spec value, so it is used for both the engagement
+                        // gate and the routing fill.
+                        (
+                            routing_tokens.chat_placeholder_token_id,
+                            routing_tokens.bos_token_string,
+                        )
+                    };
 
                     match (counter.is_some(), img_tok.is_some()) {
                         (true, true) => tracing::info!(
@@ -693,6 +922,7 @@ impl OpenAIPreprocessor {
                             model_dir = %model_dir.display(),
                             "MM-aware KV routing enabled"
                         ),
+                        _ if fastokens_active => {}
                         (counter_ok, img_ok) => {
                             let mut reasons: Vec<String> = Vec::new();
                             if !counter_ok {
@@ -704,8 +934,8 @@ impl OpenAIPreprocessor {
                             if !img_ok {
                                 reasons.push(
                                     "image-placeholder token unresolvable from \
-                                 config.json / processor_config.json / \
-                                 tokenizer_config.json / vocab probe"
+                                     config.json / processor_config.json / \
+                                     tokenizer_config.json / vocab probe"
                                         .to_string(),
                                 );
                             }
@@ -734,7 +964,7 @@ impl OpenAIPreprocessor {
             };
 
         // Force the dim-fetch HTTP client to build at startup for any
-        // MM-routable preprocessor, so TLS / env-var / reqwest-init
+        // MM-countable or routable preprocessor, so TLS / env-var / reqwest-init
         // failures fail the deployment instead of crashing the first
         // MM request 20 minutes in. Text-only preprocessors skip the
         // force (both MM-routing hooks resolved to `None`) — no point
@@ -831,8 +1061,15 @@ impl OpenAIPreprocessor {
         request: &R,
         tracker: Option<&RequestTracker>,
     ) -> Result<(PreprocessedRequest, HashMap<String, String>, bool)> {
-        self.preprocess_request_with_options(request, tracker, PreprocessRequestOptions::default())
-            .await
+        let (request, annotations, prompt_injected_reasoning, _image_tokens) = self
+            .preprocess_request_with_options(
+                request,
+                tracker,
+                PreprocessRequestOptions::default(),
+                None,
+            )
+            .await?;
+        Ok((request, annotations, prompt_injected_reasoning))
     }
 
     async fn preprocess_request_with_options<
@@ -848,10 +1085,16 @@ impl OpenAIPreprocessor {
         request: &R,
         tracker: Option<&RequestTracker>,
         options: PreprocessRequestOptions,
-    ) -> Result<(PreprocessedRequest, HashMap<String, String>, bool)> {
+        lora_name: Option<String>,
+    ) -> Result<(
+        PreprocessedRequest,
+        HashMap<String, String>,
+        bool,
+        Option<usize>,
+    )> {
         let _stage_guard = StageGuard::new(STAGE_PREPROCESS, "");
         let preprocess_start = Instant::now();
-        let mut builder = self.builder(request)?;
+        let mut builder = self.builder_with_lora(request, lora_name)?;
 
         let template_start = Instant::now();
         let formatted_prompt = {
@@ -878,8 +1121,8 @@ impl OpenAIPreprocessor {
         };
         TOKENIZE_SECONDS.observe(tokenize_start.elapsed().as_secs_f64());
 
-        let _mm_image_entries = self
-            .gather_multi_modal_data(
+        let (_mm_image_entries, image_tokens) = self
+            .gather_multi_modal_data_with_image_tokens(
                 request,
                 &mut builder,
                 formatted_prompt.as_deref(),
@@ -951,7 +1194,12 @@ impl OpenAIPreprocessor {
             preprocessed.stop_conditions.max_tokens = Some(max_tokens);
         }
 
-        Ok((preprocessed, annotations, prompt_injected_reasoning))
+        Ok((
+            preprocessed,
+            annotations,
+            prompt_injected_reasoning,
+            image_tokens,
+        ))
     }
 
     pub fn builder<
@@ -964,6 +1212,21 @@ impl OpenAIPreprocessor {
     >(
         &self,
         request: &R,
+    ) -> Result<PreprocessedRequestBuilder> {
+        self.builder_with_lora(request, None)
+    }
+
+    fn builder_with_lora<
+        R: OAIChatLikeRequest
+            + AnnotationsProvider
+            + SamplingOptionsProvider
+            + StopConditionsProvider
+            + OutputOptionsProvider
+            + NvExtProvider,
+    >(
+        &self,
+        request: &R,
+        lora_name_override: Option<String>,
     ) -> Result<PreprocessedRequestBuilder> {
         let mut builder = PreprocessedRequest::builder();
         builder.model(request.model());
@@ -1049,7 +1312,7 @@ impl OpenAIPreprocessor {
         builder.output_options(output_options);
         builder.annotations(request.annotations().unwrap_or_default());
         builder.mdc_sum(Some(self.mdcsum.clone()));
-        let lora_name = self.lora_name.clone();
+        let lora_name = self.lora_name.clone().or(lora_name_override);
         let cache_namespace = request_cache_salt(request).map(str::to_owned);
 
         // Extract routing hints from nvext if present
@@ -1244,6 +1507,24 @@ impl OpenAIPreprocessor {
         }
     }
 
+    fn replace_reserved_media_slot(
+        media_map: &mut MultimodalDataMap,
+        modality: &str,
+        slot_idx: usize,
+        value: MultimodalData,
+    ) -> Result<()> {
+        let slot = media_map
+            .get_mut(modality)
+            .and_then(|slots| slots.get_mut(slot_idx))
+            .with_context(|| {
+                format!(
+                    "missing reserved multimodal slot {modality}[{slot_idx}] during media decode"
+                )
+            })?;
+        *slot = value;
+        Ok(())
+    }
+
     pub async fn gather_multi_modal_data<
         R: OAIChatLikeRequest + MediaRequestExt + NvExtProvider,
     >(
@@ -1256,18 +1537,45 @@ impl OpenAIPreprocessor {
         // `gather_mm_exact_routing_info`, so the two never diverge.
         token_ids: &[crate::protocols::TokenIdType],
     ) -> Result<Vec<MmImageEntry>> {
+        let (entries, _image_tokens) = self
+            .gather_multi_modal_data_with_image_tokens(
+                request,
+                builder,
+                formatted_prompt,
+                token_ids,
+            )
+            .await?;
+        Ok(entries)
+    }
+
+    async fn gather_multi_modal_data_with_image_tokens<
+        R: OAIChatLikeRequest + MediaRequestExt + NvExtProvider,
+    >(
+        &self,
+        request: &R,
+        builder: &mut PreprocessedRequestBuilder,
+        formatted_prompt: Option<&str>,
+        token_ids: &[crate::protocols::TokenIdType],
+    ) -> Result<(Vec<MmImageEntry>, Option<usize>)> {
         // `token_ids` is only consumed by the mm-routing `mm_hashes` gate below.
         #[cfg(not(feature = "mm-routing"))]
         let _ = token_ids;
 
         let mut media_map: MultimodalDataMap = HashMap::new();
-        let mut fetch_tasks: Vec<(String, &ChatCompletionRequestUserMessageContentPart)> =
-            Vec::new();
+        let mut uuid_map: MultimodalUuidMap = HashMap::new();
+        let mut has_user_uuid = false;
+        // Decoded results are written back into these reserved modality slots so
+        // URL-backed and UUID-only inputs retain request order.
+        let mut fetch_tasks: Vec<MediaFetchTask<'_>> = Vec::new();
         // Per-image (mm_hash, width, height) for the MM-routing path.
         // Accumulated in message order so we don't walk messages twice.
         // Cleared and returned to the caller; empty for non-image / text-only requests.
         #[cfg(feature = "mm-routing")]
         let mut mm_image_entries: Vec<MmImageEntry> = Vec::new();
+        // Private per-request total for frontend metrics. `None` means the SMG
+        // counter is unavailable or checked addition overflowed.
+        #[cfg(feature = "mm-routing")]
+        let mut image_tokens = self.image_token_counter.as_ref().map(|_| 0usize);
         // Total `image_url` content parts in the request. Bumped at every
         // image part regardless of which fetch path handles it. Used at
         // `mm_hashes` forwarding time: if `mm_image_entries.len()` is
@@ -1289,54 +1597,71 @@ impl OpenAIPreprocessor {
         let mut url_passthrough_images: Vec<(u64, String)> = Vec::new();
 
         let Some(messages) = request.typed_messages() else {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), None));
         };
         let has_media_loader = self.media_loader.is_some();
 
         for message in messages.iter() {
-            let content_parts = match message {
-                ChatCompletionRequestMessage::User(u) => match &u.content {
-                    ChatCompletionRequestUserMessageContent::Array(parts) => parts,
-                    _ => continue,
-                },
-                _ => continue,
+            let Some(content_parts) = multimodal_content_parts(message) else {
+                continue;
             };
-            for content_part in content_parts.iter() {
-                if has_media_loader {
-                    let type_str = match content_part {
-                        ChatCompletionRequestUserMessageContentPart::ImageUrl(_) => "image_url",
-                        ChatCompletionRequestUserMessageContentPart::VideoUrl(_) => "video_url",
-                        ChatCompletionRequestUserMessageContentPart::AudioUrl(_) => "audio_url",
-                        _ => continue,
-                    };
-                    #[cfg(feature = "mm-routing")]
-                    if type_str == "image_url" {
-                        total_image_count += 1;
-                    }
-                    fetch_tasks.push((type_str.to_string(), content_part));
-                } else {
-                    let (type_str, url) = match content_part {
-                        ChatCompletionRequestUserMessageContentPart::ImageUrl(p) => {
-                            ("image_url", p.image_url.url.clone())
-                        }
-                        ChatCompletionRequestUserMessageContentPart::VideoUrl(p) => {
-                            ("video_url", p.video_url.url.clone())
-                        }
-                        ChatCompletionRequestUserMessageContentPart::AudioUrl(p) => {
-                            ("audio_url", p.audio_url.url.clone())
-                        }
-                        _ => continue,
-                    };
-                    #[cfg(feature = "mm-routing")]
-                    if type_str == "image_url" {
-                        total_image_count += 1;
-                        let mm_hash = Self::hash_image_url(url.as_str());
-                        url_passthrough_images.push((mm_hash, url.to_string()));
-                    }
-                    media_map
+            for content_part in content_parts {
+                let Some((type_str, url, uuid)) = content_part.media_info() else {
+                    continue;
+                };
+
+                if type_str != "image_url" && uuid.is_some() {
+                    return Err(invalid_argument_error(
+                        "multimodal cache UUIDs are supported only for image_url parts with vLLM",
+                    ));
+                }
+
+                #[cfg(feature = "mm-routing")]
+                if type_str == "image_url" {
+                    total_image_count += 1;
+                }
+
+                if uuid.as_deref().is_some_and(str::is_empty) {
+                    return Err(invalid_argument_error(format!(
+                        "{type_str} uuid must be a non-empty string"
+                    )));
+                }
+
+                let slots = media_map.entry(type_str.to_string()).or_default();
+                let slot_idx = slots.len();
+                has_user_uuid |= uuid.is_some();
+                if type_str == "image_url" {
+                    uuid_map
                         .entry(type_str.to_string())
                         .or_default()
-                        .push(MultimodalData::Url(url));
+                        .push(uuid.clone());
+                }
+
+                match (url, uuid) {
+                    (Some(url), _) => {
+                        if has_media_loader {
+                            fetch_tasks.push(MediaFetchTask {
+                                modality: type_str,
+                                slot_idx,
+                                content_part: content_part.as_user(),
+                            });
+                        } else {
+                            #[cfg(feature = "mm-routing")]
+                            if type_str == "image_url" {
+                                let mm_hash = Self::hash_image_url(url.as_str());
+                                url_passthrough_images.push((mm_hash, url.as_str().to_string()));
+                            }
+                        }
+                        slots.push(MultimodalData::Url(url));
+                    }
+                    (None, Some(uuid)) => {
+                        slots.push(MultimodalData::UuidOnly(uuid));
+                    }
+                    (None, None) => {
+                        return Err(invalid_argument_error(format!(
+                            "{type_str} part has neither `url` nor `uuid`; at least one is required"
+                        )));
+                    }
                 }
             }
         }
@@ -1345,31 +1670,23 @@ impl OpenAIPreprocessor {
         if !fetch_tasks.is_empty() {
             let loader = self.media_loader.as_ref().unwrap();
             let media_io_kwargs = request.media_io_kwargs();
-            let results = futures::future::join_all(fetch_tasks.iter().map(|(_, content_part)| {
-                loader.fetch_and_decode_media_part(content_part, media_io_kwargs)
+            let results = futures::future::join_all(fetch_tasks.iter().map(|task| {
+                loader.fetch_and_decode_media_part(task.content_part.as_ref(), media_io_kwargs)
             }))
             .await;
 
-            for ((type_str, _content_part), result) in fetch_tasks.into_iter().zip(results) {
+            for (task, result) in fetch_tasks.into_iter().zip(results) {
                 // if one item fails, errors the whole request, other items will be cleaned up by Drop
                 let rdma_descriptor = result?;
 
                 // Decoded RDMA descriptor carries shape `[H, W, C]`.
                 // Image-only; MM-routing doesn't cover audio/video.
                 #[cfg(feature = "mm-routing")]
-                if type_str == "image_url" {
+                if task.modality == "image_url" {
                     let shape = &rdma_descriptor.tensor_info.shape;
                     if shape.len() >= 2 {
                         let h = shape[0] as u32;
                         let w = shape[1] as u32;
-                        let url_str = match _content_part {
-                            ChatCompletionRequestUserMessageContentPart::ImageUrl(p) => {
-                                p.image_url.url.as_str()
-                            }
-                            _ => unreachable!(
-                                "rdma image_url descriptor only originates from ImageUrl content parts"
-                            ),
-                        };
                         // Frontend-decode path: hash the decoded RGB bytes so
                         // the same image reached via different (signed) URLs
                         // collides on the same `mm_hash` and routes to the
@@ -1379,7 +1696,15 @@ impl OpenAIPreprocessor {
                         // shouldn't happen on the frontend.
                         let (mm_hash, hash_source) = match rdma_descriptor.content_hash() {
                             Some(h) => (h, "decoded_bytes"),
-                            None => (Self::hash_image_url(url_str), "url_fallback"),
+                            None => {
+                                let source_url = image_content_part_url(task.content_part.as_ref())
+                                    .ok_or_else(|| {
+                                        invalid_argument_error(
+                                            "image_url task must contain an image URL",
+                                        )
+                                    })?;
+                                (Self::hash_image_url(source_url), "url_fallback")
+                            }
                         };
                         if let Some(counter) = self.image_token_counter.as_ref() {
                             let n = counter.count_tokens(w, h);
@@ -1393,6 +1718,7 @@ impl OpenAIPreprocessor {
                                 source = hash_source,
                                 "image-token count"
                             );
+                            image_tokens = checked_add_image_tokens(image_tokens, n);
                         }
                         mm_image_entries.push(MmImageEntry {
                             mm_hash,
@@ -1402,10 +1728,12 @@ impl OpenAIPreprocessor {
                     }
                 }
 
-                media_map
-                    .entry(type_str)
-                    .or_default()
-                    .push(MultimodalData::Decoded(rdma_descriptor));
+                Self::replace_reserved_media_slot(
+                    &mut media_map,
+                    task.modality,
+                    task.slot_idx,
+                    MultimodalData::Decoded(rdma_descriptor),
+                )?;
             }
         }
 
@@ -1414,11 +1742,11 @@ impl OpenAIPreprocessor {
         // Enables MM-aware routing for backends that register
         // `media_decoder: null` and decode images on the worker.
         #[cfg(feature = "mm-routing")]
-        if !url_passthrough_images.is_empty() {
+        if !has_user_uuid && !url_passthrough_images.is_empty() {
             let dim_results = futures::future::join_all(
                 url_passthrough_images
                     .iter()
-                    .map(|(mm_hash, url)| Self::fetch_image_dims(*mm_hash, url.as_str())),
+                    .map(|(mm_hash, url)| Self::fetch_image_dims(*mm_hash, url)),
             )
             .await;
             for ((mm_hash, url), dim_res) in url_passthrough_images.into_iter().zip(dim_results) {
@@ -1436,6 +1764,7 @@ impl OpenAIPreprocessor {
                                 source = "url_passthrough_header_fetch",
                                 "image-token count"
                             );
+                            image_tokens = checked_add_image_tokens(image_tokens, n);
                         }
                         mm_image_entries.push(MmImageEntry {
                             mm_hash,
@@ -1468,6 +1797,17 @@ impl OpenAIPreprocessor {
 
         if !media_map.is_empty() {
             builder.multi_modal_data(Some(media_map));
+            if has_user_uuid {
+                builder.multi_modal_uuids(Some(uuid_map));
+            }
+
+            // User cache identities are opaque and cannot be converted into the
+            // router's canonical image hashes. Fall back to text-prefix routing
+            // instead of routing and publishing under different cache keys.
+            #[cfg(feature = "mm-routing")]
+            if has_user_uuid {
+                mm_image_entries.clear();
+            }
 
             // Preserve original messages and formatted prompt in extra_args for multimodal
             // workers (e.g., TRT-LLM needs messages and the template-rendered prompt with
@@ -1527,6 +1867,7 @@ impl OpenAIPreprocessor {
             // text-prefix routing.
             #[cfg(feature = "mm-routing")]
             if let Some(find_token_id) = self.routing_image_token_id
+                && !has_user_uuid
                 && !mm_image_entries.is_empty()
                 && mm_image_entries.len() == total_image_count
                 && token_ids.iter().filter(|&&t| t == find_token_id).count()
@@ -1550,9 +1891,19 @@ impl OpenAIPreprocessor {
         }
 
         #[cfg(feature = "mm-routing")]
-        return Ok(mm_image_entries);
+        let has_processor_override =
+            has_image_token_processor_override(request.mm_processor_kwargs());
+        #[cfg(feature = "mm-routing")]
+        let image_tokens = aggregate_image_tokens(
+            image_tokens,
+            mm_image_entries.len(),
+            total_image_count,
+            has_processor_override,
+        );
+        #[cfg(feature = "mm-routing")]
+        return Ok((mm_image_entries, image_tokens));
         #[cfg(not(feature = "mm-routing"))]
-        Ok(Vec::new())
+        Ok((Vec::new(), None))
     }
 
     /// Build `MmRoutingInfo` for exact MM-aware KV routing. The worker-bound
@@ -2268,6 +2619,33 @@ impl OpenAIPreprocessor {
         S: Stream<Item = Annotated<BackendOutput>> + Send + 'static,
         Resp: Send + Sync + Clone + 'static + std::fmt::Debug,
     {
+        Self::transform_postprocessor_stream_with_image_tokens(
+            stream,
+            generator,
+            context,
+            emit_payload_usage_chunk,
+            trace_tokens_enabled,
+            trace_finish_reason_metadata,
+            mm_counts,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn transform_postprocessor_stream_with_image_tokens<S, Resp>(
+        stream: S,
+        generator: Box<dyn DeltaGeneratorExt<Resp>>,
+        context: Arc<dyn AsyncEngineContext>,
+        emit_payload_usage_chunk: bool,
+        trace_tokens_enabled: bool,
+        trace_finish_reason_metadata: Option<crate::request_trace::SharedFinishReasonMetadata>,
+        mm_counts: MultimodalCounts,
+        image_tokens: Option<usize>,
+    ) -> impl Stream<Item = Annotated<Resp>> + Send
+    where
+        S: Stream<Item = Annotated<BackendOutput>> + Send + 'static,
+        Resp: Send + Sync + Clone + 'static + std::fmt::Debug,
+    {
         struct State<Resp>
         where
             Resp: Send + Sync + Clone + 'static + std::fmt::Debug,
@@ -2287,6 +2665,7 @@ impl OpenAIPreprocessor {
             trace_tokens_enabled: bool,
             trace_finish_reason_metadata: Option<crate::request_trace::SharedFinishReasonMetadata>,
             mm_counts: MultimodalCounts,
+            image_tokens: Option<usize>,
         }
 
         let state = State {
@@ -2303,6 +2682,7 @@ impl OpenAIPreprocessor {
             trace_tokens_enabled,
             trace_finish_reason_metadata,
             mm_counts,
+            image_tokens,
         };
 
         // transform the common response stream into a chat response stream
@@ -2417,6 +2797,7 @@ impl OpenAIPreprocessor {
                         image_count: inner.mm_counts.image,
                         video_count: inner.mm_counts.video,
                         audio_count: inner.mm_counts.audio,
+                        image_tokens: inner.image_tokens,
                         prefill_worker_id,
                         prefill_dp_rank,
                         prefill_worker_type,
@@ -2497,6 +2878,7 @@ impl OpenAIPreprocessor {
                             image_count: inner.mm_counts.image,
                             video_count: inner.mm_counts.video,
                             audio_count: inner.mm_counts.audio,
+                            image_tokens: inner.image_tokens,
                             prefill_worker_id,
                             prefill_dp_rank,
                             prefill_worker_type,
@@ -3338,6 +3720,10 @@ impl
 
         // Set stream=true for internal processing (after request payload capture)
         request.inner.stream = Some(true);
+        // Apply the deployment default before parser-specific normalization so
+        // it can override an implicit model default (for example Kimi K2.5),
+        // while explicit request controls still take precedence.
+        self.apply_default_thinking_mode(&mut request);
         Self::normalize_thinking_arg(
             &mut request,
             self.runtime_config.reasoning_parser.as_deref(),
@@ -3354,8 +3740,17 @@ impl
         };
 
         // convert the chat completion request to a common completion request
-        let (mut common_request, annotations, prompt_injected_reasoning) = self
-            .preprocess_request_with_options(&request, tracker.as_deref(), preprocess_options)
+        let (mut common_request, annotations, prompt_injected_reasoning, image_tokens) = self
+            .preprocess_request_with_options(
+                &request,
+                tracker.as_deref(),
+                preprocess_options,
+                context
+                    .get_optional::<String>(LORA_NAME_CONTEXT_KEY)
+                    .ok()
+                    .flatten()
+                    .map(|name| name.as_ref().clone()),
+            )
             .await?;
         attach_agent_context_from_context(&mut common_request, &context);
 
@@ -3406,7 +3801,7 @@ impl
         let context = response_stream.context();
 
         // transform the postprocessor stream (no boxing yet) - detokenize
-        let stream = Self::transform_postprocessor_stream(
+        let stream = Self::transform_postprocessor_stream_with_image_tokens(
             response_stream,
             response_generator,
             context.clone(),
@@ -3414,6 +3809,7 @@ impl
             trace_tokens_enabled,
             trace_finish_reason_metadata,
             mm_counts,
+            image_tokens,
         );
 
         let transformed_stream = self.postprocessor_parsing_stream(
@@ -3518,7 +3914,14 @@ impl
         let mut response_generator = Box::new(response_generator);
         let tracker = Some(response_generator.tracker());
         // convert the chat completion request to a common completion request
-        let mut builder = self.builder(&request)?;
+        let mut builder = self.builder_with_lora(
+            &request,
+            context
+                .get_optional::<String>(LORA_NAME_CONTEXT_KEY)
+                .ok()
+                .flatten()
+                .map(|name| name.as_ref().clone()),
+        )?;
 
         // Check if embeddings are provided - skip tokenization path
         let annotations = if let Some(ref prompt_embeds) = request.inner.prompt_embeds {
@@ -3772,6 +4175,122 @@ mod tests {
     }
 
     #[test]
+    fn tool_message_exposes_multimodal_content_parts() {
+        let message: ChatCompletionRequestMessage = serde_json::from_value(serde_json::json!({
+            "role": "tool",
+            "tool_call_id": "call_media",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "data:image/png;base64,aGVsbG8="
+                    }
+                },
+                {
+                    "type": "video_url",
+                    "video_url": {
+                        "url": "https://example.com/clip.mp4"
+                    }
+                },
+                {
+                    "type": "audio_url",
+                    "audio_url": {
+                        "url": "https://example.com/audio.wav"
+                    }
+                }
+            ]
+        }))
+        .unwrap();
+
+        let parts: Vec<_> = multimodal_content_parts(&message).unwrap().collect();
+        assert!(matches!(
+            parts[0].as_user().as_ref(),
+            ChatCompletionRequestUserMessageContentPart::ImageUrl(_)
+        ));
+        assert!(matches!(
+            parts[1].as_user().as_ref(),
+            ChatCompletionRequestUserMessageContentPart::VideoUrl(_)
+        ));
+        assert!(matches!(
+            parts[2].as_user().as_ref(),
+            ChatCompletionRequestUserMessageContentPart::AudioUrl(_)
+        ));
+    }
+
+    #[cfg(feature = "mm-routing")]
+    #[test]
+    fn image_token_aggregate_requires_complete_trustworthy_counts() {
+        assert_eq!(aggregate_image_tokens(Some(300), 2, 2, false), Some(300));
+        assert_eq!(aggregate_image_tokens(Some(300), 2, 3, false), None);
+        assert_eq!(aggregate_image_tokens(Some(300), 2, 2, true), None);
+        assert_eq!(aggregate_image_tokens(None, 2, 2, false), None);
+        assert_eq!(aggregate_image_tokens(Some(0), 0, 0, false), None);
+        assert_eq!(
+            checked_add_image_tokens(Some(usize::MAX), 1),
+            None,
+            "overflow must omit the aggregate rather than wrap"
+        );
+    }
+
+    #[cfg(feature = "mm-routing")]
+    #[test]
+    fn image_token_processor_override_is_conservative() {
+        assert!(!has_image_token_processor_override(None));
+        assert!(!has_image_token_processor_override(Some(
+            &serde_json::Value::Null
+        )));
+        assert!(!has_image_token_processor_override(Some(
+            &serde_json::json!({})
+        )));
+        assert!(has_image_token_processor_override(Some(
+            &serde_json::json!([])
+        )));
+        assert!(has_image_token_processor_override(Some(
+            &serde_json::json!({"min_pixels": 64})
+        )));
+    }
+
+    #[test]
+    fn replace_reserved_media_slot_preserves_alignment_and_returns_errors() {
+        let mut map = HashMap::from([(
+            "image_url".to_string(),
+            vec![
+                url_entry("http://x/a.png"),
+                MultimodalData::UuidOnly("cached-b".to_string()),
+                url_entry("http://x/c.png"),
+            ],
+        )]);
+
+        OpenAIPreprocessor::replace_reserved_media_slot(
+            &mut map,
+            "image_url",
+            2,
+            MultimodalData::RawUrl("decoded-c".to_string()),
+        )
+        .unwrap();
+
+        let images = &map["image_url"];
+        assert!(matches!(images[0], MultimodalData::Url(_)));
+        assert!(matches!(
+            &images[1],
+            MultimodalData::UuidOnly(uuid) if uuid == "cached-b"
+        ));
+        assert!(matches!(
+            &images[2],
+            MultimodalData::RawUrl(value) if value == "decoded-c"
+        ));
+
+        let error = OpenAIPreprocessor::replace_reserved_media_slot(
+            &mut map,
+            "image_url",
+            3,
+            MultimodalData::RawUrl("out-of-range".to_string()),
+        )
+        .expect_err("an out-of-range reserved slot must return an error");
+        assert!(error.to_string().contains("image_url[3]"));
+    }
+
+    #[test]
     fn routing_priorities_keep_strict_tier_independent() {
         let hints = crate::protocols::common::extensions::AgentHints {
             priority: Some(-3),
@@ -3792,6 +4311,7 @@ mod tests {
             output_tokens: 20,
             chunk_tokens: 3,
             cached_tokens: Some(4),
+            image_tokens: Some(512),
             prefill_worker_id: Some(1),
             prefill_dp_rank: Some(2),
             prefill_worker_type: Some("prefill".to_string()),
@@ -3826,6 +4346,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("metrics recognized for tag {tag}"));
             assert_eq!(metrics.input_tokens, 10);
             assert_eq!(metrics.output_tokens, 20);
+            assert_eq!(metrics.image_tokens, Some(512));
             assert_eq!(metrics.detokenize_count, Some(6));
         }
     }
@@ -4138,6 +4659,7 @@ mod tests {
             "detokenize": false,
             "allowed_token_ids": [10, 11],
             "bad_words_token_ids": [[12, 13]],
+            "logprob_token_ids": [14, 15],
             "nvext": {
                 "cache_salt": "step_7",
                 "extra_fields": ["completion_token_ids"],
@@ -4170,6 +4692,136 @@ mod tests {
             extra_args["sampling_options"]["bad_words_token_ids"],
             serde_json::json!([[12, 13]])
         );
+        assert_eq!(
+            extra_args["sampling_options"]["logprob_token_ids"],
+            serde_json::json!([14, 15])
+        );
+    }
+
+    fn chat_request_with_args(
+        chat_template_args: Option<HashMap<String, serde_json::Value>>,
+    ) -> NvCreateChatCompletionRequest {
+        let mut request: NvCreateChatCompletionRequest =
+            serde_json::from_value(serde_json::json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .unwrap();
+        request.chat_template_args = chat_template_args;
+        request
+    }
+
+    fn runtime_config_with_default_thinking_mode(
+        mode: &str,
+    ) -> crate::local_model::runtime_config::ModelRuntimeConfig {
+        let mut runtime_config = crate::local_model::runtime_config::ModelRuntimeConfig::new();
+        runtime_config
+            .set_engine_specific(DEFAULT_THINKING_MODE_RUNTIME_KEY, mode)
+            .unwrap();
+        runtime_config
+    }
+
+    #[test]
+    fn test_default_thinking_mode_disabled_adds_template_args() {
+        let runtime_config = runtime_config_with_default_thinking_mode("disabled");
+        let mut request = chat_request_with_args(None);
+
+        OpenAIPreprocessor::apply_default_thinking_mode_from_runtime_config(
+            &runtime_config,
+            &mut request,
+        );
+
+        let args = request.chat_template_args.as_ref().unwrap();
+        assert_eq!(args.get("thinking"), Some(&serde_json::json!(false)));
+        assert_eq!(args.get("enable_thinking"), Some(&serde_json::json!(false)));
+        assert_eq!(
+            args.get("thinking_mode"),
+            Some(&serde_json::json!("disabled"))
+        );
+    }
+
+    #[test]
+    fn test_default_thinking_mode_enabled_adds_template_args() {
+        let runtime_config = runtime_config_with_default_thinking_mode("enabled");
+        let mut request = chat_request_with_args(None);
+
+        OpenAIPreprocessor::apply_default_thinking_mode_from_runtime_config(
+            &runtime_config,
+            &mut request,
+        );
+
+        let args = request.chat_template_args.as_ref().unwrap();
+        assert_eq!(args.get("thinking"), Some(&serde_json::json!(true)));
+        assert_eq!(args.get("enable_thinking"), Some(&serde_json::json!(true)));
+        assert_eq!(
+            args.get("thinking_mode"),
+            Some(&serde_json::json!("enabled"))
+        );
+    }
+
+    #[test]
+    fn test_default_thinking_mode_does_not_override_request() {
+        let runtime_config = runtime_config_with_default_thinking_mode("disabled");
+        let mut request = chat_request_with_args(Some(HashMap::from([(
+            "thinking_mode".to_string(),
+            serde_json::json!("enabled"),
+        )])));
+
+        OpenAIPreprocessor::apply_default_thinking_mode_from_runtime_config(
+            &runtime_config,
+            &mut request,
+        );
+
+        let args = request.chat_template_args.as_ref().unwrap();
+        assert_eq!(
+            args.get("thinking_mode"),
+            Some(&serde_json::json!("enabled"))
+        );
+        assert!(!args.contains_key("thinking"));
+        assert!(!args.contains_key("enable_thinking"));
+    }
+
+    #[test]
+    fn test_default_thinking_mode_precedes_parser_implicit_default() {
+        let runtime_config = runtime_config_with_default_thinking_mode("disabled");
+        let mut request = chat_request_with_args(None);
+
+        OpenAIPreprocessor::apply_default_thinking_mode_from_runtime_config(
+            &runtime_config,
+            &mut request,
+        );
+        OpenAIPreprocessor::normalize_thinking_arg(&mut request, Some("kimi_k25"));
+
+        let args = request.chat_template_args.as_ref().unwrap();
+        assert_eq!(args.get("thinking"), Some(&serde_json::json!(false)));
+        assert_eq!(args.get("enable_thinking"), Some(&serde_json::json!(false)));
+        assert_eq!(
+            args.get("thinking_mode"),
+            Some(&serde_json::json!("disabled"))
+        );
+    }
+
+    #[test]
+    fn test_default_thinking_mode_does_not_override_reasoning_effort() {
+        let runtime_config = runtime_config_with_default_thinking_mode("disabled");
+        let mut request = chat_request_with_args(Some(HashMap::from([(
+            "reasoning_effort".to_string(),
+            serde_json::json!("high"),
+        )])));
+
+        OpenAIPreprocessor::apply_default_thinking_mode_from_runtime_config(
+            &runtime_config,
+            &mut request,
+        );
+
+        let args = request.chat_template_args.as_ref().unwrap();
+        assert_eq!(
+            args.get("reasoning_effort"),
+            Some(&serde_json::json!("high"))
+        );
+        assert!(!args.contains_key("thinking"));
+        assert!(!args.contains_key("enable_thinking"));
+        assert!(!args.contains_key("thinking_mode"));
     }
 
     /// Verifies template reasoning controls are forwarded to a configured parser.

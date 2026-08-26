@@ -23,15 +23,18 @@ from typing import (
 )
 
 import sglang as sgl
+from sglang.srt.managers.io_struct import ProfileReq
 from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 
 from dynamo._core import Context
 from dynamo.common.constants import DisaggregationMode
 from dynamo.common.lora.manager import get_lora_manager
 from dynamo.common.utils.endpoint_types import parse_endpoint_types
+from dynamo.common.utils.guided_json import reject_nonprogressing_guided_json_ref_cycles
 from dynamo.common.utils.input_params import InputParamManager
 from dynamo.common.utils.structural_tag import serialize_structural_tag
 from dynamo.llm import (
+    HttpError,
     KvEventPublisher,
     ModelInput,
     ModelType,
@@ -43,7 +46,6 @@ from dynamo.llm import (
 )
 from dynamo.llm.exceptions import EngineShutdown
 from dynamo.runtime import DistributedRuntime
-from dynamo.sglang._compat import start_profile_compat
 from dynamo.sglang.args import Config
 from dynamo.sglang.pause import SGLangEnginePauseController
 from dynamo.sglang.publisher import DynamoSglangPublisher
@@ -670,8 +672,10 @@ class BaseWorkerHandler(LoraMixin, RLMixin, BaseGenerativeHandler[RequestT, Resp
         self.serving_mode = config.serving_mode
         self.use_sglang_tokenizer = config.dynamo_args.use_sglang_tokenizer
         self.enable_trace = getattr(config.server_args, "enable_trace", False)
+        self._max_input_token_id: Optional[int] = None
 
         if engine is not None:
+            self._max_input_token_id = self._resolve_max_input_token_id(engine)
             self.input_param_manager = InputParamManager(
                 self.engine.tokenizer_manager.tokenizer
                 if self.use_sglang_tokenizer
@@ -876,7 +880,7 @@ class BaseWorkerHandler(LoraMixin, RLMixin, BaseGenerativeHandler[RequestT, Resp
         Args:
             body: Dict with profiling parameters passed to start_profile.
         """
-        await start_profile_compat(self.engine.tokenizer_manager, body)
+        await self.engine.tokenizer_manager.start_profile(ProfileReq(**body))
         return {"status": "ok", "message": "Profiling started"}
 
     async def stop_profile(self, body: dict) -> dict:
@@ -1012,10 +1016,109 @@ class BaseWorkerHandler(LoraMixin, RLMixin, BaseGenerativeHandler[RequestT, Resp
         request_input = self.input_param_manager.get_input_param(
             request, use_tokenizer=self.use_sglang_tokenizer
         )
+        self._validate_nvext_token_data(request, request_input)
 
         return {
             "prompt" if isinstance(request_input, str) else "input_ids": request_input
         }
+
+    @staticmethod
+    def _resolve_max_input_token_id(engine: sgl.Engine) -> Optional[int]:
+        """Resolve the largest token ID accepted by the model embedding table."""
+        tokenizer_manager = getattr(engine, "tokenizer_manager", None)
+        model_config = getattr(tokenizer_manager, "model_config", None)
+        return BaseWorkerHandler._resolve_max_input_token_id_from_model_config(
+            model_config
+        )
+
+    @staticmethod
+    def _resolve_max_input_token_id_from_model_config(
+        model_config: Any,
+    ) -> Optional[int]:
+        model_vocab_size: object = getattr(model_config, "vocab_size", None)
+
+        # Compatibility fallback for SGLang model configs that expose the
+        # Hugging Face text config but not the derived vocab_size attribute.
+        if model_vocab_size is None:
+            hf_text_config = getattr(model_config, "hf_text_config", None)
+            model_vocab_size = getattr(hf_text_config, "vocab_size", None)
+
+        if (
+            isinstance(model_vocab_size, bool)
+            or not isinstance(model_vocab_size, int)
+            or model_vocab_size <= 0
+        ):
+            return None
+        return model_vocab_size - 1
+
+    def _resolve_request_multimodal_token_ids(
+        self, request: Dict[str, Any]
+    ) -> frozenset[int]:
+        mm_data = request.get("multi_modal_data")
+        if not isinstance(mm_data, dict):
+            return frozenset()
+
+        tokenizer_manager = getattr(self.engine, "tokenizer_manager", None)
+        mm_processor = getattr(tokenizer_manager, "mm_processor", None)
+        mm_tokens = getattr(mm_processor, "mm_tokens", None)
+        token_ids = set()
+
+        if mm_tokens is not None:
+            for modality in ("image", "video", "audio"):
+                if not mm_data.get(f"{modality}_url"):
+                    continue
+                token_id = getattr(mm_tokens, f"{modality}_token_id", None)
+                if isinstance(token_id, int) and not isinstance(token_id, bool):
+                    token_ids.add(token_id)
+
+        # Some processors, including LLaVA's wrapper, expose only the image
+        # token on ModelConfig. LLaVA also represents video frames as images.
+        if mm_data.get("image_url") or mm_data.get("video_url"):
+            model_config = getattr(tokenizer_manager, "model_config", None)
+            image_token_id = getattr(model_config, "image_token_id", None)
+            if isinstance(image_token_id, int) and not isinstance(image_token_id, bool):
+                token_ids.add(image_token_id)
+
+        return frozenset(token_ids)
+
+    def _validate_token_ids(
+        self,
+        token_ids: Any,
+        allowed_oov_ids: frozenset[int] = frozenset(),
+    ) -> None:
+        if not isinstance(token_ids, list):
+            raise HttpError(400, "nvext.token_data must resolve to a token ID list")
+
+        max_input_token_id = self._max_input_token_id
+        for index, token_id in enumerate(token_ids):
+            if isinstance(token_id, bool) or not isinstance(token_id, int):
+                raise HttpError(
+                    400,
+                    f"nvext.token_data[{index}] must be an integer token ID",
+                )
+            # Dynamo's Rust frontend uses u32 token IDs, so negatives are not expected.
+            if (
+                max_input_token_id is not None and token_id > max_input_token_id
+            ) and token_id not in allowed_oov_ids:
+                raise HttpError(400, f"Token id {token_id} is out of vocabulary")
+
+    def _validate_nvext_token_data(
+        self,
+        request: Dict[str, Any],
+        token_ids: Any,
+    ) -> None:
+        """Reject out-of-vocabulary IDs supplied through ``nvext.token_data``."""
+        extra_args = request.get("extra_args")
+        if not isinstance(extra_args, dict):
+            return
+        nvext = extra_args.get("nvext")
+        if not isinstance(nvext, dict) or nvext.get("token_in") is not True:
+            return
+
+        self._validate_token_ids(
+            token_ids,
+            self._resolve_request_multimodal_token_ids(request),
+        )
 
     @staticmethod
     def _get_guided_decoding_params(
@@ -1025,6 +1128,7 @@ class BaseWorkerHandler(LoraMixin, RLMixin, BaseGenerativeHandler[RequestT, Resp
         if isinstance(guided_decoding, dict):
             json_schema = guided_decoding.get("json")
             if json_schema is not None:
+                reject_nonprogressing_guided_json_ref_cycles(json_schema)
                 return {"json_schema": json.dumps(json_schema)}
             structural_tag = guided_decoding.get("structural_tag")
             if structural_tag is not None:

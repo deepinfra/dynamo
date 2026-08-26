@@ -4,7 +4,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt::Display,
-    sync::Arc,
+    sync::{Arc, LazyLock},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -23,7 +23,7 @@ use axum::{
 };
 use base64::Engine as _;
 use bytes::Bytes;
-use dynamo_runtime::config::environment_names::llm as env_llm;
+use dynamo_runtime::config::{env_is_truthy, environment_names::llm as env_llm};
 use dynamo_runtime::{
     pipeline::{AsyncEngineContextProvider, Context},
     protocols::annotated::AnnotationsProvider,
@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use super::{
     RouteDoc,
     disconnect::{ConnectionHandle, create_connection_monitor, monitor_for_disconnects},
-    error::HttpError,
+    error::{HttpError, invalid_argument},
     metadata::{attach_x_request_id, extract_metadata_from_http},
     metrics::{
         CancellationLabels, Endpoint, ErrorType, EventConverter,
@@ -58,10 +58,19 @@ use crate::protocols::openai::{
         NvCreateChatCompletionRequest, NvCreateChatCompletionResponse,
         NvCreateChatCompletionStreamResponse,
     },
+    classify::{NvCreateClassifyRequest, NvCreateClassifyResponse},
     completions::{NvCreateCompletionRequest, NvCreateCompletionResponse},
+    delta_common,
     embeddings::{NvCreateEmbeddingRequest, NvCreateEmbeddingResponse},
     images::{NvCreateImageRequest, NvImagesResponse},
-    responses::{NvCreateResponse, NvResponse, ResponseParams, chat_completion_to_response},
+    pooling::{
+        NvCreatePoolingRequest, NvCreatePoolingResponse, PoolingEmbedDType, PoolingEncodingFormat,
+        PoolingEndianness, PoolingOutput,
+    },
+    responses::{
+        NvCreateResponse, NvResponse, ResponseParams, ResponsesConversionError,
+        chat_completion_to_response,
+    },
     videos::{NvCreateVideoRequest, NvVideosResponse},
 };
 use crate::protocols::unified::UnifiedRequest;
@@ -80,6 +89,14 @@ pub const DYNAMO_REQUEST_ID_HEADER: &str = "x-dynamo-request-id";
 pub const ANNOTATION_REQUEST_ID: &str = "request_id";
 
 const VALIDATION_PREFIX: &str = "Validation: ";
+const BATCH_FILE_STORAGE_NOT_IMPLEMENTED: &str = "Batch file storage is not implemented yet.";
+const BATCH_JOB_STATE_NOT_IMPLEMENTED: &str =
+    "Batch job lifecycle persistence is not implemented yet.";
+const BATCH_OUTPUT_RETRIEVAL_NOT_IMPLEMENTED: &str =
+    "Batch output file retrieval is not implemented yet.";
+
+static FORCE_INCLUDE_USAGE: LazyLock<bool> =
+    LazyLock::new(|| env_is_truthy(env_llm::DYN_ENABLE_FORCE_INCLUDE_USAGE));
 
 use super::error::{SanitizedError, overload_status_code};
 
@@ -151,6 +168,29 @@ fn classify_error_for_metrics(code: StatusCode, message: &str) -> ErrorType {
 /// Extract ErrorType from ErrorResponse for metrics
 fn extract_error_type_from_response(response: &ErrorResponse) -> ErrorType {
     classify_error_for_metrics(response.0, &response.1.message)
+}
+
+fn responses_conversion_error_type(error: &anyhow::Error) -> ErrorType {
+    match error.downcast_ref::<ResponsesConversionError>() {
+        Some(ResponsesConversionError::InvalidArgument(_)) => ErrorType::Validation,
+        Some(ResponsesConversionError::NotImplemented(_)) => ErrorType::NotImplemented,
+        None => ErrorType::Internal,
+    }
+}
+
+fn responses_conversion_error_response(error: anyhow::Error) -> ErrorResponse {
+    const CONTEXT: &str = "Failed to convert responses request";
+
+    match error.downcast_ref::<ResponsesConversionError>() {
+        Some(ResponsesConversionError::InvalidArgument(message)) => ErrorMessage::from_anyhow(
+            invalid_argument(format!("{CONTEXT}: {message}")).into(),
+            CONTEXT,
+        ),
+        Some(ResponsesConversionError::NotImplemented(message)) => {
+            ErrorMessage::not_implemented_error(format!("{VALIDATION_PREFIX}{CONTEXT}: {message}"))
+        }
+        None => ErrorMessage::from_anyhow(error, CONTEXT),
+    }
 }
 
 /// Match `InvalidArgument` at top-level OR under `Backend()`.
@@ -630,6 +670,9 @@ async fn handler_completions(
 ) -> Result<Response, ErrorResponse> {
     ensure_json_content_type(&headers)?;
     let mut request: NvCreateCompletionRequest = parse_json_request("completions", &body)?;
+    if *FORCE_INCLUDE_USAGE && request.inner.stream.unwrap_or(false) {
+        delta_common::force_include_usage(&mut request.inner.stream_options);
+    }
 
     // return a 503 if the service or model is not ready
     check_ready(&state)?;
@@ -873,6 +916,86 @@ async fn completions_single(
     }
 }
 
+fn add_optional_token_count(total: &mut Option<u32>, value: Option<u32>) {
+    if let Some(value) = value {
+        *total = Some(total.unwrap_or_default().saturating_add(value));
+    }
+}
+
+fn merge_completion_usage(
+    total: &mut dynamo_protocols::types::CompletionUsage,
+    usage: dynamo_protocols::types::CompletionUsage,
+) {
+    total.prompt_tokens = total.prompt_tokens.saturating_add(usage.prompt_tokens);
+    total.completion_tokens = total
+        .completion_tokens
+        .saturating_add(usage.completion_tokens);
+    total.total_tokens = total.total_tokens.saturating_add(usage.total_tokens);
+
+    if let Some(details) = usage.prompt_tokens_details {
+        let total_details = total.prompt_tokens_details.get_or_insert_default();
+        add_optional_token_count(&mut total_details.audio_tokens, details.audio_tokens);
+        add_optional_token_count(&mut total_details.cached_tokens, details.cached_tokens);
+    }
+
+    if let Some(details) = usage.completion_tokens_details {
+        let total_details = total.completion_tokens_details.get_or_insert_default();
+        add_optional_token_count(
+            &mut total_details.accepted_prediction_tokens,
+            details.accepted_prediction_tokens,
+        );
+        add_optional_token_count(&mut total_details.audio_tokens, details.audio_tokens);
+        add_optional_token_count(
+            &mut total_details.reasoning_tokens,
+            details.reasoning_tokens,
+        );
+        add_optional_token_count(
+            &mut total_details.rejected_prediction_tokens,
+            details.rejected_prediction_tokens,
+        );
+    }
+}
+
+/// Combine the terminal usage-only chunks from per-prompt streams into one
+/// request-level chunk. Continuous usage attached to content chunks passes
+/// through unchanged because those values are cumulative snapshots.
+fn aggregate_batch_completion_usage(
+    stream: impl futures::Stream<Item = Annotated<NvCreateCompletionResponse>>,
+    request_id: String,
+) -> impl futures::Stream<Item = Annotated<NvCreateCompletionResponse>> {
+    async_stream::stream! {
+        let mut stream = Box::pin(stream);
+        let mut aggregate_usage = dynamo_protocols::types::CompletionUsage::default();
+        let mut final_usage_chunk = None;
+
+        while let Some(mut response) = stream.next().await {
+            let terminal_usage = response.data.as_mut().and_then(|data| {
+                data.inner
+                    .choices
+                    .is_empty()
+                    .then(|| data.inner.usage.take())
+                    .flatten()
+            });
+
+            if let Some(usage) = terminal_usage {
+                merge_completion_usage(&mut aggregate_usage, usage);
+                final_usage_chunk = Some(response);
+                continue;
+            }
+
+            yield response;
+        }
+
+        if let Some(mut response) = final_usage_chunk {
+            if let Some(data) = response.data.as_mut() {
+                data.inner.id = format!("cmpl-{request_id}");
+                data.inner.usage = Some(aggregate_usage);
+            }
+            yield response;
+        }
+    }
+}
+
 /// Handle batch prompt completions (multiple prompts with n choices each)
 #[tracing::instrument(skip_all)]
 async fn completions_batch(
@@ -977,6 +1100,7 @@ async fn completions_batch(
 
     // Merge all streams
     let merged_stream = stream::select_all(all_streams);
+    let merged_stream = aggregate_batch_completion_usage(merged_stream, request_id.clone());
 
     // capture the context to cancel the stream if the client disconnects
     let ctx = first_ctx.expect("At least one stream should be generated");
@@ -1244,6 +1368,410 @@ fn decode_base64_embedding_to_floats(s: &str) -> Result<Vec<f32>, anyhow::Error>
     Ok(floats)
 }
 
+#[tracing::instrument(skip_all)]
+async fn classify(
+    State(state): State<Arc<service_v2::State>>,
+    headers: HeaderMap,
+    Json(mut request): Json<NvCreateClassifyRequest>,
+) -> Result<Response, ErrorResponse> {
+    // return a 503 if the service or model is not ready
+    check_ready(&state)?;
+    check_model_serving_ready(&state, &request.model)?;
+
+    if !state.nvext_enabled() {
+        warn_nvext_disabled("classify", request.nvext.is_some(), &headers);
+        request.nvext = None;
+    }
+
+    // Resolve alias → primary served name before wrapping the request, so
+    // engine routing, metrics, and the response model all use the canonical
+    // primary (mirrors `embeddings` / `completions_single`).
+    let canonical = state.manager().resolve_canonical_name(&request.model);
+    if canonical != request.model {
+        request.model = canonical;
+    }
+    let request_id = get_or_create_request_id(&headers);
+    let request = context_from_headers(request, request_id, &headers)?;
+    let request_id = request.id().to_string();
+
+    // Classification, like embeddings, is a pooling task returned as a single
+    // (non-streaming) response.
+    let streaming = false;
+
+    let model = &request.model;
+    let metric_model = state.manager().metric_model_for(model).to_string();
+
+    // Create inflight_guard early to ensure all errors (including validation)
+    // are counted. Request validation runs after this point so a rejected
+    // request still lands in `requests_total` with error_type=validation
+    // (mirrors `chat_completions`).
+    let mut inflight = state.metrics_clone().create_inflight_guard(
+        &metric_model,
+        Endpoint::Classify,
+        streaming,
+        &request_id,
+    );
+
+    // Marked as `Validation` explicitly rather than through
+    // `extract_error_type_from_response`: that helper infers the type from the
+    // message, and only a `VALIDATION_PREFIX`-prefixed 400 maps to
+    // `Validation` (anything else falls back to `Internal`). These messages
+    // stay verbatim vLLM-compatible, so the prefix is not an option here.
+    if let Err(err_response) = validate_pooling_cache_salt(request.cache_salt.as_deref()) {
+        inflight.mark_error(ErrorType::Validation);
+        return Err(err_response);
+    }
+
+    // Create http_queue_guard early - tracks time waiting to be processed
+    let http_queue_guard = state.metrics_clone().create_http_queue_guard(&metric_model);
+
+    let engine = state.manager().get_classify_engine(model).map_err(|e| {
+        let err_response = ErrorMessage::from_model_error(&e);
+        inflight.mark_error(extract_error_type_from_response(&err_response));
+        err_response
+    })?;
+
+    let mut response_collector = state
+        .metrics_clone()
+        .create_response_collector(&metric_model);
+    let model_name = model.to_string();
+
+    // issue the generate call on the engine
+    let stream = engine.generate(request).await.map_err(|e| {
+        if super::metrics::request_was_rejected(e.as_ref()) {
+            state
+                .metrics_clone()
+                .inc_rejection(&model_name, super::metrics::Endpoint::Classify);
+        }
+        let err_response = ErrorMessage::from_anyhow(e, "Failed to generate classification");
+        inflight.mark_error(extract_error_type_from_response(&err_response));
+        err_response
+    })?;
+
+    // Process stream to collect metrics and drop http_queue_guard on first token
+    let mut http_queue_guard = Some(http_queue_guard);
+    let stream = stream.inspect(move |response| {
+        process_response_and_observe_metrics(
+            response,
+            &mut response_collector,
+            &mut http_queue_guard,
+        );
+    });
+
+    // Fold the (single-response) stream into one classification response.
+    let response = NvCreateClassifyResponse::from_annotated_stream(stream)
+        .await
+        .map_err(|e| {
+            let err_response = ErrorMessage::from_anyhow(
+                anyhow::Error::new(e),
+                "Failed to fold classification stream",
+            );
+            inflight.mark_error(extract_error_type_from_response(&err_response));
+            err_response
+        })?;
+
+    inflight.mark_ok();
+    Ok(Json(response).into_response())
+}
+
+fn pooling_or_classify_bad_request(message: String) -> ErrorResponse {
+    let code = StatusCode::BAD_REQUEST;
+    (
+        code,
+        Json(ErrorMessage {
+            message,
+            error_type: map_error_code_to_error_type(code),
+            code: code.as_u16(),
+            details: None,
+        }),
+    )
+}
+
+fn validate_pooling_cache_salt(cache_salt: Option<&str>) -> Result<(), ErrorResponse> {
+    if cache_salt == Some("") {
+        return Err(pooling_or_classify_bad_request(
+            "Parameter 'cache_salt' must be a non-empty string if provided.".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct PoolingBinaryMetadataItem {
+    index: u32,
+    embed_dtype: &'static str,
+    endianness: &'static str,
+    start: usize,
+    end: usize,
+    shape: Vec<u64>,
+}
+
+#[derive(Serialize)]
+struct PoolingBinaryUsage {
+    prompt_tokens: u32,
+    total_tokens: u32,
+}
+
+#[derive(Serialize)]
+struct PoolingBinaryMetadata {
+    id: String,
+    created: u64,
+    model: String,
+    data: Vec<PoolingBinaryMetadataItem>,
+    usage: PoolingBinaryUsage,
+}
+
+fn build_pooling_binary_response(
+    response: NvCreatePoolingResponse,
+    include_metadata: bool,
+    embed_dtype: PoolingEmbedDType,
+    endianness: PoolingEndianness,
+) -> anyhow::Result<Response> {
+    let NvCreatePoolingResponse {
+        id,
+        created,
+        model,
+        data,
+        usage,
+        ..
+    } = response;
+
+    let mut chunks = Vec::with_capacity(data.len());
+    let mut metadata_items = Vec::with_capacity(if include_metadata { data.len() } else { 0 });
+    let mut offset = 0usize;
+
+    for item in data {
+        let encoded = match item.data {
+            PoolingOutput::Base64(encoded) => encoded,
+            _ => anyhow::bail!(
+                "binary pooling output at index {} was not base64 encoded",
+                item.index
+            ),
+        };
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "invalid base64 in binary pooling output at index {}: {e}",
+                    item.index
+                )
+            })?;
+        let end = offset.checked_add(bytes.len()).ok_or_else(|| {
+            anyhow::anyhow!(
+                "binary pooling response size overflow at index {}",
+                item.index
+            )
+        })?;
+
+        if include_metadata {
+            let shape = item.shape.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "binary pooling output at index {} is missing its tensor shape",
+                    item.index
+                )
+            })?;
+            let expected_len =
+                shape
+                    .iter()
+                    .try_fold(embed_dtype.byte_width(), |size, &dimension| {
+                        let dimension = usize::try_from(dimension).map_err(|_| {
+                            anyhow::anyhow!(
+                                "binary pooling tensor dimension overflow at index {}",
+                                item.index
+                            )
+                        })?;
+                        size.checked_mul(dimension).ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "binary pooling tensor size overflow at index {}",
+                                item.index
+                            )
+                        })
+                    })?;
+            anyhow::ensure!(
+                bytes.len() == expected_len,
+                "binary pooling output at index {} has {} bytes, but shape {:?} with dtype {} requires {}",
+                item.index,
+                bytes.len(),
+                shape,
+                embed_dtype.as_str(),
+                expected_len
+            );
+            metadata_items.push(PoolingBinaryMetadataItem {
+                index: item.index,
+                embed_dtype: embed_dtype.as_str(),
+                endianness: endianness.as_str(),
+                start: offset,
+                end,
+                shape,
+            });
+        }
+
+        chunks.push(Bytes::from(bytes));
+        offset = end;
+    }
+
+    let metadata = if include_metadata {
+        Some(serde_json::to_string(&PoolingBinaryMetadata {
+            id,
+            created,
+            model,
+            data: metadata_items,
+            usage: PoolingBinaryUsage {
+                prompt_tokens: usage.prompt_tokens,
+                total_tokens: usage.total_tokens,
+            },
+        })?)
+    } else {
+        None
+    };
+
+    let body = Body::from_stream(stream::iter(
+        chunks
+            .into_iter()
+            .map(Ok::<Bytes, std::convert::Infallible>),
+    ));
+    let mut builder =
+        Response::builder().header(axum::http::header::CONTENT_TYPE, "application/octet-stream");
+    if let Some(metadata) = metadata {
+        builder = builder.header("metadata", metadata);
+    }
+    Ok(builder.body(body)?)
+}
+
+#[tracing::instrument(skip_all)]
+async fn pooling(
+    State(state): State<Arc<service_v2::State>>,
+    headers: HeaderMap,
+    Json(mut request): Json<NvCreatePoolingRequest>,
+) -> Result<Response, ErrorResponse> {
+    // return a 503 if the service or model is not ready
+    check_ready(&state)?;
+    check_model_serving_ready(&state, &request.model)?;
+
+    if !state.nvext_enabled() {
+        warn_nvext_disabled("pooling", request.nvext.is_some(), &headers);
+        request.nvext = None;
+    }
+    let response_encoding = request.encoding_format;
+    let response_dtype = request.embed_dtype.unwrap_or_default();
+    let response_endianness = request.endianness.unwrap_or_default();
+
+    // Resolve alias → primary served name before wrapping the request, so
+    // engine routing, metrics, and the response model all use the canonical
+    // primary (mirrors `embeddings` / `completions_single`).
+    let canonical = state.manager().resolve_canonical_name(&request.model);
+    if canonical != request.model {
+        request.model = canonical;
+    }
+    let request_id = get_or_create_request_id(&headers);
+    let request = context_from_headers(request, request_id, &headers)?;
+    let request_id = request.id().to_string();
+
+    // Pooling, like embeddings, is a single (non-streaming) response.
+    let streaming = false;
+
+    let model = &request.model;
+    let metric_model = state.manager().metric_model_for(model).to_string();
+
+    // Create inflight_guard early to ensure all errors (including validation)
+    // are counted. Request validation runs after this point so a rejected
+    // request still lands in `requests_total` with error_type=validation
+    // (mirrors `chat_completions`).
+    let mut inflight = state.metrics_clone().create_inflight_guard(
+        &metric_model,
+        Endpoint::Pooling,
+        streaming,
+        &request_id,
+    );
+
+    // Marked as `Validation` explicitly rather than through
+    // `extract_error_type_from_response`: that helper infers the type from the
+    // message, and only a `VALIDATION_PREFIX`-prefixed 400 maps to
+    // `Validation` (anything else falls back to `Internal`). These messages
+    // stay verbatim vLLM-compatible, so the prefix is not an option here.
+    if let Err(err_response) = validate_pooling_cache_salt(request.cache_salt.as_deref()) {
+        inflight.mark_error(ErrorType::Validation);
+        return Err(err_response);
+    }
+
+    // vLLM currently rejects dimensionality reduction on `/pooling`.
+    if request.dimensions.is_some() {
+        inflight.mark_error(ErrorType::Validation);
+        return Err(pooling_or_classify_bad_request(
+            "dimensions is currently not supported".to_string(),
+        ));
+    }
+
+    // Create http_queue_guard early - tracks time waiting to be processed
+    let http_queue_guard = state.metrics_clone().create_http_queue_guard(&metric_model);
+
+    let engine = state.manager().get_pooling_engine(model).map_err(|e| {
+        let err_response = ErrorMessage::from_model_error(&e);
+        inflight.mark_error(extract_error_type_from_response(&err_response));
+        err_response
+    })?;
+
+    let mut response_collector = state
+        .metrics_clone()
+        .create_response_collector(&metric_model);
+    let model_name = model.to_string();
+
+    // issue the generate call on the engine
+    let stream = engine.generate(request).await.map_err(|e| {
+        if super::metrics::request_was_rejected(e.as_ref()) {
+            state
+                .metrics_clone()
+                .inc_rejection(&model_name, super::metrics::Endpoint::Pooling);
+        }
+        let err_response = ErrorMessage::from_anyhow(e, "Failed to generate pooling output");
+        inflight.mark_error(extract_error_type_from_response(&err_response));
+        err_response
+    })?;
+
+    // Process stream to collect metrics and drop http_queue_guard on first token
+    let mut http_queue_guard = Some(http_queue_guard);
+    let stream = stream.inspect(move |response| {
+        process_response_and_observe_metrics(
+            response,
+            &mut response_collector,
+            &mut http_queue_guard,
+        );
+    });
+
+    // Fold the (single-response) stream into one pooling response.
+    let response = NvCreatePoolingResponse::from_annotated_stream(stream)
+        .await
+        .map_err(|e| {
+            let err_response =
+                ErrorMessage::from_anyhow(anyhow::Error::new(e), "Failed to fold pooling stream");
+            inflight.mark_error(extract_error_type_from_response(&err_response));
+            err_response
+        })?;
+
+    let response = match response_encoding {
+        PoolingEncodingFormat::Float | PoolingEncodingFormat::Base64 => {
+            Json(response).into_response()
+        }
+        PoolingEncodingFormat::Bytes | PoolingEncodingFormat::BytesOnly => {
+            build_pooling_binary_response(
+                response,
+                response_encoding == PoolingEncodingFormat::Bytes,
+                response_dtype,
+                response_endianness,
+            )
+            .map_err(|e| {
+                let err_response =
+                    ErrorMessage::from_anyhow(e, "Failed to build pooling binary response");
+                inflight.mark_error(extract_error_type_from_response(&err_response));
+                err_response
+            })?
+        }
+    };
+
+    inflight.mark_ok();
+    Ok(response)
+}
+
 async fn handler_chat_completions(
     State((state, template)): State<(Arc<service_v2::State>, Option<RequestTemplate>)>,
     headers: HeaderMap,
@@ -1251,6 +1779,9 @@ async fn handler_chat_completions(
 ) -> Result<Response, ErrorResponse> {
     ensure_json_content_type(&headers)?;
     let mut request: NvCreateChatCompletionRequest = parse_json_request("chat completions", &body)?;
+    if *FORCE_INCLUDE_USAGE && request.inner.stream.unwrap_or(false) {
+        delta_common::force_include_usage(&mut request.inner.stream_options);
+    }
 
     // return a 503 if the service is not ready (process-level + per-model
     // serving readiness). An aggregated request to a decode-only namespace
@@ -1920,6 +2451,11 @@ async fn chat_completions(
         ),
     );
 
+    // When parallel_tool_calls is false, limit the response to a single tool call.
+    let parsing_options =
+        parsing_options.with_parallel_tool_calls(request.inner.parallel_tool_calls);
+    let enforce_single_tool_call = request.inner.parallel_tool_calls == Some(false);
+
     let mut response_collector = state
         .metrics_clone()
         .create_response_collector(&metric_model);
@@ -1981,8 +2517,23 @@ async fn chat_completions(
             let mut stream = Box::pin(stream);
             let mut events: Vec<Result<Event, axum::Error>> = Vec::with_capacity(4);
 
-            while let Some(response) = stream.next().await {
+            while let Some(mut response) = stream.next().await {
                 events.clear();
+
+                // When parallel_tool_calls is false, surface only the first tool call
+                // Keep index 0 and drop any higher indexes
+                if enforce_single_tool_call
+                    && let Some(data) = response.data.as_mut()
+                {
+                    for choice in data.inner.choices.iter_mut() {
+                        if let Some(tool_calls) = choice.delta.tool_calls.as_mut() {
+                            tool_calls.retain(|tc| tc.index == 0);
+                            if tool_calls.is_empty() {
+                                choice.delta.tool_calls = None;
+                            }
+                        }
+                    }
+                }
 
                 // Drop empty chunks from multi-byte token assembly.
                 if response.data.as_ref().is_some_and(is_empty_stream_response) {
@@ -2368,12 +2919,9 @@ async fn responses(
             error = %e,
             "Failed to convert NvCreateResponse to UnifiedRequest",
         );
-        let err_response = ErrorMessage::not_implemented_error(
-            VALIDATION_PREFIX.to_string()
-                + "Failed to convert responses request: "
-                + &e.to_string(),
-        );
-        inflight_guard.mark_error(extract_error_type_from_response(&err_response));
+        let error_type = responses_conversion_error_type(&e);
+        let err_response = responses_conversion_error_response(e);
+        inflight_guard.mark_error(error_type);
         err_response
     })?;
     // Extract the API context before consuming the UnifiedRequest — this
@@ -2383,6 +2931,14 @@ async fn responses(
     let mut chat_request = unified_request.into_inner();
     if let Err(err_response) = normalize_chat_reasoning_template_args(&mut chat_request) {
         inflight_guard.mark_error(extract_error_type_from_response(&err_response));
+        return Err(err_response);
+    }
+    if let Err(error) = chat_request.validate() {
+        let err_response = ErrorMessage::from_anyhow(
+            invalid_argument(error.to_string()).into(),
+            "Invalid responses request",
+        );
+        inflight_guard.mark_error(ErrorType::Validation);
         return Err(err_response);
     }
 
@@ -2818,6 +3374,107 @@ pub fn embeddings_router(
     (vec![doc], router)
 }
 
+/// Create an Axum [`Router`] for the `/v1/classify` endpoint (sequence
+/// classification / cross-encoder pooling). If no path is provided, the
+/// default path is `/v1/classify`. Deployments migrating clients from native
+/// `vllm-serve` (which mounts a bare `/classify`) can set the path via
+/// `DYN_HTTP_SVC_CLASSIFY_PATH`.
+pub fn classify_router(
+    state: Arc<service_v2::State>,
+    path: Option<String>,
+) -> (Vec<RouteDoc>, Router) {
+    let path = path.unwrap_or("/v1/classify".to_string());
+    let doc = RouteDoc::new(axum::http::Method::POST, &path);
+    let router = Router::new()
+        .route(&path, post(classify))
+        .layer(middleware::from_fn(smart_json_error_middleware))
+        .layer(axum::extract::DefaultBodyLimit::max(get_body_limit()))
+        .with_state(state);
+    (vec![doc], router)
+}
+
+/// Create an Axum [`Router`] for the `/v1/pooling` endpoint (raw pooler output
+/// from pooling-runner models). If no path is provided, the default path is
+/// `/v1/pooling`. Deployments migrating clients from native `vllm-serve`
+/// (which mounts a bare `/pooling`) can set the path via
+/// `DYN_HTTP_SVC_POOLING_PATH`.
+pub fn pooling_router(
+    state: Arc<service_v2::State>,
+    path: Option<String>,
+) -> (Vec<RouteDoc>, Router) {
+    let path = path.unwrap_or("/v1/pooling".to_string());
+    let doc = RouteDoc::new(axum::http::Method::POST, &path);
+    let router = Router::new()
+        .route(&path, post(pooling))
+        .layer(middleware::from_fn(smart_json_error_middleware))
+        .layer(axum::extract::DefaultBodyLimit::max(get_body_limit()))
+        .with_state(state);
+    (vec![doc], router)
+}
+
+/// Create an Axum [`Router`] for the OpenAI Batch API skeleton.
+///
+/// The first slice exposes the route and protocol shape. Durable file storage,
+/// batch job persistence, dispatch, and output assembly are implemented by
+/// follow-up work, so handlers return explicit 501 responses instead of
+/// accepting work that cannot complete yet.
+pub fn batch_router(
+    state: Arc<service_v2::State>,
+    files_path: Option<String>,
+    batches_path: Option<String>,
+) -> (Vec<RouteDoc>, Router) {
+    let files_path = files_path.unwrap_or("/v1/files".to_string());
+    let file_content_path = format!("{}/{{file_id}}/content", files_path);
+    let batches_path = batches_path.unwrap_or("/v1/batches".to_string());
+    let batch_path = format!("{}/{{batch_id}}", batches_path);
+
+    let docs = vec![
+        RouteDoc::new(axum::http::Method::POST, &files_path),
+        RouteDoc::new(axum::http::Method::GET, &file_content_path),
+        RouteDoc::new(axum::http::Method::POST, &batches_path),
+        RouteDoc::new(axum::http::Method::GET, &batch_path),
+    ];
+
+    let router = Router::new()
+        .route(&files_path, post(create_batch_file))
+        .route(&file_content_path, get(retrieve_batch_file_content))
+        .route(&batches_path, post(create_batch))
+        .route(&batch_path, get(retrieve_batch))
+        .layer(middleware::from_fn(smart_json_error_middleware))
+        .layer(axum::extract::DefaultBodyLimit::max(get_body_limit()))
+        .with_state(state);
+
+    (docs, router)
+}
+
+async fn create_batch_file() -> Result<Response, ErrorResponse> {
+    Err(ErrorMessage::not_implemented_error(
+        BATCH_FILE_STORAGE_NOT_IMPLEMENTED,
+    ))
+}
+
+async fn create_batch() -> Result<Response, ErrorResponse> {
+    Err(ErrorMessage::not_implemented_error(
+        BATCH_JOB_STATE_NOT_IMPLEMENTED,
+    ))
+}
+
+async fn retrieve_batch(
+    axum::extract::Path(_batch_id): axum::extract::Path<String>,
+) -> Result<Response, ErrorResponse> {
+    Err(ErrorMessage::not_implemented_error(
+        BATCH_JOB_STATE_NOT_IMPLEMENTED,
+    ))
+}
+
+async fn retrieve_batch_file_content(
+    axum::extract::Path(_file_id): axum::extract::Path<String>,
+) -> Result<Response, ErrorResponse> {
+    Err(ErrorMessage::not_implemented_error(
+        BATCH_OUTPUT_RETRIEVAL_NOT_IMPLEMENTED,
+    ))
+}
+
 /// List Models
 pub fn list_models_router(
     state: Arc<service_v2::State>,
@@ -2988,6 +3645,7 @@ async fn images(
             dynamo_protocols::types::ImageModel::GptImage1 => "gpt-image-1".to_string(),
             dynamo_protocols::types::ImageModel::GptImage1dot5 => "gpt-image-1.5".to_string(),
             dynamo_protocols::types::ImageModel::GptImage1Mini => "gpt-image-1-mini".to_string(),
+            dynamo_protocols::types::ImageModel::GptImage2 => "gpt-image-2".to_string(),
             dynamo_protocols::types::ImageModel::Other(s) => s.clone(),
         })
         .unwrap_or_else(|| "diffusion".to_string());
@@ -3438,10 +4096,16 @@ async fn audio_speech(
 
     let mut response_collector = state.metrics_clone().create_response_collector(&model);
 
-    let stream = engine
-        .generate(request)
-        .await
-        .map_err(|e| ErrorMessage::from_anyhow(e, "Failed to generate audio"))?;
+    let stream = engine.generate(request).await.map_err(|e| {
+        if super::metrics::request_was_rejected(e.as_ref()) {
+            state
+                .metrics_clone()
+                .inc_rejection(&model, super::metrics::Endpoint::Audios);
+        }
+        let err_response = ErrorMessage::from_anyhow(e, "Failed to generate audio");
+        inflight.mark_error(extract_error_type_from_response(&err_response));
+        err_response
+    })?;
 
     let mut http_queue_guard = Some(http_queue_guard);
     let stream = stream.inspect(move |response| {
@@ -3455,12 +4119,17 @@ async fn audio_speech(
     let response = NvAudioSpeechResponse::from_annotated_stream(stream)
         .await
         .map_err(|e| {
-            tracing::error!("Failed to fold audio stream for {}: {:?}", request_id, e);
-            ErrorMessage::internal_server_error("Failed to fold audio stream")
+            let err_response =
+                ErrorMessage::from_anyhow(anyhow::Error::new(e), "Failed to fold audio stream");
+            inflight.mark_error(extract_error_type_from_response(&err_response));
+            err_response
         })?;
 
     // Check for failure before marking success
     if response.status == "failed" {
+        // Without this the guard drops on its default and books this 400 as an
+        // internal error.
+        inflight.mark_error(ErrorType::Validation);
         return Ok((axum::http::StatusCode::BAD_REQUEST, Json(response)).into_response());
     }
 
@@ -3516,6 +4185,7 @@ mod tests {
     use crate::protocols::openai::chat_completions::NvCreateChatCompletionRequest;
     use crate::protocols::openai::common_ext::CommonExt;
     use crate::protocols::openai::completions::NvCreateCompletionRequest;
+    use crate::protocols::openai::pooling::{PoolingData, PoolingUsage};
     use crate::protocols::openai::responses::NvCreateResponse;
     use dynamo_protocols::types::responses::{CreateResponse, Input, PromptConfig};
     use dynamo_protocols::types::{
@@ -3525,6 +4195,139 @@ mod tests {
     };
 
     const BACKUP_ERROR_MESSAGE: &str = "Failed to generate completions";
+
+    fn binary_pooling_response() -> NvCreatePoolingResponse {
+        NvCreatePoolingResponse {
+            id: "pool-request".to_string(),
+            object: "list".to_string(),
+            created: 123,
+            model: "test-model".to_string(),
+            data: vec![
+                PoolingData {
+                    index: 0,
+                    object: "pooling".to_string(),
+                    data: PoolingOutput::Base64(
+                        base64::engine::general_purpose::STANDARD.encode([1, 2, 3, 4]),
+                    ),
+                    shape: Some(vec![2]),
+                },
+                PoolingData {
+                    index: 1,
+                    object: "pooling".to_string(),
+                    data: PoolingOutput::Base64(
+                        base64::engine::general_purpose::STANDARD.encode([5, 6, 7, 8]),
+                    ),
+                    shape: Some(vec![1, 2]),
+                },
+            ],
+            usage: PoolingUsage {
+                prompt_tokens: 7,
+                total_tokens: 7,
+                completion_tokens: 0,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn pooling_bytes_response_has_vllm_metadata_and_chunked_body() {
+        let response = build_pooling_binary_response(
+            binary_pooling_response(),
+            true,
+            PoolingEmbedDType::Float16,
+            PoolingEndianness::Big,
+        )
+        .unwrap();
+
+        assert_eq!(
+            response.headers()[axum::http::header::CONTENT_TYPE],
+            "application/octet-stream"
+        );
+        let metadata: serde_json::Value =
+            serde_json::from_str(response.headers()["metadata"].to_str().unwrap()).unwrap();
+        assert_eq!(
+            metadata,
+            serde_json::json!({
+                "id": "pool-request",
+                "created": 123,
+                "model": "test-model",
+                "data": [
+                    {
+                        "index": 0,
+                        "embed_dtype": "float16",
+                        "endianness": "big",
+                        "start": 0,
+                        "end": 4,
+                        "shape": [2]
+                    },
+                    {
+                        "index": 1,
+                        "embed_dtype": "float16",
+                        "endianness": "big",
+                        "start": 4,
+                        "end": 8,
+                        "shape": [1, 2]
+                    }
+                ],
+                "usage": {"prompt_tokens": 7, "total_tokens": 7}
+            })
+        );
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], &[1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    #[tokio::test]
+    async fn pooling_bytes_only_response_omits_metadata() {
+        let mut source = binary_pooling_response();
+        for item in &mut source.data {
+            item.shape = None;
+        }
+        let response = build_pooling_binary_response(
+            source,
+            false,
+            PoolingEmbedDType::Float32,
+            PoolingEndianness::Native,
+        )
+        .unwrap();
+
+        assert!(response.headers().get("metadata").is_none());
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], &[1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn pooling_bytes_metadata_requires_tensor_shape() {
+        let mut response = binary_pooling_response();
+        response.data[0].shape = None;
+
+        let error = build_pooling_binary_response(
+            response,
+            true,
+            PoolingEmbedDType::Float32,
+            PoolingEndianness::Native,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("missing its tensor shape"));
+    }
+
+    #[test]
+    fn pooling_bytes_metadata_validates_tensor_size() {
+        let mut response = binary_pooling_response();
+        response.data[0].shape = Some(vec![3]);
+
+        let error = build_pooling_binary_response(
+            response,
+            true,
+            PoolingEmbedDType::Float16,
+            PoolingEndianness::Native,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("requires 6"));
+    }
 
     #[test]
     fn test_is_json_content_type() {
@@ -3634,6 +4437,38 @@ mod tests {
             "unexpected error: {}",
             err.1.message
         );
+    }
+
+    #[test]
+    fn test_parse_chat_completion_request_accepts_empty_image_url_with_uuid() {
+        let body = br#"{"model":"test-model","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":""},"uuid":"image-42"}]}]}"#;
+
+        let request: NvCreateChatCompletionRequest =
+            parse_json_request("chat completions", body).expect("request should parse");
+        let request = serde_json::to_value(request).expect("request should serialize");
+        assert_eq!(request["messages"][0]["content"][0]["uuid"], "image-42");
+        assert_eq!(
+            request["messages"][0]["content"][0]["image_url"],
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn test_parse_chat_completion_request_accepts_empty_uuid_url_after_tolerant_parse() {
+        let body = b"{\"model\":\"test-model\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"raw \xff \x1b data\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"\"},\"uuid\":\"image-42\"}]}]}";
+
+        let request: NvCreateChatCompletionRequest =
+            parse_json_request("chat completions", body).expect("request should parse");
+        let request = serde_json::to_value(request).expect("request should serialize");
+        assert_eq!(
+            request["messages"][0]["content"][0]["text"],
+            "raw \u{fffd} \u{1b} data"
+        );
+        assert_eq!(
+            request["messages"][0]["content"][1]["image_url"],
+            serde_json::Value::Null
+        );
+        assert_eq!(request["messages"][0]["content"][1]["uuid"], "image-42");
     }
 
     #[test]
@@ -3748,6 +4583,19 @@ mod tests {
         let response = ErrorMessage::from_anyhow(err, BACKUP_ERROR_MESSAGE);
         assert_eq!(response.0, StatusCode::BAD_REQUEST);
         assert_eq!(response.1.message, "custom error message");
+    }
+
+    #[test]
+    fn empty_pooling_cache_salt_is_rejected() {
+        assert!(validate_pooling_cache_salt(None).is_ok());
+        assert!(validate_pooling_cache_salt(Some("salt")).is_ok());
+
+        let response = validate_pooling_cache_salt(Some("")).unwrap_err();
+        assert_eq!(response.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response.1.message,
+            "Parameter 'cache_salt' must be a non-empty string if provided."
+        );
     }
 
     #[test]
@@ -5181,6 +6029,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn untyped_responses_conversion_errors_remain_internal() {
+        let response = responses_conversion_error_response(anyhow::anyhow!(
+            "internal response conversion details"
+        ));
+
+        assert_eq!(response.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(response.1.message, "Failed to convert responses request");
+        assert_eq!(
+            extract_error_type_from_response(&response),
+            ErrorType::Internal
+        );
+    }
+
     // ── streaming dispatch tests ──────────────────────────────────────
 
     use std::collections::{HashMap, HashSet};
@@ -6221,6 +7083,139 @@ mod tests {
             !is_empty_completion_stream_response(&make_completion_chunk("", None, Some(usage))),
             "usage present → not empty",
         );
+    }
+
+    fn make_completion_usage_chunk(
+        id: &str,
+        usage: dynamo_protocols::types::CompletionUsage,
+    ) -> NvCreateCompletionResponse {
+        NvCreateCompletionResponse {
+            inner: CreateCompletionResponse {
+                id: id.to_string(),
+                choices: vec![],
+                created: 0,
+                model: "m".to_string(),
+                system_fingerprint: None,
+                object: "text_completion".to_string(),
+                usage: Some(usage),
+            },
+            nvext: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_completion_usage_is_aggregated_once() {
+        use dynamo_protocols::types::{
+            CompletionTokensDetails, CompletionUsage, PromptTokensDetails,
+        };
+
+        let continuous_usage = CompletionUsage {
+            prompt_tokens: 3,
+            completion_tokens: 1,
+            total_tokens: 4,
+            prompt_tokens_details: None,
+            completion_tokens_details: None,
+        };
+        let first_usage = CompletionUsage {
+            prompt_tokens: 3,
+            completion_tokens: 2,
+            total_tokens: 5,
+            prompt_tokens_details: Some(PromptTokensDetails {
+                audio_tokens: Some(1),
+                cached_tokens: Some(2),
+            }),
+            completion_tokens_details: Some(CompletionTokensDetails {
+                accepted_prediction_tokens: Some(1),
+                audio_tokens: None,
+                reasoning_tokens: Some(2),
+                rejected_prediction_tokens: Some(0),
+            }),
+        };
+        let second_usage = CompletionUsage {
+            prompt_tokens: 4,
+            completion_tokens: 1,
+            total_tokens: 5,
+            prompt_tokens_details: Some(PromptTokensDetails {
+                audio_tokens: Some(2),
+                cached_tokens: Some(3),
+            }),
+            completion_tokens_details: Some(CompletionTokensDetails {
+                accepted_prediction_tokens: Some(2),
+                audio_tokens: Some(1),
+                reasoning_tokens: None,
+                rejected_prediction_tokens: Some(1),
+            }),
+        };
+
+        let chunks = vec![
+            Annotated::from_data(make_completion_chunk(
+                "first",
+                None,
+                Some(continuous_usage.clone()),
+            )),
+            Annotated::from_data(make_completion_usage_chunk("cmpl-request-0", first_usage)),
+            Annotated::from_data(make_completion_chunk("second", None, None)),
+            Annotated::from_data(make_completion_usage_chunk("cmpl-request-1", second_usage)),
+        ];
+
+        let output: Vec<_> =
+            aggregate_batch_completion_usage(futures::stream::iter(chunks), "request".to_string())
+                .collect()
+                .await;
+
+        assert_eq!(output.len(), 3, "two content chunks and one usage chunk");
+        assert_eq!(
+            output[0]
+                .data
+                .as_ref()
+                .and_then(|data| data.inner.usage.as_ref()),
+            Some(&continuous_usage),
+            "continuous usage must pass through unchanged",
+        );
+
+        let final_response = output[2].data.as_ref().expect("final data chunk");
+        assert_eq!(final_response.inner.id, "cmpl-request");
+        assert!(final_response.inner.choices.is_empty());
+        let usage = final_response
+            .inner
+            .usage
+            .as_ref()
+            .expect("aggregate usage");
+        assert_eq!(usage.prompt_tokens, 7);
+        assert_eq!(usage.completion_tokens, 3);
+        assert_eq!(usage.total_tokens, 10);
+        let prompt_details = usage
+            .prompt_tokens_details
+            .as_ref()
+            .expect("prompt token details");
+        assert_eq!(prompt_details.audio_tokens, Some(3));
+        assert_eq!(prompt_details.cached_tokens, Some(5));
+        let completion_details = usage
+            .completion_tokens_details
+            .as_ref()
+            .expect("completion token details");
+        assert_eq!(completion_details.accepted_prediction_tokens, Some(3));
+        assert_eq!(completion_details.audio_tokens, Some(1));
+        assert_eq!(completion_details.reasoning_tokens, Some(2));
+        assert_eq!(completion_details.rejected_prediction_tokens, Some(1));
+    }
+
+    #[tokio::test]
+    async fn batch_completion_without_usage_is_unchanged() {
+        let chunks = vec![Annotated::from_data(make_completion_chunk(
+            "content", None, None,
+        ))];
+
+        let output: Vec<_> =
+            aggregate_batch_completion_usage(futures::stream::iter(chunks), "request".to_string())
+                .collect()
+                .await;
+
+        assert_eq!(output.len(), 1);
+        let response = output[0].data.as_ref().expect("content chunk");
+        assert_eq!(response.inner.id, "test");
+        assert_eq!(response.inner.choices[0].text, "content");
+        assert!(response.inner.usage.is_none());
     }
 
     // ── decode_base64_embedding_to_floats ────────────────────────────────

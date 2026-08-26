@@ -349,6 +349,7 @@ impl WorkerConfig {
         media_decoder = None,
         media_fetcher = None,
         kv_state_endpoint = None,
+        default_thinking_mode = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -377,6 +378,7 @@ impl WorkerConfig {
         media_decoder: Option<MediaDecoder>,
         media_fetcher: Option<MediaFetcher>,
         kv_state_endpoint: Option<String>,
+        default_thinking_mode: Option<String>,
     ) -> PyResult<Self> {
         // Delegating to the same conversion used by `register_model`.
         let model_input_rs = match model_input {
@@ -446,6 +448,7 @@ impl WorkerConfig {
                 custom_jinja_template: custom_jinja_template.map(PathBuf::from),
                 tool_call_parser,
                 reasoning_parser,
+                default_thinking_mode,
                 exclude_tools_when_tool_choice_none,
                 enable_local_indexer,
                 enable_kv_routing,
@@ -481,8 +484,8 @@ pub struct Worker {
     /// Single-shot guard — flipped to `true` on the first `run()` call.
     /// The Rust `Worker` underneath consumes `self`; calling `run()`
     /// twice from Python would build a second `RsWorker` and call
-    /// `engine.start()` again, which most engines (vLLM, sglang, trtllm)
-    /// don't tolerate. We surface a clear `RuntimeError` instead.
+    /// `engine.start()` again, which engine implementations generally do not
+    /// tolerate. We surface a clear `RuntimeError` instead.
     consumed: AtomicBool,
     /// `true` when `engine` is a `DiffusionEngine` (raw media pipeline).
     /// Set by the Python `Worker` shim via `isinstance`. Selects the raw

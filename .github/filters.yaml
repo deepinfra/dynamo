@@ -3,7 +3,8 @@
 # Filters that trigger CI jobs:
 #   core     -> dynamo build-test, all backend builds (vllm/sglang/trtllm)
 #   operator -> operator build and test
-#   snapshot -> snapshot-agent build and test
+#   snapshot -> snapshot-agent build/test + all-framework DynamoCheckpoint deploy tests
+#   snapshot_vllm / snapshot_sglang / snapshot_trtllm -> that framework's DynamoCheckpoint suite
 #   power_agent -> power-agent image build
 #   deploy   -> deploy tests
 #   planner  -> dynamo build-test
@@ -108,6 +109,7 @@ core:
   - '.cargo/config.toml'
   - 'lib/**'
   - 'tests/**'
+  - 'components/src/dynamo/kv_dc_relay/**'
   - 'components/src/dynamo/router/**'
   - 'components/src/dynamo/thunderagent_router/**'
   - 'components/src/dynamo/mocker/**'
@@ -118,6 +120,7 @@ core:
   # TODO(will): Move TokenSpeed to a dedicated framework filter once CI has
   # TokenSpeed Docker images and backend-specific build/test jobs.
   - 'components/src/dynamo/tokenspeed/**'
+  - 'components/src/dynamo/squeeze_evolve/**'
   - '*.toml'
   - '*.lock'
   - '*.py'
@@ -136,7 +139,7 @@ operator:
   - 'deploy/operator/.*'
   # Operator imports the local snapshot module.
   - 'deploy/snapshot/**'
-  - 'docs/kubernetes/api-reference.md'
+  - 'docs/fern/kubernetes/api-reference.md'
   - 'deploy/helm/charts/platform/**'
   # The operator check owns the real Go/Python DGD override contract test.
   - 'components/src/dynamo/profiler/utils/dgd_override.py'
@@ -149,6 +152,19 @@ snapshot:
   - 'components/src/dynamo/common/snapshot/**'
   - 'deploy/operator/internal/checkpoint/**'
   - 'tests/deploy/test_dynamocheckpoint.py'
+
+# Framework-local snapshot lifecycle files, plus TRT-LLM's unit test. These gate
+# that framework's DynamoCheckpoint deploy jobs (and shared snapshot-agent/operator
+# deps) without forcing the other backends' checkpoint suites.
+snapshot_vllm:
+  - 'components/src/dynamo/vllm/snapshot.py'
+
+snapshot_sglang:
+  - 'components/src/dynamo/sglang/snapshot.py'
+
+snapshot_trtllm:
+  - 'components/src/dynamo/trtllm/snapshot.py'
+  - 'components/src/dynamo/trtllm/tests/test_trtllm_snapshot.py'
 
 power_agent:
   - *ci
@@ -177,6 +193,8 @@ planner:
   - 'components/src/dynamo/global_planner/**'
   - 'components/src/dynamo/profiler/**'
   - 'components/src/dynamo/global_router/**'
+  - 'aisimulate/**'
+  - 'examples/aisimulate/**'
   # Power-aware planner (PR #9369): per-node power agent component
   - 'deploy/power-agent/**'
   - 'deploy/helm/charts/power-agent/**'
@@ -197,6 +215,7 @@ sglang:
   - 'examples/backends/sglang/**'
   - 'components/src/dynamo/sglang*/**'
   - 'lib/sidecar/sglang/**'
+  - 'lib/sidecar/trtllm/**'
   - 'container/templates/sglang_*'
   - 'container/deps/sglang/**'
   - '!**/*.md'
@@ -228,12 +247,14 @@ frontend:
   - '*.lock'
   - 'container/deps/*'
   - 'container/compliance/**'
+  - 'components/src/dynamo/kv_dc_relay/**'
   - 'components/src/dynamo/router/**'
   - 'components/src/dynamo/thunderagent_router/**'
   - 'components/src/dynamo/mocker/**'
   - 'components/src/dynamo/replay/**'
   - 'components/src/dynamo/frontend/**'
   - 'components/src/dynamo/common/**'
+  - 'tests/frontend/router_aic_image_smoke.py'
   - 'deploy/inference-gateway/**'
   - 'container/templates/frontend.Dockerfile'
   - '!**/*.md'

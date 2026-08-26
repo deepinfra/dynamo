@@ -69,6 +69,10 @@ fn preprocessed_multimodal_cache_keys(request: &PreprocessedRequest) -> Vec<Stri
             MultimodalData::Url(url) => keys.push(multimodal_cache_key_from_url(url.as_str())),
             MultimodalData::RawUrl(url) => keys.push(multimodal_cache_key_from_url(url)),
             MultimodalData::Decoded(_) => {}
+            // Opaque UUIDs are not content-derived routing keys. UUID-only
+            // reuse intentionally relies on text-prefix routing and affinity
+            // to the worker that owns the processor/embedding cache entry.
+            MultimodalData::UuidOnly(_) => {}
         }
     }
     keys.sort();
@@ -467,7 +471,7 @@ where
         .link(engine)?
         .link(backend.backward_edge())?
         .link(preprocessor.backward_edge())?
-        .link(frontend)?)
+        .link_terminal(frontend)?)
 }
 
 impl PreprocessedRouting {
@@ -512,7 +516,7 @@ impl PreprocessedRouting {
             .link(token_backend.backward_edge())?
             .link(migration.backward_edge())?
             .link(preprocessor_op.backward_edge())?
-            .link(frontend)?;
+            .link_terminal(frontend)?;
 
         Ok(engine)
     }
@@ -546,7 +550,7 @@ impl PreprocessedRouting {
             .link(prefill_op.backward_edge())?
             .link(encoder_op.backward_edge())?
             .link(migration.backward_edge())?
-            .link(frontend)?;
+            .link_terminal(frontend)?;
 
         Ok(engine)
     }

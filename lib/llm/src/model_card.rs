@@ -87,9 +87,12 @@ fn instrumented_tokenizer_cache(
     cache_bytes: usize,
     cache_extend: bool,
     model: &str,
-) -> Arc<dyn crate::tokenizers::traits::Tokenizer> {
-    Arc::new(
-        crate::tokenizers::CachedTokenizer::new(raw, special_tokens, cache_bytes)
+) -> Result<Arc<dyn crate::tokenizers::traits::Tokenizer>> {
+    let cached = crate::tokenizers::CachedTokenizer::new(raw, special_tokens, cache_bytes)
+        .context("failed to initialize tokenizer prefix cache")?;
+
+    Ok(Arc::new(
+        cached
             .with_extend(cache_extend)
             .with_observer(
                 Arc::new(|| {
@@ -100,7 +103,7 @@ fn instrumented_tokenizer_cache(
                 }),
             )
             .with_token_observer(tokenizer_cache_token_observer(model)),
-    )
+    ))
 }
 
 /// Identify model deployment cards in the key-value store
@@ -856,6 +859,20 @@ pub struct ModelDeploymentCard {
     #[builder(default)]
     pub architectural_max_context_length: Option<u32>,
 
+    /// Deprecated v1.2 MDC wire field.
+    ///
+    /// This is only a deserialization fallback and serialization projection. Canonical state
+    /// remains in `runtime_config.context_length` and `architectural_max_context_length`.
+    ///
+    /// TODO(v1.5): Remove after the temporary v1.2-to-v1.4 upgrade exception expires.
+    #[serde(
+        default,
+        rename = "context_length",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[builder(default, setter(skip))]
+    legacy_context_length: Option<u32>,
+
     /// Size of a KV cache block.
     /// Passed to the engine, KV router, and trace replay hash path.
     pub kv_cache_block_size: u32,
@@ -1021,12 +1038,19 @@ impl ModelDeploymentCard {
         self.runtime_config
             .context_length
             .or(self.architectural_max_context_length)
+            .or(self.legacy_context_length)
             .unwrap_or(0)
+    }
+
+    pub(crate) fn for_mdc_wire(&self) -> Self {
+        let mut card = self.clone();
+        card.legacy_context_length = Some(self.effective_context_length());
+        card
     }
 
     /// Serialize the model deployment card to a JSON string
     pub fn to_json(&self) -> Result<String, anyhow::Error> {
-        Ok(serde_json::to_string(self)?)
+        Ok(serde_json::to_string(&self.for_mdc_wire())?)
     }
 
     /// Per-MDC resolve directory. After `download_config` runs, every
@@ -1296,7 +1320,7 @@ impl ModelDeploymentCard {
                         cache_bytes,
                         cache_extend,
                         self.name(),
-                    )
+                    )?
                 } else {
                     raw
                 }
@@ -1328,7 +1352,7 @@ impl ModelDeploymentCard {
                         cache_bytes,
                         cache_extend,
                         self.name(),
-                    )
+                    )?
                 } else {
                     raw
                 }
@@ -1705,6 +1729,7 @@ impl ModelDeploymentCard {
             chat_template_file,
             prompt_context: None, // TODO - auto-detect prompt context
             architectural_max_context_length,
+            legacy_context_length: None,
             kv_cache_block_size: 0, // set later
             migration_limit: 0,
             model_type: Default::default(),  // set later
@@ -2970,6 +2995,21 @@ mod ownership_tests {
     }
 
     #[test]
+    fn context_length_wire_compatibility() {
+        let card = ModelDeploymentCard::with_name_only("model");
+        let mut legacy_value = serde_json::to_value(&card).unwrap();
+        legacy_value["context_length"] = serde_json::json!(32_768);
+
+        let mut parsed: ModelDeploymentCard = serde_json::from_value(legacy_value).unwrap();
+        assert_eq!(parsed.effective_context_length(), 32_768);
+
+        parsed.runtime_config.context_length = Some(8_192);
+        let wire_value: serde_json::Value =
+            serde_json::from_str(&parsed.to_json().unwrap()).unwrap();
+        assert_eq!(wire_value["context_length"], 8_192);
+    }
+
+    #[test]
     fn tensor_config_serializes_at_card_top_level() {
         let mut card = ModelDeploymentCard::with_name_only("tensor");
         card.tensor_model_config = Some(TensorModelConfig {
@@ -2989,6 +3029,17 @@ mod ownership_tests {
                 .map(|config| config.name.as_str()),
             Some("tensor")
         );
+    }
+
+    #[test]
+    fn runtime_kv_event_capability_does_not_change_mdcsum() {
+        let mut disabled = ModelDeploymentCard::with_name_only("model");
+        disabled.runtime_config.kv_event_publishing_enabled = Some(false);
+
+        let mut enabled = ModelDeploymentCard::with_name_only("model");
+        enabled.runtime_config.kv_event_publishing_enabled = Some(true);
+
+        assert_eq!(disabled.mdcsum(), enabled.mdcsum());
     }
 }
 

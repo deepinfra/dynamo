@@ -12,7 +12,7 @@ spec:
       replicas: 1
       extraPodSpec:
         mainContainer:
-          image: my-registry/vllm-runtime:my-tag
+          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.4.1
           workingDir: /workspace/examples/backends/vllm
           command:
           - python3
@@ -32,7 +32,7 @@ spec:
           gpu: "1"
       extraPodSpec:
         mainContainer:
-          image: my-registry/vllm-runtime:my-tag
+          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.4.1
           workingDir: /workspace/examples/backends/vllm
           command:
           - python3
@@ -43,7 +43,8 @@ spec:
           - Qwen/Qwen3-0.6B
           - --tensor-parallel-size
           - "2"
-          - --is-decode-worker
+          - --disaggregation-mode
+          - decode
           - --kv-transfer-config
           - '{"kv_connector": "NixlConnector", "kv_role": "kv_both", "engine_id":
             "vllm-disagg-decode-engine-0abc123"}'
@@ -58,7 +59,7 @@ spec:
           gpu: "1"
       extraPodSpec:
         mainContainer:
-          image: my-registry/vllm-runtime:my-tag
+          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.4.1
           workingDir: /workspace/examples/backends/vllm
           command:
           - python3

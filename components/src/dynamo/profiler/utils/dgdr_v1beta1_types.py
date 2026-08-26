@@ -205,7 +205,7 @@ class FeaturesSpec(BaseModel):
 
     planner: Optional[PlannerConfig] = Field(
         default=None,
-        description="Planner contains the raw Planner configuration passed to the Planner service. Its schema is defined by dynamo.planner.config.planner_config.PlannerConfig. See https://docs.dynamo.nvidia.com/dynamo/components/planner/planner-guide#plannerconfig-reference. DGDR passes this object through without field-level validation; the Planner service validates it at startup. The presence of this field (non-null) enables the planner in the generated DGD.",
+        description="Planner contains the raw Planner configuration passed to the Planner service. Its schema is defined by dynamo.planner.config.planner_config.PlannerConfig. See https://docs.nvidia.com/dynamo/dev/knowledge-base/modular-components/planner/planner-guide#plannerconfig-reference. DGDR passes this object through without field-level validation; the Planner service validates it at startup. The presence of this field (non-null) enables the planner in the generated DGD.",
     )
     mocker: Optional[MockerSpec] = Field(
         default=None,
@@ -254,7 +254,11 @@ class DynamoGraphDeploymentRequestSpec(BaseModel):
     )
     image: Optional[str] = Field(
         default=None,
-        description='Image is the container image reference for the profiling job (planner image). Example: "nvcr.io/nvidia/ai-dynamo/dynamo-planner:1.2.1". For Dynamo < 1.1.0, use dynamo-frontend.',
+        description='Image is the container image reference for the profiling job (planner image). Example: "nvcr.io/nvidia/ai-dynamo/dynamo-planner:1.4.1". For Dynamo < 1.1.0, use dynamo-frontend.',
+    )
+    runtimeVersionOverride: Optional[str] = Field(
+        default=None,
+        description="RuntimeVersionOverride supplies the default Dynamo runtime version for generated DynamoGraphDeployment components that do not set their own override. Set this when Image uses a non-semantic-version tag or digest, or when its tag does not identify the Dynamo runtime version. An explicit component value in overrides.dgd takes precedence.",
     )
     modelCache: Optional[ModelCacheSpec] = Field(
         default=None,

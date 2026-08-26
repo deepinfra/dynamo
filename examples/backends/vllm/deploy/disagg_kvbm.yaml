@@ -12,7 +12,7 @@ spec:
       replicas: 1
       extraPodSpec:
         mainContainer:
-          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:my-tag
+          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.4.1
     VllmDecodeWorker:
       envFromSecret: hf-token-secret
       componentType: worker
@@ -22,7 +22,7 @@ spec:
           gpu: "1"
       extraPodSpec:
         mainContainer:
-          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:my-tag
+          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.4.1
           workingDir: /workspace/examples/backends/vllm
           command:
           - python3
@@ -33,6 +33,7 @@ spec:
             - Qwen/Qwen3-8B
             - --disaggregation-mode
             - decode
+            - --disable-hybrid-kv-cache-manager
             - --kv-transfer-config
             - '{"kv_connector":"NixlConnector","kv_role":"kv_both"}'
             - --max-model-len
@@ -54,7 +55,7 @@ spec:
           value: "100"
       extraPodSpec:
         mainContainer:
-          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:my-tag
+          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.4.1
           workingDir: /workspace/examples/backends/vllm
           command:
           - python3

@@ -11,7 +11,9 @@ import math
 import os
 import time as _time
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from pathlib import Path
+from types import TracebackType
 from typing import Any, Optional
 
 from vllm.config import VllmConfig
@@ -45,6 +47,7 @@ from .health_check import (
 )
 from .instrumented_scheduler import ENV_FPM_BENCHMARK_OUTPUT_PATH, ENV_FPM_WORKER_ID
 from .multimodal_handlers import EncodeWorkerHandler
+from .pooling_handlers import ClassifyWorkerHandler
 from .publisher import StatLoggerFactory
 
 logger = logging.getLogger(__name__)
@@ -536,6 +539,44 @@ SetupFpmRelayFn = Callable[..., Optional[list]]
 SetupMetricsCollectionFn = Callable[..., None]
 
 
+@dataclass
+class _DecodeWorkerLifecycle:
+    engine_client: Optional[AsyncLLM] = None
+    vllm_config: Optional[VllmConfig] = None
+    handler: Optional[BaseWorkerHandler] = None
+    shutdown_event: asyncio.Event | None = None
+
+    def __enter__(self) -> "_DecodeWorkerLifecycle":
+        return self
+
+    def __exit__(
+        self,
+        _exc_type: type[BaseException] | None,
+        original_error: BaseException | None,
+        _traceback: TracebackType | None,
+    ) -> None:
+        try:
+            self.cleanup()
+        except Exception:
+            if original_error is None:
+                raise
+            logger.exception(
+                "Failed to clean up decode worker after an earlier failure"
+            )
+
+    def cleanup(self) -> None:
+        """Release resources in reverse construction order."""
+        logger.debug("Cleaning up decode worker")
+        if self.shutdown_event is not None:
+            self.shutdown_event.set()
+        try:
+            if self.handler is not None:
+                self.handler.cleanup()
+        finally:
+            if self.engine_client is not None and self.vllm_config is not None:
+                self.engine_client.shutdown(timeout=self.vllm_config.shutdown_timeout)
+
+
 class WorkerFactory:
     """Factory for creating and initializing multimodal vLLM workers."""
 
@@ -569,6 +610,12 @@ class WorkerFactory:
         # enforced earlier in DynamoVllmConfig._validate_embedding_worker_exclusivity.
         if config.embedding_worker:
             await self._create_embedding_worker(
+                runtime, config, shutdown_event, shutdown_endpoints
+            )
+            return
+
+        if config.classify_worker:
+            await self._create_classify_worker(
                 runtime, config, shutdown_event, shutdown_endpoints
             )
             return
@@ -755,18 +802,117 @@ class WorkerFactory:
         finally:
             handler.cleanup()
 
+    async def _create_classify_worker(
+        self,
+        runtime: DistributedRuntime,
+        config: Config,
+        shutdown_event: asyncio.Event,
+        shutdown_endpoints: list,  # mutated in place
+    ) -> None:
+        """Initialize an aggregated sequence-classification worker.
+
+        Like the embeddings worker, this uses a pooling ``AsyncLLM`` and skips
+        the generation-only KV-cache and scheduler machinery. The combined
+        model type advertises both pooling-family endpoints.
+        """
+        generate_endpoint = runtime.endpoint(
+            f"{config.namespace}.{config.component}.{config.endpoint}"
+        )
+        shutdown_endpoints[:] = [generate_endpoint]
+
+        fpm_worker_id = str(generate_endpoint.connection_id())
+        factory = StatLoggerFactory(
+            endpoint=generate_endpoint,
+            embedding_worker=True,
+        )
+        (
+            engine_client,
+            vllm_config,
+            _default_sampling_params,
+            _prometheus_temp_dir,
+            _component_gauges,
+        ) = self.setup_vllm_engine(config, factory, fpm_worker_id=fpm_worker_id)
+
+        handler = ClassifyWorkerHandler(
+            runtime=runtime,
+            engine=engine_client,
+            config=config,
+            model_config=getattr(vllm_config, "model_config", None),
+            shutdown_event=shutdown_event,
+        )
+
+        classify_health_check_payload = VllmEmbeddingHealthCheckPayload(
+            model_name=config.served_model_name or config.model
+        ).to_dict()
+
+        logger.info("Starting to serve the classify worker endpoint...")
+        try:
+            await asyncio.gather(
+                generate_endpoint.serve_endpoint(
+                    handler.generate,
+                    metrics_labels=[("model", config.model)],
+                    health_check_payload=classify_health_check_payload,
+                ),
+                self.register_vllm_model(
+                    ModelInput.Text,
+                    ModelType.Classify | ModelType.Pooling,
+                    generate_endpoint,
+                    config,
+                    engine_client,
+                    vllm_config,
+                    worker_type=WorkerType.Aggregated,
+                    needs=[],
+                ),
+            )
+        except Exception as e:
+            logger.error(f"Failed to serve classify worker endpoint: {e}")
+            raise
+        finally:
+            handler.cleanup()
+
+    def _maybe_create_failover_metrics(self, config: Config, generate_endpoint):
+        """Create + register per-engine failover metrics (shadow mode only).
+
+        Called before the model loads so ``init`` spans the load and a restarted
+        engine re-exposes its persisted switch counters within seconds. Uses a
+        dedicated registry surfaced on ``generate_endpoint``'s system /metrics.
+        """
+        if not config.gms_shadow_mode:
+            return None
+        from gpu_memory_service.failover_lock.failover_metrics import (
+            create_failover_metrics,
+        )
+
+        persist_dir = os.path.dirname(
+            os.path.abspath(
+                os.environ.get("FAILOVER_LOCK_PATH", "/shared/failover.lock")
+            )
+        )
+        failover_metrics = create_failover_metrics(
+            endpoint=generate_endpoint,
+            engine_id=os.environ.get("ENGINE_ID", "0"),
+            model_name=config.served_model_name or config.model,
+            component_name=config.component,
+            persist_dir=persist_dir,
+        )
+        failover_metrics.set_state("init")
+        return failover_metrics
+
     async def _maybe_wait_for_failover_lock(
         self,
         handler,
         runtime: DistributedRuntime,
         config: Config,
-    ) -> None:
-        # Shadow mode: lock-driven activation.
-        # Flow: sleep → startup probe passes → block on lock → wake → register.
+        failover_metrics=None,
+    ) -> bool:
+        # Shadow mode: sleep → probe → block on lock → wake. True only for a real
+        # (contended) failover, not the initial bootup.
         if not config.gms_shadow_mode:
-            return
+            return False
 
         await handler._pause_controller.pause(1)
+        if failover_metrics is not None:
+            failover_metrics.set_state("standby")
 
         runtime.set_health_status(True)
         logger.info(
@@ -779,11 +925,18 @@ class WorkerFactory:
         engine_id = os.environ.get("ENGINE_ID", "0")
         lock = FlockFailoverLock(lock_path)
         await lock.acquire(engine_id=f"engine-{engine_id}")
+        was_failover = lock.was_contended
         logger.info("[Shadow] Lock acquired, waking engine")
+        if failover_metrics is not None:
+            failover_metrics.set_state("waking")
+            if was_failover:
+                # Only a contended acquire is a failover; a bootup is not a switch.
+                failover_metrics.record_switch_attempt()
 
         await handler._pause_controller.resume()
         handler._pause_controller.mark_resumed()
         logger.info("[Shadow] Engine awake, registering with discovery")
+        return was_failover
 
     async def _create_decode_worker(
         self,
@@ -796,6 +949,26 @@ class WorkerFactory:
         """
         Instantiate and serve
         """
+        with _DecodeWorkerLifecycle(shutdown_event=shutdown_event) as lifecycle:
+            await self._run_decode_worker(
+                runtime,
+                config,
+                shutdown_event,
+                shutdown_endpoints,
+                snapshot_engine=snapshot_engine,
+                lifecycle=lifecycle,
+            )
+
+    async def _run_decode_worker(
+        self,
+        runtime: DistributedRuntime,
+        config: Config,
+        shutdown_event: asyncio.Event,
+        shutdown_endpoints: list,  # mutated in place
+        snapshot_engine: Optional[EngineSetupResult],
+        lifecycle: _DecodeWorkerLifecycle,
+    ) -> None:
+        """Initialize and serve a decode worker."""
 
         generate_endpoint = runtime.endpoint(
             f"{config.namespace}.{config.component}.{config.endpoint}"
@@ -836,6 +1009,11 @@ class WorkerFactory:
                 ]
             )
 
+        # Shadow mode: create metrics + enter 'init' before load, so 'init' spans it.
+        failover_metrics = self._maybe_create_failover_metrics(
+            config, generate_endpoint
+        )
+
         # Use pre-created engine if provided (checkpoint mode), otherwise create new
         fpm_worker_id = str(generate_endpoint.connection_id())
         if snapshot_engine is not None:
@@ -866,6 +1044,8 @@ class WorkerFactory:
                 prometheus_temp_dir,
                 component_gauges,
             ) = self.setup_vllm_engine(config, factory, fpm_worker_id=fpm_worker_id)
+        lifecycle.engine_client = engine_client
+        lifecycle.vllm_config = vllm_config
         await configure_kv_event_block_size(engine_client, vllm_config)
 
         # TODO Hack to get data, move this to registering in TBD
@@ -898,6 +1078,7 @@ class WorkerFactory:
             enable_frontend_decoding=config.frontend_decoding,
             encode_worker_client=encode_worker_client,
         )
+        lifecycle.handler = handler
         handler.add_temp_dir(prometheus_temp_dir)
 
         # Check if kv event consolidator is enabled (port was allocated in setup_vllm_engine)
@@ -960,7 +1141,9 @@ class WorkerFactory:
                 "The chat template will be loaded but the /v1/chat/completions endpoint will not be available."
             )
 
-        await self._maybe_wait_for_failover_lock(handler, runtime, config)
+        was_failover = await self._maybe_wait_for_failover_lock(
+            handler, runtime, config, failover_metrics
+        )
 
         # Wait for self-benchmark to complete before registering.
         bench_cfg = vllm_config.additional_config.get("benchmark")
@@ -995,6 +1178,12 @@ class WorkerFactory:
             worker_type=worker_type,
             needs=needs,
         )
+        # Serving now: a failover that got here succeeded. Gated on was_failover
+        # (same as the attempt) so bootup isn't counted and success pairs with attempt.
+        if failover_metrics is not None:
+            failover_metrics.set_state("active")
+            if was_failover:
+                failover_metrics.record_switch_success()
 
         health_check_payload = VllmHealthCheckPayload(
             engine_client, use_text_input=config.use_vllm_tokenizer
@@ -1069,10 +1258,6 @@ class WorkerFactory:
         except Exception as e:
             logger.error(f"Failed to serve endpoints: {e}")
             raise
-        finally:
-            logger.debug("Cleaning up decode worker")
-            # Cleanup background tasks
-            handler.cleanup()
 
     async def _create_prefill_worker(
         self,
@@ -1107,6 +1292,11 @@ class WorkerFactory:
             list_loras_endpoint = runtime.endpoint(
                 f"{config.namespace}.{config.component}.list_loras"
             )
+
+        # Shadow mode: create metrics + enter 'init' before load, so 'init' spans it.
+        failover_metrics = self._maybe_create_failover_metrics(
+            config, generate_endpoint
+        )
 
         # Use pre-created engine if provided (checkpoint mode), otherwise create new
         fpm_worker_id = str(generate_endpoint.connection_id())
@@ -1200,7 +1390,9 @@ class WorkerFactory:
             runtime, handler, lora_enabled=config.engine_args.enable_lora
         )
 
-        await self._maybe_wait_for_failover_lock(handler, runtime, config)
+        was_failover = await self._maybe_wait_for_failover_lock(
+            handler, runtime, config, failover_metrics
+        )
 
         # Wait for self-benchmark to complete before registering.
         bench_cfg = vllm_config.additional_config.get("benchmark")
@@ -1245,6 +1437,12 @@ class WorkerFactory:
             worker_type=WorkerType.Prefill,
             needs=[prefill_needs_set],
         )
+        # Serving now: a failover that got here succeeded. Gated on was_failover
+        # (same as the attempt) so bootup isn't counted and success pairs with attempt.
+        if failover_metrics is not None:
+            failover_metrics.set_state("active")
+            if was_failover:
+                failover_metrics.record_switch_success()
 
         health_check_payload = VllmPrefillHealthCheckPayload(
             engine_client, use_text_input=config.use_vllm_tokenizer

@@ -20,6 +20,7 @@ from sglang.srt.parser.conversation import chat_template_exists
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 
 from dynamo._internal import ModelDeploymentCard
+from dynamo.common.multimodal.cache_uuid import reject_unsupported_multimodal_uuids
 from dynamo.frontend.frontend_args import FrontendConfig
 from dynamo.llm import ModelCardInstanceId, PythonAsyncEngine, RoutedEngine
 from dynamo.llm.exceptions import InvalidArgument, Unknown
@@ -36,6 +37,7 @@ from .sglang_prepost import (
     detect_force_reasoning_from_template,
     preprocess_chat_request,
 )
+from .thinking import runtime_default_thinking_mode
 from .utils import (
     PreprocessError,
     extract_mm_urls,
@@ -144,6 +146,7 @@ _w_tool_call_parser_name: str | None = None
 _w_reasoning_parser_name: str | None = None
 _w_exclude_tools_when_tool_choice_none: bool = True
 _w_template_force_reasoning: bool = False
+_w_default_thinking_mode: str | None = None
 
 
 def _load_chat_template(chat_template: str | None) -> str | None:
@@ -193,10 +196,12 @@ def _init_worker(
     trust_remote_code: bool = False,
     template_force_reasoning: bool = False,
     chat_template: str | None = None,
+    default_thinking_mode: str | None = None,
 ) -> None:
     """Initialize a worker process with its own tokenizer."""
     global _w_tokenizer, _w_tool_call_parser_name, _w_reasoning_parser_name
     global _w_exclude_tools_when_tool_choice_none, _w_template_force_reasoning
+    global _w_default_thinking_mode
     _w_tokenizer = _load_tokenizer(model_path, trust_remote_code)
     if chat_template is not None:
         _w_tokenizer.chat_template = chat_template
@@ -204,6 +209,7 @@ def _init_worker(
     _w_reasoning_parser_name = reasoning_parser_name
     _w_exclude_tools_when_tool_choice_none = exclude_tools_when_tool_choice_none
     _w_template_force_reasoning = template_force_reasoning
+    _w_default_thinking_mode = default_thinking_mode
 
 
 def _preprocess_worker(
@@ -219,6 +225,7 @@ def _preprocess_worker(
         reasoning_parser_name=_w_reasoning_parser_name,
         exclude_tools_when_tool_choice_none=_w_exclude_tools_when_tool_choice_none,
         template_force_reasoning=_w_template_force_reasoning,
+        default_thinking_mode=_w_default_thinking_mode,
     )
 
     n = request.get("n", 1)
@@ -281,7 +288,7 @@ def _build_dynamo_preproc(
     logprobs = request.get("logprobs")
     top_logprobs = request.get("top_logprobs")
     if logprobs is True:
-        logprobs_val = top_logprobs or 1
+        logprobs_val = top_logprobs if top_logprobs is not None else 1
     elif isinstance(logprobs, int) and not isinstance(logprobs, bool):
         logprobs_val = logprobs
     elif top_logprobs not in (None, 0):
@@ -326,8 +333,12 @@ def _build_dynamo_preproc(
         "routing": request.get("routing"),
     }
 
-    # Forward multimodal URLs so the backend handler can load the media.
-    mm_data = extract_mm_urls(request.get("messages", []))
+    try:
+        # Forward multimodal URLs so the backend handler can load the media.
+        mm_data, mm_uuids = extract_mm_urls(request.get("messages", []))
+        reject_unsupported_multimodal_uuids(mm_uuids)
+    except ValueError as exc:
+        raise PreprocessError(str(exc)) from exc
     if mm_data:
         preproc["multi_modal_data"] = mm_data
 
@@ -353,6 +364,7 @@ class SglangProcessor:
         preprocess_pool: ProcessPoolExecutor | None = None,
         preprocess_workers: int = 0,
         stream_interval: int = 1,
+        default_thinking_mode: str | None = None,
     ):
         self.tokenizer = tokenizer
         # Detect force_reasoning once from the chat template, matching
@@ -376,6 +388,7 @@ class SglangProcessor:
         self.eos_token_ids = _normalize_eos_token_ids(eos_token_ids)
         self.debug_perf = debug_perf
         self.stream_interval = stream_interval
+        self.default_thinking_mode = default_thinking_mode
         self.preprocess_pool = preprocess_pool
         if preprocess_pool is not None:
             self._worker_semaphore: asyncio.Semaphore | None = asyncio.Semaphore(
@@ -432,6 +445,7 @@ class SglangProcessor:
                 reasoning_parser_name=self.reasoning_parser_name,
                 exclude_tools_when_tool_choice_none=self.exclude_tools_when_tool_choice_none,
                 template_force_reasoning=self.template_force_reasoning,
+                default_thinking_mode=self.default_thinking_mode,
             )
 
             if self.debug_perf:
@@ -479,6 +493,7 @@ class SglangProcessor:
             sglang_tools=convert_tools(request.get("tools")),
             tool_call_parser_name=self.tool_call_parser_name,
             eos_token_ids=self.eos_token_ids,
+            prompt_token_ids=pre.prompt_token_ids,
         )
 
         async for item in self._generate_and_stream(
@@ -536,6 +551,7 @@ class SglangProcessor:
             sglang_tools=convert_tools(request.get("tools")),
             tool_call_parser_name=self.tool_call_parser_name,
             eos_token_ids=self.eos_token_ids,
+            prompt_token_ids=preproc_result.prompt_token_ids,
         )
 
         async for item in self._generate_and_stream(
@@ -573,16 +589,104 @@ class SglangProcessor:
             # finish_reason.  Use si=1 for the first chunk to minimize
             # TTFT, then switch to the configured interval.
             pending_token_ids: list[int] = []
+            pending_log_probs: list[float] | None = None
+            pending_top_logprobs: list[list[dict[str, Any]]] | None = None
             pending_usage: dict[str, Any] | None = None
             first_chunk = True
             input_tokens = len(tokens)
             cumulative_output_tokens = 0
             # Rust postprocessor is bypassed on this path, so emit the multimodal
             # content-part counts here too (else frontend metrics report zero media).
-            _mm_counts = extract_mm_urls(request.get("messages", [])) or {}
+            _mm_counts, _ = extract_mm_urls(request.get("messages", []))
+            _mm_counts = _mm_counts or {}
             image_count = len(_mm_counts.get("image_url", []))
             video_count = len(_mm_counts.get("video_url", []))
             audio_count = len(_mm_counts.get("audio_url", []))
+
+            def flush_pending(
+                *,
+                finish_reason: str | None,
+                stop_reason: Any | None,
+                engine_data: Any | None,
+            ) -> dict[str, Any]:
+                nonlocal pending_token_ids
+                nonlocal pending_log_probs
+                nonlocal pending_top_logprobs
+                nonlocal pending_usage
+                nonlocal first_chunk
+                nonlocal post_proc_total_ms
+                nonlocal token_count
+
+                chunk_token_count = len(pending_token_ids)
+                usage_for_metrics = pending_usage
+                mapped_response: dict[str, Any] = {
+                    "token_ids": pending_token_ids,
+                    "finish_reason": finish_reason,
+                }
+                if pending_log_probs is not None:
+                    mapped_response["log_probs"] = pending_log_probs
+                if pending_top_logprobs is not None:
+                    mapped_response["top_logprobs"] = pending_top_logprobs
+
+                if self.debug_perf:
+                    t_pp0 = time.monotonic()
+
+                choice = post.process_output(mapped_response)
+
+                if self.debug_perf:
+                    t_pp1 = time.monotonic()
+                    post_proc_total_ms += (t_pp1 - t_pp0) * 1000.0
+                    token_count += chunk_token_count
+
+                envelope: dict[str, Any] = {"_dynamo_annotated": True}
+                if choice:
+                    dynamo_out: dict[str, Any] = {
+                        "id": request_id,
+                        "choices": [choice],
+                        "created": created_ts,
+                        "model": request["model"],
+                        "object": "chat.completion.chunk",
+                    }
+                    if pending_usage:
+                        dynamo_out["usage"] = pending_usage
+                    response_nvext: dict[str, Any] = {}
+                    if stop_reason is not None and nvext_extra_field_requested(
+                        request, "stop_reason"
+                    ):
+                        response_nvext["stop_reason"] = stop_reason
+                    if engine_data is not None and nvext_extra_field_requested(
+                        request, "engine_data"
+                    ):
+                        response_nvext["engine_data"] = engine_data
+                    if response_nvext:
+                        dynamo_out["nvext"] = response_nvext
+
+                    envelope["data"] = dynamo_out
+
+                metrics: dict[str, Any] = {
+                    "input_tokens": input_tokens,
+                    "output_tokens": cumulative_output_tokens,
+                    "chunk_tokens": chunk_token_count,
+                }
+                # Include nonzero counts on every frame (text-only carries nothing).
+                if image_count:
+                    metrics["image_count"] = image_count
+                if video_count:
+                    metrics["video_count"] = video_count
+                if audio_count:
+                    metrics["audio_count"] = audio_count
+                cached_tokens = _cached_tokens_from_usage(usage_for_metrics)
+                if cached_tokens is not None:
+                    metrics["cached_tokens"] = cached_tokens
+                envelope["event"] = "llm_metrics"
+                envelope["comment"] = [json.dumps(metrics)]
+
+                pending_token_ids = []
+                pending_log_probs = None
+                pending_top_logprobs = None
+                pending_usage = None
+                first_chunk = False
+                return envelope
 
             async for dynamo_response in dynamo_stream:
                 if dynamo_response.is_error():
@@ -610,6 +714,25 @@ class SglangProcessor:
                     break
 
                 new_ids = engine_response["token_ids"]
+                log_probs = engine_response.get("log_probs")
+                top_logprobs = engine_response.get("top_logprobs")
+
+                if new_ids and pending_token_ids:
+                    pending_logprob_shape = (
+                        pending_log_probs is not None,
+                        pending_top_logprobs is not None,
+                    )
+                    chunk_logprob_shape = (
+                        log_probs is not None,
+                        top_logprobs is not None,
+                    )
+                    if pending_logprob_shape != chunk_logprob_shape:
+                        yield flush_pending(
+                            finish_reason=None,
+                            stop_reason=None,
+                            engine_data=None,
+                        )
+
                 chunk_tokens = len(new_ids)
                 cumulative_output_tokens += chunk_tokens
                 raw_finish = engine_response.get("finish_reason")
@@ -621,76 +744,24 @@ class SglangProcessor:
                 engine_data = engine_response.get("engine_data")
 
                 pending_token_ids.extend(new_ids)
+                if log_probs is not None:
+                    if pending_log_probs is None:
+                        pending_log_probs = []
+                    pending_log_probs.extend(log_probs)
+                if top_logprobs is not None:
+                    if pending_top_logprobs is None:
+                        pending_top_logprobs = []
+                    pending_top_logprobs.extend(top_logprobs)
 
                 # Flush on finish or when we've accumulated enough tokens.
                 # First chunk flushes immediately (si=1) to minimize TTFT.
                 flush_threshold = 1 if first_chunk else stream_interval
                 if finish_reason or len(pending_token_ids) >= flush_threshold:
-                    usage_for_metrics = pending_usage
-                    mapped_response = {
-                        "token_ids": pending_token_ids,
-                        "finish_reason": finish_reason,
-                    }
-
-                    if self.debug_perf:
-                        t_pp0 = time.monotonic()
-
-                    choice = post.process_output(mapped_response)
-
-                    if self.debug_perf:
-                        t_pp1 = time.monotonic()
-                        post_proc_total_ms += (t_pp1 - t_pp0) * 1000.0
-                        token_count += len(pending_token_ids)
-
-                    envelope: dict[str, Any] = {"_dynamo_annotated": True}
-                    if choice:
-                        dynamo_out: dict[str, Any] = {
-                            "id": request_id,
-                            "choices": [choice],
-                            "created": created_ts,
-                            "model": request["model"],
-                            "object": "chat.completion.chunk",
-                        }
-                        if pending_usage:
-                            dynamo_out["usage"] = pending_usage
-                            pending_usage = None
-                        response_nvext: dict[str, Any] = {}
-                        if stop_reason is not None and nvext_extra_field_requested(
-                            request, "stop_reason"
-                        ):
-                            response_nvext["stop_reason"] = stop_reason
-                        if engine_data is not None and (
-                            nvext_extra_field_requested(request, "engine_data")
-                        ):
-                            response_nvext["engine_data"] = engine_data
-                        if response_nvext:
-                            dynamo_out["nvext"] = response_nvext
-
-                        envelope["data"] = dynamo_out
-
-                    metrics: dict[str, Any] = {
-                        "input_tokens": input_tokens,
-                        "output_tokens": cumulative_output_tokens,
-                        "chunk_tokens": len(pending_token_ids),
-                    }
-                    # Include nonzero counts on every frame (text-only carries nothing).
-                    if image_count:
-                        metrics["image_count"] = image_count
-                    if video_count:
-                        metrics["video_count"] = video_count
-                    if audio_count:
-                        metrics["audio_count"] = audio_count
-                    cached_tokens = _cached_tokens_from_usage(usage_for_metrics)
-                    if cached_tokens is not None:
-                        metrics["cached_tokens"] = cached_tokens
-                    envelope["event"] = "llm_metrics"
-                    envelope["comment"] = [json.dumps(metrics)]
-
-                    yield envelope
-
-                    pending_token_ids = []
-                    pending_usage = None
-                    first_chunk = False
+                    yield flush_pending(
+                        finish_reason=finish_reason,
+                        stop_reason=stop_reason,
+                        engine_data=engine_data,
+                    )
         except Unknown:
             raise
         except Exception as e:
@@ -783,11 +854,14 @@ class SglangEngineFactory:
             self.reasoning_parser_name
             or _runtime_config_parser_name(mdc, "reasoning_parser")
         )
+        default_thinking_mode = runtime_default_thinking_mode(mdc.runtime_config())
 
         if tool_call_parser_name:
             logger.info("SGLang tool call parser: %s", tool_call_parser_name)
         if reasoning_parser_name:
             logger.info("SGLang reasoning parser: %s", reasoning_parser_name)
+        if default_thinking_mode:
+            logger.info("SGLang default thinking mode: %s", default_thinking_mode)
 
         preprocess_pool = None
         preprocess_workers = self.config.preprocess_workers
@@ -808,6 +882,7 @@ class SglangEngineFactory:
                     self.trust_remote_code,
                     template_force_reasoning,
                     chat_template,
+                    default_thinking_mode,
                 ),
             )
             futures = [
@@ -843,6 +918,7 @@ class SglangEngineFactory:
             preprocess_pool=preprocess_pool,
             preprocess_workers=preprocess_workers,
             stream_interval=self.stream_interval,
+            default_thinking_mode=default_thinking_mode,
         )
         gen.exclude_tools_when_tool_choice_none = (
             self.config.exclude_tools_when_tool_choice_none
