@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::preprocessor::OpenAIPreprocessor;
 use std::{
     collections::{HashMap, HashSet},
     sync::{
@@ -698,6 +699,37 @@ impl ModelManager {
             .get(model)
             .ok_or_else(|| ModelManagerError::ModelNotFound(model.to_string()))?
             .get_pooling_engine()
+    }
+
+    pub fn get_chat_preprocessor(&self, model: &str) -> Option<Arc<OpenAIPreprocessor>> {
+        self.models.get(model)?.get_chat_preprocessor()
+    }
+
+    /// Whichever pipeline exists; both share the model's tokenizer.
+    pub fn get_preprocessor(&self, model: &str) -> Option<Arc<OpenAIPreprocessor>> {
+        self.models.get(model)?.get_preprocessor()
+    }
+
+    /// Attach preprocessors for an in-process model. Discovery-backed models get theirs
+    /// from the watcher as it builds their pipelines.
+    pub fn add_model_preprocessors(
+        &self,
+        model: &str,
+        card_checksum: &str,
+        chat: Option<Arc<OpenAIPreprocessor>>,
+        completions: Option<Arc<OpenAIPreprocessor>>,
+    ) -> Result<(), ModelManagerError> {
+        let model_entry = self.get_or_create_model(model);
+        let namespace = format!("__local_preprocessors_{}", model);
+        let mut ws = WorkerSet::new(
+            namespace.clone(),
+            card_checksum.to_string(),
+            Self::aggregated_local_card(),
+        );
+        ws.chat_preprocessor = chat;
+        ws.completions_preprocessor = completions;
+        model_entry.add_worker_set(namespace, Arc::new(ws));
+        Ok(())
     }
 
     pub fn get_completions_engine(

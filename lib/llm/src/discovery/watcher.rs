@@ -1824,6 +1824,7 @@ impl ModelWatcher {
                     let preprocessor =
                         OpenAIPreprocessor::new_with_parts(card.clone(), formatter, tk.clone())
                             .context("OpenAIPreprocessor.new_with_parts")?;
+                    worker_set.chat_preprocessor = Some(preprocessor.clone());
                     Some(
                         routing
                             .build_pipeline::<
@@ -1866,6 +1867,7 @@ impl ModelWatcher {
                     let preprocessor =
                         OpenAIPreprocessor::new_with_parts(card.clone(), formatter, tk.clone())
                             .context("OpenAIPreprocessor::new_with_parts")?;
+                    worker_set.completions_preprocessor = Some(preprocessor.clone());
                     let routing = preprocessed_routing.as_ref().ok_or_else(|| {
                         anyhow::anyhow!("completions pipeline requires preprocessed routing")
                     })?;

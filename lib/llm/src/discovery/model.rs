@@ -15,6 +15,7 @@ use serde::Serialize;
 use super::ModelManagerError;
 use super::worker_monitor::LoadThresholdConfig;
 use super::worker_set::WorkerSet;
+use crate::preprocessor::OpenAIPreprocessor;
 use crate::protocols::openai::ParsingOptions;
 
 use crate::types::{
@@ -687,6 +688,21 @@ impl Model {
     ) -> Result<OpenAIChatCompletionsStreamingEngine, ModelManagerError> {
         self.select_worker_set_with(|ws| ws.chat_engine.clone())
             .ok_or_else(|| self.engine_error(self.has_chat_engine()))
+    }
+
+    /// `None` when chat is served by a Python engine factory or the model has no Rust
+    /// tokenizer.
+    pub fn get_chat_preprocessor(&self) -> Option<Arc<OpenAIPreprocessor>> {
+        self.select_worker_set_with(|ws| ws.chat_preprocessor.clone())
+    }
+
+    /// Either pipeline's preprocessor; both are built on the model's single tokenizer.
+    pub fn get_preprocessor(&self) -> Option<Arc<OpenAIPreprocessor>> {
+        self.select_worker_set_with(|ws| {
+            ws.completions_preprocessor
+                .clone()
+                .or_else(|| ws.chat_preprocessor.clone())
+        })
     }
 
     pub fn get_completions_engine(
