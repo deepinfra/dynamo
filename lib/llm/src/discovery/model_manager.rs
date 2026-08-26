@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::preprocessor::OpenAIPreprocessor;
 use std::{
     collections::{HashMap, HashSet},
     sync::{
@@ -698,6 +699,43 @@ impl ModelManager {
             .get(model)
             .ok_or_else(|| ModelManagerError::ModelNotFound(model.to_string()))?
             .get_pooling_engine()
+    }
+
+    /// The chat pipeline's preprocessor for `model` — the model's own chat template and
+    /// tokenizer, as used by `/v1/chat/completions`.
+    pub fn get_chat_preprocessor(&self, model: &str) -> Option<Arc<OpenAIPreprocessor>> {
+        self.models.get(model)?.get_chat_preprocessor()
+    }
+
+    /// A preprocessor for `model` from whichever pipeline exists. Both share the model's
+    /// tokenizer, so this is the handle for tokenizer-only work.
+    pub fn get_preprocessor(&self, model: &str) -> Option<Arc<OpenAIPreprocessor>> {
+        self.models.get(model)?.get_preprocessor()
+    }
+
+    /// Attach the preprocessors for an in-process model, so the tokenizer-facing
+    /// endpoints (`/tokenize`, `/detokenize`) reach the same chat template and tokenizer
+    /// the generate pipeline uses. Discovery-backed models get theirs from the watcher
+    /// when it builds their pipelines; this is the equivalent seam for models registered
+    /// directly, and for tests.
+    pub fn add_model_preprocessors(
+        &self,
+        model: &str,
+        card_checksum: &str,
+        chat: Option<Arc<OpenAIPreprocessor>>,
+        completions: Option<Arc<OpenAIPreprocessor>>,
+    ) -> Result<(), ModelManagerError> {
+        let model_entry = self.get_or_create_model(model);
+        let namespace = format!("__local_preprocessors_{}", model);
+        let mut ws = WorkerSet::new(
+            namespace.clone(),
+            card_checksum.to_string(),
+            Self::aggregated_local_card(),
+        );
+        ws.chat_preprocessor = chat;
+        ws.completions_preprocessor = completions;
+        model_entry.add_worker_set(namespace, Arc::new(ws));
+        Ok(())
     }
 
     pub fn get_completions_engine(

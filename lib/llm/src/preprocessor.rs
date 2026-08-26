@@ -421,6 +421,100 @@ struct PreprocessRequestOptions {
     preserve_omitted_max_tokens: bool,
 }
 
+/// Renders `req` with `add_generation_prompt` forced to a caller-supplied value.
+///
+/// The renderer puts `add_generation_prompt` in the template context itself, and
+/// MiniJinja's `context!{ ..a, ..b }` resolves `a` first — so `chat_template_args`
+/// can add keys but cannot override it. `/tokenize` accepts the flag per vLLM's API,
+/// so it needs this rather than a kwarg.
+struct GenerationPromptOverride<'a, R>(&'a R, bool);
+
+impl<R: OAIChatLikeRequest> OAIChatLikeRequest for GenerationPromptOverride<'_, R> {
+    fn model(&self) -> String {
+        self.0.model()
+    }
+
+    fn messages(&self) -> minijinja::value::Value {
+        self.0.messages()
+    }
+
+    fn typed_messages(&self) -> Option<&[dynamo_protocols::types::ChatCompletionRequestMessage]> {
+        self.0.typed_messages()
+    }
+
+    fn tools(&self) -> Option<minijinja::value::Value> {
+        self.0.tools()
+    }
+
+    fn tool_choice(&self) -> Option<minijinja::value::Value> {
+        self.0.tool_choice()
+    }
+
+    fn response_format(&self) -> Option<minijinja::value::Value> {
+        self.0.response_format()
+    }
+
+    fn should_add_generation_prompt(&self) -> bool {
+        self.1
+    }
+
+    fn prompt_input_type(&self) -> PromptInput {
+        self.0.prompt_input_type()
+    }
+
+    fn extract_tokens(&self) -> Option<TokenInput> {
+        self.0.extract_tokens()
+    }
+
+    fn extract_text(&self) -> Option<TextInput> {
+        self.0.extract_text()
+    }
+
+    fn chat_template_args(&self) -> Option<&std::collections::HashMap<String, serde_json::Value>> {
+        self.0.chat_template_args()
+    }
+
+    fn mm_processor_kwargs(&self) -> Option<&serde_json::Value> {
+        self.0.mm_processor_kwargs()
+    }
+}
+
+impl<R: AnnotationsProvider> AnnotationsProvider for GenerationPromptOverride<'_, R> {
+    fn annotations(&self) -> Option<Vec<String>> {
+        self.0.annotations()
+    }
+}
+
+impl<R: SamplingOptionsProvider> SamplingOptionsProvider for GenerationPromptOverride<'_, R> {
+    fn extract_sampling_options(
+        &self,
+    ) -> anyhow::Result<crate::protocols::common::SamplingOptions> {
+        self.0.extract_sampling_options()
+    }
+}
+
+impl<R: StopConditionsProvider> StopConditionsProvider for GenerationPromptOverride<'_, R> {
+    fn extract_stop_conditions(&self) -> anyhow::Result<crate::protocols::common::StopConditions> {
+        self.0.extract_stop_conditions()
+    }
+}
+
+impl<R: OutputOptionsProvider> OutputOptionsProvider for GenerationPromptOverride<'_, R> {
+    fn extract_output_options(&self) -> anyhow::Result<crate::protocols::common::OutputOptions> {
+        self.0.extract_output_options()
+    }
+}
+
+impl<R: NvExtProvider> NvExtProvider for GenerationPromptOverride<'_, R> {
+    fn nvext(&self) -> Option<&crate::protocols::common::extensions::NvExt> {
+        self.0.nvext()
+    }
+
+    fn raw_prompt(&self) -> Option<String> {
+        self.0.raw_prompt()
+    }
+}
+
 pub struct OpenAIPreprocessor {
     mdcsum: String,
     formatter: Arc<dyn OAIPromptFormatter>,
@@ -1038,6 +1132,80 @@ impl OpenAIPreprocessor {
     /// Encode a string to it's tokens
     pub fn tokenize(&self, s: &str) -> anyhow::Result<Encoding> {
         self.tokenizer.encode(s)
+    }
+
+    /// Tokenize a chat request the way [`Self::generate`] would, stopping before the
+    /// worker hop: same default-thinking-mode normalization, same chat template, same
+    /// tokenizer. `/tokenize` calls this instead of re-deriving the steps, so the count
+    /// it reports cannot drift from the count the model is sent.
+    /// Every normalization [`Self::generate`] applies to a chat request before templating.
+    ///
+    /// Extracted so `/tokenize` renders the prompt the model is actually sent: these all
+    /// mutate `chat_template_args`, so skipping one changes the token count. A step added
+    /// here reaches both callers — which is the point of it being one function rather
+    /// than a sequence each caller repeats.
+    pub(crate) fn normalize_chat_request(&self, request: &mut NvCreateChatCompletionRequest) {
+        self.apply_default_thinking_mode(request);
+        Self::normalize_thinking_arg(request, self.runtime_config.reasoning_parser.as_deref());
+    }
+
+    /// Tokenize a chat request the way [`Self::generate`] would, stopping before the worker
+    /// hop: the same normalizations, the same chat template, and the same encode
+    /// `gather_tokens` performs. `/tokenize` calls this rather than re-deriving the steps,
+    /// so the count it reports cannot drift from the count the model is sent.
+    pub async fn tokenize_chat(
+        &self,
+        request: &mut NvCreateChatCompletionRequest,
+        add_generation_prompt: bool,
+    ) -> anyhow::Result<Encoding> {
+        self.normalize_chat_request(request);
+        let rendered = self
+            .apply_template(&GenerationPromptOverride(&*request, add_generation_prompt))?
+            .ok_or_else(|| anyhow::anyhow!("chat template produced no prompt"))?;
+        self.tokenize_completion(&rendered).await
+    }
+
+    /// Tokenize a bare prompt the way `/v1/completions` would.
+    ///
+    /// That pipeline applies a no-op formatter and encodes the prompt as given, so this is
+    /// the whole of it — `tokenize_completion_matches_the_completions_pipeline` pins the
+    /// equivalence. Notably it does *not* add special tokens: Dynamo's completions path
+    /// never does, so neither does the count reported for it.
+    pub async fn tokenize_completion(&self, prompt: &str) -> anyhow::Result<Encoding> {
+        Self::encode_text(self.tokenizer.clone(), prompt).await
+    }
+
+    /// Decode token ids through this model's tokenizer — the same instance the
+    /// postprocessor decodes worker output with.
+    pub fn detokenize(
+        &self,
+        token_ids: &[TokenIdType],
+        skip_special_tokens: bool,
+    ) -> anyhow::Result<String> {
+        Ok(self
+            .tokenizer
+            .decode(token_ids, skip_special_tokens)?
+            .into())
+    }
+
+    /// The text each token contributes, for callers that surface it (`/tokenize`'s
+    /// `return_token_strs`).
+    ///
+    /// Always decoded per id rather than read from a vocabulary. The alternative —
+    /// `Encoding::Hf`'s table, which is what vLLM's `convert_ids_to_tokens` returns — is
+    /// only reachable when the L1 prefix cache is off, since `CachedTokenizer` normalizes
+    /// every encode to `Encoding::Sp` on both its hit and miss paths. Deriving these from
+    /// the encoding would therefore make one model answer differently depending on
+    /// `DYN_TOKENIZER_CACHE`, so this takes the one form available either way.
+    ///
+    /// Two consequences worth knowing: the strings are decoded text (`" world"`) rather
+    /// than byte-level vocabulary spellings (`"Ġworld"`), and a token holding part of a
+    /// multi-byte sequence decodes to U+FFFD on its own.
+    pub fn token_strings(&self, token_ids: &[TokenIdType]) -> anyhow::Result<Vec<String>> {
+        token_ids
+            .iter()
+            .map(|id| self.detokenize(&[*id], false))
+            .collect()
     }
 
     /// Translate a [`NvCreateChatCompletionRequest`] request to a common completion request.
@@ -2350,12 +2518,14 @@ impl OpenAIPreprocessor {
         Ok(())
     }
 
-    async fn encode_with_timing(
-        &self,
+    /// Encode `prompt` with `tokenizer`, applying the hygiene every prompt this frontend
+    /// tokenizes gets. Free-standing so callers holding a tokenizer this preprocessor does
+    /// not own (the `/tokenize` completion form's specials-on instance) encode identically
+    /// rather than reimplementing it.
+    pub async fn encode_text(
+        tokenizer: Arc<dyn Tokenizer>,
         prompt: &str,
-        tracker: Option<&RequestTracker>,
     ) -> anyhow::Result<Encoding> {
-        let encode_start = Instant::now();
         // Offload the CPU-heavy BPE encode to the bounded blocking pool instead of running it on
         // the async event loop. For long prompts at high concurrency, a synchronous encode here
         // stalls the frontend tokio runtime for seconds, starving the I/O tasks that share the
@@ -2367,8 +2537,16 @@ impl OpenAIPreprocessor {
         } else {
             prompt.to_string()
         };
-        let tokenizer = self.tokenizer.clone();
-        let encoding = tokio::task::spawn_blocking(move || tokenizer.encode(&owned)).await??;
+        tokio::task::spawn_blocking(move || tokenizer.encode(&owned)).await?
+    }
+
+    async fn encode_with_timing(
+        &self,
+        prompt: &str,
+        tracker: Option<&RequestTracker>,
+    ) -> anyhow::Result<Encoding> {
+        let encode_start = Instant::now();
+        let encoding = Self::encode_text(self.tokenizer.clone(), prompt).await?;
         if let Some(t) = tracker {
             t.record_tokenize_latency(encode_start.elapsed());
         }
@@ -3723,11 +3901,7 @@ impl
         // Apply the deployment default before parser-specific normalization so
         // it can override an implicit model default (for example Kimi K2.5),
         // while explicit request controls still take precedence.
-        self.apply_default_thinking_mode(&mut request);
-        Self::normalize_thinking_arg(
-            &mut request,
-            self.runtime_config.reasoning_parser.as_deref(),
-        );
+        self.normalize_chat_request(&mut request);
 
         // create a response generator
         let response_generator = request.response_generator(context.id().to_string());
@@ -5730,6 +5904,182 @@ mod tests {
         assert_ne!(
             s3a, s3b,
             "s3:// query params identify objects and must not collide"
+        );
+    }
+    /// Drift guard: `/tokenize` must produce exactly the token ids the generate path does.
+    ///
+    /// Both share [`OpenAIPreprocessor::normalize_chat_request`] and `apply_template`, so
+    /// this holds by construction today. It is asserted anyway because the failure mode is
+    /// silent — a normalization added to one path and not the other changes a reported
+    /// count without breaking anything else — and every divergence found while building
+    /// this endpoint was found by reading the code, not by a failing test.
+    ///
+    /// The request sends only `thinking`; the `enable_thinking` the template branches on
+    /// exists solely because `normalize_chat_request` derived it from that alias. The
+    /// second assertion checks the branch was actually taken, so this test cannot quietly
+    /// decay into comparing two paths that both skipped the normalization.
+    #[tokio::test]
+    async fn tokenize_chat_matches_the_generate_path_token_ids() {
+        use crate::model_card::ModelDeploymentCard;
+        use crate::preprocessor::prompt::prompt_formatter_from_mdc;
+        use dynamo_renderer::PromptFormatter;
+        use std::io::Write;
+
+        let mut template = tempfile::Builder::new()
+            .suffix(".jinja")
+            .tempfile()
+            .expect("tempfile");
+        template
+            .write_all(
+                b"{% for m in messages %}{{ m['content'] }}{% endfor %}\
+                  {% if enable_thinking %} thinking thinking thinking{% endif %}",
+            )
+            .expect("write template");
+        let template = template.into_temp_path();
+
+        let card = ModelDeploymentCard::load_from_disk(
+            "tests/data/sample-models/TinyLlama_v1.1",
+            Some(template.as_ref()),
+        )
+        .expect("load card");
+        let PromptFormatter::OAI(formatter) = prompt_formatter_from_mdc(&card).expect("formatter");
+        let preprocessor = OpenAIPreprocessor::new_with_parts(
+            card.clone(),
+            formatter,
+            card.tokenizer().expect("tokenizer"),
+        )
+        .expect("preprocessor");
+
+        // `thinking` alone. Only `normalize_chat_request` turns it into the
+        // `enable_thinking` the template reads.
+        let body = serde_json::json!({
+            "model": card.display_name,
+            "messages": [{"role": "user", "content": "What is 2+2?"}],
+            "chat_template_kwargs": {"thinking": true},
+        });
+
+        // The generate path: normalize, template, tokenize, hand a worker the token ids.
+        let mut via_generate: NvCreateChatCompletionRequest =
+            serde_json::from_value(body.clone()).expect("request");
+        preprocessor.normalize_chat_request(&mut via_generate);
+        let (preprocessed, _, _) = preprocessor
+            .preprocess_request(&via_generate, None)
+            .await
+            .expect("preprocess");
+
+        // The /tokenize path: same preprocessor, same request, no worker hop.
+        let mut via_tokenize: NvCreateChatCompletionRequest =
+            serde_json::from_value(body).expect("request");
+        let encoding = preprocessor
+            .tokenize_chat(&mut via_tokenize, true)
+            .await
+            .expect("tokenize_chat");
+
+        assert_eq!(
+            encoding.token_ids(),
+            preprocessed.token_ids.as_slice(),
+            "/tokenize and the generate path must agree on the token ids"
+        );
+
+        // Without the alias there is nothing to normalize, so a shorter prompt renders.
+        // If these match, the normalization never fired and the assertion above proved
+        // nothing.
+        let mut without: NvCreateChatCompletionRequest =
+            serde_json::from_value(serde_json::json!({
+                "model": card.display_name,
+                "messages": [{"role": "user", "content": "What is 2+2?"}],
+            }))
+            .expect("request");
+        let baseline = preprocessor
+            .tokenize_chat(&mut without, true)
+            .await
+            .expect("tokenize_chat");
+        assert!(
+            encoding.token_ids().len() > baseline.token_ids().len(),
+            "the thinking alias must reach the template via normalization, else this guard is vacuous"
+        );
+    }
+    /// The generate path strips null bytes before encoding ("to avoid tokenizer
+    /// divergence", per `encode_text`). `/tokenize` reaches that through the same
+    /// function, so a prompt containing one tokenizes identically on both — it used to
+    /// encode the raw bytes and report a different count.
+    #[tokio::test]
+    async fn tokenize_text_strips_null_bytes_like_the_generate_path() {
+        use crate::model_card::ModelDeploymentCard;
+        use crate::preprocessor::prompt::prompt_formatter_from_mdc;
+        use dynamo_renderer::PromptFormatter;
+
+        let card =
+            ModelDeploymentCard::load_from_disk("tests/data/sample-models/TinyLlama_v1.1", None)
+                .expect("load card");
+        let PromptFormatter::OAI(formatter) = PromptFormatter::no_op();
+        let _ = prompt_formatter_from_mdc(&card);
+        let preprocessor = OpenAIPreprocessor::new_with_parts(
+            card.clone(),
+            formatter,
+            card.tokenizer().expect("tokenizer"),
+        )
+        .expect("preprocessor");
+
+        let with_null = preprocessor
+            .tokenize_completion("Hello\0, world!")
+            .await
+            .expect("encode");
+        let without_null = preprocessor
+            .tokenize_completion("Hello, world!")
+            .await
+            .expect("encode");
+        assert_eq!(
+            with_null.token_ids(),
+            without_null.token_ids(),
+            "null bytes must be stripped before encoding, as the generate path does"
+        );
+    }
+
+    /// The completion form of `/tokenize` must equal what the `/v1/completions` pipeline
+    /// sends the worker.
+    ///
+    /// This is the whole contract for a bare prompt: no template, no special tokens, the same
+    /// tokenizer. Pinned because `tokenize_completion` is a short function that *looks* like
+    /// it could be replaced by any other encode call, and the pipeline's behaviour here is
+    /// itself non-obvious — Dynamo adds no BOS on completions where vLLM would.
+    #[tokio::test]
+    async fn tokenize_completion_matches_the_completions_pipeline() {
+        use crate::model_card::ModelDeploymentCard;
+        use crate::protocols::openai::completions::NvCreateCompletionRequest;
+        use dynamo_renderer::PromptFormatter;
+
+        let card =
+            ModelDeploymentCard::load_from_disk("tests/data/sample-models/TinyLlama_v1.1", None)
+                .expect("load card");
+        // Exactly how the watcher builds the completions pipeline: a no-op formatter.
+        let PromptFormatter::OAI(no_op) = PromptFormatter::no_op();
+        let preprocessor = OpenAIPreprocessor::new_with_parts(
+            card.clone(),
+            no_op,
+            card.tokenizer().expect("tokenizer"),
+        )
+        .expect("preprocessor");
+
+        let request: NvCreateCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": card.display_name,
+            "prompt": "Hello, world!",
+        }))
+        .expect("request");
+
+        let (preprocessed, _, _) = preprocessor
+            .preprocess_request(&request, None)
+            .await
+            .expect("preprocess");
+        let via_tokenize = preprocessor
+            .tokenize_completion("Hello, world!")
+            .await
+            .expect("tokenize_text");
+
+        assert_eq!(
+            via_tokenize.token_ids(),
+            preprocessed.token_ids.as_slice(),
+            "/tokenize must reproduce the /v1/completions token ids exactly"
         );
     }
 }

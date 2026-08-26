@@ -318,6 +318,8 @@ fn generate_summary_for_path(path: &str) -> String {
         "/v1/embeddings" => "Create embeddings".to_string(),
         "/v1/responses" => "Create response".to_string(),
         "/v1/models" => "List available models".to_string(),
+        "/tokenize" => "Tokenize a prompt or chat conversation".to_string(),
+        "/detokenize" => "Detokenize a list of token ids".to_string(),
         "/health" => "Health check".to_string(),
         "/live" => "Liveness check".to_string(),
         "/metrics" => "Prometheus metrics".to_string(),
@@ -351,6 +353,16 @@ fn generate_description_for_path(path: &str) -> String {
         }
         "/v1/models" => {
             "Lists the currently available models and provides basic information about each."
+                .to_string()
+        }
+        "/tokenize" => {
+            "Returns the token ids for a prompt (`prompt`) or a chat conversation (`messages`, \
+            rendered through the model's chat template) without running inference. \
+            Compatible with vLLM's tokenize API."
+                .to_string()
+        }
+        "/detokenize" => {
+            "Returns the text for a list of token ids. Compatible with vLLM's detokenize API."
                 .to_string()
         }
         "/health" => {
