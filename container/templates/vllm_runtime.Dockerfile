@@ -80,23 +80,19 @@ ENV PATH=/opt/uv/bin:${PATH}
 
 {% if device == "cuda" %}
 # Bring base-image OS packages up to the current patch releases published in
-# the distro archives. --only-upgrade skips anything not already installed, so
-# no new packages are added; versions are left unpinned so a cache-busted
+# the distro archives. --only-upgrade skips anything not already installed, but
+# still hard-errors if a listed package doesn't exist in the apt index at all
+# (e.g. the noble-only libssl3t64/keyboxd names on a jammy-based runtime image),
+# so pre-filter to packages dpkg actually knows about on this base image.
+# No new packages are added; versions are left unpinned so a cache-busted
 # rebuild picks up the newest patch level (BuildKit reuses this layer otherwise).
 RUN apt-get update && \
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends --only-upgrade \
-        dirmngr \
-        gnupg \
-        gnupg-utils \
-        gnupg2 \
-        gpg \
-        gpg-agent \
-        gpgconf \
-        gpgsm \
-        gpgv \
-        keyboxd \
-        libssl3t64 \
-        openssl && \
+    PRESENT_PKGS="$(dpkg-query -W -f='${Package}\n' \
+        dirmngr gnupg gnupg-utils gnupg2 gpg gpg-agent gpgconf gpgsm gpgv \
+        keyboxd libssl3t64 libssl3 openssl 2>/dev/null | tr '\n' ' ')" && \
+    if [ -n "$PRESENT_PKGS" ]; then \
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends --only-upgrade $PRESENT_PKGS; \
+    fi && \
     rm -rf /var/lib/apt/lists/*
 {% endif %}
 
