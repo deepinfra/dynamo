@@ -120,6 +120,11 @@ pub const PASSTHROUGH_EXTRA_FIELDS: &[&str] = &[
     "bad_words_token_ids",
     "logprob_token_ids",
     "vllm_xargs",
+    // Accepted and ignored: some OpenAI-compatible clients (e.g. DeepInfra
+    // deepapi) always send a `reasoning` object. It is not consumed here and,
+    // because `unsupported_fields` is `#[serde(skip_serializing)]`, it is
+    // dropped rather than forwarded to the worker.
+    "reasoning",
 ];
 
 /// `vllm_xargs` keys vLLM itself fills from dedicated request fields. Dynamo only
@@ -1322,6 +1327,7 @@ mod tests {
             "bad_words_token_ids": [[2]],
             "logprob_token_ids": [3],
             "vllm_xargs": {"flag": true},
+            "reasoning": {"effort": "low"},
         }))
         .unwrap();
         validate_no_unsupported_fields_with_ignore(&fields.fields, false).unwrap();
@@ -1411,6 +1417,12 @@ mod tests {
     fn validate_no_unsupported_fields_rejects_unknown_fields_by_default() {
         let err = validate_no_unsupported_fields_with_ignore(&unknown_fields(), false).unwrap_err();
         assert!(err.to_string().contains("Unsupported parameter(s)"));
+    }
+
+    #[test]
+    fn validate_no_unsupported_fields_accepts_reasoning() {
+        let fields = HashMap::from([("reasoning".to_string(), json!({"effort": "low"}))]);
+        validate_no_unsupported_fields_with_ignore(&fields, false).unwrap();
     }
 
     #[test]
