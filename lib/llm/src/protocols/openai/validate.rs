@@ -503,9 +503,8 @@ pub fn validate_stop(stop: &Option<dynamo_protocols::types::Stop>) -> Result<(),
                 }
             }
             dynamo_protocols::types::Stop::StringArray(sequences) => {
-                if sequences.is_empty() {
-                    anyhow::bail!("Stop sequences array cannot be empty");
-                }
+                // An empty stop array means "no stop sequences" (OpenAI/vLLM
+                // semantics); accept it as a no-op instead of rejecting.
                 if sequences.len() > MAX_STOP_SEQUENCES {
                     return Err(crate::protocols::common::invalid_argument_error(format!(
                         "Maximum of {} stop sequences allowed, got {}",
@@ -520,9 +519,8 @@ pub fn validate_stop(stop: &Option<dynamo_protocols::types::Stop>) -> Result<(),
                 }
             }
             dynamo_protocols::types::Stop::TokenIdArray(token_ids) => {
-                if token_ids.is_empty() {
-                    anyhow::bail!("Stop token IDs array cannot be empty");
-                }
+                // An empty stop-token-id array means "no stop sequences";
+                // accept it as a no-op instead of rejecting.
                 if token_ids.len() > MAX_STOP_SEQUENCES {
                     return Err(crate::protocols::common::invalid_argument_error(format!(
                         "Maximum of {} stop token IDs allowed, got {}",
@@ -1328,6 +1326,13 @@ mod tests {
     fn validate_no_unsupported_fields_rejects_unknown_fields_by_default() {
         let err = validate_no_unsupported_fields_with_ignore(&unknown_fields(), false).unwrap_err();
         assert!(err.to_string().contains("Unsupported parameter(s)"));
+    }
+
+    #[test]
+    fn validate_stop_accepts_empty_arrays() {
+        use dynamo_protocols::types::Stop;
+        validate_stop(&Some(Stop::StringArray(vec![]))).unwrap();
+        validate_stop(&Some(Stop::TokenIdArray(vec![]))).unwrap();
     }
 
     #[test]
