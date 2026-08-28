@@ -107,6 +107,11 @@ pub const PASSTHROUGH_EXTRA_FIELDS: &[&str] = &[
     "allowed_token_ids",
     "bad_words_token_ids",
     "logprob_token_ids",
+    // Accepted and ignored: some OpenAI-compatible clients (e.g. DeepInfra
+    // deepapi) always send a `reasoning` object. It is not consumed here and,
+    // because `unsupported_fields` is `#[serde(skip_serializing)]`, it is
+    // dropped rather than forwarded to the worker.
+    "reasoning",
 ];
 
 static IGNORE_OPENAI_FE_UNSUPPORTED_FIELDS: LazyLock<bool> =
@@ -438,9 +443,8 @@ pub fn validate_stop(stop: &Option<dynamo_protocols::types::Stop>) -> Result<(),
                 }
             }
             dynamo_protocols::types::Stop::StringArray(sequences) => {
-                if sequences.is_empty() {
-                    anyhow::bail!("Stop sequences array cannot be empty");
-                }
+                // An empty stop array means "no stop sequences" (OpenAI/vLLM
+                // semantics); accept it as a no-op instead of rejecting.
                 if sequences.len() > MAX_STOP_SEQUENCES {
                     anyhow::bail!(
                         "Maximum of {} stop sequences allowed, got {}",
@@ -455,9 +459,8 @@ pub fn validate_stop(stop: &Option<dynamo_protocols::types::Stop>) -> Result<(),
                 }
             }
             dynamo_protocols::types::Stop::TokenIdArray(token_ids) => {
-                if token_ids.is_empty() {
-                    anyhow::bail!("Stop token IDs array cannot be empty");
-                }
+                // An empty stop-token-id array means "no stop sequences";
+                // accept it as a no-op instead of rejecting.
                 if token_ids.len() > MAX_STOP_SEQUENCES {
                     anyhow::bail!(
                         "Maximum of {} stop token IDs allowed, got {}",
@@ -929,6 +932,19 @@ mod tests {
     fn validate_no_unsupported_fields_rejects_unknown_fields_by_default() {
         let err = validate_no_unsupported_fields_with_ignore(&unknown_fields(), false).unwrap_err();
         assert!(err.to_string().contains("Unsupported parameter(s)"));
+    }
+
+    #[test]
+    fn validate_no_unsupported_fields_accepts_reasoning() {
+        let fields = HashMap::from([("reasoning".to_string(), json!({"effort": "low"}))]);
+        validate_no_unsupported_fields_with_ignore(&fields, false).unwrap();
+    }
+
+    #[test]
+    fn validate_stop_accepts_empty_arrays() {
+        use dynamo_protocols::types::Stop;
+        validate_stop(&Some(Stop::StringArray(vec![]))).unwrap();
+        validate_stop(&Some(Stop::TokenIdArray(vec![]))).unwrap();
     }
 
     #[test]
