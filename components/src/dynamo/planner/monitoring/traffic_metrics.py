@@ -453,16 +453,28 @@ class PrometheusAPIClient:
             f"{prometheus_names.router.KV_HIT_RATE}"
         )
         try:
-            ns = self.dynamo_namespace.replace("-", "_")
-            ns_filter = f'{prometheus_names.labels.NAMESPACE}="{ns}"'
-            query = (
-                f"sum(increase({full_metric_name}_sum{{{ns_filter}}}[{interval}])) / "
-                f"sum(increase({full_metric_name}_count{{{ns_filter}}}[{interval}]))"
-            )
-            result = self.prom.custom_query(query=query)
+            # The router emits `dynamo_namespace` sanitized to underscores, but
+            # some scrape paths relabel it back to the hyphenated k8s form
+            # (nvidia.com/dynamo-namespace). Try both so the query works under
+            # either emission style instead of silently returning no data.
+            candidates = []
+            for ns in (self.dynamo_namespace.replace("-", "_"), self.dynamo_namespace):
+                if ns not in candidates:
+                    candidates.append(ns)
+            result = []
+            for ns in candidates:
+                ns_filter = f'{prometheus_names.labels.NAMESPACE}="{ns}"'
+                query = (
+                    f"sum(increase({full_metric_name}_sum{{{ns_filter}}}[{interval}])) / "
+                    f"sum(increase({full_metric_name}_count{{{ns_filter}}}[{interval}]))"
+                )
+                result = self.prom.custom_query(query=query)
+                if result:
+                    break
             if not result:
                 logger.info(
-                    f"No prometheus data for {full_metric_name}, returning None"
+                    f"No prometheus data for {full_metric_name} "
+                    f"(tried dynamo_namespace in {candidates}), returning None"
                 )
                 return None
             value = float(result[0]["value"][1])
