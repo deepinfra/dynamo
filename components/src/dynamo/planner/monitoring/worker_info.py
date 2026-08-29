@@ -163,7 +163,21 @@ def resolve_worker_info(
         model_name = config_model_name
     else:
         mdc_model = decode_info.model_name or prefill_info.model_name
-        if mdc_model:
+        # Prefer the operator-supplied name. Discovery-derived MDC names are
+        # normalized to lowercase, but engine metrics carry the model's real
+        # casing, so an MDC name silently makes every engine-metric query
+        # (spec-decode accept_length, kv_hit_rate) return empty.
+        if config_model_name:
+            model_name = config_model_name
+            if mdc_model and mdc_model != config_model_name:
+                logger.info(
+                    "Using model name from config: %s (MDC reported %s)",
+                    model_name,
+                    mdc_model,
+                )
+            else:
+                logger.info(f"Using model name from config: {model_name}")
+        elif mdc_model:
             model_name = mdc_model
             logger.info(f"Using model name from MDC: {model_name}")
         elif can_query_mdc:
