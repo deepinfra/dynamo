@@ -258,6 +258,11 @@ def validate_row(
 ) -> Violation | None:
     if not spdx or spdx == "UNKNOWN":
         if policy.unknown_action == "deny":
+            # A per-package exception listing "UNKNOWN" in its allow set is an
+            # auditor's explicit sign-off that this package's missing metadata
+            # is acceptable (e.g. a first-party component with no SPDX field).
+            if "UNKNOWN" in _exception_allow_set(policy, ecosystem, name, version):
+                return None
             return Violation(
                 ecosystem,
                 name,

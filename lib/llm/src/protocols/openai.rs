@@ -200,19 +200,23 @@ impl<T: OpenAIStopConditionsProvider> StopConditionsProvider for T {
     fn extract_stop_conditions(&self) -> Result<common::StopConditions> {
         let max_tokens = self.get_max_tokens();
         let min_tokens = self.get_min_tokens();
-        let stop = self.get_stop();
-        let stop_token_ids = self.get_stop_token_ids();
+        let mut stop = self.get_stop();
+        let mut stop_token_ids = self.get_stop_token_ids();
         let max_thinking_tokens = self.get_max_thinking_tokens();
 
-        if let Some(stop) = &stop
+        // Some OpenAI-compatible clients (e.g. DeepInfra deepapi) send more
+        // than the 4 stop conditions the backend supports. Truncate to the
+        // first 4 (OpenAI/vLLM-tolerant semantics) instead of rejecting,
+        // matching the no-op handling of empty stop arrays in validate_stop.
+        if let Some(stop) = &mut stop
             && stop.len() > 4
         {
-            anyhow::bail!("stop conditions must be less than 4")
+            stop.truncate(4);
         }
-        if let Some(stop_token_ids) = &stop_token_ids
+        if let Some(stop_token_ids) = &mut stop_token_ids
             && stop_token_ids.len() > 4
         {
-            anyhow::bail!("stop token IDs must be less than 4")
+            stop_token_ids.truncate(4);
         }
 
         // Use the trait method to get ignore_eos, which handles precedence

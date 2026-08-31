@@ -301,6 +301,12 @@ copyleft = "deny"
 # contains. If the actual license adds tokens beyond these, the build breaks.
 
 [[exceptions]]
+type = "python"
+name = "kv-local-indexer"
+allow = ["UNKNOWN"]
+reason = "First-party DeepInfra component (k3 kv-local-indexer, from the internal vLLM 0.28 fork); no SPDX metadata, internally owned and Apache-2.0-compatible."
+
+[[exceptions]]
 type = "dpkg"
 name = "login"
 allow = ["GPL-1.0-only", "GPL-2.0-or-later"]
