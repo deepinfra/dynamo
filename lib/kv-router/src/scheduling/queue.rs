@@ -1456,9 +1456,15 @@ impl<
             None => (None, None),
         };
 
+        let (best_overlap_worker, best_overlap_blocks) = match request.max_overlap_worker() {
+            Some((worker, blocks)) => (Some(worker), blocks),
+            None => (None, 0.0),
+        };
         let response = SchedulingResponse {
             best_worker: selection.worker,
             effective_overlap_blocks: selection.effective_overlap_blocks,
+            best_overlap_worker,
+            best_overlap_blocks,
             cached_tokens: selection.cached_tokens,
             selected_worker_tiers,
             request_progress,

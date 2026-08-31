@@ -194,7 +194,7 @@ impl
         next: ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>>,
     ) -> Result<ManyOut<Annotated<LLMEngineOutput>>> {
         // Extract request data while preserving context
-        let (mut req, context) = request.into_parts();
+        let (mut req, mut context) = request.into_parts();
         let request_id = context.id().to_string();
         let metadata = context.metadata().clone();
         let engine_ctx = context.context();
@@ -206,6 +206,131 @@ impl
         // deactivated (all prefill workers died), route directly to the backend. Model admission
         // remains gated by the registered worker topology before the request reaches this stage.
         if self.lifecycle_state() != PrefillLifecycleState::Active {
+            return next.generate(context.map(|_| req)).await;
+        }
+
+        // Conditional disaggregation: prompts below DYN_MIN_REMOTE_PREFILL_TOKENS
+        // are served entirely on the decode worker (aggregate-style local
+        // prefill). Remote prefill only pays for itself when the prefill
+        // compute exceeds the handoff cost (route + prefill queue + KV
+        // transfer + decode admission); below that the handoff dominates
+        // TTFT. 0 (default) disables the gate.
+        static MIN_REMOTE_PREFILL_TOKENS: std::sync::OnceLock<usize> =
+            std::sync::OnceLock::new();
+        let min_remote = *MIN_REMOTE_PREFILL_TOKENS.get_or_init(|| {
+            std::env::var("DYN_MIN_REMOTE_PREFILL_TOKENS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0)
+        });
+
+        // Derive a session-affinity key from the prompt's leading tokens when
+        // the caller did not send one. A conversation's rendered history grows
+        // by appending, so its first N tokens are identical across turns; the
+        // affinity map then pins every turn to the same decode worker, which
+        // is what makes its prefix cache reusable. Overlap-credit scoring
+        // cannot do this at high load: the decode-load term (thousands of
+        // blocks) dwarfs any per-request overlap credit. 0 (default) disables.
+        static SESSION_FROM_PREFIX_TOKENS: std::sync::OnceLock<usize> =
+            std::sync::OnceLock::new();
+        let prefix_key_tokens = *SESSION_FROM_PREFIX_TOKENS.get_or_init(|| {
+            std::env::var("DYN_SESSION_FROM_PREFIX_TOKENS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0)
+        });
+        // Hash a fixed-length prefix window, never `min(len, N)`: a shorter
+        // window would change as the conversation grows, so every turn would
+        // look like a brand new session and land on a worker that has none of
+        // its blocks. Requests below the window get no session id and fall back
+        // to plain KV-overlap routing.
+        if prefix_key_tokens > 0
+            && req.token_ids.len() >= prefix_key_tokens
+            && context
+                .get_optional::<SessionAffinityId>(SESSION_AFFINITY_CONTEXT_KEY)
+                .ok()
+                .flatten()
+                .is_none()
+        {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::hash::DefaultHasher::new();
+            req.token_ids[..prefix_key_tokens].hash(&mut hasher);
+            context.insert(
+                SESSION_AFFINITY_CONTEXT_KEY,
+                SessionAffinityId::new(format!("prefix-{:016x}", hasher.finish())),
+            );
+        }
+
+        // Uncached-length gating (DYN_LOCAL_CONTINUATIONS=1): a conversation
+        // continuation's history is already cached on its pinned decode
+        // worker, so only its NEW tail needs prefill -- serve it locally no
+        // matter how long the raw prompt is; only cold large prefills gain
+        // from a dedicated prefill worker. Approximated with a bounded
+        // recently-seen set keyed by the session prefix hash. Loss on restart
+        // is benign: a continuation goes remote once, then re-registers.
+        static LOCAL_CONTINUATIONS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static SEEN_SESSIONS: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<u64, std::time::Instant>>,
+        > = std::sync::OnceLock::new();
+        let local_continuations = *LOCAL_CONTINUATIONS.get_or_init(|| {
+            std::env::var("DYN_LOCAL_CONTINUATIONS")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false)
+        });
+        let session_seen = if local_continuations && prefix_key_tokens > 0 {
+            match context.get_optional::<SessionAffinityId>(SESSION_AFFINITY_CONTEXT_KEY) {
+                Ok(Some(sid)) => {
+                    use std::hash::{Hash, Hasher};
+                    let mut hasher = std::hash::DefaultHasher::new();
+                    sid.as_str().hash(&mut hasher);
+                    let key = hasher.finish();
+                    let now = std::time::Instant::now();
+                    let mut seen = SEEN_SESSIONS
+                        .get_or_init(Default::default)
+                        .lock()
+                        .expect("seen-session map poisoned");
+                    if seen.len() > 4_000_000 {
+                        seen.clear();
+                    }
+                    seen.insert(key, now)
+                        .is_some_and(|t| now.duration_since(t).as_secs() < 3600)
+                }
+                _ => false,
+            }
+        } else {
+            false
+        };
+        // KV migration (DYN_KV_MIGRATION_SAMPLE > 0): for a sampled fraction
+        // of continuation requests, run the prefill leg on the session's OLD
+        // pinned decode worker (whose prefix cache makes it nearly free) and
+        // decode on a different worker, moving the conversation's KV via the
+        // existing bidirectional NIXL path. Mechanism validation for
+        // load-relief-that-preserves-cache; production distress wiring
+        // replaces the random sample once the mechanism is proven.
+        static MIGRATION_SAMPLE: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+        let migration_sample = *MIGRATION_SAMPLE.get_or_init(|| {
+            std::env::var("DYN_KV_MIGRATION_SAMPLE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.0)
+        });
+        let migrate = migration_sample > 0.0
+            && session_seen
+            && self.lifecycle_state() == PrefillLifecycleState::Active
+            && rand::random::<f64>() < migration_sample;
+        if migrate {
+            // Telemetry-only for now: the D->D dispatch leg lands in the next
+            // increment (needs backend-instance targeting for the bootstrap
+            // handshake); this quantifies migration rate and candidate shape
+            // in production traffic without touching the data path.
+            tracing::info!(
+                request_id = %request_id,
+                tokens = req.token_ids.len(),
+                "KVMIGRATE_CANDIDATE: continuation would migrate (prefill on pinned worker, decode elsewhere)"
+            );
+        }
+
+        if min_remote > 0 && (req.token_ids.len() < min_remote || session_seen) {
             return next.generate(context.map(|_| req)).await;
         }
 
@@ -306,10 +431,23 @@ impl
                         error = %error,
                         "request rejected by prefill worker (at capacity)"
                     );
-                } else {
-                    tracing::error!(error = %error, "Remote prefill failed, failing request");
+                    return Err(error);
                 }
-                return Err(error);
+                // Transient dispatch failures (e.g. the selected instance
+                // missing from the transport map during a discovery re-list)
+                // must not fail the request: the decode worker can always run
+                // the prefill locally, exactly like the passthrough taken when
+                // the prefill router is inactive.
+                tracing::warn!(
+                    error = %error,
+                    "Remote prefill dispatch failed, falling back to local prefill"
+                );
+                if let Some(ref tracker) = req.tracker {
+                    let _decode_permit = tracker.set_phase(RequestPhase::Decode).await;
+                }
+                let mut local_req = req;
+                local_req.stop_conditions.max_tokens = original_max_tokens;
+                return next.generate(context.map(|_| local_req)).await;
             }
         };
 

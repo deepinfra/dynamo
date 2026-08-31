@@ -108,6 +108,10 @@ pub struct KvPushRouter {
     pub chooser: Arc<KvRouter>,
     request_metrics: Arc<RouterRequestMetrics>,
     affinity: Option<AffinityCoordinator>,
+    /// session_id -> (worker that last served it, when). Observational only:
+    /// it never influences selection, it only names a migration source when the
+    /// router's KV index has not caught up with a recent placement.
+    kv_home: Arc<dashmap::DashMap<String, (u64, std::time::Instant)>>,
 }
 
 impl KvPushRouter {
@@ -139,6 +143,7 @@ impl KvPushRouter {
             chooser,
             request_metrics,
             affinity,
+            kv_home: Arc::new(dashmap::DashMap::new()),
         }
     }
 
@@ -323,6 +328,56 @@ impl KvPushRouter {
             return Err(error);
         }
         Ok(guard)
+    }
+
+    /// Record which worker just served this session, so a later turn that lands
+    /// elsewhere knows where the blocks are. Bounded: swept back to entries seen
+    /// in the last 15 minutes whenever it grows past the cap.
+    fn remember_kv_home(&self, session_id: &str, worker_id: u64) {
+        const KV_HOME_TTL: std::time::Duration = std::time::Duration::from_secs(900);
+        const KV_HOME_CAP: usize = 200_000;
+        let now = std::time::Instant::now();
+        self.kv_home.insert(session_id.to_string(), (worker_id, now));
+        if self.kv_home.len() > KV_HOME_CAP {
+            self.kv_home
+                .retain(|_, (_, seen)| now.duration_since(*seen) < KV_HOME_TTL);
+        }
+    }
+
+    /// Run one producer step on `source` so it publishes a NIXL handshake for
+    /// this conversation's blocks. The caller hands the result to the worker
+    /// that will actually decode, which then pulls the blocks instead of
+    /// recomputing the prefix. Returns None if the source cannot produce one.
+    async fn kv_migration_handshake(
+        &self,
+        req: &PreprocessedRequest,
+        ctx_id: &str,
+        metadata: std::collections::BTreeMap<String, String>,
+        source: u64,
+    ) -> Option<crate::protocols::common::preprocessor::PrefillResult> {
+        let mut src_req = req.clone();
+        src_req.kv_migration_source = Some(true);
+        src_req.stop_conditions.max_tokens = Some(1);
+        let src_ctx = dynamo_runtime::pipeline::Context::with_id_and_metadata(
+            src_req,
+            format!("{ctx_id}-kvmig"),
+            metadata,
+        );
+        let mut stream = match self.inner.direct(src_ctx, source).await {
+            Ok(stream) => stream,
+            Err(error) => {
+                tracing::warn!(%error, source, "KVMIGRATE: producer dispatch failed");
+                return None;
+            }
+        };
+        let first = stream.next().await?;
+        let data = first.data.as_ref()?;
+        let disaggregated_params = data.disaggregated_params.clone()?;
+        tracing::info!(source, "KVMIGRATE: producer handshake obtained");
+        Some(crate::protocols::common::preprocessor::PrefillResult {
+            disaggregated_params,
+            prompt_tokens_details: None,
+        })
     }
 
     async fn dispatch_selection(
@@ -572,6 +627,83 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
             worker_id: selection.instance_id,
             dp_rank: Some(selection.dp_rank),
         };
+        // KV migration: source is whichever worker holds the most of THIS
+        // request's blocks, read from the router's KV index -- no session id
+        // required, so any request can migrate. Take one producer step there to
+        // publish a NIXL handshake and hand it to the selected target, which
+        // pulls the blocks instead of recomputing.
+        // DYN_KV_MIGRATION: "1" migrates, "dry" only logs the opportunity.
+        static KV_MIGRATION: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+        let migration_mode = *KV_MIGRATION.get_or_init(|| {
+            match std::env::var("DYN_KV_MIGRATION").unwrap_or_default().as_str() {
+                "1" | "true" | "TRUE" => 2,
+                "dry" | "DRY" => 1,
+                _ => 0,
+            }
+        });
+        static KV_MIGRATION_MIN_TOKENS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let migration_min_tokens = *KV_MIGRATION_MIN_TOKENS.get_or_init(|| {
+            std::env::var("DYN_KV_MIGRATION_MIN_TOKENS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(16384)
+        });
+        let migratable_tokens =
+            (selection.best_overlap_blocks * self.chooser.block_size() as f64) as usize;
+        let request = if migration_mode > 0
+            && phase != RequestPhase::Prefill
+            && migratable_tokens >= migration_min_tokens
+        {
+            let session_key = affinity_id(&request).ok().flatten();
+            let cached_worker = selection
+                .best_overlap_worker
+                .or_else(|| {
+                    session_key
+                        .as_ref()
+                        .and_then(|sid| self.kv_home.get(sid.as_str()))
+                        .map(|e| e.value().0)
+                })
+                .filter(|w| *w != selection.instance_id);
+            if let Some(sid) = session_key.as_ref() {
+                self.remember_kv_home(sid.as_str(), selection.instance_id);
+            }
+            match cached_worker {
+                Some(source) => {
+                    let ctx_id = request.context().id().to_string();
+                    tracing::info!(
+                        request_id = %ctx_id,
+                        source,
+                        target = selection.instance_id,
+                        tokens = request.token_ids.len(),
+                        migratable_tokens,
+                        "KVMIGRATE_SPILL: request routed off the worker holding its KV"
+                    );
+                    if migration_mode < 2 {
+                        request
+                    } else {
+                        let metadata = request.metadata().clone();
+                        let (mut req, ctx) = request.into_parts();
+                        if req.prefill_result.is_none() {
+                            if let Some(result) = self
+                                .kv_migration_handshake(&req, &ctx_id, metadata, source)
+                                .await
+                            {
+                                tracing::info!(
+                                    request_id = %ctx_id, source, target = selection.instance_id,
+                                    "KVMIGRATE: decoding on target with migrated KV"
+                                );
+                                req.prefill_result = Some(result);
+                            }
+                        }
+                        ctx.map(|_| req)
+                    }
+                }
+                None => request,
+            }
+        } else {
+            request
+        };
+
         let stream = match self
             .dispatch_selection(request, selection, guard, operation.is_some())
             .await

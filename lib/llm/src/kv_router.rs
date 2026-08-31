@@ -136,6 +136,9 @@ pub enum FindBestMatchOutcome {
         effective_overlap_blocks: f64,
         cached_tokens: usize,
         routing_hashes: Option<RoutingDecisionHashes>,
+        /// Worker holding the most of this request's blocks, selected or not.
+        best_overlap_worker: Option<WorkerWithDpRank>,
+        best_overlap_blocks: f64,
     },
     QueueRejected {
         rejection: scheduling::QueueRejection,
@@ -911,6 +914,8 @@ where
                 effective_overlap_blocks: response.effective_overlap_blocks,
                 cached_tokens: response.cached_tokens,
                 routing_hashes,
+                best_overlap_worker: response.best_overlap_worker,
+                best_overlap_blocks: response.best_overlap_blocks,
             },
             lifecycle,
         ))

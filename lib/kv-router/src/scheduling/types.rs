@@ -74,6 +74,10 @@ impl KvSchedulerError {
 pub struct SchedulingResponse {
     pub best_worker: WorkerWithDpRank,
     pub effective_overlap_blocks: f64,
+    /// Worker holding the most of this request's blocks, selected or not.
+    /// Lets a caller find the blocks for any request, with no session concept.
+    pub best_overlap_worker: Option<WorkerWithDpRank>,
+    pub best_overlap_blocks: f64,
     pub cached_tokens: usize,
     pub selected_worker_tiers: SelectedWorkerTierSnapshot,
     pub request_progress: Option<RequestProgressUpdater>,
@@ -271,6 +275,16 @@ impl SchedulingRequest {
             .get(&worker)
             .copied()
             .unwrap_or(0)
+    }
+
+    /// Argmax over the per-worker overlap map: (worker, blocks).
+    pub(crate) fn max_overlap_worker(&self) -> Option<(WorkerWithDpRank, f64)> {
+        self.overlap
+            .effective_overlap_blocks
+            .iter()
+            .filter(|(_, blocks)| **blocks > 0.0)
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(worker, blocks)| (*worker, *blocks))
     }
 
     pub(crate) fn effective_overlap_blocks_for(&self, worker: WorkerWithDpRank) -> f64 {
