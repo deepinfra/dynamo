@@ -141,10 +141,19 @@ class PrometheusAPIClient:
         A frontend serving grouped workers labels its own metrics with the model
         stem (``<stem>``) while each planner owns a group (``<stem>--<group>``).
         Those model-wide series carry the only TTFT/ITL data available, so accept
-        a stem prefix rather than requiring equality. Ungrouped deployments have
-        stem == group and still match.
+        a stem that this planner's namespace extends at a ``--`` boundary.
+        Ungrouped deployments have stem == group and match by equality.
+
+        An absent or empty label is rejected rather than treated as a wildcard.
+        Frontends whose series predate the dynamo_namespace relabel carry no
+        namespace at all, and folding those into one planner's reading inflates
+        it; equality rejected them before, so this keeps that behaviour.
         """
-        return self.dynamo_namespace.startswith(metric_namespace or "")
+        if not metric_namespace:
+            return False
+        if metric_namespace == self.dynamo_namespace:
+            return True
+        return self.dynamo_namespace.startswith(f"{metric_namespace}--")
 
     def _sum_worker_namespace_metric(self, result, model_name: str) -> Optional[float]:
         """Sum the selection-time counter for exactly this planner's group."""

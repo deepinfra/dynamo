@@ -227,6 +227,69 @@ def test_get_average_metric_none_result():
         assert result == 0
 
 
+STEM = "deepseek-ai--DeepSeek-V4-Flash-0731-roce-disagg"
+
+
+@pytest.mark.parametrize(
+    "planner_ns,series_ns,expected",
+    [
+        # A grouped planner must see the model-wide series: TTFT/ITL histograms
+        # only ever carry the frontend's own namespace, which is the stem.
+        (f"{STEM}--g1", STEM, True),
+        (f"{STEM}--g1", f"{STEM}--g1", True),
+        # ...but never a sibling group's.
+        (f"{STEM}--g1", f"{STEM}--g2", False),
+        # An absent or empty label carries no attribution and is not a wildcard.
+        (f"{STEM}--g1", "", False),
+        (f"{STEM}--g1", None, False),
+        # Ungrouped deployments keep the old equality behaviour exactly.
+        (STEM, STEM, True),
+        (STEM, f"{STEM}--g1", False),
+        # A shared prefix that is not a "--" segment boundary is a different model.
+        ("aa--Foo-extra", "aa--Foo", False),
+    ],
+)
+def test_namespace_matches(planner_ns, series_ns, expected):
+    """Frontend series attribution for grouped and ungrouped planners."""
+    client = PrometheusAPIClient("http://localhost:9090", planner_ns)
+    assert client._namespace_matches(series_ns) is expected
+
+
+def test_get_avg_request_count_prefers_worker_namespace_counter():
+    """The per-group counter wins over the model-wide one when it has series."""
+    client = PrometheusAPIClient("http://localhost:9090", f"{STEM}--g1")
+
+    def fake_query(query):
+        if "worker_namespace_requests_started_total" in query:
+            return [
+                {
+                    "metric": {"model": "m", "worker_namespace": f"{STEM}--g1"},
+                    "value": [0, "7"],
+                },
+                {
+                    "metric": {"model": "m", "worker_namespace": f"{STEM}--g2"},
+                    "value": [0, "99"],
+                },
+            ]
+        raise AssertionError("must not fall back when the counter has series")
+
+    with patch.object(client.prom, "custom_query", side_effect=fake_query):
+        assert client.get_avg_request_count("60s", "m") == 7
+
+
+def test_get_avg_request_count_falls_back_without_worker_namespace_counter():
+    """An older frontend has no such series, so the model-wide counter is used."""
+    client = PrometheusAPIClient("http://localhost:9090", STEM)
+
+    def fake_query(query):
+        if "worker_namespace_requests_started_total" in query:
+            return []
+        return [{"metric": {"model": "m", "dynamo_namespace": STEM}, "value": [0, "5"]}]
+
+    with patch.object(client.prom, "custom_query", side_effect=fake_query):
+        assert client.get_avg_request_count("60s", "m") == 5
+
+
 def test_get_average_metric_empty_result():
     """Test _get_average_metric when prometheus returns empty list"""
     client = PrometheusAPIClient("http://localhost:9090", "test_namespace")
@@ -362,9 +425,14 @@ def test_get_avg_request_count_uses_started_requests():
 
     assert result == 150.0
     queries = [call.kwargs["query"] for call in mock_query.call_args_list]
-    assert "dynamo_frontend_requests_started_total" in queries[0]
-    assert "increase(" in queries[0]
-    assert len(queries) == 1
+    # The per-group counter is tried first; these series carry no
+    # worker_namespace label, so it yields nothing and the model-wide
+    # started counter answers.
+    assert "worker_namespace_requests_started_total" in queries[0]
+    assert "dynamo_frontend_requests_started_total" in queries[1]
+    assert "increase(" in queries[1]
+    # Still no query for the completed counter -- started requests answered.
+    assert len(queries) == 2
 
 
 def test_get_avg_request_count_falls_back_to_completed_when_started_missing():
@@ -382,14 +450,15 @@ def test_get_avg_request_count_falls_back_to_completed_when_started_missing():
     ]
 
     with patch.object(client.prom, "custom_query") as mock_query:
-        mock_query.side_effect = [[], completed]
+        mock_query.side_effect = [[], [], completed]
 
         result = client.get_avg_request_count("30s", "target_model")
 
     assert result == 73.0
     queries = [call.kwargs["query"] for call in mock_query.call_args_list]
-    assert "dynamo_frontend_requests_started_total" in queries[0]
-    assert "dynamo_frontend_requests_total" in queries[1]
+    assert "worker_namespace_requests_started_total" in queries[0]
+    assert "dynamo_frontend_requests_started_total" in queries[1]
+    assert "dynamo_frontend_requests_total" in queries[2]
 
 
 def test_vllm_spec_decode_accept_length_query_derives_from_counters():
