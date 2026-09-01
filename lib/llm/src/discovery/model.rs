@@ -15,6 +15,7 @@ use serde::Serialize;
 use super::ModelManagerError;
 use super::worker_monitor::LoadThresholdConfig;
 use super::worker_set::WorkerSet;
+use crate::http::service::metrics;
 use crate::protocols::openai::ParsingOptions;
 
 use crate::types::{
@@ -832,6 +833,19 @@ impl Model {
     where
         F: Fn(&WorkerSet) -> Option<T>,
     {
+        let (value, worker_set) = self.select_worker_set_inner(extract)?;
+        metrics::inc_worker_namespace_requests_started(&self.name, worker_set.namespace());
+        Some(value)
+    }
+
+    /// Selection proper. Returns the chosen WorkerSet alongside the extracted
+    /// value so the caller can attribute the request to the namespace it landed
+    /// on -- with namespace grouping the frontend's own namespace label is the
+    /// model stem and cannot identify the group.
+    fn select_worker_set_inner<T, F>(&self, extract: F) -> Option<(T, Arc<WorkerSet>)>
+    where
+        F: Fn(&WorkerSet) -> Option<T>,
+    {
         // One snapshot drives both the readiness filter and candidate
         // eligibility, so a concurrent add/remove can't make us treat a
         // namespace as complete while routing to a set that lost a peer. It also
@@ -864,21 +878,21 @@ impl Model {
             if ws.worker_count() == 0 || !ready_namespaces.contains(ws.namespace()) {
                 return None;
             }
-            return extract(ws);
+            return extract(ws).map(|val| (val, ws.clone()));
         }
 
         // Collect eligible sets with their worker counts, skipping sets with no workers or sets in
         // a namespace whose worker set is incomplete.
         // In-process models (no discovery watcher) return count=1, so they always participate.
         // Discovery models with count=0 have no available workers and are skipped.
-        let eligible: Vec<(T, usize)> = snapshot
+        let eligible: Vec<(T, usize, Arc<WorkerSet>)> = snapshot
             .iter()
             .filter_map(|ws| {
                 let count = ws.worker_count();
                 if count == 0 || !ready_namespaces.contains(ws.namespace()) {
                     return None;
                 }
-                extract(ws).map(|val| (val, count))
+                extract(ws).map(|val| (val, count, ws.clone()))
             })
             .collect();
 
@@ -887,15 +901,15 @@ impl Model {
         }
 
         if eligible.len() == 1 {
-            return eligible.into_iter().next().map(|(val, _)| val);
+            return eligible.into_iter().next().map(|(val, _, ws)| (val, ws));
         }
 
         // Weighted random selection proportional to worker count
-        let total_weight: usize = eligible.iter().map(|(_, w)| w).sum();
+        let total_weight: usize = eligible.iter().map(|(_, w, _)| w).sum();
         let mut pick = rand::rng().random_range(0..total_weight);
-        for (val, weight) in eligible {
+        for (val, weight, ws) in eligible {
             if pick < weight {
-                return Some(val);
+                return Some((val, ws));
             }
             pick -= weight;
         }
@@ -1109,6 +1123,40 @@ mod tests {
         // Multiple sets (weighted path)
         model.add_worker_set("ns2".to_string(), make_worker_set("ns2", "abc"));
         assert!(model.get_chat_engine().is_err()); // Still no engines → all filtered out
+    }
+
+    #[test]
+    fn test_selection_counts_offered_load_per_worker_namespace() {
+        // Model name is the counter's label, so a name unique to this test keeps
+        // the process-global counter isolated from other tests.
+        let model = Model::new("offered-load-model".to_string());
+        let counted = |ns: &str| {
+            crate::http::service::metrics::WORKER_NAMESPACE_REQUESTS_STARTED
+                .with_label_values(&["offered-load-model", ns])
+                .get()
+        };
+
+        // Nothing selected -> nothing counted.
+        assert!(model.select_worker_set_with(|_| Some(())).is_none());
+        assert_eq!(counted("ns1"), 0);
+
+        // Fast path (single set) must count, not just the weighted path.
+        let (ws1, _tx1) = make_worker_set_with_count("ns1", "abc", vec![1]);
+        model.add_worker_set("ns1".to_string(), ws1);
+        assert!(model.select_worker_set_with(|_| Some(())).is_some());
+        assert_eq!(counted("ns1"), 1);
+
+        // Weighted path: whichever group wins the draw is the one credited.
+        let (ws2, _tx2) = make_worker_set_with_count("ns2", "abc", vec![2]);
+        model.add_worker_set("ns2".to_string(), ws2);
+        for _ in 0..20 {
+            assert!(model.select_worker_set_with(|_| Some(())).is_some());
+        }
+        assert_eq!(counted("ns1") + counted("ns2"), 21);
+
+        // A set that yields no engine is not a selection and must not be counted.
+        assert!(model.select_worker_set_with(|_| None::<()>).is_none());
+        assert_eq!(counted("ns1") + counted("ns2"), 21);
     }
 
     #[test]

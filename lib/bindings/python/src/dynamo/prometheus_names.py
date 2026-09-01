@@ -78,6 +78,10 @@ class frontend_service:
     REQUESTS_TOTAL = "requests_total"
     # Total number of LLM requests accepted by the frontend handler
     REQUESTS_STARTED_TOTAL = "requests_started_total"
+    # Offered load attributed to the worker namespace chosen at selection time.
+    # Labels: model, worker_namespace. Lets a per-group planner read its own
+    # demand from a frontend that serves several worker namespaces.
+    WORKER_NAMESPACE_REQUESTS_STARTED_TOTAL = "worker_namespace_requests_started_total"
     # Number of requests waiting in HTTP queue before receiving the first response (gauge)
     QUEUED_REQUESTS = "queued_requests"
     # Number of inflight/concurrent requests going to the engine (vLLM, SGLang, ...)

@@ -92,6 +92,7 @@ class Metrics:
 class FrontendMetric(BaseModel):
     container: typing.Optional[str] = None
     dynamo_namespace: typing.Optional[str] = None
+    worker_namespace: typing.Optional[str] = None
     endpoint: typing.Optional[str] = None
     instance: typing.Optional[str] = None
     job: typing.Optional[str] = None
@@ -134,6 +135,44 @@ class PrometheusAPIClient:
             return metric_name
         return f"{prometheus_names.name_prefix.FRONTEND}_{metric_name}"
 
+    def _namespace_matches(self, metric_namespace: Optional[str]) -> bool:
+        """Does a frontend series belong to this planner's namespace?
+
+        A frontend serving grouped workers labels its own metrics with the model
+        stem (``<stem>``) while each planner owns a group (``<stem>--<group>``).
+        Those model-wide series carry the only TTFT/ITL data available, so accept
+        a stem that this planner's namespace extends at a ``--`` boundary.
+        Ungrouped deployments have stem == group and match by equality.
+
+        An absent or empty label is rejected rather than treated as a wildcard.
+        Frontends whose series predate the dynamo_namespace relabel carry no
+        namespace at all, and folding those into one planner's reading inflates
+        it; equality rejected them before, so this keeps that behaviour.
+        """
+        if not metric_namespace:
+            return False
+        if metric_namespace == self.dynamo_namespace:
+            return True
+        return self.dynamo_namespace.startswith(f"{metric_namespace}--")
+
+    def _sum_worker_namespace_metric(self, result, model_name: str) -> Optional[float]:
+        """Sum the selection-time counter for exactly this planner's group."""
+        if not result:
+            return None
+
+        total = 0.0
+        matched = False
+        for container in parse_frontend_metric_containers(result):
+            if (
+                container.metric.model
+                and container.metric.model.lower() == model_name.lower()
+                and container.metric.worker_namespace == self.dynamo_namespace
+                and not math.isnan(container.value[1])
+            ):
+                matched = True
+                total += container.value[1]
+        return total if matched else None
+
     def _sum_frontend_metric(self, result, model_name: str) -> Optional[float]:
         if not result:
             return None
@@ -146,7 +185,7 @@ class PrometheusAPIClient:
             if (
                 container.metric.model
                 and container.metric.model.lower() == model_name.lower()
-                and container.metric.dynamo_namespace == self.dynamo_namespace
+                and self._namespace_matches(container.metric.dynamo_namespace)
                 and not math.isnan(container.value[1])
             ):
                 matched = True
@@ -219,7 +258,7 @@ class PrometheusAPIClient:
                     if (
                         container.metric.model
                         and container.metric.model.lower() == model_name.lower()
-                        and container.metric.dynamo_namespace == self.dynamo_namespace
+                        and self._namespace_matches(container.metric.dynamo_namespace)
                     ):
                         values.append(container.value[1])
                 if not values:
@@ -360,6 +399,21 @@ class PrometheusAPIClient:
         # use frontend-started requests so throughput planning sees offered load,
         # not only completed responses.
         try:
+            # Offered load must be attributed to this planner's group. The
+            # model-wide requests_started_total counts every group's traffic, so
+            # each planner would read the whole model's demand and over-scale.
+            worker_ns_metric = self._frontend_metric_name(
+                prometheus_names.frontend_service.WORKER_NAMESPACE_REQUESTS_STARTED_TOTAL
+            )
+            worker_ns_res = self.prom.custom_query(
+                query=f"increase({worker_ns_metric}[{interval}])"
+            )
+            worker_ns_count = self._sum_worker_namespace_metric(worker_ns_res, model_name)
+            if worker_ns_count is not None:
+                return worker_ns_count
+
+            # Frontend predates the per-namespace counter: fall back to the
+            # model-wide one, correct whenever the model has a single group.
             requests_started_metric = self._frontend_metric_name(
                 prometheus_names.frontend_service.REQUESTS_STARTED_TOTAL
             )

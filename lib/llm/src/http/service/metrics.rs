@@ -63,6 +63,42 @@ pub use crate::discovery::{WORKER_TYPE_DECODE, WORKER_TYPE_PREFILL};
 const UNSET_DP_RANK_LABEL: &str = "none";
 const ITL_LOCAL_FLUSH_TOKENS: u64 = 64;
 
+/// Offered load per worker namespace, counted at the moment a WorkerSet is
+/// selected -- before any queue or scheduler work, so a request later rejected
+/// with 529 still counts as demand.
+///
+/// With namespace grouping one frontend serves several worker namespaces
+/// (`<stem>--<group>`), while its own `dynamo_namespace` label is the model
+/// stem. Per-group planners therefore cannot attribute demand from the existing
+/// `requests_started_total`. This counter carries the selected group directly.
+///
+/// Ungrouped models emit the same series shape with their single namespace, so
+/// old and new frontends look alike to the planner.
+///
+/// Labels: model, worker_namespace
+pub static WORKER_NAMESPACE_REQUESTS_STARTED: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            format!(
+                "{}_{}",
+                name_prefix::FRONTEND,
+                frontend_service::WORKER_NAMESPACE_REQUESTS_STARTED_TOTAL
+            ),
+            "Requests attributed to the selected worker namespace at selection time",
+        ),
+        &["model", "worker_namespace"],
+    )
+    .expect("failed to create worker_namespace_requests_started_total")
+});
+
+/// Increment the per-namespace offered-load counter. Called from the WorkerSet
+/// selection path, which every serving entry point passes through exactly once.
+pub fn inc_worker_namespace_requests_started(model: &str, worker_namespace: &str) {
+    WORKER_NAMESPACE_REQUESTS_STARTED
+        .with_label_values(&[model, worker_namespace])
+        .inc();
+}
+
 /// Global Prometheus gauge for last observed TTFT per worker (in seconds)
 /// Labels: worker_id, dp_rank, worker_type
 pub static WORKER_LAST_TIME_TO_FIRST_TOKEN_GAUGE: LazyLock<GaugeVec> = LazyLock::new(|| {
@@ -123,6 +159,7 @@ pub static WORKER_LAST_INTER_TOKEN_LATENCY_GAUGE: LazyLock<GaugeVec> = LazyLock:
 /// # Errors
 /// Returns an error if the metrics are already registered with the registry.
 pub fn register_worker_timing_metrics(registry: &Registry) -> Result<(), prometheus::Error> {
+    registry.register(Box::new(WORKER_NAMESPACE_REQUESTS_STARTED.clone()))?;
     registry.register(Box::new(WORKER_LAST_TIME_TO_FIRST_TOKEN_GAUGE.clone()))?;
     registry.register(Box::new(WORKER_LAST_INPUT_SEQUENCE_TOKENS_GAUGE.clone()))?;
     registry.register(Box::new(WORKER_LAST_INTER_TOKEN_LATENCY_GAUGE.clone()))?;
