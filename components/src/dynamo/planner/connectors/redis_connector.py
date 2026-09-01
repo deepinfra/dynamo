@@ -45,6 +45,7 @@ import os
 import time
 
 import redis.asyncio as redis_asyncio
+from redis.asyncio.sentinel import Sentinel
 
 from dynamo.planner.config.defaults import SubComponentType, TargetReplica
 from dynamo.planner.connectors.base import PlannerConnector
@@ -98,13 +99,15 @@ class RedisConnector(PlannerConnector):
         self.model_name = model_name
         self.dynamo_namespace = dynamo_namespace
 
-        redis_url = redis_url or os.environ.get("DYN_REDIS_URL")
-        if not redis_url:
-            raise ValueError(
-                "redis_url is required for redis connector "
-                "(pass explicitly or set DYN_REDIS_URL)"
-            )
-        self._redis = redis_asyncio.from_url(redis_url, decode_responses=True)
+        # Two ways to connect, selected by which env is set:
+        #  - Sentinel (DYN_REDIS_SENTINELS): the client asks Sentinel for the
+        #    current master on connect and re-asks after a failover, so it keeps
+        #    working when the master moves. Use this for a self-run HA Redis.
+        #  - Direct URL (DYN_REDIS_URL / the redis_url arg): one fixed address,
+        #    for a single-node or externally-load-balanced Redis.
+        # Sentinel wins if both are set.
+        self._sentinel: Sentinel | None = None
+        self._redis = self._build_client(redis_url)
         self._closed = False
         # Curly braces are a Redis Cluster hash tag: only the portion inside
         # them is hashed to pick a shard, so every key for one deployment
@@ -113,6 +116,69 @@ class RedisConnector(PlannerConnector):
         # deployments sharing a model_name under different namespaces never
         # collide on the same key.
         self._key = f"{REDIS_KEY_PREFIX}:{{{self.dynamo_namespace}:{self.model_name}}}"
+
+    def _build_client(self, redis_url: str | None) -> "redis_asyncio.Redis":
+        sentinels = os.environ.get("DYN_REDIS_SENTINELS")
+        if sentinels:
+            return self._build_sentinel_client(sentinels)
+        redis_url = redis_url or os.environ.get("DYN_REDIS_URL")
+        if not redis_url:
+            raise ValueError(
+                "redis connector needs either DYN_REDIS_SENTINELS (Sentinel) "
+                "or DYN_REDIS_URL / the redis_url arg (direct)"
+            )
+        return redis_asyncio.from_url(redis_url, decode_responses=True)
+
+    def _build_sentinel_client(self, sentinels: str) -> "redis_asyncio.Redis":
+        master_name = os.environ.get("DYN_REDIS_MASTER_NAME")
+        if not master_name:
+            raise ValueError(
+                "DYN_REDIS_MASTER_NAME is required when DYN_REDIS_SENTINELS is set"
+            )
+        nodes: list[tuple[str, int]] = []
+        for entry in sentinels.split(","):
+            entry = entry.strip()
+            if not entry:
+                continue
+            host, sep, port = entry.rpartition(":")
+            if not sep:
+                raise ValueError(
+                    f"DYN_REDIS_SENTINELS entry {entry!r} must be host:port"
+                )
+            nodes.append((host, int(port)))
+        if not nodes:
+            raise ValueError("DYN_REDIS_SENTINELS is set but empty")
+
+        # Auth for the Sentinel connections themselves vs. the data (master)
+        # connections are separate credentials -- keep them apart.
+        sentinel_kwargs: dict[str, str] = {}
+        s_user = os.environ.get("DYN_REDIS_SENTINEL_USERNAME")
+        s_pass = os.environ.get("DYN_REDIS_SENTINEL_PASSWORD")
+        if s_user:
+            sentinel_kwargs["username"] = s_user
+        if s_pass:
+            sentinel_kwargs["password"] = s_pass
+
+        connection_kwargs: dict[str, object] = {
+            "decode_responses": True,
+            "db": int(os.environ.get("DYN_REDIS_DB", "0")),
+        }
+        d_user = os.environ.get("DYN_REDIS_USERNAME")
+        d_pass = os.environ.get("DYN_REDIS_PASSWORD")
+        if d_user:
+            connection_kwargs["username"] = d_user
+        if d_pass:
+            connection_kwargs["password"] = d_pass
+
+        self._sentinel = Sentinel(
+            nodes,
+            min_other_sentinels=0,
+            sentinel_kwargs=sentinel_kwargs or None,
+            **connection_kwargs,
+        )
+        # master_for returns a client that resolves the current master through
+        # Sentinel on each connection, so it survives failover without a restart.
+        return self._sentinel.master_for(master_name)
 
     async def async_init(self) -> None:
         """Nothing to do -- the Redis client connects lazily on first command."""
@@ -289,3 +355,6 @@ class RedisConnector(PlannerConnector):
             return
         self._closed = True
         await self._redis.aclose()
+        if self._sentinel is not None:
+            for s in self._sentinel.sentinels:
+                await s.aclose()
