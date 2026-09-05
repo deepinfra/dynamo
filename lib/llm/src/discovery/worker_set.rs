@@ -17,6 +17,7 @@ use crate::{
     discovery::{KvWorkerMonitor, allocator::AllocatorTrimOnDrop},
     kv_router::{EncoderRouter, KvRouter, PrefillRouter},
     model_card::ModelDeploymentCard,
+    preprocessor::OpenAIPreprocessor,
     types::{
         RealtimeBidirectionalEngine,
         generic::tensor::TensorStreamingEngine,
@@ -143,6 +144,11 @@ pub struct WorkerSet {
     card: ModelDeploymentCard,
 
     // Engines — each WorkerSet owns its own pipelines
+    /// Retained so callers can reuse this model's template and tokenizer instead of
+    /// building a second copy that can drift from the pipeline's.
+    pub(crate) chat_preprocessor: Option<Arc<OpenAIPreprocessor>>,
+    pub(crate) completions_preprocessor: Option<Arc<OpenAIPreprocessor>>,
+
     pub(crate) chat_engine: Option<OpenAIChatCompletionsStreamingEngine>,
     pub(crate) completions_engine: Option<OpenAICompletionsStreamingEngine>,
     pub(crate) embeddings_engine: Option<OpenAIEmbeddingsStreamingEngine>,
@@ -185,6 +191,8 @@ impl WorkerSet {
             endpoint_id: None,
             mdcsum,
             card,
+            chat_preprocessor: None,
+            completions_preprocessor: None,
             chat_engine: None,
             completions_engine: None,
             embeddings_engine: None,
@@ -391,6 +399,8 @@ impl WorkerSet {
             endpoint_id: self.endpoint_id.clone(),
             mdcsum,
             card,
+            chat_preprocessor: self.chat_preprocessor.clone(),
+            completions_preprocessor: self.completions_preprocessor.clone(),
             chat_engine: lora_context_engine(&self.chat_engine, &lora_name),
             completions_engine: lora_context_engine(&self.completions_engine, &lora_name),
             embeddings_engine: lora_context_engine(&self.embeddings_engine, &lora_name),
