@@ -13,28 +13,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Redis connector: publishes scaling decisions to Redis and reads back
+"""DeepInfra connector: publishes scaling decisions to Redis and reads back
 observed worker state, instead of talking to Kubernetes directly.
 
 Sibling to VirtualConnector for "hand the decision to a non-native
 environment," but with no etcd/nats/DistributedRuntime dependency -- just a
-Redis connection.
+Redis connection. Specialized to DeepInfra's model manager (not a generic
+upstream connector).
 
-Wire format: one Redis hash per deployment, key
-``{prefix}:{dynamo_namespace}:{model_name}``. Two deployments serving the
-same model_name under different namespaces get distinct keys -- necessary
-since Redis may be shared across more than one deployment. This connector
-owns the "desired" fields (``prefill``, ``decode``, ``updated_at``).
-An external actuator (not part of this repo) is expected to read those and,
-separately, write back "observed" fields (``prefill_active``,
-``decode_active``, ``prefill_stable``, ``decode_stable``, ``observed_at``)
-reflecting what it actually did. Distinct field names on both sides means
-neither side's write can clobber the other's fields, even sharing one key.
-The two ``*_stable`` fields are plain strings, ``"true"``/``"false"``
-(case-insensitive), not JSON booleans -- kept human-readable for anyone
-inspecting the key by hand.
+The planner publishes its per-tick decision to its own deployment hash
+``{prefix}:{dynamo_namespace}:{model_name}`` (the ``prefill``/``decode``
+desired counts), and separately translates the decode target to a power unit
+on DeepInfra's ``model:{model_name}`` hash (``target_power``), enrolling the
+name in the ``power_scaled_models`` set. The model manager's power realizer
+reads ``target_power`` and actuates workers, then writes the realized power
+back as ``committed_power`` on the same hash. ``get_actual_worker_counts``
+reads ``committed_power`` back and translates it to a worker count via the
+per-model ``power_coefficient``.
 
-If the external actuator never writes the observed fields -- before its
+If the model manager hasn't published ``committed_power`` yet -- before its
 first write-back, or because it doesn't track this at all --
 ``get_actual_worker_counts`` reads inactive/unstable defaults rather than
 raising or assuming a settled empty deployment.
@@ -48,7 +45,10 @@ import redis.asyncio as redis_asyncio
 from redis.asyncio.sentinel import Sentinel
 
 from dynamo.planner.config.defaults import SubComponentType, TargetReplica
-from dynamo.planner.connectors.base import PlannerConnector
+from dynamo.planner.connectors.base import (
+    PlannerConnector,
+    WorkerInfoProvider,
+)
 from dynamo.planner.errors import EmptyTargetReplicasError
 from dynamo.planner.monitoring.worker_info import (
     WorkerInfo,
@@ -61,8 +61,24 @@ logger = logging.getLogger(__name__)
 
 REDIS_KEY_PREFIX = os.environ.get("DYN_REDIS_KEY_PREFIX", "dynamo:planner:target")
 
+# DeepInfra model-catalog keys (mirror RedisModelCatalog in the backend).
+# The planner writes its target as a power unit on the model-name's ModelInfo
+# hash, and enrolls the name in the power-scaled set so the model manager's
+# power realizer discovers and actuates on it. The model manager writes the
+# realized power back as `committed_power` on the same hash, which this
+# connector reads as the actual worker count. See set_target_power /
+# set_committed_power in deepinfra/redis_models/redis_model_catalog.py.
+MODEL_KEY = "model:{%s}"
+POWER_SCALED = "power_scaled_models"
+# Power <-> instance translation. The per-model coefficient is read from the
+# model:{name} hash (`power_coefficient`) on each tick so config updates take
+# effect without a planner restart; POWER_COEFFICIENT is the fallback when the
+# field is absent. For now each worker is one power unit, so the translation
+# is a no-op; revisit when a config carries power != 1.
+POWER_COEFFICIENT = 1
 
-def _parse_non_negative_int(raw: dict[str, str], field: str) -> int:
+
+def _parse_nonnegative_int(raw: dict[str, str], field: str) -> int:
     """Parse one hash field as a non-negative int, defaulting to 0 if absent.
 
     Raises ValueError naming the offending field on a negative or otherwise
@@ -81,14 +97,45 @@ def _parse_non_negative_int(raw: dict[str, str], field: str) -> int:
     return parsed
 
 
-class RedisConnector(PlannerConnector):
-    """Publishes scaling decisions to Redis; reads observed state back from it."""
+def _parse_nonnegative_float(raw: dict[str, str], field: str) -> float | None:
+    """Parse one hash field as a non-negative float, or None if absent.
+
+    Unlike the int variant, absence is meaningful here: a missing field means
+    "no value published yet" (the caller decides how to treat that), not
+    "zero". Raises ValueError on a negative or otherwise invalid value.
+    """
+    value = raw.get(field)
+    if value is None:
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"redis field {field!r} is not a valid number: {value!r}"
+        ) from None
+    if parsed < 0:
+        raise ValueError(f"redis field {field!r} must not be negative, got {parsed}")
+    return parsed
+
+
+class DeepInfraConnector(PlannerConnector):
+    """Publishes scaling decisions to Redis; reads observed state back from it.
+
+    Specialized to DeepInfra's model manager: the planner writes its target as
+    a power unit on the model-name's ModelInfo hash (``target_power``) and
+    enrolls the name in the ``power_scaled_models`` set; the model manager's
+    power realizer reads that and actuates workers, then writes the realized
+    power back as ``committed_power`` on the same hash, which this connector
+    reads as the actual worker count. See set_target_power / set_committed_power
+    in deepinfra/redis_models/redis_model_catalog.py.
+    """
 
     def __init__(
         self,
         dynamo_namespace: str,
         model_name: str | None = None,
         redis_url: str | None = None,
+        worker_info_provider: WorkerInfoProvider | None = None,
     ) -> None:
         if not model_name:
             raise ValueError("Model name is required for redis connector")
@@ -98,6 +145,11 @@ class RedisConnector(PlannerConnector):
         # distinct, differently-cased model names onto the same Redis key.
         self.model_name = model_name
         self.dynamo_namespace = dynamo_namespace
+        # Optional source of runtime WorkerInfo/MDC, wired in by
+        # construct_environment (a RuntimeFpmProvider). When present,
+        # get_worker_info delegates to it so the planner reads real worker
+        # capabilities (e.g. KV cache size) from MDC instead of defaults.
+        self.worker_info_provider = worker_info_provider
 
         # Two ways to connect, selected by which env is set:
         #  - Sentinel (DYN_REDIS_SENTINELS): the client asks Sentinel for the
@@ -183,12 +235,30 @@ class RedisConnector(PlannerConnector):
     async def async_init(self) -> None:
         """Nothing to do -- the Redis client connects lazily on first command."""
 
+    def get_worker_runtime_namespace(self, base_dynamo_namespace: str) -> str:
+        # Required so the planner wires up the RuntimeFpmProvider (forward-pass
+        # metrics subscription). Workers live under the same dynamo namespace.
+        return base_dynamo_namespace
+
     async def _read_desired_counts(self) -> tuple[int, int]:
         raw = await self._redis.hgetall(self._key)
         return (
-            _parse_non_negative_int(raw, "prefill"),
-            _parse_non_negative_int(raw, "decode"),
+            _parse_nonnegative_int(raw, "prefill"),
+            _parse_nonnegative_int(raw, "decode"),
         )
+
+    async def _read_power_coefficient(self) -> float:
+        """Read the per-model power coefficient from the model:{name} hash.
+
+        The coefficient is the number of power units one worker consumes; the
+        planner uses it to translate worker counts <-> power units. It is read
+        on each tick (not cached at init) so a config update takes effect
+        without a planner restart. Falls back to ``POWER_COEFFICIENT`` (1) when
+        the field is absent -- e.g. before the backend starts writing it.
+        """
+        raw = await self._redis.hgetall(MODEL_KEY % self.model_name)
+        coefficient = _parse_nonnegative_float(raw, "power_coefficient")
+        return coefficient if coefficient is not None else float(POWER_COEFFICIENT)
 
     async def add_component(
         self, sub_component_type: SubComponentType, blocking: bool = True
@@ -267,6 +337,34 @@ class RedisConnector(PlannerConnector):
             return
         mapping["updated_at"] = time.time()
         await self._redis.hset(self._key, mapping=mapping)
+        await self._write_target_power(mapping)
+
+    async def _write_target_power(self, mapping: dict[str, int | float]) -> None:
+        """Publish the tick's target to DeepInfra's model-name power field.
+
+        DeepInfra scales power-scaled names by ``ModelInfo.target_power`` (the
+        model manager's power realizer reads it and actuates workers). The
+        planner thinks in instance counts; translate to power here using the
+        per-model ``power_coefficient`` (read from the model hash each tick),
+        so the MM side only ever talks power.
+
+        Mirrors ``RedisModelCatalog.set_target_power``: write ``target_power``
+        into the ``model:{model_name}`` hash and enroll the name in the
+        ``power_scaled_models`` set so the realizer discovers it.
+        """
+        # In agg mode the decode target is the aggregated worker count; in
+        # disagg the decode target is the decode pool. Prefer decode as the
+        # power target (the aggregated engine is the capacity unit).
+        decode = mapping.get("decode")
+        if decode is None:
+            return
+        coefficient = await self._read_power_coefficient()
+        target_power = int(decode * coefficient)
+        model_key = MODEL_KEY % self.model_name
+        pipe = self._redis.pipeline()
+        pipe.hset(model_key, "target_power", target_power)
+        pipe.sadd(POWER_SCALED, self.model_name)
+        await pipe.execute()
 
     async def validate_deployment(
         self,
@@ -305,12 +403,19 @@ class RedisConnector(PlannerConnector):
         sub_component_type: SubComponentType,
         backend: str = "vllm",
     ) -> WorkerInfo:
-        """No live discovery source for this connector -- always defaults.
+        """Resolve worker capabilities from the runtime MDC when a provider is
+        wired in, else fall back to defaults.
 
-        ``VirtualConnector`` gets an MDC source wired in after construction
-        (a ``VirtualConnector``-specific hook in ``construct_environment``);
-        this connector never receives one and always falls back to defaults.
+        ``construct_environment`` supplies a ``RuntimeFpmProvider`` (the same
+        source used for forward-pass metrics), so the planner reads real worker
+        capabilities -- e.g. KV cache size -- from MDC, exactly like
+        ``VirtualConnector``. Without a provider (e.g. a bare connector with no
+        runtime), fall back to defaults.
         """
+        if self.worker_info_provider is not None:
+            return self.worker_info_provider.get_worker_info(
+                sub_component_type, backend
+            )
         info = build_worker_info_from_defaults(backend, sub_component_type)
         info.model_name = self.model_name
         return info
@@ -322,30 +427,41 @@ class RedisConnector(PlannerConnector):
     ) -> tuple[int, int, bool]:
         """Read observed state written back by the external actuator.
 
+        The model manager writes the realized power as ``committed_power`` on
+        the ``model:{model_name}`` hash (see ``set_committed_power`` in the
+        backend). Committed power counts the pods the model manager has
+        committed to -- BOOT/PENDING/ACTIVE -- not just the ones currently
+        serving; that is the right figure for the planner to compare against
+        its own target, since it is the capacity the control plane is actually
+        standing up. Translate power back to a worker count here via the
+        per-model ``power_coefficient`` (read from the same hash, so no extra
+        round-trip).
+
         Per the ``PlannerConnector`` contract, a component whose name arg is
         ``None`` (not required by this planner mode) reports 0 and does not
         count against the returned ``stable`` flag -- only roles actually in
         play for this planner instance affect it.
 
-        If the external actuator hasn't published observed counts for this
-        model -- before its first write-back, or because it doesn't track
-        this at all -- missing fields default to inactive/unstable: fail
-        closed as "still converging," never a false "settled empty."
+        If the model manager hasn't published ``committed_power`` yet --
+        before its first write-back, or because it doesn't track this at all
+        -- the field is absent and we fail closed as "still converging,"
+        never a false "settled empty."
         """
-        raw = await self._redis.hgetall(self._key)
+        raw = await self._redis.hgetall(MODEL_KEY % self.model_name)
+        committed = _parse_nonnegative_float(raw, "committed_power")
+        if committed is None:
+            # No observed state yet: report inactive/unstable so the planner
+            # keeps converging rather than assuming a settled deployment.
+            return 0, 0, False
 
-        prefill_active = 0
-        decode_active = 0
-        stable = True
-
-        if prefill_component_name is not None:
-            prefill_active = _parse_non_negative_int(raw, "prefill_active")
-            stable = stable and raw.get("prefill_stable", "").lower() == "true"
-        if decode_component_name is not None:
-            decode_active = _parse_non_negative_int(raw, "decode_active")
-            stable = stable and raw.get("decode_stable", "").lower() == "true"
-
-        return prefill_active, decode_active, stable
+        # In agg mode the decode target is the aggregated worker count (the
+        # capacity unit the planner sizes against), so the committed power
+        # maps onto decode. Prefill is not a separate role in agg mode.
+        coefficient = _parse_nonnegative_float(raw, "power_coefficient")
+        coefficient = coefficient if coefficient is not None else float(POWER_COEFFICIENT)
+        decode = int(committed / coefficient)
+        prefill = 0 if prefill_component_name is None else decode
+        return prefill, decode, True
 
     async def shutdown(self) -> None:
         """Release the Redis client. Idempotent -- safe to call more than

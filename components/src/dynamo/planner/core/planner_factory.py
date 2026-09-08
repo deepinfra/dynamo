@@ -9,7 +9,7 @@ from dynamo.planner.config.planner_config import PlannerConfig
 from dynamo.planner.connectors.base import PlannerConnector, WorkerInfoProvider
 from dynamo.planner.connectors.global_planner import GlobalPlannerConnector
 from dynamo.planner.connectors.kubernetes import KubernetesConnector
-from dynamo.planner.connectors.redis_connector import RedisConnector
+from dynamo.planner.connectors.deepinfra_connector import DeepInfraConnector
 from dynamo.planner.connectors.virtual import VirtualConnector
 from dynamo.planner.environment.base import PlannerEnvironmentImpl
 from dynamo.planner.environment.interface import PlannerEnvironment
@@ -66,10 +66,11 @@ def construct_connector(
             worker_info_provider=worker_info_provider,
             model_name=config.model_name,
         )
-    if config.environment == "redis":
-        return RedisConnector(
+    if config.environment == "deepinfra":
+        return DeepInfraConnector(
             dynamo_namespace=config.namespace,
             model_name=config.model_name,
+            worker_info_provider=worker_info_provider,
         )
     raise ValueError(f"Invalid environment: {config.environment}")
 
@@ -82,9 +83,11 @@ def construct_environment(
     runtime: Optional[DistributedRuntime] = None,
 ) -> PlannerEnvironment:
     fpm_provider: Optional[RuntimeFpmProvider] = None
-    if config.environment == "virtual":
+    if config.environment in ("virtual", "deepinfra"):
         if runtime is None:
-            raise ValueError("runtime is required for environment='virtual'")
+            raise ValueError(
+                f"runtime is required for environment='{config.environment}'"
+            )
         fpm_provider = RuntimeFpmProvider(
             require_prefill=require_prefill,
             require_decode=require_decode,

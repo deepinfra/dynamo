@@ -13,12 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from dynamo.planner.config.defaults import SubComponentType, TargetReplica
-from dynamo.planner.connectors.redis_connector import RedisConnector
+from dynamo.planner.connectors.deepinfra_connector import DeepInfraConnector
 from dynamo.planner.errors import EmptyTargetReplicasError
 
 pytestmark = [
@@ -40,10 +41,10 @@ def mock_redis_client():
 @pytest.fixture
 def connector(mock_redis_client):
     with patch(
-        "dynamo.planner.connectors.redis_connector.redis_asyncio.from_url",
+        "dynamo.planner.connectors.deepinfra_connector.redis_asyncio.from_url",
         return_value=mock_redis_client,
     ):
-        return RedisConnector(
+        return DeepInfraConnector(
             "test-namespace",
             model_name="test-model",
             redis_url="redis://localhost:6379",
@@ -52,7 +53,7 @@ def connector(mock_redis_client):
 
 def test_requires_model_name():
     with pytest.raises(ValueError, match="Model name is required"):
-        RedisConnector(
+        DeepInfraConnector(
             "test-namespace", model_name=None, redis_url="redis://localhost:6379"
         )
 
@@ -60,16 +61,16 @@ def test_requires_model_name():
 def test_requires_redis_url(monkeypatch):
     monkeypatch.delenv("DYN_REDIS_URL", raising=False)
     with pytest.raises(ValueError, match="redis_url is required"):
-        RedisConnector("test-namespace", model_name="test-model", redis_url=None)
+        DeepInfraConnector("test-namespace", model_name="test-model", redis_url=None)
 
 
 def test_redis_url_falls_back_to_env(mock_redis_client, monkeypatch):
     monkeypatch.setenv("DYN_REDIS_URL", "redis://from-env:6379")
     with patch(
-        "dynamo.planner.connectors.redis_connector.redis_asyncio.from_url",
+        "dynamo.planner.connectors.deepinfra_connector.redis_asyncio.from_url",
         return_value=mock_redis_client,
     ) as mock_from_url:
-        RedisConnector("test-namespace", model_name="test-model")
+        DeepInfraConnector("test-namespace", model_name="test-model")
         mock_from_url.assert_called_once_with(
             "redis://from-env:6379", decode_responses=True
         )
@@ -81,13 +82,13 @@ def test_key_uses_hash_tag_on_namespace_and_model_name(connector):
 
 def test_key_isolates_same_model_name_across_namespaces(mock_redis_client):
     with patch(
-        "dynamo.planner.connectors.redis_connector.redis_asyncio.from_url",
+        "dynamo.planner.connectors.deepinfra_connector.redis_asyncio.from_url",
         return_value=mock_redis_client,
     ):
-        a = RedisConnector(
+        a = DeepInfraConnector(
             "namespace-a", model_name="shared-model", redis_url="redis://localhost:6379"
         )
-        b = RedisConnector(
+        b = DeepInfraConnector(
             "namespace-b", model_name="shared-model", redis_url="redis://localhost:6379"
         )
     assert a._key != b._key
@@ -103,10 +104,10 @@ def test_model_name_case_is_preserved(mock_redis_client):
     case -- and doing so risks merging two distinct, differently-cased
     model names onto the same Redis key."""
     with patch(
-        "dynamo.planner.connectors.redis_connector.redis_asyncio.from_url",
+        "dynamo.planner.connectors.deepinfra_connector.redis_asyncio.from_url",
         return_value=mock_redis_client,
     ):
-        connector = RedisConnector(
+        connector = DeepInfraConnector(
             "test-namespace",
             model_name="Some-Mixed-Case-Model",
             redis_url="redis://localhost:6379",
@@ -123,6 +124,34 @@ def test_get_gpu_counts_returns_none_none(connector):
 def test_get_worker_info_uses_defaults(connector):
     info = connector.get_worker_info(SubComponentType.PREFILL, backend="vllm")
     assert info.model_name == "test-model"
+
+
+def test_get_worker_info_delegates_to_provider_when_wired(mock_redis_client):
+    """When construct_environment wires in a worker_info_provider (a
+    RuntimeFpmProvider), get_worker_info must delegate to it so the planner
+    reads real worker capabilities (e.g. KV cache size) from MDC instead of
+    defaults."""
+    provider = SimpleNamespace(
+        get_worker_info=lambda st, backend: SimpleNamespace(
+            model_name="from-provider",
+            total_kv_blocks=999,
+            kv_cache_block_size=2,
+        )
+    )
+    with patch(
+        "dynamo.planner.connectors.deepinfra_connector.redis_asyncio.from_url",
+        return_value=mock_redis_client,
+    ):
+        connector = DeepInfraConnector(
+            "test-namespace",
+            model_name="test-model",
+            redis_url="redis://localhost:6379",
+            worker_info_provider=provider,
+        )
+    info = connector.get_worker_info(SubComponentType.DECODE, backend="vllm")
+    assert info.model_name == "from-provider"
+    assert info.total_kv_blocks == 999
+    assert info.kv_cache_block_size == 2
 
 
 @pytest.mark.asyncio
@@ -182,6 +211,53 @@ async def test_set_component_replicas_negative_raises(connector, mock_redis_clie
     mock_redis_client.hset.assert_not_called()
 
 
+class TestWriteTargetPower:
+    """_write_target_power translates the decode worker count to target_power
+    on the model:{name} hash using the per-model power_coefficient, and
+    enrolls the name in the power_scaled_models set."""
+
+    @pytest.mark.asyncio
+    async def test_writes_target_power_from_decode_with_default_coefficient(
+        self, connector, mock_redis_client
+    ):
+        # hgetall returns {} -> power_coefficient absent -> falls back to 1
+        mock_redis_client.hgetall.return_value = {}
+        await connector._write_target_power({"decode": 5})
+        # target_power = 5 * 1 = 5, written via the pipeline
+        pipe = mock_redis_client.pipeline.return_value
+        pipe.hset.assert_called_once_with(
+            "model:{test-model}", "target_power", 5
+        )
+
+    @pytest.mark.asyncio
+    async def test_writes_target_power_using_power_coefficient(
+        self, connector, mock_redis_client
+    ):
+        mock_redis_client.hgetall.return_value = {"power_coefficient": "2"}
+        await connector._write_target_power({"decode": 5})
+        # target_power = 5 * 2 = 10
+        pipe = mock_redis_client.pipeline.return_value
+        pipe.hset.assert_called_once_with(
+            "model:{test-model}", "target_power", 10
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_decode_does_not_write_target_power(
+        self, connector, mock_redis_client
+    ):
+        await connector._write_target_power({"prefill": 3})
+        mock_redis_client.pipeline.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_enrolls_in_power_scaled_set(
+        self, connector, mock_redis_client
+    ):
+        mock_redis_client.hgetall.return_value = {}
+        await connector._write_target_power({"decode": 5})
+        pipe = mock_redis_client.pipeline.return_value
+        pipe.sadd.assert_called_once_with("power_scaled_models", "test-model")
+
+
 @pytest.mark.asyncio
 async def test_add_component_increments_from_current(connector, mock_redis_client):
     mock_redis_client.hgetall.return_value = {"prefill": "2", "decode": "1"}
@@ -234,18 +310,18 @@ class TestShutdown:
 
 
 class TestGetActualWorkerCounts:
-    """get_actual_worker_counts reads observed state a companion process
-    (not part of this repo) writes back into the same hash. If it hasn't
-    published anything yet -- or never does -- missing fields must default
-    to inactive/unstable, and a component whose name arg is None must
-    report 0 and not count against the returned stable flag.
+    """get_actual_worker_counts reads the model manager's committed_power back
+    from the model:{name} hash and translates it to a worker count via the
+    per-model power_coefficient. If the MM hasn't published committed_power
+    yet -- or never does -- the field is absent and we fail closed as
+    inactive/unstable, never a false "settled empty".
     """
 
     @pytest.mark.asyncio
-    async def test_no_observed_fields_defaults_to_unstable(
+    async def test_no_committed_power_defaults_to_unstable(
         self, connector, mock_redis_client
     ):
-        mock_redis_client.hgetall.return_value = {"prefill": "3", "decode": "5"}
+        mock_redis_client.hgetall.return_value = {}
         prefill, decode, stable = await connector.get_actual_worker_counts(
             prefill_component_name="prefill-worker",
             decode_component_name="decode-worker",
@@ -253,64 +329,54 @@ class TestGetActualWorkerCounts:
         assert (prefill, decode, stable) == (0, 0, False)
 
     @pytest.mark.asyncio
-    async def test_reads_observed_fields_when_present(
+    async def test_reads_committed_power_when_present(
+        self, connector, mock_redis_client
+    ):
+        mock_redis_client.hgetall.return_value = {"committed_power": "5"}
+        prefill, decode, stable = await connector.get_actual_worker_counts(
+            prefill_component_name="prefill-worker",
+            decode_component_name="decode-worker",
+        )
+        # coefficient defaults to 1 -> committed power 5 == 5 workers
+        assert (prefill, decode, stable) == (5, 5, True)
+
+    @pytest.mark.asyncio
+    async def test_uses_power_coefficient_to_convert_to_count(
         self, connector, mock_redis_client
     ):
         mock_redis_client.hgetall.return_value = {
-            "prefill_active": "3",
-            "decode_active": "5",
-            "prefill_stable": "true",
-            "decode_stable": "true",
+            "committed_power": "10",
+            "power_coefficient": "2",
         }
         prefill, decode, stable = await connector.get_actual_worker_counts(
             prefill_component_name="prefill-worker",
             decode_component_name="decode-worker",
         )
-        assert (prefill, decode, stable) == (3, 5, True)
+        # 10 power units / 2 power-per-worker = 5 workers
+        assert (prefill, decode, stable) == (5, 5, True)
 
     @pytest.mark.asyncio
-    async def test_either_role_unstable_makes_the_whole_result_unstable(
+    async def test_component_name_none_reports_zero(
         self, connector, mock_redis_client
     ):
-        mock_redis_client.hgetall.return_value = {
-            "prefill_active": "3",
-            "decode_active": "5",
-            "prefill_stable": "true",
-            "decode_stable": "false",
-        }
-        _, _, stable = await connector.get_actual_worker_counts(
-            prefill_component_name="prefill-worker",
-            decode_component_name="decode-worker",
-        )
-        assert stable is False
-
-    @pytest.mark.asyncio
-    async def test_component_name_none_reports_zero_and_excluded_from_stable(
-        self, connector, mock_redis_client
-    ):
-        """Decode isn't required by this planner mode (name arg is None):
-        its observed values must not appear in the count or gate stability,
-        even though the hash happens to carry stale/irrelevant decode data.
+        """Decode isn't required by this planner mode (name arg is None): it
+        reports 0 and does not gate stability, even though committed_power is
+        present. In agg mode prefill is not a separate role, so a None prefill
+        also reports 0.
         """
-        mock_redis_client.hgetall.return_value = {
-            "prefill_active": "3",
-            "prefill_stable": "true",
-            "decode_active": "99",
-            "decode_stable": "false",
-        }
+        mock_redis_client.hgetall.return_value = {"committed_power": "5"}
         prefill, decode, stable = await connector.get_actual_worker_counts(
             prefill_component_name="prefill-worker",
             decode_component_name=None,
         )
-        assert (prefill, decode, stable) == (3, 0, True)
+        assert (prefill, decode, stable) == (5, 0, True)
 
     @pytest.mark.asyncio
-    async def test_negative_observed_value_raises(self, connector, mock_redis_client):
-        mock_redis_client.hgetall.return_value = {
-            "prefill_active": "-2",
-            "prefill_stable": "true",
-        }
-        with pytest.raises(ValueError, match="'prefill_active'.*must not be negative"):
+    async def test_negative_committed_power_raises(
+        self, connector, mock_redis_client
+    ):
+        mock_redis_client.hgetall.return_value = {"committed_power": "-2"}
+        with pytest.raises(ValueError, match="'committed_power'.*must not be negative"):
             await connector.get_actual_worker_counts(
                 prefill_component_name="prefill-worker",
                 decode_component_name=None,

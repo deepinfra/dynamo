@@ -101,6 +101,40 @@ def test_construct_environment_binds_namespace_without_runtime():
     fpm_provider_class.assert_not_called()
 
 
+def test_construct_environment_deepinfra_wires_worker_info_provider():
+    """The deepinfra environment must get a RuntimeFpmProvider wired
+    into the connector so get_worker_info reads real worker capabilities from
+    MDC instead of defaults."""
+    connector = MagicMock()
+    runtime = MagicMock()
+    with (
+        patch(
+            "dynamo.planner.core.planner_factory.construct_connector",
+            return_value=connector,
+        ) as construct_connector_mock,
+        patch(
+            "dynamo.planner.core.planner_factory.RuntimeFpmProvider"
+        ) as fpm_provider_class,
+        patch(
+            "dynamo.planner.core.planner_factory.PrometheusTrafficProvider"
+        ) as traffic_provider_class,
+    ):
+        construct_environment(
+            config=_config(environment="deepinfra"),
+            runtime=runtime,
+            require_prefill=True,
+            require_decode=True,
+        )
+
+    # The connector must be constructed with the RuntimeFpmProvider as its
+    # worker_info_provider.
+    assert construct_connector_mock.call_args.kwargs["worker_info_provider"] is (
+        fpm_provider_class.return_value
+    )
+    # The provider must be bound to the environment's namespace source.
+    assert fpm_provider_class.return_value.bind_sources.called
+
+
 @pytest.mark.parametrize("global_planner_namespace", [None, ""])
 def test_global_planner_namespace_uses_explicit_runtime_validation(
     global_planner_namespace,
