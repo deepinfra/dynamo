@@ -59,8 +59,12 @@ class LoadScalingMixin:
     _last_suggested_p: int
     _last_suggested_d: int
     _last_real_fpm: dict
+    _all_queued_streak_p: int
     _confirm_ticks: dict
     _last_up_tick: dict
+    _reactive_floor_p: int
+    _reactive_floor_bump_tick: int
+    _load_tick_counter: int
 
     def _confirm_proposal(
         self,
@@ -296,8 +300,36 @@ class LoadScalingMixin:
             else ScalingDecision(num_decode=desired)
         )
 
+    def _decay_reactive_floor(self) -> None:
+        """DEEPINFRA: reactive high-water floor bookkeeping (per load tick).
+
+        The all-engines-queued force-up records the level the traffic's burst
+        tail demonstrably needed (see _prefill_load_decision). Without a
+        floor, mean-wait sizing (Erlang-C or consolidation) keeps pulling the
+        fleet back below that level and the force-up refires — observed
+        2026-07-06: a ~15min 2<->3 limit cycle (59 force-ups in 4h). The floor
+        decays one step per ``reactive_floor_decay_ticks`` quiet ticks, so a
+        genuinely calm period releases the pods.
+        """
+        self._load_tick_counter += 1
+        decay = self._config.reactive_floor_decay_ticks
+        if decay <= 0:
+            self._reactive_floor_p = 0
+            return
+        if (
+            self._reactive_floor_p > 0
+            and self._load_tick_counter - self._reactive_floor_bump_tick >= decay
+        ):
+            self._reactive_floor_p -= 1
+            self._reactive_floor_bump_tick = self._load_tick_counter
+            logger.info(
+                "Reactive prefill floor decayed to %d (no force-up for %d ticks)",
+                self._reactive_floor_p, decay,
+            )
+
     def _advance_load_disagg(self, obs: FpmObservations) -> Optional[ScalingDecision]:
         p_stats, d_stats = obs.prefill, obs.decode
+        self._decay_reactive_floor()
 
         if not p_stats and not d_stats:
             logger.warning("No FPM data for either prefill or decode, skipping")
@@ -374,6 +406,9 @@ class LoadScalingMixin:
         if self._config.enable_throughput_scaling:
             final_p = max(final_p, self._throughput_lower_bound_p)
             final_d = max(final_d, self._throughput_lower_bound_d)
+        # DEEPINFRA: reactive high-water floor — hold the level recent
+        # force-ups proved necessary (decays in _decay_reactive_floor).
+        final_p = max(final_p, self._reactive_floor_p)
         post_floor_p, post_floor_d = final_p, final_d
 
         final_p = max(final_p, self._config.min_endpoint)
@@ -620,8 +655,10 @@ class LoadScalingMixin:
         # excluded from the safety-margin budget.
         can_scale_down = num_workers > 1
         consolidation_refused = False
+        queued_per_engine: list[int] = []
         for label, group in self._prefill_regression.query_groups(fpm_stats):
             queued = max(fpm.queued_requests.sum_prefill_tokens for fpm in group)
+            queued_per_engine.append(queued)
             est = self._prefill_regression.estimate_queued_prefill_time(
                 group,
                 max_num_batched_tokens=max_tokens,
@@ -645,11 +682,21 @@ class LoadScalingMixin:
                     queue_scale=0.0,
                 )
                 if t_own_s is None:
+                    logger.info(
+                        f"Prefill engine {label}: consolidation check skipped: "
+                        f"t_own (queue_scale=0) eval returned None"
+                    )
                     can_scale_down = False
                     continue
                 t_own_ms = t_own_s * 1000
                 queue_budget_ms = (self._config.ttft_ms - t_own_ms) * sensitivity
                 if queue_budget_ms <= 0:
+                    logger.info(
+                        f"Prefill engine {label}: consolidation check (budget): "
+                        f"REFUSE — t_own={t_own_ms:.2f}ms already at/over "
+                        f"ttft_sla={self._config.ttft_ms:.1f}ms × sensitivity={sensitivity:.2f}, "
+                        f"queue_budget={queue_budget_ms:.2f}ms (<= 0)"
+                    )
                     can_scale_down = False
                     consolidation_refused = True
                     continue
@@ -660,15 +707,71 @@ class LoadScalingMixin:
                     queue_scale=consolidation,
                 )
                 if post_est is None:
+                    logger.info(
+                        f"Prefill engine {label}: consolidation check skipped: "
+                        f"post_est (queue_scale={consolidation:.2f}) eval returned None"
+                    )
                     can_scale_down = False
                 else:
                     queue_induced_ms = post_est * 1000 - t_own_ms
-                    if queue_induced_ms >= queue_budget_ms:
+                    queue_refuse = queue_induced_ms >= queue_budget_ms
+                    logger.info(
+                        f"Prefill engine {label}: consolidation check (queue): "
+                        f"t_own={t_own_ms:.2f}ms, post_est={post_est * 1000:.2f}ms, "
+                        f"queue_induced={queue_induced_ms:.2f}ms, "
+                        f"queue_budget={queue_budget_ms:.2f}ms "
+                        f"(ttft_sla={self._config.ttft_ms:.1f}ms × sensitivity={sensitivity:.2f}), "
+                        f"result={'REFUSE' if queue_refuse else 'pass'}"
+                    )
+                    if queue_refuse:
                         can_scale_down = False
                         consolidation_refused = True
 
         if estimates:
             self._diag_estimated_ttft_ms = max(estimates)
+
+        # Every worker is queuing prefill work → force scale-up regardless of
+        # TTFT projection. When the router has parked non-zero queue on every
+        # engine, the fleet has no spare capacity to absorb the next request
+        # without adding latency, even if the current TTFT estimate happens
+        # to fall under SLA.
+        #
+        # DEEPINFRA: persistence-gated. Instantaneous all-engines-queued is
+        # routine transient queueing at moderate utilization with bursty
+        # arrivals (observed 2026-07-03: ~1-3s of queued work on each engine
+        # every ~15min at rho~0.6 drove a 3<->4 boot/kill limit cycle once
+        # Erlang-C sizing removed the static over-provision that had masked
+        # it). A genuine capacity shortage keeps queues on every engine for
+        # many consecutive ticks; a burst clears in one or two.
+        if (
+            num_workers > 1
+            and len(queued_per_engine) == num_workers
+            and all(q > 0 for q in queued_per_engine)
+        ):
+            self._all_queued_streak_p += 1
+            needed = self._config.prefill_force_up_persistence_ticks
+            if self._all_queued_streak_p >= needed:
+                logger.info(
+                    f"Prefill: all {num_workers} engines have queued prefill "
+                    f"work for {self._all_queued_streak_p} consecutive ticks "
+                    f"(queued={queued_per_engine}), forcing scale-up to "
+                    f"{num_workers + 1}"
+                )
+                self._diag_load_reason = "scale_up"
+                # Record the level the burst tail demonstrably needed so
+                # mean-wait sizing can't immediately pull the fleet back
+                # below it (decays in _decay_reactive_floor).
+                if num_workers + 1 > self._reactive_floor_p:
+                    self._reactive_floor_p = num_workers + 1
+                self._reactive_floor_bump_tick = self._load_tick_counter
+                return num_workers + 1
+            logger.info(
+                f"Prefill: all {num_workers} engines have queued prefill work "
+                f"(queued={queued_per_engine}); persistence "
+                f"{self._all_queued_streak_p}/{needed}, not forcing yet"
+            )
+        else:
+            self._all_queued_streak_p = 0
 
         decision = self._scale_decision(
             estimates,

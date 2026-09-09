@@ -125,10 +125,18 @@ class PlannerScalingState(LoadScalingMixin, ThroughputScalingMixin):
         )
         self._last_suggested_p: int = 0
         self._last_suggested_d: int = 0
-        # DEEPINFRA: anti-flap state. Per-component tick/last-up bookkeeping
-        # for the post-scale-up down cooldown.
+        # DEEPINFRA: anti-flap state. Streak counter for the all-engines-
+        # queued force-up (persistence gate) and per-component tick/last-up
+        # bookkeeping for the post-scale-up down cooldown.
+        self._all_queued_streak_p: int = 0
         self._confirm_ticks: dict[str, int] = {}
         self._last_up_tick: dict[str, int] = {}
+        # DEEPINFRA: reactive high-water floor — level the burst tail proved
+        # necessary via force-ups; decays when force-ups stop (see
+        # _decay_reactive_floor).
+        self._reactive_floor_p: int = 0
+        self._reactive_floor_bump_tick: int = 0
+        self._load_tick_counter: int = 0
 
         # DEEPINFRA: most recent NON-IDLE FPM per (worker_id, dp_rank), used to
         # paper over TRT-LLM's polling-iter snapshot artifact. The FPM publish
