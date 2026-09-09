@@ -103,14 +103,20 @@ class PlannerScalingState(LoadScalingMixin, ThroughputScalingMixin):
         self._throughput_lower_bound_p: int = 1
         self._throughput_lower_bound_d: int = 1
 
-        # DEEPINFRA: N-tick proposal-confirmation buffer (re-added; dropped in
-        # the v2 rebase). Store the last N *proposed* replica counts per
-        # component and only emit a new suggestion when every entry in a full
-        # buffer is unanimously higher or unanimously lower than the planner's
-        # current commitment (`_last_suggested_*`, latched to observed on the
-        # first tick) — debounces noisy single-tick TTFT/ITL estimates and
-        # transient FPM-staleness flaps. Set to 1 to disable.
+        # DEEPINFRA: asymmetric proposal-confirmation buffer (re-added; dropped
+        # in the v2 rebase). Stores the last N *proposed* replica counts per
+        # component. Scale-DOWN needs every entry of a full buffer strictly
+        # below the commitment (`_last_suggested_*`, latched to observed on the
+        # first tick) and emits max(buffer) — debounces noisy single-tick
+        # TTFT/ITL estimates and transient FPM-staleness flaps. Scale-UP only
+        # needs the last `_scaling_confirmation_ticks_up` proposals above the
+        # commitment and emits their minimum: surge under-provisioning is paid
+        # in user-visible queueing, and the throughput lower bound feeding the
+        # proposals is already 30s-smoothed (2026-07-02 20:43Z breach: the
+        # symmetric gate held commit=5-6 for ~6min against a bound of 8-10).
+        # Set both to 1 to disable.
         self._scaling_confirmation_ticks: int = 6
+        self._scaling_confirmation_ticks_up: int = 2
         self._proposed_buffer_p: deque[int] = deque(
             maxlen=self._scaling_confirmation_ticks
         )
@@ -119,6 +125,10 @@ class PlannerScalingState(LoadScalingMixin, ThroughputScalingMixin):
         )
         self._last_suggested_p: int = 0
         self._last_suggested_d: int = 0
+        # DEEPINFRA: anti-flap state. Per-component tick/last-up bookkeeping
+        # for the post-scale-up down cooldown.
+        self._confirm_ticks: dict[str, int] = {}
+        self._last_up_tick: dict[str, int] = {}
 
         # DEEPINFRA: most recent NON-IDLE FPM per (worker_id, dp_rank), used to
         # paper over TRT-LLM's polling-iter snapshot artifact. The FPM publish
