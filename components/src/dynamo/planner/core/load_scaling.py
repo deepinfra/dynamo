@@ -555,6 +555,51 @@ class LoadScalingMixin:
         if estimates:
             self._diag_estimated_itl_ms = max(estimates)
 
+        # DEEPINFRA: KV saturation scale-up trigger. The ITL regression only
+        # sees in-batch decode time, so an engine running 30 active decodes
+        # at 25ms ITL looks "healthy" even when many more requests are
+        # queued with their KV reserved-but-transferring (router
+        # over-commit; disagg-generation pending states balloon;
+        # gpu_cache_usage hits 1.0). The consolidation check above catches
+        # the survivor-after-scale-down case but not *current*
+        # over-commitment. If every decode engine's combined sched+queued
+        # KV breaches the saturation threshold, force scale-up regardless
+        # of ITL. Threshold configurable via
+        # PlannerConfig.decode_kv_saturation_threshold (default 0.9).
+        threshold = self._config.decode_kv_saturation_threshold
+        if (
+            threshold is not None
+            and threshold > 0.0
+            and max_kv is not None
+            and max_kv > 0
+            and num_workers > 0
+            and fpm_stats
+        ):
+            saturated = True
+            max_util = 0.0
+            for _label, group in self._decode_regression.query_groups(fpm_stats):
+                used = max(
+                    (
+                        fpm.scheduled_requests.sum_decode_kv_tokens
+                        + fpm.queued_requests.sum_decode_kv_tokens
+                    )
+                    for fpm in group
+                )
+                util = used / max_kv
+                max_util = max(max_util, util)
+                if util < threshold:
+                    saturated = False
+                    break
+            if saturated:
+                logger.info(
+                    f"Decode KV saturation scale-up: all {num_workers} engines "
+                    f">= {threshold * 100:.0f}% of max_kv_tokens={max_kv} "
+                    f"(max_util={max_util * 100:.0f}%), forcing scale-up "
+                    f"regardless of ITL"
+                )
+                self._diag_load_reason = "scale_up_kv_saturation"
+                return num_workers + 1
+
         decision = self._scale_decision(
             estimates,
             self._config.itl_ms,
