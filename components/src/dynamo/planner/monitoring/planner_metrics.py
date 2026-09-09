@@ -26,6 +26,13 @@ LOAD_DECISION_STATES = [
     "reconcile_clamped_to_ceiling",
     "held_over",
     "rejected_by_plugin",
+    # KV-saturation scale-up trigger (DEEPINFRA): scale up because projected
+    # steady-state decode KV exceeds the saturation ceiling.
+    "scale_up_kv_saturation",
+    # Scaling-proposal confirmation buffer (DEEPINFRA): a scale proposal must
+    # persist for N consecutive ticks before it is applied; emitted while the
+    # proposal is still accumulating confirmations.
+    "awaiting_confirmation",
 ]
 
 THROUGHPUT_DECISION_STATES = [

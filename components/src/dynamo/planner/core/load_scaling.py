@@ -11,6 +11,7 @@ Mixin consumed by ``PlannerScalingState``.  All methods access state via
 from __future__ import annotations
 
 import logging
+from collections import deque
 from typing import TYPE_CHECKING, Optional
 
 from dynamo.planner.core.types import FpmObservations, ScalingDecision
@@ -43,6 +44,74 @@ class LoadScalingMixin:
     _diag_load_reason: Optional[str]
     _diag_load_reason_prefill: Optional[str]
     _diag_load_reason_decode: Optional[str]
+    _scaling_confirmation_ticks: int
+    _proposed_buffer_p: deque
+    _proposed_buffer_d: deque
+    _last_suggested_p: int
+    _last_suggested_d: int
+
+    def _confirm_proposal(
+        self,
+        buffer: deque,
+        proposed: int,
+        last_suggested_attr: str,
+        observed: int,
+    ) -> int:
+        """N-tick proposal-confirmation gate.
+
+        Appends ``proposed`` to ``buffer`` (last N replica-count proposals).
+        Returns the planner's current commitment (``self.<last_suggested_attr>``)
+        unless every entry in a *full* buffer is unanimously higher or
+        unanimously lower than the commitment — in which case the commitment is
+        updated to ``proposed`` and that value is emitted. Lazily latches the
+        commitment to ``observed`` on the first tick so the gate has a baseline.
+
+        Comparison is against the commitment, not the moving observed count: a
+        worker coming online doesn't invalidate older buffer entries, and a
+        single dissenting sample blocks an otherwise-unanimous buffer.
+        """
+        last_suggested: int = getattr(self, last_suggested_attr)
+        if last_suggested == 0:
+            last_suggested = observed
+            setattr(self, last_suggested_attr, last_suggested)
+
+        buffer.append(proposed)
+        label = "prefill" if last_suggested_attr.endswith("_p") else "decode"
+
+        if len(buffer) < buffer.maxlen:
+            logger.info(
+                "Confirmation buffer [%s]: last %d proposals=%s commit=%d "
+                "observed=%d -> HOLD (filling %d/%d)",
+                label, len(buffer), list(buffer), last_suggested, observed,
+                len(buffer), buffer.maxlen,
+            )
+            return last_suggested
+
+        all_higher = all(p > last_suggested for p in buffer)
+        all_lower = all(p < last_suggested for p in buffer)
+        if all_higher or all_lower:
+            logger.info(
+                "Confirmation buffer [%s]: last %d proposals=%s commit=%d "
+                "observed=%d -> CONFIRMED %d (unanimous %s)",
+                label, buffer.maxlen, list(buffer), last_suggested, observed,
+                proposed, "up" if all_higher else "down",
+            )
+            setattr(self, last_suggested_attr, proposed)
+            return proposed
+        # Full buffer but not a unanimous move off the commitment. Two sub-cases
+        # worth distinguishing: every proposal already EQUALS the commitment
+        # (steady state — nothing to change) vs a genuine mix of above/below/at
+        # (noisy — the debounce is doing its job).
+        if all(p == last_suggested for p in buffer):
+            detail = "steady at commit"
+        else:
+            detail = "mixed — not all strictly above/below commit"
+        logger.info(
+            "Confirmation buffer [%s]: last %d proposals=%s commit=%d "
+            "observed=%d -> HOLD (%s)",
+            label, buffer.maxlen, list(buffer), last_suggested, observed, detail,
+        )
+        return last_suggested
 
     def _advance_load(self, obs: FpmObservations) -> Optional[ScalingDecision]:
         if not self._config.enable_load_scaling:
@@ -223,11 +292,30 @@ class LoadScalingMixin:
             final_d, original_d, post_floor_d, self._num_d_workers
         )
 
+        # DEEPINFRA: N-tick proposal confirmation. Emit a new target only when
+        # the last N proposals are unanimously above/below the planner's
+        # current commitment; otherwise hold (debounces noisy TTFT/ITL
+        # estimates and transient FPM-staleness flaps). Reconcile mismatches
+        # already returned None above, so both sides are safe to buffer here.
+        confirmed_p = self._confirm_proposal(
+            self._proposed_buffer_p, final_p, "_last_suggested_p", self._num_p_workers
+        )
+        if confirmed_p != final_p:
+            self._diag_load_reason_prefill = "awaiting_confirmation"
+            final_p = confirmed_p
+        confirmed_d = self._confirm_proposal(
+            self._proposed_buffer_d, final_d, "_last_suggested_d", self._num_d_workers
+        )
+        if confirmed_d != final_d:
+            self._diag_load_reason_decode = "awaiting_confirmation"
+            final_d = confirmed_d
+
         # Aggregate reason: prioritise "most interesting" across components.
-        _PRIORITY = {
+        _PRIORITY: dict[str, float] = {
             "scale_up": 4,
             "scale_down_capped_by_throughput": 3,
             "scale_down": 2,
+            "awaiting_confirmation": 1.5,
             "no_change": 1,
         }
         self._diag_load_reason = max(
@@ -533,8 +621,18 @@ class LoadScalingMixin:
 
             if can_scale_down:
                 post_sched_kv = int((sched_kv + queued_kv) * consolidation)
-                # (1) cache feasibility
-                if max_kv is not None and max_kv > 0 and post_sched_kv >= max_kv:
+                # (1) cache feasibility — gate on the SAME saturation threshold
+                #     used by the scale-up trigger below, not the full max_kv.
+                #     Using max_kv (100%) let the planner consolidate into the
+                #     [threshold, 1.0] utilization band, which the saturation
+                #     trigger then immediately bounces back up (3<->2 flapping).
+                kv_threshold = self._config.decode_kv_saturation_threshold
+                kv_ceiling = (
+                    kv_threshold * max_kv
+                    if (kv_threshold is not None and 0.0 < kv_threshold <= 1.0)
+                    else max_kv
+                )
+                if max_kv is not None and max_kv > 0 and post_sched_kv >= kv_ceiling:
                     can_scale_down = False
                     consolidation_refused = True
                     continue
