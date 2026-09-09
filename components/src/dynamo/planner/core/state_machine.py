@@ -137,6 +137,9 @@ class PlannerScalingState(LoadScalingMixin, ThroughputScalingMixin):
         self._reactive_floor_p: int = 0
         self._reactive_floor_bump_tick: int = 0
         self._load_tick_counter: int = 0
+        # DEEPINFRA: fleet-total decode KV history (tick, tokens) for the
+        # consolidation peak/trend pad (~60min at 5s load ticks).
+        self._decode_kv_history: deque[tuple[int, float]] = deque(maxlen=720)
 
         # DEEPINFRA: most recent NON-IDLE FPM per (worker_id, dp_rank), used to
         # paper over TRT-LLM's polling-iter snapshot artifact. The FPM publish

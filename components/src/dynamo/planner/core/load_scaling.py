@@ -11,6 +11,7 @@ Mixin consumed by ``PlannerScalingState``.  All methods access state via
 from __future__ import annotations
 
 import logging
+import math
 import time
 from collections import deque
 from typing import TYPE_CHECKING, Optional
@@ -43,6 +44,39 @@ _DECODE_LATENCY_SCALE_UP = 0.4  # util > 40%
 _DECODE_LATENCY_SCALE_DOWN = 0.1  # util < 10%
 
 
+def _kstar_affine(
+    k_curr: float,
+    k_naive: float,
+    itl_curr_s: float,
+    itl_naive_s: float,
+) -> tuple[Optional[float], Optional[float]]:
+    """Closed-form steady-state KV for an affine ITL(K) model (DEEPINFRA).
+
+    Fits ``ITL(K) = alpha + beta*K`` through the two evaluations we already
+    have — (k_curr, itl_curr) and (k_naive, itl_naive) — which is exact when
+    the decode perf model is the FPM linear regression. Solves the residency
+    fixed point ``K* = k_naive * ITL(K*) / itl_curr``:
+
+        q  = k_naive * beta / itl_curr        (contraction factor)
+        K* = k_naive * (alpha / itl_curr) / (1 - q)   when q < 1
+        K* = inf                                       when q >= 1 (divergent)
+
+    Returns ``(k_star, q)``; ``(None, None)`` on degenerate inputs (caller
+    falls back to the iterative estimate). ``beta`` is clamped at 0 so probe
+    noise can't produce a K* below the naive projection.
+    """
+    if itl_curr_s <= 0 or itl_naive_s <= 0 or k_naive <= 0 or k_naive == k_curr:
+        return None, None
+    beta = max(0.0, (itl_naive_s - itl_curr_s) / (k_naive - k_curr))
+    alpha = itl_curr_s - beta * k_curr
+    if alpha <= 0:
+        return None, None
+    q = k_naive * beta / itl_curr_s
+    if q >= 1.0:
+        return math.inf, q
+    return k_naive * (alpha / itl_curr_s) / (1.0 - q), q
+
+
 class LoadScalingMixin:
     """FPM-driven load-based scaling decisions."""
 
@@ -65,6 +99,7 @@ class LoadScalingMixin:
     _reactive_floor_p: int
     _reactive_floor_bump_tick: int
     _load_tick_counter: int
+    _decode_kv_history: deque
 
     def _confirm_proposal(
         self,
@@ -299,6 +334,65 @@ class LoadScalingMixin:
             if component == "prefill"
             else ScalingDecision(num_decode=desired)
         )
+
+    def _record_decode_kv_observation(self, total_kv: float) -> None:
+        """DEEPINFRA: append the fleet-total decode KV (scheduled + queued)
+        for trend estimation. Fleet total, not per-worker average — it is
+        invariant across scale events, so the trend reflects demand."""
+        self._decode_kv_history.append((self._load_tick_counter, float(total_kv)))
+
+    def _decode_consolidation_pad(self) -> float:
+        """Multiplier projecting fleet decode KV for consolidation checks.
+
+        Two components, combined by max():
+
+        - PEAK: trailing-window peak over current — fleet decode KV is
+          intrinsically wave-like (measured 2026-07-07: median 2x swing
+          within 30min at constant demand, 44% of windows >2x; heavy OSL
+          tails accumulate/drain on tens of minutes). Consolidation must fit
+          the recent peak on the surviving fleet, not the instantaneous dip
+          the decision happens to sample. Window:
+          ``decode_consolidation_peak_window_ticks``.
+        - TREND: measured growth rate (oldest-vs-newest thirds of history)
+          extrapolated over ``decode_consolidation_horizon_ticks`` — covers
+          steady ramps, where the peak term is blind (peak == current the
+          whole way up).
+
+        Clamped to [1.0, decode_consolidation_pad_max]. Returns 1.0 when
+        history is short (<~2min) or both components are disabled (0).
+        """
+        history = self._decode_kv_history
+        if len(history) < 24:
+            return 1.0
+        entries = list(history)
+        pad = 1.0
+
+        peak_window = self._config.decode_consolidation_peak_window_ticks
+        if peak_window > 0:
+            now_tick = entries[-1][0]
+            # current = mean of the newest few ticks (single-tick noise)
+            recent = entries[-4:]
+            current = sum(v for _, v in recent) / len(recent)
+            peak = max(
+                (v for t, v in entries if t >= now_tick - peak_window),
+                default=current,
+            )
+            if current > 0 and peak > current:
+                pad = max(pad, peak / current)
+
+        horizon = self._config.decode_consolidation_horizon_ticks
+        if horizon > 0:
+            n = max(4, len(entries) // 3)
+            first, last = entries[:n], entries[-n:]
+            kv0 = sum(v for _, v in first) / n
+            kv1 = sum(v for _, v in last) / n
+            t0 = sum(t for t, _ in first) / n
+            t1 = sum(t for t, _ in last) / n
+            if kv0 > 0 and t1 > t0:
+                growth_per_tick = (kv1 - kv0) / (kv0 * (t1 - t0))
+                pad = max(pad, 1.0 + growth_per_tick * horizon)
+
+        return min(max(pad, 1.0), self._config.decode_consolidation_pad_max)
 
     def _decay_reactive_floor(self) -> None:
         """DEEPINFRA: reactive high-water floor bookkeeping (per load tick).
@@ -805,32 +899,47 @@ class LoadScalingMixin:
         accept_length = self._current_decode_accept_length()
 
         estimates: list[float] = []
-        # Consolidation-aware scale-down. Three safety checks per worker:
-        #  1. Hard cache-feasibility: post-consolidation KV must fit within
-        #     ``max_kv_tokens``. Exceeding the cache forces request queueing
-        #     / block eviction, a non-linear regime the perf model cannot
-        #     model, so refuse outright when crossed.
-        #  2. SLA check: predicted ITL at the survivor's post-consolidation KV
-        #     must stay within ``SLA * sensitivity``. Decouples from cache
-        #     size -- engines often saturate latency well before cache.
-        #  3. Steady-state K* check: (1) treats consolidation as just
-        #     spreading total tokens across (N-1) survivors, but at the
-        #     higher per-survivor arrival rate each request's residency
-        #     grows with ITL, so the true steady-state KV is higher:
-        #         K* = naive_kv * itl0 / (itl_curr + itl0 - itl_naive)
-        #     The Rust perf shim doesn't expose itl0 (the regression
-        #     intercept) directly, so we recover it from two ITL
-        #     evaluations (already needed for (2)) via finite-difference
-        #     slope and extrapolation to KV=0. Exact for affine
-        #     regressions, local-tangent approximation otherwise. Without
-        #     this, the naive (1) passes scale-down approvals that the
-        #     KV saturation trigger then immediately bounces back up --
-        #     the consolidate -> saturate -> rebound flap.
+        # Aggregate fleet load for consolidation safety checks (3 checks
+        # below). We project against the average post-consolidation worker
+        # rather than the bottleneck engine because the router redistributes
+        # work — pre-scale-down imbalance is not a meaningful signal for
+        # post-scale-down steady-state.
+        consolidation_threshold = (
+            self._config.decode_kv_consolidation_ceiling
+            if self._config.decode_kv_consolidation_ceiling is not None
+            else self._config.decode_kv_saturation_threshold
+        )
+        kv_ceiling = (
+            consolidation_threshold * max_kv
+            if (
+                consolidation_threshold is not None
+                and 0.0 < consolidation_threshold <= 1.0
+                and max_kv is not None
+            )
+            else max_kv
+        )
         can_scale_down = num_workers > 1
         consolidation_refused = False
-        for label, group in self._decode_regression.query_groups(fpm_stats):
+        # DEEPINFRA: consolidation is evaluated at PROJECTED demand (trailing
+        # peak + trend), not the instantaneous sample. Observed 2026-07-07:
+        # consolidation approved at ~26% projected KV bounced off the 80%
+        # scale-up trigger 20min later — fleet KV had tripled at constant
+        # rps/ITL (a long-OSL wave reaching steady state), and such 2-3x
+        # waves recur within most 30min windows. See _decode_consolidation_pad.
+        trend_pad = self._decode_consolidation_pad()
+        consolidation_padded = consolidation * trend_pad
+        sum_sched_kv = 0
+        sum_queued_kv = 0
+        sum_curr_itl_s = 0.0
+        sum_post_itl_s = 0.0
+        n_groups_with_est = 0
+        n_groups_with_post = 0
+        groups_list = self._decode_regression.query_groups(fpm_stats)
+        for label, group in groups_list:
             sched_kv = max(fpm.scheduled_requests.sum_decode_kv_tokens for fpm in group)
             queued_kv = max(fpm.queued_requests.sum_decode_kv_tokens for fpm in group)
+            sum_sched_kv += sched_kv
+            sum_queued_kv += queued_kv
             est = self._decode_regression.estimate_scheduled_decode_itl(
                 group,
                 include_queued_decode=True,
@@ -843,96 +952,145 @@ class LoadScalingMixin:
                     f"(sched_kv={sched_kv}, queued_kv={queued_kv}, "
                     f"accept_length={accept_length:.2f})"
                 )
+                sum_curr_itl_s += est
+                n_groups_with_est += 1
+                if can_scale_down:
+                    post_itl = self._decode_regression.estimate_scheduled_decode_itl(
+                        group,
+                        decode_scale=consolidation_padded,
+                        include_queued_decode=True,
+                    )
+                    if post_itl is not None:
+                        sum_post_itl_s += post_itl
+                        n_groups_with_post += 1
 
-            if can_scale_down:
-                post_sched_kv = int((sched_kv + queued_kv) * consolidation)
-                # (1) cache feasibility — gate on the SAME saturation threshold
-                #     used by the scale-up trigger below, not the full max_kv.
-                #     Using max_kv (100%) let the planner consolidate into the
-                #     [threshold, 1.0] utilization band, which the saturation
-                #     trigger then immediately bounces back up (3<->2 flapping).
-                kv_threshold = self._config.decode_kv_saturation_threshold
-                kv_ceiling = (
-                    kv_threshold * max_kv
-                    if (kv_threshold is not None and 0.0 < kv_threshold <= 1.0)
-                    else max_kv
-                )
-                if max_kv is not None and max_kv > 0 and post_sched_kv >= kv_ceiling:
-                    can_scale_down = False
-                    consolidation_refused = True
-                    continue
-                # Single post-consolidation ITL evaluation reused by (2)
-                # SLA and (3) K* checks.
-                post_itl = self._decode_regression.estimate_scheduled_decode_itl(
-                    group,
-                    decode_scale=consolidation,
-                    include_queued_decode=True,
-                )
-                if post_itl is None:
-                    can_scale_down = False
-                    continue
-                # (2) SLA check via perf model at post-consolidation kv
-                if (
-                    post_itl * 1000 / accept_length >= self._config.itl_ms * sensitivity
-                ):
-                    can_scale_down = False
-                    consolidation_refused = True
-                    continue
-                # (3) K* steady-state KV check. Recover itl0 by
-                # finite-difference between the two evaluations in hand
-                # (est = itl(K_curr) at decode_scale=1.0, post_itl =
-                # itl(K_naive) at decode_scale=consolidation). Exact for
-                # the affine regression; degrades gracefully if a future
-                # perf model is non-linear.
-                if (
-                    max_kv is not None
-                    and max_kv > 0
-                    and est is not None
-                ):
-                    k_curr = sched_kv + queued_kv
-                    k_naive = post_sched_kv
-                    delta_itl = post_itl - est
-                    delta_kv = k_naive - k_curr
-                    # Skip K* when the regression is effectively flat in
-                    # KV (slope ~ 0). In that regime residency growth is
-                    # negligible and K* ~ naive_kv, which (1) already
-                    # cleared. Threshold scales with est to avoid a fixed
-                    # epsilon misbehaving when ITL is tiny.
-                    if delta_kv > 0 and delta_itl > 1e-6 * max(abs(est), 1e-6):
-                        slope = delta_itl / delta_kv
-                        itl0 = est - slope * k_curr
-                        denom = est + itl0 - post_itl
-                        # denom <= 0 means the per-survivor arrival rate
-                        # exceeds the drain capacity (KV diverges in the
-                        # fixed-point) -- rate-bound, refuse.
-                        # itl0 <= 0 means the regression extrapolates to
-                        # an unphysical intercept; the K* projection
-                        # can't be trusted, so conservatively refuse.
-                        if denom <= 0 or itl0 <= 0:
-                            can_scale_down = False
-                            consolidation_refused = True
-                            logger.info(
-                                f"Decode engine {label}: K* check refused "
-                                f"(rate-bound: denom={denom * 1000:.2f}ms, "
-                                f"itl0={itl0 * 1000:.2f}ms)"
-                            )
-                            continue
-                        k_star = k_naive * itl0 / denom
-                        if k_star >= kv_ceiling:
-                            can_scale_down = False
-                            consolidation_refused = True
-                            logger.info(
-                                f"Decode engine {label}: K* check refused "
-                                f"(K*={k_star:.0f} >= ceiling={kv_ceiling:.0f}, "
-                                f"naive_kv={k_naive}, "
-                                f"itl0={itl0 * 1000:.2f}ms, "
-                                f"itl_curr={est * 1000:.2f}ms, "
-                                f"itl_naive={post_itl * 1000:.2f}ms)"
-                            )
-                            continue
+        self._record_decode_kv_observation(sum_sched_kv + sum_queued_kv)
 
         if estimates:
             self._diag_estimated_itl_ms = max(estimates)
+
+        # Consolidation checks on fleet averages. Three safety gates:
+        #  1. Cache feasibility: avg post-consolidation KV must fit under
+        #     ``decode_kv_saturation_threshold * max_kv``. Gates against
+        #     consolidating into the saturation band that the scale-up
+        #     trigger would immediately bounce back up (flap prevention).
+        #  2. SLA: predicted ITL at average post-consolidation KV must
+        #     stay within ``itl_sla * sensitivity``.
+        #  3. Steady-state K*: at the higher per-survivor arrival rate each
+        #     request's residency grows with ITL, so the true steady-state
+        #     KV is higher than naive. K* = naive_kv * itl0 / (itl_curr +
+        #     itl0 - itl_naive). itl0 recovered via finite difference;
+        #     exact for affine regressions, approximate otherwise.
+        if can_scale_down and n_groups_with_est > 0 and max_kv and max_kv > 0:
+            avg_sched_kv = sum_sched_kv / num_workers
+            avg_queued_kv = sum_queued_kv / num_workers
+            post_sched_kv = int((avg_sched_kv + avg_queued_kv) * consolidation_padded)
+
+            cache_refuse = post_sched_kv >= kv_ceiling
+            logger.info(
+                f"Consolidation check (1) cache_feasibility [avg]: "
+                f"post_sched_kv={post_sched_kv}, ceiling={kv_ceiling:.0f}, "
+                f"max_kv={max_kv}, num_workers={num_workers}, "
+                f"trend_pad={trend_pad:.3f}, "
+                f"result={'REFUSE' if cache_refuse else 'pass'}"
+            )
+            if cache_refuse:
+                can_scale_down = False
+                consolidation_refused = True
+            elif n_groups_with_post == 0:
+                logger.info(
+                    "Consolidation checks (2,3) skipped: "
+                    "no post-consolidation ITL estimates available"
+                )
+                can_scale_down = False
+            else:
+                avg_curr_itl_s = sum_curr_itl_s / n_groups_with_est
+                avg_post_itl_s = sum_post_itl_s / n_groups_with_post
+                post_itl_ms = avg_post_itl_s * 1000 / accept_length
+                sla_budget_ms = self._config.itl_ms * sensitivity
+                sla_refuse = post_itl_ms >= sla_budget_ms
+                logger.info(
+                    f"Consolidation check (2) sla [avg]: "
+                    f"post_itl={post_itl_ms:.2f}ms, budget={sla_budget_ms:.2f}ms "
+                    f"(itl_sla={self._config.itl_ms:.1f}ms × sensitivity={sensitivity:.2f}), "
+                    f"result={'REFUSE' if sla_refuse else 'pass'}"
+                )
+                if sla_refuse:
+                    can_scale_down = False
+                    consolidation_refused = True
+                else:
+                    k_curr = int(avg_sched_kv + avg_queued_kv)
+                    k_naive = post_sched_kv
+
+                    # (3) Steady-state K*. In regression mode the ITL model
+                    # is exactly affine in load, so the residency fixed point
+                    # has a closed form with an explicit divergence verdict
+                    # (q >= 1: residency growth outruns capacity — a state
+                    # the truncated iteration below can under-detect).
+                    k_star_cf = q_cf = None
+                    if getattr(self._decode_regression, "is_regression", False):
+                        k_star_cf, q_cf = _kstar_affine(
+                            k_curr, k_naive, avg_curr_itl_s, avg_post_itl_s
+                        )
+                    if k_star_cf is not None:
+                        k_star = k_star_cf
+                        kstar_refuse = k_star >= kv_ceiling
+                        logger.info(
+                            f"Consolidation check (3) K* [avg, closed-form]: "
+                            f"K*={k_star:.0f}, q={q_cf:.3f}, "
+                            f"ceiling={kv_ceiling:.0f}, naive_kv={k_naive}, "
+                            f"itl_curr={avg_curr_itl_s * 1000:.2f}ms, "
+                            f"itl_naive={avg_post_itl_s * 1000:.2f}ms, "
+                            f"result={'REFUSE' if kstar_refuse else 'pass'}"
+                        )
+                        if kstar_refuse:
+                            can_scale_down = False
+                            consolidation_refused = True
+                    else:
+                        # K* via 2-iteration Banach on AIC's actual curve.
+                        # Linear extrapolation from two nearby AIC points was
+                        # numerically unstable (small itl_curr/itl_naive noise
+                        # → wild itl0), and full-convergence iteration wandered
+                        # into an AIC model artifact (a spurious ~5× ITL step
+                        # around K ≈ 1M for gpt-oss-120b on B200 that reality
+                        # doesn't have). Two steps stays inside AIC's smooth
+                        # region and matches observed post-consolidation KV to
+                        # within a few percent empirically. Also the fallback
+                        # when the closed form hits degenerate inputs.
+                        # Iter 0 uses avg_post_itl_s already computed above.
+                        K_iter = k_naive * avg_post_itl_s / avg_curr_itl_s
+                        trajectory = [k_naive, K_iter]
+                        # Iter 1: query AIC at K_iter/k_curr scale across groups.
+                        scale_2 = K_iter / k_curr if k_curr > 0 else 0.0
+                        sum_itl_2_s = 0.0
+                        n_2 = 0
+                        for _, group in groups_list:
+                            itl_2 = self._decode_regression.estimate_scheduled_decode_itl(
+                                group,
+                                decode_scale=scale_2,
+                                include_queued_decode=True,
+                            )
+                            if itl_2 is not None:
+                                sum_itl_2_s += itl_2
+                                n_2 += 1
+                        if n_2 > 0:
+                            avg_itl_2_s = sum_itl_2_s / n_2
+                            K_iter = k_naive * avg_itl_2_s / avg_curr_itl_s
+                            trajectory.append(K_iter)
+                        k_star = K_iter
+                        kstar_refuse = k_star >= kv_ceiling
+                        logger.info(
+                            f"Consolidation check (3) K* [avg, 2-iter]: "
+                            f"K*={k_star:.0f}, ceiling={kv_ceiling:.0f}, "
+                            f"naive_kv={k_naive}, "
+                            f"itl_curr={avg_curr_itl_s * 1000:.2f}ms, "
+                            f"itl_naive={avg_post_itl_s * 1000:.2f}ms, "
+                            f"trajectory=[{','.join(f'{int(x)}' for x in trajectory)}], "
+                            f"result={'REFUSE' if kstar_refuse else 'pass'}"
+                        )
+                        if kstar_refuse:
+                            can_scale_down = False
+                            consolidation_refused = True
 
         # DEEPINFRA: KV saturation scale-up trigger. The ITL regression only
         # sees in-batch decode time, so an engine running 30 active decodes
@@ -944,8 +1102,14 @@ class LoadScalingMixin:
         # over-commitment. If every decode engine's combined sched+queued
         # KV breaches the saturation threshold, force scale-up regardless
         # of ITL. Threshold configurable via
-        # PlannerConfig.decode_kv_saturation_threshold (default 0.9).
-        threshold = self._config.decode_kv_saturation_threshold
+        # PlannerConfig.decode_kv_saturation_threshold (default 0.9); can be
+        # overridden independently of the consolidation ceiling via
+        # decode_kv_scale_up_threshold.
+        threshold = (
+            self._config.decode_kv_scale_up_threshold
+            if self._config.decode_kv_scale_up_threshold is not None
+            else self._config.decode_kv_saturation_threshold
+        )
         if (
             threshold is not None
             and threshold > 0.0
