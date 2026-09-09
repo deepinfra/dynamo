@@ -101,6 +101,29 @@ class LoadScalingMixin:
     _load_tick_counter: int
     _decode_kv_history: deque
 
+    @staticmethod
+    def _anchor_no_change_proposal(
+        final: int,
+        observed: int,
+        reason: Optional[str],
+        commit: int,
+    ) -> int:
+        """Anchor a "no change" decision to the planner's commitment.
+
+        A "no change" decision means "keep the current level". Translating it
+        to the OBSERVED ready count leaks external churn into the confirmation
+        buffer: model-manager worker replacement briefly runs the old and new
+        pod side by side, so observed transiently exceeds the commit, and once
+        the replacement outlives the confirmation window (likely — worker boot
+        takes minutes) the gate confirms a phantom scale-up and re-spawns the
+        extra worker after the old one is removed. Directional decisions
+        (scale_up / scale_down / floor-capped) are real signals and pass
+        through untouched; commit==0 means the gate hasn't latched yet.
+        """
+        if commit != 0 and reason == "no_change" and final == observed:
+            return commit
+        return final
+
     def _confirm_proposal(
         self,
         buffer: deque,
@@ -528,6 +551,21 @@ class LoadScalingMixin:
         )
         self._diag_load_reason_decode = _reason(
             final_d, original_d, post_floor_d, self._num_d_workers
+        )
+
+        # DEEPINFRA: anchor "no change" proposals to the planner's commitment
+        # rather than the observed ready count (see _anchor_no_change_proposal).
+        final_p = self._anchor_no_change_proposal(
+            final_p,
+            self._num_p_workers,
+            self._diag_load_reason_prefill,
+            self._last_suggested_p,
+        )
+        final_d = self._anchor_no_change_proposal(
+            final_d,
+            self._num_d_workers,
+            self._diag_load_reason_decode,
+            self._last_suggested_d,
         )
 
         # DEEPINFRA: N-tick proposal confirmation. Emit a new target only when

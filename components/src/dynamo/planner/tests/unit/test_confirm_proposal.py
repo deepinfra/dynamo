@@ -271,3 +271,52 @@ def test_zero_cooldown_preserves_old_down_behavior():
     for _ in range(2):
         g.push(3, observed=4)
     assert g.push(3, observed=4) == 3  # full buffer of 3s confirms immediately
+
+
+# ---------------------------------------------------------------------------
+# _anchor_no_change_proposal: "no change" must anchor to the commit, not the
+# observed ready count (model-manager replace surges inflate observed).
+# ---------------------------------------------------------------------------
+
+
+def _anchor(final, observed, reason, commit):
+    return LoadScalingMixin._anchor_no_change_proposal(final, observed, reason, commit)
+
+
+def test_anchor_rewrites_no_change_to_commit_during_replace_surge():
+    # MM replace: observed 8 (old+new side by side), commit 7, model says keep.
+    assert _anchor(8, 8, "no_change", 7) == 7
+
+
+def test_anchor_passes_directional_decisions_through():
+    assert _anchor(9, 8, "scale_up", 7) == 9
+    assert _anchor(6, 8, "scale_down", 7) == 6
+    assert _anchor(8, 8, "scale_down_capped_by_throughput", 7) == 8
+
+
+def test_anchor_noop_before_gate_latches():
+    assert _anchor(8, 8, "no_change", 0) == 8
+
+
+def test_anchor_noop_when_final_diverges_from_observed():
+    # floor already lifted the value away from observed: not a bare "keep".
+    assert _anchor(9, 8, "no_change", 7) == 9
+
+
+def test_replace_surge_does_not_ratchet_commit_through_gate():
+    # End-to-end through the confirmation gate: a replace surge lasting far
+    # longer than the confirmation window must not move the commit when every
+    # tick's decision is "no change" (anchored to commit before buffering).
+    g = _Gate(ticks=6, ticks_up=2, commit=7)
+    for _ in range(12):
+        proposal = _anchor(8, 8, "no_change", g._last_suggested_p)
+        assert g.push(proposal, observed=8) == 7
+    assert g._last_suggested_p == 7
+
+
+def test_unanchored_surge_would_have_ratcheted():
+    # Documents the failure mode the anchor prevents: feeding observed
+    # directly confirms a phantom scale-up within ticks_up ticks.
+    g = _Gate(ticks=6, ticks_up=2, commit=7)
+    g.push(8, observed=8)
+    assert g.push(8, observed=8) == 8
