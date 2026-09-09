@@ -626,6 +626,58 @@ class PlannerEnginePerfModel:
             result.e2e_latency_ms, result.eligible,
         )
         rps = result.rps
+        # DEEPINFRA: strip batching credit from prefill capacity. The shim's
+        # batch sweep picks the batch size that maximizes throughput, but
+        # kv-router cache-affinity dispatch causes rotating per-pod imbalances
+        # that keep individual pods below their batching sweet spot in
+        # practice, so the batched estimate over-credits capacity and
+        # under-provisions prefill. Query the model directly with a synthetic
+        # single queued prefill at the effective token count (ISL after the
+        # prefix-cache discount) and derive capacity as 1/iter_ttft.
+        # result.ttft_ms is kept as the SLA-eligibility signal.
+        if self._worker_type == "prefill":
+            effective_isl = max(
+                1,
+                int(math.ceil(isl * (1.0 - _clamp_kv_hit_rate(kv_hit_rate)))),
+            )
+            synth_fpm = ForwardPassMetrics(
+                version=FPM_VERSION,
+                worker_id="0",
+                dp_rank=0,
+                counter_id=0,
+                wall_time=0.0,
+                scheduled_requests=ScheduledRequestMetrics(),
+                queued_requests=QueuedRequestMetrics(
+                    num_prefill_requests=1,
+                    sum_prefill_tokens=effective_isl,
+                ),
+            )
+            try:
+                ttft_batch1_s = self._rust_model.get_queued_prefill_time([synth_fpm])
+            except _RUST_SHIM_FALLBACK_EXCEPTIONS as e:
+                logger.warning(
+                    "RUST_CAPACITY[prefill]: batch-1 query failed: %s "
+                    "(keeping shim rps=%.2f)",
+                    e,
+                    rps,
+                )
+                ttft_batch1_s = None
+            if ttft_batch1_s is not None and ttft_batch1_s > 0:
+                rps_batch1 = 1.0 / ttft_batch1_s
+                ttft_batch1_ms = ttft_batch1_s * 1000.0
+                shim_ttft_ms = result.ttft_ms if result.ttft_ms is not None else 0.0
+                logger.info(
+                    "RUST_CAPACITY[prefill]: batch-1 override: "
+                    "shim rps=%.2f (batch~%.1f, ttft=%.2fms) -> "
+                    "rps=%.2f (effective_isl=%d, ttft=%.2fms)",
+                    rps,
+                    rps * shim_ttft_ms / 1000.0,
+                    shim_ttft_ms,
+                    rps_batch1,
+                    effective_isl,
+                    ttft_batch1_ms,
+                )
+                rps = rps_batch1
         itl_ms = result.itl_ms
         return PlannerEngineCapacity(
             rps=rps,
