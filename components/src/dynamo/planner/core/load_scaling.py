@@ -593,7 +593,7 @@ class LoadScalingMixin:
         accept_length = self._current_decode_accept_length()
 
         estimates: list[float] = []
-        # Consolidation-aware scale-down. Two safety checks per worker:
+        # Consolidation-aware scale-down. Three safety checks per worker:
         #  1. Hard cache-feasibility: post-consolidation KV must fit within
         #     ``max_kv_tokens``. Exceeding the cache forces request queueing
         #     / block eviction, a non-linear regime the perf model cannot
@@ -601,6 +601,19 @@ class LoadScalingMixin:
         #  2. SLA check: predicted ITL at the survivor's post-consolidation KV
         #     must stay within ``SLA * sensitivity``. Decouples from cache
         #     size -- engines often saturate latency well before cache.
+        #  3. Steady-state K* check: (1) treats consolidation as just
+        #     spreading total tokens across (N-1) survivors, but at the
+        #     higher per-survivor arrival rate each request's residency
+        #     grows with ITL, so the true steady-state KV is higher:
+        #         K* = naive_kv * itl0 / (itl_curr + itl0 - itl_naive)
+        #     The Rust perf shim doesn't expose itl0 (the regression
+        #     intercept) directly, so we recover it from two ITL
+        #     evaluations (already needed for (2)) via finite-difference
+        #     slope and extrapolation to KV=0. Exact for affine
+        #     regressions, local-tangent approximation otherwise. Without
+        #     this, the naive (1) passes scale-down approvals that the
+        #     KV saturation trigger then immediately bounces back up --
+        #     the consolidate -> saturate -> rebound flap.
         can_scale_down = num_workers > 1
         consolidation_refused = False
         for label, group in self._decode_regression.query_groups(fpm_stats):
@@ -636,7 +649,8 @@ class LoadScalingMixin:
                     can_scale_down = False
                     consolidation_refused = True
                     continue
-                # (2) SLA check via perf model at post-consolidation kv
+                # Single post-consolidation ITL evaluation reused by (2)
+                # SLA and (3) K* checks.
                 post_itl = self._decode_regression.estimate_scheduled_decode_itl(
                     group,
                     decode_scale=consolidation,
@@ -644,11 +658,66 @@ class LoadScalingMixin:
                 )
                 if post_itl is None:
                     can_scale_down = False
-                elif (
+                    continue
+                # (2) SLA check via perf model at post-consolidation kv
+                if (
                     post_itl * 1000 / accept_length >= self._config.itl_ms * sensitivity
                 ):
                     can_scale_down = False
                     consolidation_refused = True
+                    continue
+                # (3) K* steady-state KV check. Recover itl0 by
+                # finite-difference between the two evaluations in hand
+                # (est = itl(K_curr) at decode_scale=1.0, post_itl =
+                # itl(K_naive) at decode_scale=consolidation). Exact for
+                # the affine regression; degrades gracefully if a future
+                # perf model is non-linear.
+                if (
+                    max_kv is not None
+                    and max_kv > 0
+                    and est is not None
+                ):
+                    k_curr = sched_kv + queued_kv
+                    k_naive = post_sched_kv
+                    delta_itl = post_itl - est
+                    delta_kv = k_naive - k_curr
+                    # Skip K* when the regression is effectively flat in
+                    # KV (slope ~ 0). In that regime residency growth is
+                    # negligible and K* ~ naive_kv, which (1) already
+                    # cleared. Threshold scales with est to avoid a fixed
+                    # epsilon misbehaving when ITL is tiny.
+                    if delta_kv > 0 and delta_itl > 1e-6 * max(abs(est), 1e-6):
+                        slope = delta_itl / delta_kv
+                        itl0 = est - slope * k_curr
+                        denom = est + itl0 - post_itl
+                        # denom <= 0 means the per-survivor arrival rate
+                        # exceeds the drain capacity (KV diverges in the
+                        # fixed-point) -- rate-bound, refuse.
+                        # itl0 <= 0 means the regression extrapolates to
+                        # an unphysical intercept; the K* projection
+                        # can't be trusted, so conservatively refuse.
+                        if denom <= 0 or itl0 <= 0:
+                            can_scale_down = False
+                            consolidation_refused = True
+                            logger.info(
+                                f"Decode engine {label}: K* check refused "
+                                f"(rate-bound: denom={denom * 1000:.2f}ms, "
+                                f"itl0={itl0 * 1000:.2f}ms)"
+                            )
+                            continue
+                        k_star = k_naive * itl0 / denom
+                        if k_star >= kv_ceiling:
+                            can_scale_down = False
+                            consolidation_refused = True
+                            logger.info(
+                                f"Decode engine {label}: K* check refused "
+                                f"(K*={k_star:.0f} >= ceiling={kv_ceiling:.0f}, "
+                                f"naive_kv={k_naive}, "
+                                f"itl0={itl0 * 1000:.2f}ms, "
+                                f"itl_curr={est * 1000:.2f}ms, "
+                                f"itl_naive={post_itl * 1000:.2f}ms)"
+                            )
+                            continue
 
         if estimates:
             self._diag_estimated_itl_ms = max(estimates)
