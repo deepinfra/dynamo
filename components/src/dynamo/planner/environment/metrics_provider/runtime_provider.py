@@ -28,6 +28,10 @@ logger = logging.getLogger(__name__)
 
 
 class RuntimeFpmProvider(FpmMetricsProvider, WorkerInfoProvider):
+    # DEEPINFRA: consecutive polls of wall_time==0 with no scheduled work after
+    # which a (worker_id, dp_rank) is dropped from the observed engine set.
+    _FPM_STALE_POLLS = 3
+
     def __init__(
         self,
         *,
@@ -48,6 +52,14 @@ class RuntimeFpmProvider(FpmMetricsProvider, WorkerInfoProvider):
         self.namespace_source = namespace_source
         self._prefill_fpm_sub = None
         self._decode_fpm_sub = None
+        # DEEPINFRA: per-(label) idle-FPM tracker. The Rust FpmDirectPublisher
+        # keeps an idle-heartbeat task that emits zeroed snapshots every ~5s
+        # with an incrementing counter -- so bytes-based staleness can't tell a
+        # drained worker from an active one. Track by FPM semantics instead:
+        # any consecutive run of polls where wall_time==0 and no scheduled
+        # work was observed counts as drained/idle. Maps
+        # label -> {(wid, dp): consecutive_idle_polls}.
+        self._fpm_stale_tracker: dict[str, dict[tuple[str, int], int]] = {}
 
     def bind_sources(
         self,
@@ -71,14 +83,14 @@ class RuntimeFpmProvider(FpmMetricsProvider, WorkerInfoProvider):
         decode_stats = None
 
         if self._prefill_fpm_sub is not None:
-            stats = self._decode_fpm_bytes(self._prefill_fpm_sub)
+            stats = self._decode_fpm_bytes(self._prefill_fpm_sub, "prefill")
             if stats:
                 for (wid, dp), fpm in stats.items():
                     _log_fpm(wid, dp, fpm, "prefill")
                 prefill_stats = stats
 
         if self._decode_fpm_sub is not None:
-            stats = self._decode_fpm_bytes(self._decode_fpm_sub)
+            stats = self._decode_fpm_bytes(self._decode_fpm_sub, "decode")
             if stats:
                 for (wid, dp), fpm in stats.items():
                     _log_fpm(wid, dp, fpm, "decode")
@@ -176,18 +188,47 @@ class RuntimeFpmProvider(FpmMetricsProvider, WorkerInfoProvider):
         self._decode_fpm_sub = None
 
     def _decode_fpm_bytes(
-        self, subscriber
+        self, subscriber, label: str = ""
     ) -> dict[tuple[str, int], ForwardPassMetrics]:
         # Match the subscriber's lazy binding path; decoding is optional at startup.
         from dynamo.common.forward_pass_metrics import decode as decode_fpm
 
         if subscriber is None:
             return {}
-        result = {}
-        for key, raw_bytes in subscriber.get_recent_stats().items():
+        # DEEPINFRA: a worker emitting wall_time==0 with no scheduled work for N
+        # consecutive polls is treated as drained/idle and dropped from the
+        # observed set so it doesn't inflate the engine count past DGD. Drain
+        # v9's Python emission gate produces exactly this shape (Rust heartbeats
+        # keep firing zeroed snapshots while paused). Truly idle workers get
+        # evicted too, which is fine -- they re-enter the moment a non-zero FPM
+        # arrives, and an idle worker contributes nothing to the load estimate.
+        raw = subscriber.get_recent_stats()
+        tracker = self._fpm_stale_tracker.setdefault(label, {})
+        result: dict[tuple[str, int], ForwardPassMetrics] = {}
+        for key, raw_bytes in raw.items():
             fpm = decode_fpm(raw_bytes)
-            if fpm is not None:
-                result[key] = fpm
+            if fpm is None:
+                continue
+            sched = fpm.scheduled_requests
+            is_idle = (
+                fpm.wall_time == 0.0
+                and sched.num_prefill_requests == 0
+                and sched.num_decode_requests == 0
+            )
+            stale = tracker.get(key, 0) + 1 if is_idle else 0
+            tracker[key] = stale
+            if stale >= self._FPM_STALE_POLLS:
+                if stale == self._FPM_STALE_POLLS:
+                    logger.warning(
+                        f"Evicting idle FPM engine {key[0]}:dp{key[1]} ({label}): "
+                        f"wall_time==0 with no scheduled work for {stale} polls "
+                        f"(publisher paused or worker truly idle)"
+                    )
+                continue
+            result[key] = fpm
+        # forget keys the subscriber no longer reports (worker left discovery)
+        for key in [k for k in tracker if k not in raw]:
+            del tracker[key]
         return result
 
 
