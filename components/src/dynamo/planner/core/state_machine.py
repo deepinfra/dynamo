@@ -137,6 +137,9 @@ class PlannerScalingState(LoadScalingMixin, ThroughputScalingMixin):
         self._all_queued_streak_p: int = 0
         self._confirm_ticks: dict[str, int] = {}
         self._last_up_tick: dict[str, int] = {}
+        # DEEPINFRA: consecutive FPM-coverage-mismatch ticks per component,
+        # for the stale-FPM tolerance (see _reconcile_fpm_or_tolerate).
+        self._fpm_mismatch_ticks: dict[str, int] = {}
         # DEEPINFRA: last Erlang-C prefill prescription, for down-hysteresis
         # across the integer boundary (see _prefill_replicas_erlang).
         self._last_erlang_bound_p: int = 0
