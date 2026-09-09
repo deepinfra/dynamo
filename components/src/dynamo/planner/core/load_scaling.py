@@ -11,6 +11,7 @@ Mixin consumed by ``PlannerScalingState``.  All methods access state via
 from __future__ import annotations
 
 import logging
+import time
 from collections import deque
 from typing import TYPE_CHECKING, Optional
 
@@ -20,6 +21,13 @@ if TYPE_CHECKING:
     from dynamo.common.forward_pass_metrics import ForwardPassMetrics
 
 logger = logging.getLogger(__name__)
+
+# DEEPINFRA: how long a cached "real iter" FPM stays valid for substituting in
+# place of an incoming wall_time==0 polling iter. TRT-LLM real iters under
+# heavy load run ~1-2s each, so 1s covers the typical gap between real iters;
+# beyond that we treat the worker as genuinely idle and let the polling-iter
+# snapshot surface (which the regression filter already handles cleanly).
+_FPM_REAL_TTL_SECONDS: float = 1.0
 
 # -- Easy-mode static thresholds (optimization_target != "sla") -----------
 # Prefill: ratio of queued_prefill_tokens / context_length
@@ -49,6 +57,7 @@ class LoadScalingMixin:
     _proposed_buffer_d: deque
     _last_suggested_p: int
     _last_suggested_d: int
+    _last_real_fpm: dict
 
     def _confirm_proposal(
         self,
@@ -113,10 +122,60 @@ class LoadScalingMixin:
         )
         return last_suggested
 
+    def _substitute_polling_iters(
+        self,
+        fpm_stats: Optional[dict],
+        now_s: float,
+    ) -> Optional[dict]:
+        """Replace fresh wall_time==0 snapshots with each worker's last real
+        FPM (within ``_FPM_REAL_TTL_SECONDS``).
+
+        TRT-LLM emits FPMs on every iteration including polling iters that
+        run between real forward passes; those have wall_time=0 and all-zero
+        scheduled fields. The publish poll cadence (10-100ms) is much faster
+        than a heavy real iter (~1.5s), so the latest snapshot per worker is
+        most often a polling iter and briefly makes a busy worker look idle
+        to per-tick scaling logic. Cache each worker's last non-zero FPM
+        with a TTL: substitute it in for incoming polling iters within the
+        TTL window, expire and pass through otherwise (genuinely idle).
+
+        The regression-tuning path already filters wall_time==0 via
+        ``add_observation``; this substitution is only for the per-tick
+        decision path (``_prefill_load_decision`` etc.) which reads the
+        latest-per-worker snapshot directly.
+        """
+        if not fpm_stats:
+            return fpm_stats
+        ttl = _FPM_REAL_TTL_SECONDS
+        result = {}
+        for key, fpm in fpm_stats.items():
+            if fpm.wall_time > 0.0:
+                self._last_real_fpm[key] = (fpm, now_s)
+                result[key] = fpm
+                continue
+            cached = self._last_real_fpm.get(key)
+            if cached is not None and now_s - cached[1] <= ttl:
+                result[key] = cached[0]
+            else:
+                # Stale cache (or never had one) -- worker has genuinely been
+                # idle for >TTL. Surface the polling iter so the decision
+                # logic can treat the worker as available-but-quiet rather
+                # than burdened.
+                result[key] = fpm
+        return result
+
     def _advance_load(self, obs: FpmObservations) -> Optional[ScalingDecision]:
         if not self._config.enable_load_scaling:
             self._diag_load_reason = "disabled"
             return None
+        # DEEPINFRA: paper over TRT-LLM's polling-iter snapshot artifact (see
+        # _substitute_polling_iters docstring). Done here so every downstream
+        # decision (prefill/decode/agg) sees corrected FPMs.
+        now_s = time.monotonic()
+        obs = FpmObservations(
+            prefill=self._substitute_polling_iters(obs.prefill, now_s),
+            decode=self._substitute_polling_iters(obs.decode, now_s),
+        )
         mode = self._config.mode
         if mode == "agg":
             return self._advance_load_agg(obs)

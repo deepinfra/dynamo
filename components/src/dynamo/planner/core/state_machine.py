@@ -21,7 +21,7 @@ from __future__ import annotations
 import logging
 import math
 from collections import deque
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from dynamo.planner.config.planner_config import PlannerConfig
 from dynamo.planner.core.budget import (
@@ -119,6 +119,21 @@ class PlannerScalingState(LoadScalingMixin, ThroughputScalingMixin):
         )
         self._last_suggested_p: int = 0
         self._last_suggested_d: int = 0
+
+        # DEEPINFRA: most recent NON-IDLE FPM per (worker_id, dp_rank), used to
+        # paper over TRT-LLM's polling-iter snapshot artifact. The FPM publish
+        # loop polls every 10-100ms, but TRT-LLM emits stats only at iteration
+        # boundaries; between real iters it emits "polling iters" with
+        # wall_time=0 and all-zero scheduled fields. With heavy batches (~1.5s
+        # per real iter), the latest snapshot for an active worker is
+        # statistically much more likely to be a polling iter than a real
+        # one, briefly making a busy worker LOOK idle to per-tick scaling
+        # logic. Substituted in by LoadScalingMixin before each tick's
+        # decision; expired after _FPM_REAL_TTL_SECONDS so a genuinely
+        # drained worker eventually surfaces as idle.
+        self._last_real_fpm: dict[
+            tuple[str, int], tuple[Any, float]
+        ] = {}
 
         # Most recent observed KV hit rate from the router. Runtime metadata like
         # this is intentionally last-value only, not fed through the traffic load
