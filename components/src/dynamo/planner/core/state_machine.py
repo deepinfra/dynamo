@@ -103,6 +103,12 @@ class PlannerScalingState(LoadScalingMixin, ThroughputScalingMixin):
         self._throughput_lower_bound_p: int = 1
         self._throughput_lower_bound_d: int = 1
 
+        # DEEPINFRA: lazy provider for traffic-shape statistics (second
+        # moments from Prometheus histograms), injected by the planner that
+        # owns the Prometheus client. Consumed by Erlang-C prefill sizing;
+        # None keeps configured-constant fallbacks.
+        self._traffic_shape_provider = None
+
         # DEEPINFRA: asymmetric proposal-confirmation buffer (re-added; dropped
         # in the v2 rebase). Stores the last N *proposed* replica counts per
         # component. Scale-DOWN needs every entry of a full buffer strictly
@@ -131,6 +137,9 @@ class PlannerScalingState(LoadScalingMixin, ThroughputScalingMixin):
         self._all_queued_streak_p: int = 0
         self._confirm_ticks: dict[str, int] = {}
         self._last_up_tick: dict[str, int] = {}
+        # DEEPINFRA: last Erlang-C prefill prescription, for down-hysteresis
+        # across the integer boundary (see _prefill_replicas_erlang).
+        self._last_erlang_bound_p: int = 0
         # DEEPINFRA: reactive high-water floor — level the burst tail proved
         # necessary via force-ups; decays when force-ups stop (see
         # _decay_reactive_floor).

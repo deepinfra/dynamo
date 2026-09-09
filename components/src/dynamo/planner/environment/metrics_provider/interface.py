@@ -13,6 +13,11 @@ class TrafficMetricsProvider(Protocol):
     async def collect_traffic(self) -> Optional[TrafficObservation]:
         pass
 
+    def collect_traffic_shape(self) -> Optional[TrafficShape]:
+        # DEEPINFRA: second-moment traffic statistics for Erlang-C prefill
+        # sizing; None when unavailable.
+        pass
+
     def collect_accept_length(self, interval_str: str) -> Optional[float]:
         pass
 

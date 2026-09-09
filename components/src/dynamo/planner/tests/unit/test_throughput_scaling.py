@@ -22,7 +22,13 @@ class _PrefillRegression:
 
 class _ThroughputScalingHarness(ThroughputScalingMixin):
     def __init__(self):
-        self._config = SimpleNamespace(ttft_ms=200.0, min_endpoint=1)
+        self._config = SimpleNamespace(
+            ttft_ms=200.0,
+            min_endpoint=1,
+            # DEEPINFRA: static sizing defaults (see PlannerConfig).
+            prefill_sizing_mode="static",
+            throughput_utilization_target=1.0,
+        )
         self._prefill_regression = _PrefillRegression()
         self._diag_throughput_reason = None
         self._diag_engine_rps_prefill = None

@@ -7,7 +7,7 @@ import logging
 from typing import Optional
 
 from dynamo.planner.config.planner_config import PlannerConfig
-from dynamo.planner.core.types import TrafficObservation
+from dynamo.planner.core.types import TrafficObservation, TrafficShape
 from dynamo.planner.environment.interface import (
     DeploymentStateSource,
     RuntimeNamespaceSource,
@@ -129,6 +129,14 @@ class PrometheusTrafficProvider(TrafficMetricsProvider):
             kv_hit_rate=m.kv_hit_rate,
             accept_length=m.accept_length,
         )
+
+    def collect_traffic_shape(self) -> Optional[TrafficShape]:
+        # DEEPINFRA: the client caches results (~5min TTL), so the per-tick
+        # cost is a dict lookup.
+        model_name = self._model_name()
+        if model_name is None:
+            return None
+        return self.prometheus_traffic_client.get_traffic_shape(model_name)
 
     def collect_accept_length(self, interval_str: str) -> Optional[float]:
         if self.config.mode not in ("disagg", "decode", "agg"):

@@ -13,7 +13,11 @@ from __future__ import annotations
 from typing import Optional, Protocol
 
 from dynamo.planner.config.defaults import TargetReplica
-from dynamo.planner.core.types import FpmObservations, TrafficObservation
+from dynamo.planner.core.types import (
+    FpmObservations,
+    TrafficObservation,
+    TrafficShape,
+)
 from dynamo.planner.environment.state import DeploymentState
 from dynamo.planner.monitoring.traffic_metrics import Metrics
 
@@ -49,6 +53,10 @@ class PlannerEnvironment(Protocol):
         pass
 
     async def collect_traffic(self) -> Optional[TrafficObservation]:
+        pass
+
+    def collect_traffic_shape(self) -> Optional[TrafficShape]:
+        # DEEPINFRA: cached histogram second moments for Erlang-C prefill sizing.
         pass
 
     def collect_accept_length(self, interval_str: str) -> Optional[float]:

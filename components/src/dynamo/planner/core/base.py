@@ -170,6 +170,16 @@ class NativePlannerBase:
                 require_decode=self.require_decode,
             ),
         )
+        # DEEPINFRA: give Erlang-C prefill sizing access to traffic-shape
+        # statistics (histogram second moments) through the environment's
+        # traffic provider.
+        if (
+            self.config.prefill_sizing_mode == "erlang_c"
+            and self.config.prefill_measure_traffic_shape
+        ):
+            self._engine.set_traffic_shape_provider(
+                self.environment.collect_traffic_shape
+            )
         return self._engine
 
     async def _install_benchmark_fpms(

@@ -14,6 +14,8 @@ from __future__ import annotations
 import json
 import logging
 import math
+import statistics
+from collections import deque
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -56,6 +58,14 @@ except ImportError:  # pragma: no cover - exercised in pure-Python planner tests
     _RUST_SHIM_AVAILABLE = False
 
 _RUST_SHIM_FALLBACK_EXCEPTIONS = (RuntimeError, ValueError, TypeError)
+
+# DEEPINFRA: prefill_tokens threshold above which an iteration is considered
+# compute-dominated (fixed overhead negligible). Production FPM scatter: below
+# ~5000 tokens wall_time clusters at ~30-50ms regardless of token count, above
+# ~6000 it scales linearly. 8000 is a safe margin into the linear regime. The
+# median wall_time/token over these iterations is the measured prefill service
+# slope consumed by Erlang-C sizing (measured_prefill_service_seconds).
+_FALLBACK_HEAVY_PT_THRESHOLD: int = 8000
 
 DEFAULT_MAX_NUM_BATCHED_TOKENS = 8192
 DEFAULT_MAX_NUM_SEQS = 512
@@ -122,6 +132,12 @@ class PlannerEnginePerfModel:
         self._retained_iterations: list[list[ForwardPassMetrics]] = []
         self._avg_isl = _MovingAverage(config.max_num_fpm_samples)
         self._avg_decode_length = _MovingAverage(config.max_num_fpm_samples)
+
+        # DEEPINFRA: (prefill_tokens, wall_time) of compute-dominated prefill
+        # iterations, for the measured per-token service slope.
+        self._fallback_heavy_window: deque[tuple[int, float]] = deque(
+            maxlen=config.max_num_fpm_samples
+        )
 
         self._init_rust_model()
 
@@ -383,6 +399,16 @@ class PlannerEnginePerfModel:
         if scheduled.num_decode_requests > 0:
             self._avg_decode_length.add_after_first_nonzero(
                 scheduled.sum_decode_kv_tokens / scheduled.num_decode_requests
+            )
+        # DEEPINFRA: feed the measured prefill service slope. Skip wall_time==0
+        # (TRT-LLM's polling iteration), same filter as the regression.
+        if (
+            self._worker_type == "prefill"
+            and fpm.wall_time > 0.0
+            and scheduled.sum_prefill_tokens >= _FALLBACK_HEAVY_PT_THRESHOLD
+        ):
+            self._fallback_heavy_window.append(
+                (scheduled.sum_prefill_tokens, fpm.wall_time)
             )
 
     def _tune(self, iterations: list[list[ForwardPassMetrics]]) -> None:
@@ -686,6 +712,28 @@ class PlannerEnginePerfModel:
             e2e_latency_ms=result.e2e_latency_ms,
             eligible=result.eligible,
         )
+
+    def _fallback_per_token_slope_s(self) -> Optional[float]:
+        """Median per-token compute time (s) from heavy iters, or None."""
+        if not self._fallback_heavy_window:
+            return None
+        ratios = [wt / pt for pt, wt in self._fallback_heavy_window if pt > 0]
+        if not ratios:
+            return None
+        return statistics.median(ratios)
+
+    def measured_prefill_service_seconds(
+        self, eff_tokens: float, overhead_s: float
+    ) -> Optional[float]:
+        """FPM-measured mean prefill service time for ``eff_tokens`` computed
+        tokens: ``overhead + eff_tokens * slope``, where slope is the median
+        wall-time/token over compute-dominated iterations (DEEPINFRA, feeds
+        Erlang-C sizing). None until enough heavy iterations are observed.
+        """
+        slope_s = self._fallback_per_token_slope_s()
+        if slope_s is None or slope_s <= 0 or eff_tokens <= 0:
+            return None
+        return overhead_s + eff_tokens * slope_s
 
     # ------------------------------------------------------------------
     # Readiness and moving-average accessors used by load scaling and query

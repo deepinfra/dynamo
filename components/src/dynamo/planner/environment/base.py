@@ -10,7 +10,11 @@ from dynamo.planner.config.backend_components import WORKER_COMPONENT_NAMES
 from dynamo.planner.config.defaults import SubComponentType, TargetReplica
 from dynamo.planner.config.planner_config import PlannerConfig
 from dynamo.planner.connectors.base import PlannerConnector
-from dynamo.planner.core.types import FpmObservations, TrafficObservation
+from dynamo.planner.core.types import (
+    FpmObservations,
+    TrafficObservation,
+    TrafficShape,
+)
 from dynamo.planner.environment.interface import (
     PlannerEnvironment,
     RuntimeNamespaceSource,
@@ -37,6 +41,9 @@ _MDC_REFRESH_FIELDS = (
 
 class NoopTrafficMetricsProvider:
     async def collect_traffic(self) -> Optional[TrafficObservation]:
+        return None
+
+    def collect_traffic_shape(self) -> Optional[TrafficShape]:
         return None
 
     def collect_accept_length(self, interval_str: str) -> Optional[float]:
@@ -137,6 +144,9 @@ class PlannerEnvironmentImpl(PlannerEnvironment):
 
     async def collect_traffic(self) -> Optional[TrafficObservation]:
         return await self.traffic_provider.collect_traffic()
+
+    def collect_traffic_shape(self) -> Optional[TrafficShape]:
+        return self.traffic_provider.collect_traffic_shape()
 
     def collect_accept_length(self, interval_str: str) -> Optional[float]:
         return self.traffic_provider.collect_accept_length(interval_str)
