@@ -108,6 +108,12 @@ class NativePlannerBase:
         self._dashboard_runner: Optional[aiohttp.web.AppRunner] = None
         self._engine: Optional[EngineProtocol] = None
         self._last_worker_counts: Optional[WorkerCounts] = None
+        # DEEPINFRA: sticky "planner-wanted" counts for the predicted_num_*
+        # replica gauges. Updated on any tick that produces a scaling
+        # decision; used as the fallback on plugin-only ticks so the gauge
+        # doesn't flap between the recommendation and the running count.
+        self._last_wanted_num_prefill: Optional[int] = None
+        self._last_wanted_num_decode: Optional[int] = None
 
     async def _async_init(self) -> None:
         await self.environment.initialize()
