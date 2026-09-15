@@ -925,7 +925,7 @@ impl RouterRequestMetrics {
                 let kv_overlap_blocks_total = metrics
                     .create_intcounter(
                         &router_metric(frontend_service::KV_OVERLAP_BLOCKS_TOTAL),
-                        "Sum of predicted overlap blocks at routing time; divide by router_kv_isl_blocks_total for a block-weighted hit rate comparable to vllm:prefix_cache_hits/queries",
+                        "Sum of predicted overlap blocks at routing time; divide by router_kv_isl_blocks_total for a block-weighted hit rate comparable to the backend engine's own prefix-cache counters",
                         extra_labels,
                     )
                     .expect("failed to create router_kv_overlap_blocks_total");

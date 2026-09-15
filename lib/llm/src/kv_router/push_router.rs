@@ -310,8 +310,8 @@ impl KvPushRouter {
                     guard.request_metrics().kv_hit_rate.observe(hit_rate);
                 }
                 // Block-weighted counterpart of `kv_hit_rate`. The histogram above averages
-                // per-request ratios, which is NOT comparable to the engine's
-                // `vllm:prefix_cache_hits/queries` (a ratio of sums). On skewed ISL
+                // per-request ratios, which is NOT comparable to the prefix-cache hit
+                // counters backend engines report (a ratio of sums). On skewed ISL
                 // distributions the two diverge ~2x with nothing broken.
                 guard
                     .request_metrics()
