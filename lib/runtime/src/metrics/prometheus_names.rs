@@ -203,6 +203,12 @@ pub mod frontend_service {
     /// Predicted KV cache hit rate at routing time (0.0-1.0)
     pub const KV_HIT_RATE: &str = "kv_hit_rate";
 
+    /// Sum of predicted overlap blocks at routing time (block-weighted numerator)
+    pub const KV_OVERLAP_BLOCKS_TOTAL: &str = "kv_overlap_blocks_total";
+
+    /// Sum of request ISL blocks at routing time (block-weighted denominator)
+    pub const KV_ISL_BLOCKS_TOTAL: &str = "kv_isl_blocks_total";
+
     /// Upper-bound estimation of KV cache transfer latency in disaggregated serving (seconds)
     pub const KV_TRANSFER_ESTIMATED_LATENCY_SECONDS: &str = "kv_transfer_estimated_latency_seconds";
 
