@@ -26,6 +26,17 @@ If no `recover_endpoint` is configured, gaps are logged and the dropped batches
 are lost. Implementation lives in `listener.rs` (`recover_gap`,
 `apply_recover_response`, `apply_recovered_events`).
 
+## Data-parallel engines (`--watch-dp-size`)
+
+A vLLM engine with `--data-parallel-size N` runs N ranks per pod, each with its
+own KV cache and its own event stream: rank `r` publishes on `zmq_port + r` and
+serves `/kv_recover` on `kv_recover_port + r`. Pod discovery registers one
+listener per rank under the pod's instance (`--watch-dp-size N`, default 1),
+with `dp_rank = r` and the per-rank endpoints, so `/workers` shows N
+`listeners` per pod. With the default on a DP engine only rank 0's cache is
+indexed and every prefill scheduled on another rank is invisible to `/query`
+while the engine still hits it (`pod_watcher.rs`, `rank_endpoints`).
+
 ## Audit logging (`--enable-logging`)
 
 Pass `--enable-logging` to `python -m dynamo.indexer` to turn on verbose audit
