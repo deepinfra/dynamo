@@ -118,6 +118,14 @@ struct KvIndexerCli {
     #[arg(long)]
     watch_recover_port: Option<u16>,
 
+    /// Data-parallel ranks per discovered engine pod (vLLM
+    /// `--data-parallel-size`). Rank r publishes KV events on
+    /// `--watch-zmq-port + r` and serves recovery on `--watch-recover-port + r`;
+    /// every rank is subscribed under the pod's instance. Leaving this at 1 on
+    /// a DP engine silently indexes only rank 0's cache.
+    #[arg(long, default_value_t = 1)]
+    watch_dp_size: u32,
+
     /// Model name whose engine pods to discover, e.g. "openai/gpt-oss-120b".
     /// Unless --watch-label overrides it, the pod watch uses the selector
     /// `di/model_name=<sanitized name>` (the stable label the backend stamps
@@ -161,11 +169,15 @@ where
                 let block_size = cli.block_size.ok_or_else(|| {
                     anyhow::anyhow!("--block-size is required when --watch-namespace is set")
                 })?;
+                if cli.watch_dp_size == 0 {
+                    anyhow::bail!("--watch-dp-size must be at least 1");
+                }
                 Some(KubeDiscoveryConfig {
                     namespace,
                     label_selector,
                     zmq_port: cli.watch_zmq_port,
                     recover_port: cli.watch_recover_port,
+                    dp_size: cli.watch_dp_size,
                     model_name: cli.watch_model_name.unwrap_or_else(|| cli.model_name.clone()),
                     tenant_id: cli.tenant_id.clone(),
                     block_size,
