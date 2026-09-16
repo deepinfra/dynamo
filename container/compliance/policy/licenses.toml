@@ -301,6 +301,13 @@ copyleft = "deny"
 # contains. If the actual license adds tokens beyond these, the build breaks.
 
 [[exceptions]]
+type = "python"
+name = "instanttensor"
+version = "0.1.9"
+allow = ["UNKNOWN"]
+reason = "Apache-2.0 (distributed safetensors loader, arrives via the vLLM 0.29 base image). Its dist-info puts the FULL Apache-2.0 body in the License: field instead of an SPDX id, so the scanner reports UNKNOWN; the LICENSE file in instanttensor-0.1.9.dist-info/licenses/LICENSE is verbatim Apache-2.0. Pinned to 0.1.9 so a future release with fixed metadata is re-evaluated."
+
+[[exceptions]]
 type = "dpkg"
 name = "login"
 allow = ["GPL-1.0-only", "GPL-2.0-or-later"]
