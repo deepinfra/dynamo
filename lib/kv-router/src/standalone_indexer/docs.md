@@ -26,6 +26,14 @@ If no `recover_endpoint` is configured, gaps are logged and the dropped batches
 are lost. Implementation lives in `listener.rs` (`recover_gap`,
 `apply_recover_response`, `apply_recovered_events`).
 
+A download runs under a process-wide gate (`--recover-concurrency`, default 8)
+with a total timeout of `--recover-timeout-secs` (default 120), and a failed
+download is retried up to 3 times with 2/4 s backoff before the gap is given up
+(`"kv_recover request failed; giving up, batches lost"`). A large engine's
+TreeDump is tens of MB serialized inside the engine process; with the previous
+10 s timeout and no gate, a fleet-wide (re)subscription lost about a third of
+its recoveries on 39 DP=2 pods.
+
 ## Data-parallel engines (`--watch-dp-size`)
 
 A vLLM engine with `--data-parallel-size N` runs N ranks per pod, each with its
