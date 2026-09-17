@@ -119,6 +119,7 @@ pub fn spawn_pod_watcher(
             namespace = %config.namespace,
             label_selector = %config.label_selector,
             zmq_port = config.zmq_port,
+            dp_size = config.dp_size,
             model_name = %config.model_name,
             block_size = config.block_size,
             "Starting Kubernetes pod watcher"
@@ -259,30 +260,35 @@ async fn reconcile(
         let instance_id = instance_id_for(name);
         let ip = &pod.ip;
         let tenant_id = pod.tenant_id(&config.tenant_id);
-        let endpoint = format!("tcp://{ip}:{}", config.zmq_port);
-        let recover_endpoint = config
-            .recover_port
-            .map(|port| format!("http://{ip}:{port}"));
 
-        match registry
-            .register(
-                instance_id,
-                endpoint,
-                0, // dp_rank: single-rank engines
-                config.model_name.clone(),
-                tenant_id.clone(),
-                config.block_size,
-                recover_endpoint,
-                Some(name.clone()),
-            )
-            .await
-        {
-            Ok(()) => {
+        let mut failed: Option<(u32, anyhow::Error)> = None;
+        for rank in rank_endpoints(ip, config) {
+            if let Err(error) = registry
+                .register(
+                    instance_id,
+                    rank.endpoint,
+                    rank.dp_rank,
+                    config.model_name.clone(),
+                    tenant_id.clone(),
+                    config.block_size,
+                    rank.recover_endpoint,
+                    Some(name.clone()),
+                )
+                .await
+            {
+                failed = Some((rank.dp_rank, error));
+                break;
+            }
+        }
+
+        match failed {
+            None => {
                 tracing::info!(
                     pod = %name,
                     ip = %ip,
                     instance_id,
                     tenant_id = %tenant_id,
+                    dp_size = config.dp_size,
                     "Subscribed to engine pod"
                 );
                 subscribed.insert(
@@ -294,17 +300,55 @@ async fn reconcile(
                     },
                 );
             }
-            Err(error) => {
-                // Not recorded, so it is retried on the next reconcile.
+            Some((dp_rank, error)) => {
+                // Not recorded, so it is retried on the next reconcile. Drop
+                // any ranks that did register: register() rejects a rank that
+                // is already present, so a partial instance would never
+                // converge on retry.
                 tracing::warn!(
                     pod = %name,
                     ip = %ip,
+                    dp_rank,
                     error = %error,
                     "Failed to register engine pod; will retry"
                 );
+                if let Err(error) = registry
+                    .deregister(instance_id, &config.model_name, &tenant_id)
+                    .await
+                {
+                    tracing::debug!(
+                        pod = %name,
+                        error = %error,
+                        "Cleanup deregister was a no-op"
+                    );
+                }
             }
         }
     }
+}
+
+/// One listener to register for a pod: its data-parallel rank and the
+/// per-rank event and recovery endpoints.
+#[derive(Debug, PartialEq)]
+struct RankEndpoint {
+    dp_rank: u32,
+    endpoint: String,
+    recover_endpoint: Option<String>,
+}
+
+/// Endpoints for every data-parallel rank of a pod. vLLM offsets both the ZMQ
+/// KV-event port and the `/kv_recover` port by the rank, so rank `r` of a pod
+/// at `ip` publishes on `zmq_port + r` and recovers on `recover_port + r`.
+fn rank_endpoints(ip: &str, config: &KubeDiscoveryConfig) -> Vec<RankEndpoint> {
+    (0..config.dp_size.max(1))
+        .map(|dp_rank| RankEndpoint {
+            dp_rank,
+            endpoint: format!("tcp://{ip}:{}", u32::from(config.zmq_port) + dp_rank),
+            recover_endpoint: config
+                .recover_port
+                .map(|port| format!("http://{ip}:{}", u32::from(port) + dp_rank)),
+        })
+        .collect()
 }
 
 /// Derive a stable `WorkerId` from the pod name so the same pod always maps to
@@ -455,5 +499,61 @@ mod tests {
     fn instance_id_is_stable_and_name_specific() {
         assert_eq!(instance_id_for("engine-abc"), instance_id_for("engine-abc"));
         assert_ne!(instance_id_for("engine-abc"), instance_id_for("engine-xyz"));
+    }
+
+    fn discovery(dp_size: u32, recover_port: Option<u16>) -> KubeDiscoveryConfig {
+        KubeDiscoveryConfig {
+            namespace: "deepinfra".to_string(),
+            label_selector: "di/model_name=m".to_string(),
+            zmq_port: 5557,
+            recover_port,
+            dp_size,
+            model_name: "m".to_string(),
+            tenant_id: "default".to_string(),
+            block_size: 128,
+        }
+    }
+
+    #[test]
+    fn single_rank_engine_registers_rank_zero_on_base_ports() {
+        assert_eq!(
+            rank_endpoints("10.0.0.1", &discovery(1, Some(5559))),
+            vec![RankEndpoint {
+                dp_rank: 0,
+                endpoint: "tcp://10.0.0.1:5557".to_string(),
+                recover_endpoint: Some("http://10.0.0.1:5559".to_string()),
+            }]
+        );
+    }
+
+    #[test]
+    fn data_parallel_ranks_offset_event_and_recovery_ports() {
+        assert_eq!(
+            rank_endpoints("10.0.0.1", &discovery(2, Some(5559))),
+            vec![
+                RankEndpoint {
+                    dp_rank: 0,
+                    endpoint: "tcp://10.0.0.1:5557".to_string(),
+                    recover_endpoint: Some("http://10.0.0.1:5559".to_string()),
+                },
+                RankEndpoint {
+                    dp_rank: 1,
+                    endpoint: "tcp://10.0.0.1:5558".to_string(),
+                    recover_endpoint: Some("http://10.0.0.1:5560".to_string()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn no_recover_port_means_no_recovery_endpoint_on_any_rank() {
+        let ranks = rank_endpoints("10.0.0.1", &discovery(2, None));
+        assert_eq!(ranks.len(), 2);
+        assert!(ranks.iter().all(|r| r.recover_endpoint.is_none()));
+    }
+
+    #[test]
+    fn zero_dp_size_still_registers_rank_zero() {
+        assert_eq!(rank_endpoints("10.0.0.1", &discovery(0, None)).len(), 1);
     }
 }

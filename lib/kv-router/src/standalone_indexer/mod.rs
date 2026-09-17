@@ -124,12 +124,17 @@ pub struct KubeDiscoveryConfig {
     /// from the model name (`di/model_name=<sanitized>`, spans every
     /// engine_hash) or supplied raw, e.g. `engine_hash=d4b7a85131172ca6`.
     pub label_selector: String,
-    /// ZMQ KV-event port the engines publish on (e.g. 5557).
+    /// ZMQ KV-event port the engines publish on (e.g. 5557). Data-parallel
+    /// rank `r` publishes on `zmq_port + r`.
     pub zmq_port: u16,
     /// Optional HTTP port serving `GET /kv_recover` on the engines, used for
-    /// per-worker gap recovery. `http://<pod-ip>:<recover_port>` is the base
-    /// URL the indexer queries on a detected gap.
+    /// per-worker gap recovery. `http://<pod-ip>:<recover_port + r>` is the
+    /// base URL the indexer queries for rank `r` on a detected gap.
     pub recover_port: Option<u16>,
+    /// Data-parallel ranks per engine pod. Each rank has its own KV cache and
+    /// its own event stream, so every rank is registered as a listener of the
+    /// same instance. Engines without data parallelism run one rank.
+    pub dp_size: u32,
     /// Model name discovered pods are registered under.
     pub model_name: String,
     /// Tenant id discovered pods are registered under.

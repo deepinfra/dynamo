@@ -549,6 +549,39 @@ fn test_convert_event_block_size_mismatch_is_fatal() {
 }
 
 #[test]
+fn test_convert_event_partial_prefix_entry_is_skipped() {
+    // vLLM with prefix_match_unit (hash_block_size) < block_size publishes the
+    // prompt tail that ends inside a cache block as a BlockStored whose
+    // block_size is the sub-block length (32/64/96 for a 128-token block).
+    // That is not a --block-size misconfiguration: drop it, don't exit.
+    for partial in [32usize, 64, 96] {
+        let raw_event = RawKvEvent::BlockStored {
+            block_hashes: vec![BlockHashValue::Unsigned(21)],
+            parent_block_hash: Some(BlockHashValue::Unsigned(9)),
+            token_ids: vec![10; partial],
+            block_size: partial,
+            medium: None,
+            lora_name: None,
+            block_mm_infos: None,
+            is_eagle: None,
+            group_idx: Some(4),
+            kv_cache_spec_kind: Some(KvCacheSpecKind::MlaAttention),
+            kv_cache_spec_sliding_window: None,
+        };
+        let warning_count = Arc::new(AtomicU32::new(0));
+        let result =
+            convert_event(raw_event, 7, 128, WorkerWithDpRank::new(3, 0), &warning_count)
+                .expect("partial-prefix entry is not a config error");
+        assert!(result.is_none(), "partial entry of {partial} tokens must be dropped");
+    }
+    // Anything smaller is a partial entry; equal/larger is not.
+    assert!(is_partial_prefix_entry(96, 128));
+    assert!(!is_partial_prefix_entry(256, 128));
+    assert!(!is_partial_prefix_entry(128, 128));
+    assert!(is_partial_prefix_entry(32, 128));
+}
+
+#[test]
 fn test_convert_event_empty_store_is_not_fatal() {
     // No blocks to publish -> nothing can mismatch; must not error.
     let raw_event = RawKvEvent::BlockStored {
