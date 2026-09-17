@@ -45,6 +45,11 @@ ENV PATH=/opt/maturin/bin:$PATH
 # Source tarball (git archive), auto-extracted by ADD. rust-toolchain.toml lands
 # at /src so rustup resolves 1.93.1 for the whole workspace.
 ADD dynamo-src.tar /src
+# git archive stamps every file with the commit time, and cargo judges a path
+# crate fresh by mtime against the shared /cargo-target cache. A sibling build
+# (another branch) can therefore leave a newer artifact that cargo reuses with
+# the wrong contents; stamping the sources with the build time prevents that.
+RUN find /src -type f -exec touch {} +
 
 # Build the release wheel. kv-indexer-metrics adds the `dynamo.indexer` binary
 # + Prometheus /metrics. nixl-sys' build script runs bindgen, so point it at
