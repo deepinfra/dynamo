@@ -26,6 +26,12 @@ If no `recover_endpoint` is configured, gaps are logged and the dropped batches
 are lost. Implementation lives in `listener.rs` (`recover_gap`,
 `apply_recover_response`, `apply_recovered_events`).
 
+The SUB sockets run with an unbounded receive queue (`ZMQ_RCVHWM = 0`,
+`zmq.rs`): a listener blocked in recovery must never HWM-stop its pipe, because
+libzmq 4.3.4 aborts on `_input_stopped` when a heartbeating peer restarts such
+a pipe (zeromq/libzmq#3596). Seen in prod as a crash loop of the h24 indexer
+while 66 startup TreeDumps were being applied under the single h24 mutex.
+
 A download runs under a process-wide gate (`--recover-concurrency`, default 8)
 with a total timeout of `--recover-timeout-secs` (default 120), and a failed
 download is retried up to 3 times with 2/4 s backoff before the gap is given up

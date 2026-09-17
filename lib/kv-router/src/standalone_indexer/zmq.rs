@@ -15,6 +15,10 @@ pub(super) type MultipartMessage = Vec<Vec<u8>>;
 pub(super) type SharedSocket = Arc<Mutex<ZmqSocket>>;
 
 const ZMQ_RCVTIMEOUT_MS: i32 = 100;
+// Unbounded on purpose: libzmq 4.3.4 asserts (`_input_stopped`) when a
+// heartbeating peer restarts a pipe that HWM-stopped input, so a listener
+// stalled in recovery must never let its queue fill (zeromq/libzmq#3596).
+const ZMQ_RCVHWM: i32 = 0;
 #[cfg(test)]
 const ZMQ_SNDTIMEOUT_MS: i32 = 0;
 const ZMQ_RECONNECT_IVL_MS: i32 = 100;
@@ -151,6 +155,7 @@ fn configure_common_socket(socket: &zmq::Socket) -> Result<()> {
 fn configure_receive_socket(socket: &zmq::Socket) -> Result<()> {
     configure_common_socket(socket)?;
     socket.set_rcvtimeo(ZMQ_RCVTIMEOUT_MS)?;
+    socket.set_rcvhwm(ZMQ_RCVHWM)?;
     Ok(())
 }
 
@@ -202,4 +207,16 @@ pub(super) async fn send_multipart(socket: &SharedSocket, frames: MultipartMessa
         .map(zmq::Message::from)
         .collect::<VecDeque<_>>();
     poll_fn(|cx| socket.poll_send_multipart(cx, &mut buffer)).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn sub_socket_receive_queue_is_unbounded() {
+        let socket = connect_sub_socket("inproc://rcvhwm-test").unwrap();
+        let guard = socket.lock().await;
+        assert_eq!(guard.socket().get_rcvhwm().unwrap(), 0);
+    }
 }
