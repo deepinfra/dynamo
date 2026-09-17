@@ -89,6 +89,16 @@ struct KvIndexerCli {
     #[arg(long, default_value_t = 0.75)]
     evict_memory_threshold: f64,
 
+    /// Total timeout in seconds for one engine `GET /kv_recover` download
+    /// (connect + body). A full TreeDump of a large engine is tens of MB.
+    #[arg(long, default_value_t = 120)]
+    recover_timeout_secs: u64,
+
+    /// Maximum concurrent `/kv_recover` downloads across all listeners of this
+    /// indexer. Bounds the load a fleet-wide (re)subscription puts on engines.
+    #[arg(long, default_value_t = 8)]
+    recover_concurrency: usize,
+
     /// Emit verbose audit logs on the `kv_audit` tracing target: one line per
     /// query (block hashes + full indexer response) and one line per
     /// store/evict/clear event ingested from the engine. Filter with
@@ -221,6 +231,8 @@ where
             enable_logging: cli.enable_logging,
             h24: cli.h24,
             h24_horizon_secs: cli.h24_horizon_secs,
+            recover_timeout_secs: cli.recover_timeout_secs,
+            recover_concurrency: cli.recover_concurrency,
             kube_discovery,
         }))
     }
