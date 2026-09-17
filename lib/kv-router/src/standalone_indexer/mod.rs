@@ -53,6 +53,27 @@ use server::{AppState, create_router};
 // exactly once and read many times.
 static KEEP_EVICTIONS: OnceLock<bool> = OnceLock::new();
 static ENABLE_LOGGING: OnceLock<bool> = OnceLock::new();
+static RECOVER_TIMEOUT_SECS: OnceLock<u64> = OnceLock::new();
+static RECOVER_GATE: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
+
+pub(crate) const DEFAULT_RECOVER_TIMEOUT_SECS: u64 = 120;
+pub(crate) const DEFAULT_RECOVER_CONCURRENCY: usize = 8;
+
+/// Total timeout (connect + body) for one `GET /kv_recover` download. A full
+/// TreeDump of a large engine is tens of MB serialized inside the engine
+/// process, so this is minutes, not seconds.
+pub(crate) fn recover_timeout_secs() -> u64 {
+    *RECOVER_TIMEOUT_SECS
+        .get()
+        .unwrap_or(&DEFAULT_RECOVER_TIMEOUT_SECS)
+}
+
+/// Process-wide cap on concurrent `/kv_recover` downloads. Every listener of a
+/// freshly started indexer detects a gap at once; without the cap each engine
+/// is asked for one dump per flavor per dp_rank simultaneously.
+pub(crate) fn recover_gate() -> &'static tokio::sync::Semaphore {
+    RECOVER_GATE.get_or_init(|| tokio::sync::Semaphore::new(DEFAULT_RECOVER_CONCURRENCY))
+}
 
 /// Returns `true` when this indexer instance parks `Removed` events in the
 /// per-listener pending-evictions buffer (and drops `Cleared`) instead of
@@ -178,6 +199,12 @@ pub struct IndexerConfig {
     /// stored or touched within this window are dropped. Only meaningful
     /// with `h24`.
     pub h24_horizon_secs: u64,
+    /// Total timeout in seconds for one `/kv_recover` download. See
+    /// [`recover_timeout_secs`].
+    pub recover_timeout_secs: u64,
+    /// Maximum concurrent `/kv_recover` downloads across all listeners. See
+    /// [`recover_gate`].
+    pub recover_concurrency: usize,
 }
 
 pub(super) fn validate_zmq_endpoint(endpoint: &str) -> anyhow::Result<()> {
@@ -285,6 +312,10 @@ pub async fn run_server(config: IndexerConfig) -> anyhow::Result<()> {
     // run_server is called once, so we discard the result.
     let _ = KEEP_EVICTIONS.set(config.keep_evictions);
     let _ = ENABLE_LOGGING.set(config.enable_logging);
+    let _ = RECOVER_TIMEOUT_SECS.set(config.recover_timeout_secs.max(1));
+    let _ = RECOVER_GATE.set(tokio::sync::Semaphore::new(
+        config.recover_concurrency.max(1),
+    ));
     if config.enable_logging {
         tracing::info!(
             target: "kv_audit",

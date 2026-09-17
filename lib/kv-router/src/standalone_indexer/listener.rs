@@ -20,6 +20,15 @@ use super::zmq::{MultipartMessage, SharedSocket, connect_sub_socket, recv_multip
 
 const WATERMARK_UNSET: u64 = u64::MAX;
 
+/// Attempts per detected gap before the missed batches are given up as lost.
+const RECOVER_ATTEMPTS: u32 = 3;
+
+/// Delay before retry `attempt` (0-based) of a failed `/kv_recover` download:
+/// 2 s, 4 s, 8 s, ... capped at 32 s.
+fn recover_backoff(attempt: u32) -> std::time::Duration {
+    std::time::Duration::from_secs(2u64 << attempt.min(4))
+}
+
 fn cursor_from_watermark(watermark: u64) -> CursorState {
     if watermark == WATERMARK_UNSET {
         CursorState::Initial
@@ -213,39 +222,78 @@ impl ListenerLoop {
         };
 
         let url = format!("{}/kv_recover", recover_endpoint.trim_end_matches('/'));
-        let client = self.http_client.clone();
         let cancel = self.cancel.clone();
         let worker_id = self.worker_id;
         let dp_rank = self.dp_rank;
 
-        let fetch = async move {
-            let response = client
-                .get(&url)
-                .query(&[("start", start_seq), ("end", end_seq)])
-                .send()
-                .await?;
-            if !response.status().is_success() {
-                anyhow::bail!("kv_recover returned status {}", response.status());
-            }
-            let body: WorkerKvQueryResponse = response.json().await?;
-            anyhow::Ok(body)
-        };
-
-        let response = tokio::select! {
-            _ = cancel.cancelled() => {
-                tracing::debug!(worker_id, dp_rank, "Recovery cancelled");
-                return 0;
-            }
-            result = fetch => match result {
-                Ok(body) => body,
-                Err(error) => {
-                    tracing::error!(worker_id, dp_rank, error = %error, "kv_recover request failed");
+        for attempt in 0..RECOVER_ATTEMPTS {
+            // One dump at a time per permit: a fleet-wide (re)subscription
+            // otherwise asks every engine for several large TreeDumps at once
+            // and the downloads run past the client timeout.
+            let permit = tokio::select! {
+                _ = cancel.cancelled() => {
+                    tracing::debug!(worker_id, dp_rank, "Recovery cancelled");
                     return 0;
                 }
-            }
-        };
+                permit = super::recover_gate().acquire() => {
+                    permit.expect("recovery gate is never closed")
+                }
+            };
 
-        self.apply_recover_response(response).await
+            let client = self.http_client.clone();
+            let request_url = url.clone();
+            let fetch = async move {
+                let response = client
+                    .get(&request_url)
+                    .query(&[("start", start_seq), ("end", end_seq)])
+                    .send()
+                    .await?;
+                if !response.status().is_success() {
+                    anyhow::bail!("kv_recover returned status {}", response.status());
+                }
+                let body: WorkerKvQueryResponse = response.json().await?;
+                anyhow::Ok(body)
+            };
+
+            let result = tokio::select! {
+                _ = cancel.cancelled() => {
+                    tracing::debug!(worker_id, dp_rank, "Recovery cancelled");
+                    return 0;
+                }
+                result = fetch => result,
+            };
+            drop(permit);
+
+            let error = match result {
+                Ok(body) => return self.apply_recover_response(body).await,
+                Err(error) => error,
+            };
+            if attempt + 1 == RECOVER_ATTEMPTS {
+                tracing::error!(
+                    worker_id,
+                    dp_rank,
+                    attempts = RECOVER_ATTEMPTS,
+                    gap_size = end_seq.saturating_sub(start_seq),
+                    error = %error,
+                    "kv_recover request failed; giving up, batches lost"
+                );
+                return 0;
+            }
+            let delay = recover_backoff(attempt);
+            tracing::warn!(
+                worker_id,
+                dp_rank,
+                attempt = attempt + 1,
+                retry_in_secs = delay.as_secs(),
+                error = %error,
+                "kv_recover request failed; retrying"
+            );
+            tokio::select! {
+                _ = cancel.cancelled() => return 0,
+                _ = tokio::time::sleep(delay) => {}
+            }
+        }
+        0
     }
 
     /// Apply a [`WorkerKvQueryResponse`] to this listener's indexer and advance
@@ -598,12 +646,16 @@ async fn run_listener(
     .await
 }
 
-/// Build the HTTP client used for `/kv_recover` gap-recovery requests. The 10s
-/// timeout bounds the whole request (connect + body read). Recovery is a
-/// low-frequency, on-gap operation, so a fresh client per listener is fine.
+/// Build the HTTP client used for `/kv_recover` gap-recovery requests. The
+/// total timeout bounds the whole request (connect + body read) and comes from
+/// `--recover-timeout-secs`; a large engine's TreeDump is tens of MB produced
+/// inside the engine process, which the old 10 s bound did not cover under
+/// concurrent recoveries. Recovery is a low-frequency, on-gap operation, so a
+/// fresh client per listener is fine.
 fn build_recover_client() -> reqwest::Client {
     reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(super::recover_timeout_secs()))
         .build()
         .unwrap_or_else(|error| {
             tracing::warn!(error = %error, "Failed to build recover HTTP client; using default");
@@ -897,6 +949,26 @@ mod tests {
         .unwrap();
 
         assert_eq!(msg, vec![b"probe".to_vec()]);
+    }
+
+    #[test]
+    fn recover_backoff_doubles_and_caps() {
+        assert_eq!(super::recover_backoff(0).as_secs(), 2);
+        assert_eq!(super::recover_backoff(1).as_secs(), 4);
+        assert_eq!(super::recover_backoff(2).as_secs(), 8);
+        assert_eq!(super::recover_backoff(10).as_secs(), 32);
+    }
+
+    #[test]
+    fn recover_gate_defaults_when_unconfigured() {
+        assert_eq!(
+            crate::standalone_indexer::recover_gate().available_permits(),
+            crate::standalone_indexer::DEFAULT_RECOVER_CONCURRENCY
+        );
+        assert_eq!(
+            crate::standalone_indexer::recover_timeout_secs(),
+            crate::standalone_indexer::DEFAULT_RECOVER_TIMEOUT_SECS
+        );
     }
 
     fn reserve_open_port() -> std::net::TcpListener {
