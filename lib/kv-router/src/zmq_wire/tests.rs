@@ -641,3 +641,69 @@ fn test_convert_event_short_token_ids_keeps_parsed_blocks() {
         other => panic!("expected Stored event, got {other:?}"),
     }
 }
+
+fn stored_image_block(tokens: Vec<u32>) -> RawKvEvent {
+    RawKvEvent::BlockStored {
+        block_hashes: vec![BlockHashValue::Unsigned(21)],
+        parent_block_hash: None,
+        block_size: tokens.len(),
+        token_ids: tokens,
+        medium: None,
+        lora_name: None,
+        block_mm_infos: Some(vec![Some(BlockExtraInfo {
+            mm_objects: vec![BlockMmObjectInfo {
+                mm_hash: 0x5083_86df_2042_9a4f,
+                offsets: vec![],
+            }],
+        })]),
+        is_eagle: None,
+        group_idx: None,
+        kv_cache_spec_kind: None,
+        kv_cache_spec_sliding_window: None,
+    }
+}
+
+fn stored_tokens_hash(event: Option<PlacementEvent>) -> u64 {
+    match event.expect("stored event converts").event.data {
+        KvCacheEventData::Stored(data) => data.blocks[0].tokens_hash.0,
+        other => panic!("expected Stored, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_plain_mm_hashing_matches_token_only_probe() {
+    let tokens: Vec<u32> = (0..4).map(|t| 129_264 + t).collect();
+    let token_only = compute_block_hash_for_seq(
+        &tokens,
+        4,
+        BlockHashOptions {
+            block_mm_infos: None,
+            lora_name: None,
+            is_eagle: None,
+        },
+    )[0]
+    .0;
+    let worker = WorkerWithDpRank::new(3, 0);
+
+    let mut plain = ZmqEventNormalizer::new(4).with_plain_mm_hashing();
+    let plain_hash = stored_tokens_hash(
+        plain
+            .normalize(stored_image_block(tokens.clone()), 1, worker)
+            .unwrap(),
+    );
+    assert_eq!(
+        plain_hash, token_only,
+        "plain mode must ignore the image hash"
+    );
+
+    let mut mm_aware = ZmqEventNormalizer::new(4);
+    let mm_hash = stored_tokens_hash(
+        mm_aware
+            .normalize(stored_image_block(tokens), 1, worker)
+            .unwrap(),
+    );
+    assert_ne!(
+        mm_hash, token_only,
+        "default mode still mixes the image hash in"
+    );
+}

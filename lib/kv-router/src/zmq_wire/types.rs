@@ -97,6 +97,37 @@ pub enum RawKvEvent {
 }
 
 impl RawKvEvent {
+    pub fn without_mm_infos(self) -> Self {
+        match self {
+            Self::BlockStored {
+                block_hashes,
+                parent_block_hash,
+                token_ids,
+                block_size,
+                medium,
+                lora_name,
+                block_mm_infos: _,
+                is_eagle,
+                group_idx,
+                kv_cache_spec_kind,
+                kv_cache_spec_sliding_window,
+            } => Self::BlockStored {
+                block_hashes,
+                parent_block_hash,
+                token_ids,
+                block_size,
+                medium,
+                lora_name,
+                block_mm_infos: None,
+                is_eagle,
+                group_idx,
+                kv_cache_spec_kind,
+                kv_cache_spec_sliding_window,
+            },
+            other => other,
+        }
+    }
+
     pub fn event_type_label(&self) -> &'static str {
         match self {
             Self::BlockStored { .. } => "stored",
