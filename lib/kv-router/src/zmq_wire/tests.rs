@@ -549,6 +549,39 @@ fn test_convert_event_block_size_mismatch_is_fatal() {
 }
 
 #[test]
+fn test_convert_event_partial_prefix_entry_is_skipped() {
+    // vLLM with prefix_match_unit (hash_block_size) < block_size publishes the
+    // prompt tail that ends inside a cache block as a BlockStored whose
+    // block_size is the sub-block length (32/64/96 for a 128-token block).
+    // That is not a --block-size misconfiguration: drop it, don't exit.
+    for partial in [32usize, 64, 96] {
+        let raw_event = RawKvEvent::BlockStored {
+            block_hashes: vec![BlockHashValue::Unsigned(21)],
+            parent_block_hash: Some(BlockHashValue::Unsigned(9)),
+            token_ids: vec![10; partial],
+            block_size: partial,
+            medium: None,
+            lora_name: None,
+            block_mm_infos: None,
+            is_eagle: None,
+            group_idx: Some(4),
+            kv_cache_spec_kind: Some(KvCacheSpecKind::MlaAttention),
+            kv_cache_spec_sliding_window: None,
+        };
+        let warning_count = Arc::new(AtomicU32::new(0));
+        let result =
+            convert_event(raw_event, 7, 128, WorkerWithDpRank::new(3, 0), &warning_count)
+                .expect("partial-prefix entry is not a config error");
+        assert!(result.is_none(), "partial entry of {partial} tokens must be dropped");
+    }
+    // Anything smaller is a partial entry; equal/larger is not.
+    assert!(is_partial_prefix_entry(96, 128));
+    assert!(!is_partial_prefix_entry(256, 128));
+    assert!(!is_partial_prefix_entry(128, 128));
+    assert!(is_partial_prefix_entry(32, 128));
+}
+
+#[test]
 fn test_convert_event_empty_store_is_not_fatal() {
     // No blocks to publish -> nothing can mismatch; must not error.
     let raw_event = RawKvEvent::BlockStored {
@@ -607,4 +640,70 @@ fn test_convert_event_short_token_ids_keeps_parsed_blocks() {
         }
         other => panic!("expected Stored event, got {other:?}"),
     }
+}
+
+fn stored_image_block(tokens: Vec<u32>) -> RawKvEvent {
+    RawKvEvent::BlockStored {
+        block_hashes: vec![BlockHashValue::Unsigned(21)],
+        parent_block_hash: None,
+        block_size: tokens.len(),
+        token_ids: tokens,
+        medium: None,
+        lora_name: None,
+        block_mm_infos: Some(vec![Some(BlockExtraInfo {
+            mm_objects: vec![BlockMmObjectInfo {
+                mm_hash: 0x5083_86df_2042_9a4f,
+                offsets: vec![],
+            }],
+        })]),
+        is_eagle: None,
+        group_idx: None,
+        kv_cache_spec_kind: None,
+        kv_cache_spec_sliding_window: None,
+    }
+}
+
+fn stored_tokens_hash(event: Option<PlacementEvent>) -> u64 {
+    match event.expect("stored event converts").event.data {
+        KvCacheEventData::Stored(data) => data.blocks[0].tokens_hash.0,
+        other => panic!("expected Stored, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_plain_mm_hashing_matches_token_only_probe() {
+    let tokens: Vec<u32> = (0..4).map(|t| 129_264 + t).collect();
+    let token_only = compute_block_hash_for_seq(
+        &tokens,
+        4,
+        BlockHashOptions {
+            block_mm_infos: None,
+            lora_name: None,
+            is_eagle: None,
+        },
+    )[0]
+    .0;
+    let worker = WorkerWithDpRank::new(3, 0);
+
+    let mut plain = ZmqEventNormalizer::new(4).with_plain_mm_hashing();
+    let plain_hash = stored_tokens_hash(
+        plain
+            .normalize(stored_image_block(tokens.clone()), 1, worker)
+            .unwrap(),
+    );
+    assert_eq!(
+        plain_hash, token_only,
+        "plain mode must ignore the image hash"
+    );
+
+    let mut mm_aware = ZmqEventNormalizer::new(4);
+    let mm_hash = stored_tokens_hash(
+        mm_aware
+            .normalize(stored_image_block(tokens), 1, worker)
+            .unwrap(),
+    );
+    assert_ne!(
+        mm_hash, token_only,
+        "default mode still mixes the image hash in"
+    );
 }

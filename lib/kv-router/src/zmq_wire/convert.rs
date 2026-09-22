@@ -43,6 +43,15 @@ impl std::fmt::Display for ConvertError {
 
 impl std::error::Error for ConvertError {}
 
+/// True when a BlockStored's `block_size` is smaller than the configured cache
+/// block size: a partial-prefix (hash-boundary) entry -- vLLM hashes prefixes
+/// every `prefix_match_unit` tokens, so the prompt tail inside a cache block is
+/// published with block_size = k * prefix_match_unit (32/64/96 for a 128-token
+/// block). A *larger* event block size can only be a --block-size misconfig.
+pub fn is_partial_prefix_entry(event_block_size: usize, kv_block_size: u32) -> bool {
+    event_block_size > 0 && event_block_size < kv_block_size as usize
+}
+
 /// Convert a raw event coming from the ZMQ channel into a placement-aware worker event.
 pub fn convert_event(
     raw: RawKvEvent,
@@ -73,6 +82,32 @@ pub fn convert_event(
             kv_cache_spec_kind: _,
             kv_cache_spec_sliding_window: _,
         } => {
+            if !block_hashes.is_empty()
+                && is_partial_prefix_entry(block_size, kv_block_size)
+            {
+                // A partial-prefix entry: vLLM hashes prefixes every
+                // `prefix_match_unit` (hash_block_size) tokens, which can be
+                // finer than the cache block size, and publishes the prompt
+                // tail that ends inside a cache block as a BlockStored whose
+                // `block_size` is that sub-block length (e.g. 32/64/96 for a
+                // 128-token block). The indexer keys on whole cache blocks, so
+                // these carry no routable information: drop them instead of
+                // treating them as a --block-size misconfiguration.
+                if warning_count.fetch_add(1, Ordering::Relaxed) < 3 {
+                    tracing::warn!(
+                        event_id,
+                        worker_id = worker.worker_id,
+                        dp_rank = worker.dp_rank,
+                        event_block_size = block_size,
+                        configured_block_size = kv_block_size,
+                        "Skipping sub-block BlockStored: a partial-prefix entry \
+                         (prefix_match_unit < block_size), unless the indexer's \
+                         --block-size is larger than the engine's -- then the \
+                         index stays empty; check configured vs event size"
+                    );
+                }
+                return Ok(None);
+            }
             if !block_hashes.is_empty() && block_size != kv_block_size as usize {
                 tracing::error!(
                     event_id,

@@ -26,6 +26,43 @@ If no `recover_endpoint` is configured, gaps are logged and the dropped batches
 are lost. Implementation lives in `listener.rs` (`recover_gap`,
 `apply_recover_response`, `apply_recovered_events`).
 
+The SUB sockets run with an unbounded receive queue (`ZMQ_RCVHWM = 0`,
+`zmq.rs`): a listener blocked in recovery must never HWM-stop its pipe, because
+libzmq 4.3.4 aborts on `_input_stopped` when a heartbeating peer restarts such
+a pipe (zeromq/libzmq#3596). Seen in prod as a crash loop of the h24 indexer
+while 66 startup TreeDumps were being applied under the single h24 mutex.
+
+A download runs under a process-wide gate (`--recover-concurrency`, default 8)
+with a total timeout of `--recover-timeout-secs` (default 120), and a failed
+download is retried up to 3 times with 2/4 s backoff before the gap is given up
+(`"kv_recover request failed; giving up, batches lost"`). A large engine's
+TreeDump is tens of MB serialized inside the engine process; with the previous
+10 s timeout and no gate, a fleet-wide (re)subscription lost about a third of
+its recoveries on 39 DP=2 pods.
+
+## Image blocks hash from tokens only
+
+vLLM attaches each image's identifier to a stored block in `extra_keys`, and the
+shared ZMQ normalizer would mix it into that block's tokens hash. The standalone
+indexer's queriers do not: deepapi's probe hashes plain token ids and the
+engine's local-indexer TreeDumps (`/kv_recover`) carry token-only hashes. With
+the image hash mixed in, every query stopped matching at a conversation's first
+image block. The listener therefore builds its normalizer with
+`with_plain_mm_hashing()`. Trade-off: two prompts that share text but carry
+different images at the same position are indexed as the same prefix, so the
+indexer can over-report a hit the engine will not give.
+
+## Data-parallel engines (`--watch-dp-size`)
+
+A vLLM engine with `--data-parallel-size N` runs N ranks per pod, each with its
+own KV cache and its own event stream: rank `r` publishes on `zmq_port + r` and
+serves `/kv_recover` on `kv_recover_port + r`. Pod discovery registers one
+listener per rank under the pod's instance (`--watch-dp-size N`, default 1),
+with `dp_rank = r` and the per-rank endpoints, so `/workers` shows N
+`listeners` per pod. With the default on a DP engine only rank 0's cache is
+indexed and every prefill scheduled on another rank is invisible to `/query`
+while the engine still hits it (`pod_watcher.rs`, `rank_endpoints`).
+
 ## Audit logging (`--enable-logging`)
 
 Pass `--enable-logging` to `python -m dynamo.indexer` to turn on verbose audit
