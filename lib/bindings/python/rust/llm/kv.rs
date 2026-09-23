@@ -262,6 +262,16 @@ struct KvIndexerCli {
     #[arg(long, default_value_t = false)]
     enable_logging: bool,
 
+    /// Run as the flat h24 counterfactual (kv-indexer:h24): one map per model
+    /// of every prefix stored by any worker within --h24-horizon-secs,
+    /// ignoring evictions. Exclusive with --keep-evictions.
+    #[arg(long, default_value_t = false)]
+    h24: bool,
+
+    /// Retention horizon of the h24 expiry sweep, in seconds.
+    #[arg(long, default_value_t = 172800)]
+    h24_horizon_secs: u64,
+
     /// Kubernetes namespace to watch for engine pods. Together with
     /// --watch-model-name (or --watch-label) this enables pod auto-discovery:
     /// subscribe on Ready, unsubscribe on delete.
@@ -376,6 +386,7 @@ where
             },
             kube_discovery,
             audit_log: cli.enable_logging,
+            h24_horizon_s: cli.h24.then_some(cli.h24_horizon_secs),
             keep_evictions: cli.keep_evictions.then_some(
                 indexer::evictions::KeepEvictionsConfig {
                     retention_s: cli.evict_retention_secs,

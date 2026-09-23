@@ -18,7 +18,7 @@ use crate::identity::RoutingPartitionId;
 use crate::indexer::KvIndexerMetrics;
 use crate::protocols::WorkerId;
 
-use super::backend::{Indexer, create_indexer_with_metrics};
+use super::backend::{Indexer, create_h24_indexer, create_indexer_with_metrics};
 use super::evictions::PendingEvictions;
 use super::kv_recover::{KvRecoverClient, KvRecoverSettings};
 use super::listener::spawn_zmq_listener;
@@ -155,6 +155,8 @@ pub struct RegistryOptions {
     pub keep_evictions: bool,
     /// Emit `kv_audit` lines for queries and events (`--enable-logging`).
     pub audit_log: bool,
+    /// Every indexer is the flat h24 counterfactual, one per model (`--h24`).
+    pub h24: bool,
 }
 
 /// Where and how a listener fetches `/kv_recover` on a gap.
@@ -384,6 +386,7 @@ pub struct WorkerRegistry {
     kv_recover: Arc<KvRecoverClient>,
     keep_evictions: bool,
     audit_log: bool,
+    h24: bool,
 }
 
 impl WorkerRegistry {
@@ -438,6 +441,7 @@ impl WorkerRegistry {
             ),
             keep_evictions: false,
             audit_log: false,
+            h24: false,
         }
     }
 
@@ -446,7 +450,33 @@ impl WorkerRegistry {
         self.kv_recover = Arc::new(KvRecoverClient::new(options.kv_recover)?);
         self.keep_evictions = options.keep_evictions;
         self.audit_log = options.audit_log;
+        self.h24 = options.h24;
         Ok(self)
+    }
+
+    fn new_indexer(&self, block_size: u32) -> Indexer {
+        if self.h24 {
+            create_h24_indexer()
+        } else {
+            create_indexer_with_metrics(block_size, self.num_threads, self.indexer_metrics.clone())
+        }
+    }
+
+    /// h24 is worker-less and regime-agnostic ("stored by anyone"), so every
+    /// routing group of a model shares one flat map. Per-group maps would count
+    /// a block matched in N regimes N times against a once-per-request
+    /// denominator (live incident: 120% hit rate). Requires one block size
+    /// across the model's regimes.
+    fn partition_key(&self, model_name: String, routing_group: String) -> RoutingPartitionId {
+        if self.h24 {
+            RoutingPartitionId::new(model_name, "h24")
+        } else {
+            RoutingPartitionId::new(model_name, routing_group)
+        }
+    }
+
+    pub fn h24_enabled(&self) -> bool {
+        self.h24
     }
 
     pub fn audit_log_enabled(&self) -> bool {
@@ -532,7 +562,7 @@ impl WorkerRegistry {
         replay_endpoint: Option<String>,
         extras: ListenerExtras,
     ) -> Result<()> {
-        let key = RoutingPartitionId::new(model_name, routing_group);
+        let key = self.partition_key(model_name.to_string(), routing_group.to_string());
         let registration = self.indexer_lifecycle.lock().await;
 
         if let Some(entry) = self.workers.get(&instance_id) {
@@ -557,11 +587,7 @@ impl WorkerRegistry {
                 "Creating new indexer"
             );
             IndexerEntry {
-                indexer: create_indexer_with_metrics(
-                    block_size,
-                    self.num_threads,
-                    self.indexer_metrics.clone(),
-                ),
+                indexer: self.new_indexer(block_size),
                 block_size,
             }
         });
@@ -633,7 +659,7 @@ impl WorkerRegistry {
         model_name: &str,
         routing_group: &str,
     ) -> Result<()> {
-        let key = RoutingPartitionId::new(model_name, routing_group);
+        let key = self.partition_key(model_name.to_string(), routing_group.to_string());
 
         if let Some(entry) = self.workers.get(&instance_id) {
             if entry.key != key {
@@ -674,7 +700,7 @@ impl WorkerRegistry {
         model_name: &str,
         routing_group: &str,
     ) -> Result<()> {
-        let key = RoutingPartitionId::new(model_name, routing_group);
+        let key = self.partition_key(model_name.to_string(), routing_group.to_string());
 
         let (record, remove_worker) = {
             let mut entry = self
@@ -891,6 +917,7 @@ impl WorkerRegistry {
     }
 
     pub fn get_or_create_indexer(&self, key: RoutingPartitionId, block_size: u32) -> Indexer {
+        let key = self.partition_key(key.model_name, key.routing_group);
         let entry = self.indexers.entry(key.clone()).or_insert_with(|| {
             tracing::info!(
                 model_name = %key.model_name,
@@ -899,11 +926,7 @@ impl WorkerRegistry {
                 "Creating indexer from recovery dump"
             );
             IndexerEntry {
-                indexer: create_indexer_with_metrics(
-                    block_size,
-                    self.num_threads,
-                    self.indexer_metrics.clone(),
-                ),
+                indexer: self.new_indexer(block_size),
                 block_size,
             }
         });
@@ -949,7 +972,7 @@ impl WorkerRegistry {
         let Some(routing_group) = routing_group else {
             return self.indexers_for_model(model_name);
         };
-        let key = RoutingPartitionId::new(model_name, routing_group);
+        let key = self.partition_key(model_name.to_string(), routing_group.to_string());
         self.indexers
             .get(&key)
             .map(|entry| vec![(key.clone(), entry.indexer.clone(), entry.block_size)])

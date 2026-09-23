@@ -36,6 +36,7 @@ mod block_size;
 mod deepapi_contract_tests;
 pub mod discovery;
 pub mod evictions;
+pub mod h24;
 pub mod kv_recover;
 pub mod listener;
 pub mod logging;
@@ -83,6 +84,9 @@ pub struct IndexerConfig {
     pub keep_evictions: Option<KeepEvictionsConfig>,
     /// Emit `kv_audit` lines for every query and ingested event.
     pub audit_log: bool,
+    /// Run every indexer as the flat h24 counterfactual with this retention
+    /// horizon (seconds). Exclusive with `keep_evictions`.
+    pub h24_horizon_s: Option<u64>,
 }
 
 pub(super) fn validate_listener_endpoints(
@@ -183,7 +187,15 @@ pub async fn run_server(config: IndexerConfig) -> anyhow::Result<()> {
         kv_recover: config.kv_recover,
         keep_evictions: config.keep_evictions.is_some(),
         audit_log: config.audit_log,
+        h24: config.h24_horizon_s.is_some(),
     };
+    if let Some(horizon_s) = config.h24_horizon_s {
+        anyhow::ensure!(
+            config.keep_evictions.is_none(),
+            "--h24 and --keep-evictions are mutually exclusive"
+        );
+        anyhow::ensure!(horizon_s > 0, "--h24-horizon-secs must be positive");
+    }
     let mut state = AppState::new_with_cancel_token(config.threads, cancel_token.clone(), options)?;
     state.access_log_sink = match config.access_log {
         Some(ref path) => {
@@ -284,6 +296,14 @@ async fn run_common(
         tracing::info!(
             target: "kv_audit",
             "kv_audit logging enabled: queries and store/evict/clear events will be logged"
+        );
+    }
+
+    if let Some(horizon_s) = config.h24_horizon_s {
+        h24::spawn_expiry_loop(state.registry.clone(), horizon_s, cancel_token.clone());
+        tracing::info!(
+            horizon_s,
+            "h24 mode enabled: flat counterfactual indexer, evictions ignored"
         );
     }
 

@@ -39,9 +39,14 @@ pub(super) async fn query_model(
     let mut merged: Option<ScoreResponse> = None;
     let mut last_error: Option<String> = None;
     let mut queried_groups = Vec::with_capacity(trees.len());
+    let mut h24_queried_blocks: Option<usize> = None;
 
     for (key, indexer, block_size) in trees {
-        match indexer.find_tiered_matches(hashes_for(block_size)).await {
+        let hashes = hashes_for(block_size);
+        if matches!(indexer, Indexer::H24(_)) {
+            h24_queried_blocks = Some(h24_queried_blocks.unwrap_or(0).max(hashes.len()));
+        }
+        match indexer.find_tiered_matches(hashes).await {
             Ok(tiered) => {
                 let response = build_score_response(&tiered, block_size, pod_names);
                 match merged.as_mut() {
@@ -60,6 +65,11 @@ pub(super) async fn query_model(
                 last_error = Some(error.to_string());
             }
         }
+    }
+
+    // Once per request, not per tree: the h24 retention curve's denominator.
+    if let Some(blocks) = h24_queried_blocks {
+        super::metrics::h24_add_queried_blocks(blocks);
     }
 
     let (status, body) = match merged {
