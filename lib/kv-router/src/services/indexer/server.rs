@@ -21,9 +21,8 @@ use crate::indexer::TieredMatchDetails;
 use crate::protocols::{BlockHashOptions, LocalBlockHash, WorkerId, compute_block_hash_for_seq};
 use crate::services::overlap::{MooncakeOverlapSummary, build_mooncake_overlap_summaries};
 
-use super::kv_recover::KvRecoverSettings;
 use super::model_query::query_model;
-use super::registry::{ListenerControlError, ListenerExtras, WorkerRegistry};
+use super::registry::{ListenerControlError, ListenerExtras, RegistryOptions, WorkerRegistry};
 
 /// We need to fit one million tokens as JSON text, this should do it.
 const QUERY_REQUEST_BODY_LIMIT_BYTES: usize = 8 * 1024 * 1024;
@@ -50,14 +49,14 @@ impl AppState {
         Self::new_with_cancel_token(
             indexer_threads,
             CancellationToken::new(),
-            KvRecoverSettings::default(),
+            RegistryOptions::default(),
         )
     }
 
     pub(super) fn new_with_cancel_token(
         indexer_threads: usize,
         root_cancel_token: CancellationToken,
-        kv_recover: KvRecoverSettings,
+        options: RegistryOptions,
     ) -> anyhow::Result<Self> {
         #[cfg(feature = "metrics")]
         {
@@ -71,7 +70,7 @@ impl AppState {
                         indexer_metrics,
                         root_cancel_token,
                     )
-                    .with_kv_recover(kv_recover)?,
+                    .with_options(options)?,
                 ),
                 access_log_sink: None,
                 prom_registry,
@@ -82,7 +81,7 @@ impl AppState {
         Ok(Self {
             registry: Arc::new(
                 WorkerRegistry::new_with_cancel_token(indexer_threads, root_cancel_token)
-                    .with_kv_recover(kv_recover)?,
+                    .with_options(options)?,
             ),
             access_log_sink: None,
         })

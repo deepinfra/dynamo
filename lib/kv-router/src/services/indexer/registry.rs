@@ -19,6 +19,7 @@ use crate::indexer::KvIndexerMetrics;
 use crate::protocols::WorkerId;
 
 use super::backend::{Indexer, create_indexer_with_metrics};
+use super::evictions::PendingEvictions;
 use super::kv_recover::{KvRecoverClient, KvRecoverSettings};
 use super::listener::spawn_zmq_listener;
 
@@ -146,6 +147,14 @@ struct ListenerRuntime {
     generation: u64,
 }
 
+/// DeepInfra registry behavior chosen at startup.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RegistryOptions {
+    pub kv_recover: KvRecoverSettings,
+    /// Park evictions instead of applying them (`--keep-evictions`).
+    pub keep_evictions: bool,
+}
+
 /// Where and how a listener fetches `/kv_recover` on a gap.
 #[derive(Clone)]
 pub struct RecoverTarget {
@@ -163,10 +172,15 @@ pub struct ListenerExtras {
     pub pod_name: Option<String>,
 }
 
+/// Eviction events a `--keep-evictions` listener parks instead of applying.
+pub type SharedPendingEvictions = Arc<Mutex<PendingEvictions>>;
+
 pub struct ListenerRecord {
     endpoint: String,
     replay_endpoint: Option<String>,
     recover: Option<RecoverTarget>,
+    /// `Some` only under `--keep-evictions`; drained by the evictions sweep.
+    pending_evictions: Option<SharedPendingEvictions>,
     block_size: u32,
     indexer: Indexer,
     watermark: Arc<AtomicU64>,
@@ -178,6 +192,7 @@ impl ListenerRecord {
         endpoint: String,
         replay_endpoint: Option<String>,
         recover: Option<RecoverTarget>,
+        pending_evictions: Option<SharedPendingEvictions>,
         block_size: u32,
         indexer: Indexer,
         watermark: Arc<AtomicU64>,
@@ -186,6 +201,7 @@ impl ListenerRecord {
             endpoint,
             replay_endpoint,
             recover,
+            pending_evictions,
             block_size,
             indexer,
             watermark,
@@ -208,6 +224,10 @@ impl ListenerRecord {
 
     pub(super) fn recover_target(&self) -> Option<RecoverTarget> {
         self.recover.clone()
+    }
+
+    pub(super) fn pending_evictions(&self) -> Option<SharedPendingEvictions> {
+        self.pending_evictions.clone()
     }
 
     pub(super) fn block_size(&self) -> u32 {
@@ -352,6 +372,7 @@ pub struct WorkerRegistry {
     root_cancel_token: CancellationToken,
     retain_empty_indexers: bool,
     kv_recover: Arc<KvRecoverClient>,
+    keep_evictions: bool,
 }
 
 impl WorkerRegistry {
@@ -404,13 +425,14 @@ impl WorkerRegistry {
                 KvRecoverClient::new(KvRecoverSettings::default())
                     .expect("default kv_recover client builds"),
             ),
+            keep_evictions: false,
         }
     }
 
-    /// Replace the `/kv_recover` timeout and concurrency gate shared by every
-    /// listener registered afterwards.
-    pub fn with_kv_recover(mut self, settings: KvRecoverSettings) -> Result<Self> {
-        self.kv_recover = Arc::new(KvRecoverClient::new(settings)?);
+    /// Apply startup options; call before any registration.
+    pub fn with_options(mut self, options: RegistryOptions) -> Result<Self> {
+        self.kv_recover = Arc::new(KvRecoverClient::new(options.kv_recover)?);
+        self.keep_evictions = options.keep_evictions;
         Ok(self)
     }
 
@@ -551,10 +573,14 @@ impl WorkerRegistry {
             endpoint,
             client: self.kv_recover.clone(),
         });
+        let pending_evictions = self
+            .keep_evictions
+            .then(|| Arc::new(Mutex::new(PendingEvictions::default())));
         let record = Arc::new(ListenerRecord::new(
             endpoint,
             replay_endpoint,
             recover,
+            pending_evictions,
             bs,
             indexer,
             watermark,
@@ -871,6 +897,26 @@ impl WorkerRegistry {
             );
         }
         entry.indexer.clone()
+    }
+
+    /// Every `--keep-evictions` listener as `(worker_id, dp_rank, buffer,
+    /// indexer)`, for the evictions sweep.
+    pub(super) fn listener_records(&self) -> Vec<(WorkerId, u32, SharedPendingEvictions, Indexer)> {
+        self.workers
+            .iter()
+            .flat_map(|entry| {
+                let worker_id = *entry.key();
+                entry
+                    .value()
+                    .listeners
+                    .iter()
+                    .filter_map(|(dp_rank, record)| {
+                        let buffer = record.pending_evictions()?;
+                        Some((worker_id, *dp_rank, buffer, record.indexer()))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
     }
 
     /// The trees a query for `model_name` reads: the named routing group's,

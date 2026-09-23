@@ -239,6 +239,23 @@ struct KvIndexerCli {
     #[arg(long, default_value_t = indexer::kv_recover::DEFAULT_RECOVER_CONCURRENCY)]
     recover_concurrency: usize,
 
+    /// Park Removed events in a buffer (and drop Cleared) instead of applying
+    /// them, approximating infinite memory (the kv-indexer:routing flavor).
+    /// Buffered evictions older than --evict-retention-secs are replayed into
+    /// the tree once memory use crosses --evict-memory-threshold of the limit.
+    #[arg(long, default_value_t = false)]
+    keep_evictions: bool,
+
+    /// Minimum age (seconds) a parked eviction must reach before the memory
+    /// sweep may apply it. Only meaningful with --keep-evictions.
+    #[arg(long, default_value_t = 1800)]
+    evict_retention_secs: u64,
+
+    /// Fraction of the memory limit (0..1] above which the sweep replays aged
+    /// evictions. Only meaningful with --keep-evictions.
+    #[arg(long, default_value_t = 0.75)]
+    evict_memory_threshold: f64,
+
     /// Kubernetes namespace to watch for engine pods. Together with
     /// --watch-model-name (or --watch-label) this enables pod auto-discovery:
     /// subscribe on Ready, unsubscribe on delete.
@@ -352,6 +369,12 @@ where
                 concurrency: cli.recover_concurrency,
             },
             kube_discovery,
+            keep_evictions: cli.keep_evictions.then_some(
+                indexer::evictions::KeepEvictionsConfig {
+                    retention_s: cli.evict_retention_secs,
+                    memory_threshold: cli.evict_memory_threshold,
+                },
+            ),
         }))
     }
 

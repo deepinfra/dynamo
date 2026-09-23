@@ -7,14 +7,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
-use crate::protocols::{WorkerId, WorkerWithDpRank};
+use crate::protocols::{KvCacheEventData, RouterEvent, WorkerId, WorkerWithDpRank};
 use crate::recovery::{CursorObservation, CursorState};
 use crate::zmq_wire::{ZmqEventNormalizer, decode_event_batch};
 
 use super::backend::Indexer;
 use super::block_size::BlockSizeGuard;
 use super::kv_recover::plan_recovery;
-use super::registry::{ListenerRecord, RecoverTarget};
+use super::registry::{ListenerRecord, RecoverTarget, SharedPendingEvictions};
 use crate::services::common::zmq::{
     MultipartMessage, SharedSocket, connect_dealer_socket, connect_sub_socket, recv_multipart,
     send_multipart,
@@ -154,6 +154,7 @@ struct ListenerLoop {
     live_socket: SharedSocket,
     replay_socket: Option<SharedSocket>,
     recover: Option<RecoverTarget>,
+    pending_evictions: Option<SharedPendingEvictions>,
     watermark: Arc<AtomicU64>,
     normalizer: ZmqEventNormalizer,
     block_size_guard: BlockSizeGuard,
@@ -171,6 +172,7 @@ impl ListenerLoop {
         live_socket: SharedSocket,
         replay_socket: Option<SharedSocket>,
         recover: Option<RecoverTarget>,
+        pending_evictions: Option<SharedPendingEvictions>,
         watermark: Arc<AtomicU64>,
     ) -> Self {
         Self {
@@ -181,10 +183,35 @@ impl ListenerLoop {
             live_socket,
             replay_socket,
             recover,
+            pending_evictions,
             watermark,
             normalizer: ZmqEventNormalizer::new(block_size),
             block_size_guard: BlockSizeGuard::new(block_size),
             messages_processed: 0,
+        }
+    }
+
+    /// `--keep-evictions`: a store cancels any parked eviction of its blocks
+    /// and applies; an eviction is parked instead of applied; a clear is
+    /// dropped. `true` when the event must not reach the tree.
+    fn park_kept_eviction(&self, event: &RouterEvent) -> bool {
+        let Some(pending) = self.pending_evictions.as_ref() else {
+            return false;
+        };
+        match &event.event.data {
+            KvCacheEventData::Stored(data) => {
+                pending
+                    .lock()
+                    .cancel(data.blocks.iter().map(|b| b.block_hash.0));
+                false
+            }
+            KvCacheEventData::Removed(data) => {
+                pending
+                    .lock()
+                    .buffer(&data.block_hashes, event.storage_tier);
+                true
+            }
+            KvCacheEventData::Cleared => true,
         }
     }
 
@@ -290,6 +317,9 @@ impl ListenerLoop {
                 let router_event = placement_event
                     .into_router_event()
                     .expect("local worker placement must convert to router event");
+                if self.park_kept_eviction(&router_event) {
+                    continue;
+                }
                 indexer
                     .apply_event_routed(router_event)
                     .await
@@ -350,10 +380,18 @@ impl ListenerLoop {
 
         let plan = plan_recovery(response, worker_id, dp_rank);
         if plan.reset_dp_rank {
+            // Parked evictions describe the state being replaced; replaying
+            // them onto the snapshot could remove blocks it says are live.
+            if let Some(pending) = self.pending_evictions.as_ref() {
+                pending.lock().clear();
+            }
             self.indexer.remove_worker_dp_rank(worker_id, dp_rank).await;
         }
         let mut applied = 0u64;
         for event in plan.events {
+            if self.park_kept_eviction(&event) {
+                continue;
+            }
             self.indexer
                 .apply_event_routed(event)
                 .await
@@ -440,6 +478,9 @@ impl ListenerLoop {
             let router_event = placement_event
                 .into_router_event()
                 .expect("local worker placement must convert to router event");
+            if self.park_kept_eviction(&router_event) {
+                continue;
+            }
             self.indexer
                 .apply_event_routed(router_event)
                 .await
@@ -603,6 +644,7 @@ async fn run_listener(
         socket,
         replay_socket,
         record.recover_target(),
+        record.pending_evictions(),
         watermark,
     )
     .run()
@@ -707,6 +749,7 @@ mod tests {
             cancel.clone(),
             live_socket,
             Some(replay_socket.clone()),
+            None,
             None,
             watermark.clone(),
         );

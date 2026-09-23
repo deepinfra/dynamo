@@ -34,6 +34,7 @@ mod block_size;
 #[cfg(test)]
 mod deepapi_contract_tests;
 pub mod discovery;
+pub mod evictions;
 pub mod kv_recover;
 pub mod listener;
 pub mod logging;
@@ -56,9 +57,10 @@ use crate::config::min_initial_workers_from_env;
 use crate::services::common::zmq::validate_endpoint as validate_zmq_endpoint;
 use axum::http::header::HeaderName;
 use discovery::KubeDiscoveryConfig;
+use evictions::KeepEvictionsConfig;
 use kv_recover::KvRecoverSettings;
 use logging::AccessLogSink;
-use registry::WorkerRegistry;
+use registry::{RegistryOptions, WorkerRegistry};
 use server::{AppState, create_router};
 
 pub struct IndexerConfig {
@@ -76,6 +78,8 @@ pub struct IndexerConfig {
     pub kv_recover: KvRecoverSettings,
     /// When set, watch Kubernetes and register/deregister engine pods.
     pub kube_discovery: Option<KubeDiscoveryConfig>,
+    /// When set, park evictions and replay aged ones under memory pressure.
+    pub keep_evictions: Option<KeepEvictionsConfig>,
 }
 
 pub(super) fn validate_listener_endpoints(
@@ -172,8 +176,11 @@ pub async fn run_server(config: IndexerConfig) -> anyhow::Result<()> {
         "Starting standalone KV cache indexer (HTTP-only mode)"
     );
 
-    let mut state =
-        AppState::new_with_cancel_token(config.threads, cancel_token.clone(), config.kv_recover)?;
+    let options = RegistryOptions {
+        kv_recover: config.kv_recover,
+        keep_evictions: config.keep_evictions.is_some(),
+    };
+    let mut state = AppState::new_with_cancel_token(config.threads, cancel_token.clone(), options)?;
     state.access_log_sink = match config.access_log {
         Some(ref path) => {
             let s = AccessLogSink::new(
@@ -268,6 +275,21 @@ async fn run_common(
 
     wait_for_min_initial_workers(registry, &cancel_token).await?;
     registry.signal_ready();
+
+    if let Some(keep) = config.keep_evictions {
+        keep.validate()?;
+        evictions::spawn_cleanup_loop(
+            state.registry.clone(),
+            keep.retention_s,
+            keep.memory_threshold,
+            cancel_token.clone(),
+        );
+        tracing::info!(
+            retention_s = keep.retention_s,
+            memory_threshold = keep.memory_threshold,
+            "keep-evictions enabled: parking eviction events, sweeping under memory pressure"
+        );
+    }
 
     if let Some(kube_config) = config.kube_discovery.clone() {
         #[cfg(feature = "kube-discovery")]
