@@ -18,6 +18,12 @@ pub(crate) type MultipartMessage = Vec<Vec<u8>>;
 pub(crate) type SharedSocket = Arc<Mutex<ZmqSocket>>;
 
 const ZMQ_RCVTIMEOUT_MS: i32 = 100;
+// Unbounded on purpose: libzmq 4.3.4 asserts (`_input_stopped`) when a
+// heartbeating peer restarts a pipe that HWM-stopped input, so an indexer
+// listener stalled in gap recovery must never let its queue fill
+// (zeromq/libzmq#3596).
+#[cfg(feature = "standalone-indexer")]
+const ZMQ_INDEXER_RCVHWM: i32 = 0;
 const ZMQ_SNDTIMEOUT_MS: i32 = 0;
 const ZMQ_RECONNECT_IVL_MS: i32 = 100;
 const ZMQ_RECONNECT_IVL_MAX_MS: i32 = 5000;
@@ -217,6 +223,8 @@ pub(crate) fn create_sub_socket(topic: &[u8]) -> Result<ZmqSocket> {
 #[cfg(feature = "standalone-indexer")]
 pub(crate) fn connect_sub_socket(endpoint: &str) -> Result<SharedSocket> {
     let socket = create_sub_socket(b"")?;
+    // Must precede connect: HWM applies to pipes created afterwards.
+    socket.socket().set_rcvhwm(ZMQ_INDEXER_RCVHWM)?;
     socket.connect(endpoint)?;
     Ok(Arc::new(Mutex::new(socket)))
 }
@@ -296,5 +304,17 @@ pub(crate) fn validate_endpoint(endpoint: &str) -> Result<()> {
         other => Err(anyhow!(
             "invalid ZMQ endpoint `{endpoint}`: unsupported scheme `{other}`"
         )),
+    }
+}
+
+#[cfg(all(test, feature = "standalone-indexer"))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn indexer_sub_socket_receive_queue_is_unbounded() {
+        let socket = connect_sub_socket("inproc://rcvhwm-test").unwrap();
+        let guard = socket.lock().await;
+        assert_eq!(guard.socket().get_rcvhwm().unwrap(), 0);
     }
 }
