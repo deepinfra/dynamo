@@ -278,6 +278,7 @@ async fn reconcile(
                     None,
                     ListenerExtras {
                         recover_endpoint: rank.recover_endpoint,
+                        pod_name: Some(name.clone()),
                     },
                 )
                 .await

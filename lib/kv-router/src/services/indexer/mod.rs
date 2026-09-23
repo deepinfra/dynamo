@@ -31,6 +31,8 @@
 
 pub mod backend;
 mod block_size;
+#[cfg(test)]
+mod deepapi_contract_tests;
 pub mod discovery;
 pub mod kv_recover;
 pub mod listener;

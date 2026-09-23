@@ -103,6 +103,10 @@ pub struct ListenerInfo {
 #[derive(Debug, Clone, Serialize)]
 pub struct WorkerInfo {
     instance_id: WorkerId,
+    /// Pod name this worker was registered under, when the registrant knows
+    /// it. `instance_id` stays the canonical key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pod_name: Option<String>,
     source: WorkerSource,
     status: ListenerStatus,
     model_name: String,
@@ -155,6 +159,8 @@ pub struct ListenerExtras {
     /// HTTP base URL of the worker's `GET /kv_recover`. Takes precedence over
     /// the ZMQ `replay_endpoint` for gap recovery when both are set.
     pub recover_endpoint: Option<String>,
+    /// Pod name, surfaced in `/workers` and in `/query` instances.
+    pub pod_name: Option<String>,
 }
 
 pub struct ListenerRecord {
@@ -328,6 +334,7 @@ impl ListenerRecord {
 
 pub struct WorkerEntry {
     key: RoutingPartitionId,
+    pod_name: Option<String>,
     listeners: HashMap<u32, Arc<ListenerRecord>>,
 }
 
@@ -560,8 +567,12 @@ impl WorkerRegistry {
                 .entry(instance_id)
                 .or_insert_with(|| WorkerEntry {
                     key: key.clone(),
+                    pod_name: None,
                     listeners: HashMap::new(),
                 });
+            if extras.pod_name.is_some() {
+                entry.pod_name = extras.pod_name;
+            }
             entry.listeners.insert(dp_rank, record.clone());
         }
 
@@ -802,6 +813,7 @@ impl WorkerRegistry {
                 let status = ListenerStatus::aggregate(listeners.values().map(|info| info.status));
                 Some(WorkerInfo {
                     instance_id: *entry.key(),
+                    pod_name: worker.pod_name.clone(),
                     source: WorkerSource::Zmq,
                     status,
                     model_name: key.model_name.clone(),
@@ -819,6 +831,17 @@ impl WorkerRegistry {
         key: &RoutingPartitionId,
     ) -> Option<Ref<'_, RoutingPartitionId, IndexerEntry>> {
         self.indexers.get(key)
+    }
+
+    /// Known pod names by worker id, for enriching query responses.
+    pub fn pod_names(&self) -> HashMap<WorkerId, String> {
+        self.workers
+            .iter()
+            .filter_map(|entry| {
+                let pod_name = entry.value().pod_name.clone()?;
+                Some((*entry.key(), pod_name))
+            })
+            .collect()
     }
 
     pub fn get_or_create_indexer(&self, key: RoutingPartitionId, block_size: u32) -> Indexer {
@@ -1331,6 +1354,7 @@ mod tests {
             99u64,
             WorkerEntry {
                 key,
+                pod_name: None,
                 listeners: HashMap::new(),
             },
         );

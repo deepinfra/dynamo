@@ -108,6 +108,9 @@ struct RegisterRequest {
     /// `replay_endpoint` when set.
     #[serde(default)]
     recover_endpoint: Option<String>,
+    /// Optional pod name, surfaced in `/workers` and `/query` instances.
+    #[serde(default)]
+    pod_name: Option<String>,
     /// Optional per-tenant salt (Mooncake RFC #1403 `additionalsalt`).
     /// Currently accepted but not yet mixed into hashes — engines apply
     /// their own salt internally. Plumbed for forward compatibility.
@@ -168,7 +171,17 @@ struct ScoreResponse {
     scores: HashMap<String, HashMap<String, u32>>,
     frequencies: Vec<usize>,
     /// Per-instance tier breakdown (Mooncake RFC #1403 alignment).
-    instances: HashMap<String, MooncakeOverlapSummary>,
+    instances: HashMap<String, InstanceMatch>,
+}
+
+/// One `instances` entry: the shared Mooncake summary plus the worker's pod
+/// name when known (deepapi maps matches back to shards by pod name).
+#[derive(Serialize)]
+struct InstanceMatch {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pod_name: Option<String>,
+    #[serde(flatten)]
+    summary: MooncakeOverlapSummary,
 }
 
 async fn register(
@@ -204,6 +217,7 @@ async fn register(
             req.replay_endpoint,
             ListenerExtras {
                 recover_endpoint: req.recover_endpoint,
+                pod_name: req.pod_name,
             },
         )
         .await
@@ -289,7 +303,11 @@ async fn list_workers(
 /// (Mooncake RFC #1403) shapes from a tiered match result.
 ///
 /// All token counts are scaled from blocks → tokens via `block_size`.
-fn build_score_response(tiered: &TieredMatchDetails, block_size: u32) -> ScoreResponse {
+fn build_score_response(
+    tiered: &TieredMatchDetails,
+    block_size: u32,
+    pod_names: &HashMap<WorkerId, String>,
+) -> ScoreResponse {
     // Flat fields (unchanged) come from the device-tier overlap.
     let device = &tiered.device.overlap_scores;
 
@@ -303,7 +321,13 @@ fn build_score_response(tiered: &TieredMatchDetails, block_size: u32) -> ScoreRe
 
     let instances = build_mooncake_overlap_summaries(tiered, block_size, [])
         .into_iter()
-        .map(|(worker_id, summary)| (worker_id.to_string(), summary))
+        .map(|(worker_id, summary)| {
+            let instance = InstanceMatch {
+                pod_name: pod_names.get(&worker_id).cloned(),
+                summary,
+            };
+            (worker_id.to_string(), instance)
+        })
         .collect();
 
     ScoreResponse {
@@ -319,11 +343,14 @@ async fn run_tiered_query(
     indexer: &Indexer,
     block_hashes: Vec<LocalBlockHash>,
     block_size: u32,
+    pod_names: &HashMap<WorkerId, String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     match indexer.find_tiered_matches(block_hashes).await {
         Ok(tiered) => (
             StatusCode::OK,
-            Json(serde_json::json!(build_score_response(&tiered, block_size))),
+            Json(serde_json::json!(build_score_response(
+                &tiered, block_size, pod_names
+            ))),
         ),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -362,7 +389,13 @@ async fn query(State(state): State<Arc<AppState>>, Json(req): Json<QueryRequest>
             ..Default::default()
         },
     );
-    let (status, json) = run_tiered_query(&indexer, block_hashes, block_size).await;
+    let (status, json) = run_tiered_query(
+        &indexer,
+        block_hashes,
+        block_size,
+        &state.registry.pod_names(),
+    )
+    .await;
     let mut resp = (status, json).into_response();
     resp.extensions_mut().insert(AccessLogModel(model));
     resp
@@ -409,7 +442,13 @@ async fn query_by_hash(
         .iter()
         .map(|h| LocalBlockHash(*h as u64))
         .collect();
-    let (status, json) = run_tiered_query(&indexer, block_hashes, block_size).await;
+    let (status, json) = run_tiered_query(
+        &indexer,
+        block_hashes,
+        block_size,
+        &state.registry.pod_names(),
+    )
+    .await;
     let mut resp = (status, json).into_response();
     resp.extensions_mut().insert(AccessLogModel(model));
     resp
