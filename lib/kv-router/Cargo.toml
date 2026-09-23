@@ -21,6 +21,8 @@ profile = []
 standalone-indexer = ["dep:axum", "dep:serde_json", "dep:reqwest", "dep:zmq", "dep:chrono", "dep:tracing-appender"]
 standalone-slot-tracker = ["dep:axum", "dep:serde_json", "dep:zmq"]
 standalone-selection = ["standalone-indexer", "dep:once_cell"]
+# Kubernetes pod auto-discovery for the standalone indexer (pulls in the kube client).
+kube-discovery = ["standalone-indexer", "dep:kube", "dep:k8s-openapi", "dep:futures"]
 
 [dependencies]
 # repo
@@ -75,6 +77,11 @@ axum = { version = "=0.8.4", default-features = false, features = [
 chrono = { workspace = true, optional = true }
 reqwest = { version = "0.12.24", default-features = false, features = ["json"], optional = true }
 tracing-appender = { version = "0.2", optional = true }
+
+# kube-discovery (optional)
+kube = { workspace = true, optional = true }
+k8s-openapi = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion = "0.5"

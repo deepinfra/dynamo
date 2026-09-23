@@ -31,10 +31,13 @@
 
 pub mod backend;
 mod block_size;
+pub mod discovery;
 pub mod kv_recover;
 pub mod listener;
 pub mod logging;
 pub mod metrics;
+#[cfg(feature = "kube-discovery")]
+mod pod_watcher;
 pub mod recovery;
 pub mod registry;
 pub mod server;
@@ -49,6 +52,7 @@ use tokio_util::sync::CancellationToken;
 use crate::config::min_initial_workers_from_env;
 use crate::services::common::zmq::validate_endpoint as validate_zmq_endpoint;
 use axum::http::header::HeaderName;
+use discovery::KubeDiscoveryConfig;
 use kv_recover::KvRecoverSettings;
 use logging::AccessLogSink;
 use registry::WorkerRegistry;
@@ -67,6 +71,8 @@ pub struct IndexerConfig {
     pub access_log_local_time: bool,
     /// Timeout and concurrency of `/kv_recover` gap-recovery downloads.
     pub kv_recover: KvRecoverSettings,
+    /// When set, watch Kubernetes and register/deregister engine pods.
+    pub kube_discovery: Option<KubeDiscoveryConfig>,
 }
 
 pub(super) fn validate_listener_endpoints(
@@ -259,6 +265,19 @@ async fn run_common(
 
     wait_for_min_initial_workers(registry, &cancel_token).await?;
     registry.signal_ready();
+
+    if let Some(kube_config) = config.kube_discovery.clone() {
+        #[cfg(feature = "kube-discovery")]
+        pod_watcher::spawn_pod_watcher(kube_config, registry.clone(), cancel_token.clone());
+        #[cfg(not(feature = "kube-discovery"))]
+        {
+            let _ = kube_config;
+            anyhow::bail!(
+                "pod discovery is configured but this binary was built without the \
+                 `kube-discovery` feature"
+            );
+        }
+    }
 
     let app = create_router(state);
     let listener = TcpListener::bind(("0.0.0.0", config.port)).await?;
