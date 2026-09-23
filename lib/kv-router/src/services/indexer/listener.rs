@@ -785,3 +785,171 @@ mod tests {
         cancel.cancel();
     }
 }
+
+#[cfg(test)]
+mod deepinfra_tests {
+    use super::*;
+    use crate::protocols::{
+        BlockHashOptions, LocalBlockHash, StorageTier, compute_block_hash_for_seq,
+    };
+    use crate::services::indexer::backend::create_indexer;
+    use crate::services::indexer::evictions::PendingEvictions;
+
+    const BLOCK_SIZE: u32 = 4;
+
+    fn listener(pending: Option<SharedPendingEvictions>) -> (ListenerLoop, Indexer) {
+        // connect() is lazy, so no publisher is needed.
+        let live_socket = connect_sub_socket("tcp://127.0.0.1:1").unwrap();
+        let indexer = create_indexer(BLOCK_SIZE, 1);
+        let listener = ListenerLoop::new(
+            7,
+            0,
+            BLOCK_SIZE,
+            indexer.clone(),
+            CancellationToken::new(),
+            live_socket,
+            None,
+            None,
+            pending,
+            false,
+            Arc::new(AtomicU64::new(WATERMARK_UNSET)),
+        );
+        (listener, indexer)
+    }
+
+    /// A vLLM batch of `BlockStored` events, positional msgpack as on the wire.
+    fn stored_batch(tokens: &[u32], block_size: usize, medium: &str) -> Vec<u8> {
+        let hashes: Vec<u64> = (0..tokens.len() / block_size)
+            .map(|i| 1000 + i as u64)
+            .collect();
+        let event = (
+            "BlockStored",
+            hashes,
+            Option::<u64>::None,
+            tokens.to_vec(),
+            block_size,
+            Option::<u64>::None,
+            medium,
+        );
+        rmp_serde::to_vec(&(0.0_f64, vec![event], Some(0_i32))).unwrap()
+    }
+
+    fn removed_batch(hashes: &[u64]) -> Vec<u8> {
+        let event = ("BlockRemoved", hashes.to_vec(), "GPU");
+        rmp_serde::to_vec(&(0.0_f64, vec![event], Some(0_i32))).unwrap()
+    }
+
+    fn probe(tokens: &[u32]) -> Vec<LocalBlockHash> {
+        compute_block_hash_for_seq(tokens, BLOCK_SIZE, BlockHashOptions::default())
+    }
+
+    /// vLLM's CPU offload connector publishes `medium: "CPU"`. The fork this
+    /// replaces filed those on the device tree; they must land in HostPinned
+    /// so `/query` reports them as `cpu`, not `gpu` (upstream #10368).
+    #[tokio::test]
+    async fn cpu_medium_events_are_indexed_on_the_host_pinned_tier() {
+        let (mut listener, indexer) = listener(None);
+        let tokens: Vec<u32> = (1..=8).collect();
+        listener
+            .apply_live_batch(0, &stored_batch(&tokens, 4, "CPU"))
+            .await
+            .unwrap();
+        indexer.dump_events().await.unwrap();
+
+        let tiered = indexer.find_tiered_matches(probe(&tokens)).await.unwrap();
+        let worker = WorkerWithDpRank::new(7, 0);
+        assert_eq!(tiered.device.overlap_scores.scores.get(&worker), None);
+        assert_eq!(
+            tiered
+                .lower_tier
+                .get(&StorageTier::HostPinned)
+                .and_then(|m| m.hits.get(&worker))
+                .copied(),
+            Some(2)
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_prefix_stores_are_skipped_not_fatal() {
+        let (mut listener, indexer) = listener(None);
+        let tokens: Vec<u32> = (1..=2).collect();
+        listener
+            .apply_live_batch(0, &stored_batch(&tokens, 2, "GPU"))
+            .await
+            .unwrap();
+        assert!(indexer.dump_events().await.unwrap().is_empty());
+    }
+
+    /// `--keep-evictions`: an eviction is parked, not applied, so the block
+    /// stays matchable; a re-store cancels the parked eviction.
+    #[tokio::test]
+    async fn kept_evictions_are_parked_and_cancelled_by_a_restore() {
+        let pending: SharedPendingEvictions =
+            Arc::new(parking_lot::Mutex::new(PendingEvictions::default()));
+        let (mut listener, indexer) = listener(Some(pending.clone()));
+        let tokens: Vec<u32> = (1..=4).collect();
+        listener
+            .apply_live_batch(0, &stored_batch(&tokens, 4, "GPU"))
+            .await
+            .unwrap();
+        listener
+            .apply_live_batch(1, &removed_batch(&[1000]))
+            .await
+            .unwrap();
+        indexer.dump_events().await.unwrap();
+
+        let scores = indexer.find_matches(probe(&tokens)).await.unwrap();
+        assert_eq!(scores.scores.get(&WorkerWithDpRank::new(7, 0)), Some(&1));
+        assert_eq!(pending.lock().len(), 1);
+
+        listener
+            .apply_live_batch(2, &stored_batch(&tokens, 4, "GPU"))
+            .await
+            .unwrap();
+        assert_eq!(pending.lock().len(), 0);
+    }
+
+    /// A gap on a listener with a recover endpoint is filled from
+    /// `/kv_recover`: a TreeDump replaces the rank's state and moves the
+    /// watermark to its `last_event_id`.
+    #[tokio::test]
+    async fn gap_is_recovered_from_kv_recover_tree_dump() {
+        use crate::services::indexer::backend::test_util::store_event;
+        use crate::services::indexer::kv_recover::{KvRecoverClient, KvRecoverSettings};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let tokens: Vec<u32> = (1..=8).collect();
+        let hashes: Vec<u64> = probe(&tokens).into_iter().map(|h| h.0).collect();
+        let body = serde_json::json!({
+            "TreeDump": {
+                "events": [store_event(999, 3, 0, &[], &hashes, StorageTier::Device)],
+                "last_event_id": 41
+            }
+        })
+        .to_string();
+        let server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", server.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut stream, _) = server.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf).await;
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(reply.as_bytes()).await.unwrap();
+        });
+
+        let (mut listener, indexer) = listener(None);
+        listener.recover = Some(RecoverTarget {
+            endpoint,
+            client: Arc::new(KvRecoverClient::new(KvRecoverSettings::default()).unwrap()),
+        });
+        listener.handle_gap(42).await.unwrap();
+        indexer.dump_events().await.unwrap();
+
+        assert_eq!(listener.watermark.load(Ordering::Acquire), 41);
+        let scores = indexer.find_matches(probe(&tokens)).await.unwrap();
+        assert_eq!(scores.scores.get(&WorkerWithDpRank::new(7, 0)), Some(&2));
+    }
+}
