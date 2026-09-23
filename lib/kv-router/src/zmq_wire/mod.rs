@@ -42,7 +42,6 @@ pub struct ZmqEventNormalizer {
     kv_block_size: u32,
     warning_count: Arc<AtomicU32>,
     group_metadata: FxHashMap<(DpRank, u32), KvCacheGroupMetadata>,
-    hash_mm: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -78,7 +77,6 @@ impl ZmqEventNormalizer {
             kv_block_size,
             warning_count: Arc::new(AtomicU32::new(0)),
             group_metadata: FxHashMap::default(),
-            hash_mm: true,
         }
     }
 
@@ -87,17 +85,7 @@ impl ZmqEventNormalizer {
             kv_block_size,
             warning_count,
             group_metadata: FxHashMap::default(),
-            hash_mm: true,
         }
-    }
-
-    /// Hash image blocks from their tokens alone, ignoring the multimodal
-    /// identifiers vLLM attaches in `extra_keys`. Needed when the querier
-    /// hashes plain tokens (deepapi's probe, the engine's local-indexer
-    /// TreeDumps): otherwise every chain diverges at its first image block.
-    pub fn with_plain_mm_hashing(mut self) -> Self {
-        self.hash_mm = false;
-        self
     }
 
     pub fn preprocess(&mut self, raw: RawKvEvent, worker: WorkerWithDpRank) -> Option<RawKvEvent> {
@@ -129,11 +117,6 @@ impl ZmqEventNormalizer {
         event_id: u64,
         worker: WorkerWithDpRank,
     ) -> Result<Option<PlacementEvent>, ConvertError> {
-        let raw = if self.hash_mm {
-            raw
-        } else {
-            raw.without_mm_infos()
-        };
         convert_event(
             raw,
             event_id,
