@@ -873,6 +873,38 @@ impl WorkerRegistry {
         entry.indexer.clone()
     }
 
+    /// The trees a query for `model_name` reads: the named routing group's,
+    /// or every group's when none is named.
+    pub fn query_trees(
+        &self,
+        model_name: &str,
+        routing_group: Option<&str>,
+    ) -> Vec<(RoutingPartitionId, Indexer, u32)> {
+        let Some(routing_group) = routing_group else {
+            return self.indexers_for_model(model_name);
+        };
+        let key = RoutingPartitionId::new(model_name, routing_group);
+        self.indexers
+            .get(&key)
+            .map(|entry| vec![(key.clone(), entry.indexer.clone(), entry.block_size)])
+            .unwrap_or_default()
+    }
+
+    /// Every routing group's tree of `model_name`, for model-level queries.
+    pub fn indexers_for_model(&self, model_name: &str) -> Vec<(RoutingPartitionId, Indexer, u32)> {
+        self.indexers
+            .iter()
+            .filter(|entry| entry.key().model_name == model_name)
+            .map(|entry| {
+                (
+                    entry.key().clone(),
+                    entry.value().indexer.clone(),
+                    entry.value().block_size,
+                )
+            })
+            .collect()
+    }
+
     pub fn all_indexers_with_block_size(&self) -> Vec<(RoutingPartitionId, Indexer, u32)> {
         self.indexers
             .iter()

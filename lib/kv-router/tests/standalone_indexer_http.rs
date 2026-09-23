@@ -281,7 +281,7 @@ async fn query_by_hash_returns_per_instance_tier_breakdown() {
 }
 
 #[tokio::test]
-async fn query_by_hash_isolates_routing_groups_and_ignores_legacy_tenant_id() {
+async fn query_by_hash_reads_the_named_routing_group_or_fans_out() {
     const BLOCK_SIZE: u32 = 4;
     const MODEL: &str = "test-model";
     let registry = registry_with_events(
@@ -315,8 +315,10 @@ async fn query_by_hash_isolates_routing_groups_and_ignores_legacy_tenant_id() {
         .json()
         .await
         .expect("legacy tenant-only response");
+    // DeepInfra: without a routing_group the query fans out over every group
+    // of the model (engine_hash regimes); tenant_id stays ignored.
     assert_eq!(legacy_only["scores"]["7"]["0"], BLOCK_SIZE);
-    assert!(legacy_only["scores"].get("8").is_none());
+    assert_eq!(legacy_only["scores"]["8"]["0"], BLOCK_SIZE);
 
     let explicit_group: serde_json::Value = client
         .post(format!("{base_url}/query_by_hash"))

@@ -14,15 +14,15 @@ use prometheus::Encoder;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
-use crate::identity::{RoutingPartitionId, default_routing_group};
+use crate::identity::default_routing_group;
 #[cfg(feature = "metrics")]
 use crate::indexer::KvIndexerMetrics;
 use crate::indexer::TieredMatchDetails;
 use crate::protocols::{BlockHashOptions, LocalBlockHash, WorkerId, compute_block_hash_for_seq};
 use crate::services::overlap::{MooncakeOverlapSummary, build_mooncake_overlap_summaries};
 
-use super::backend::Indexer;
 use super::kv_recover::KvRecoverSettings;
+use super::model_query::query_model;
 use super::registry::{ListenerControlError, ListenerExtras, WorkerRegistry};
 
 /// We need to fit one million tokens as JSON text, this should do it.
@@ -134,8 +134,10 @@ struct UnregisterRequest {
 struct QueryRequest {
     token_ids: Vec<u32>,
     model_name: String,
-    #[serde(default = "default_routing_group")]
-    routing_group: String,
+    /// Queries only this group's tree when given; absent, the query fans out
+    /// over every routing group of `model_name` (see `model_query`).
+    #[serde(default)]
+    routing_group: Option<String>,
     #[serde(default = "default_routing_group", rename = "tenant_id")]
     _tenant_id: String,
     #[serde(default)]
@@ -149,8 +151,10 @@ struct QueryRequest {
 struct QueryByHashRequest {
     block_hashes: Vec<i64>,
     model_name: String,
-    #[serde(default = "default_routing_group")]
-    routing_group: String,
+    /// Queries only this group's tree when given; absent, the query fans out
+    /// over every routing group of `model_name` (see `model_query`).
+    #[serde(default)]
+    routing_group: Option<String>,
     #[serde(default = "default_routing_group", rename = "tenant_id")]
     _tenant_id: String,
     /// Invalid for `/query_by_hash`. Callers must precompute `block_hashes` with the intended
@@ -167,17 +171,17 @@ struct QueryByHashRequest {
 /// RFC #1403 (kvcache-ai/Mooncake#1403):
 /// `{instance_id: {longest_matched, gpu, dp: {rank: count}, cpu, disk}}`.
 #[derive(Serialize)]
-struct ScoreResponse {
-    scores: HashMap<String, HashMap<String, u32>>,
-    frequencies: Vec<usize>,
+pub(super) struct ScoreResponse {
+    pub(super) scores: HashMap<String, HashMap<String, u32>>,
+    pub(super) frequencies: Vec<usize>,
     /// Per-instance tier breakdown (Mooncake RFC #1403 alignment).
-    instances: HashMap<String, InstanceMatch>,
+    pub(super) instances: HashMap<String, InstanceMatch>,
 }
 
 /// One `instances` entry: the shared Mooncake summary plus the worker's pod
 /// name when known (deepapi maps matches back to shards by pod name).
 #[derive(Serialize)]
-struct InstanceMatch {
+pub(super) struct InstanceMatch {
     #[serde(skip_serializing_if = "Option::is_none")]
     pod_name: Option<String>,
     #[serde(flatten)]
@@ -303,7 +307,7 @@ async fn list_workers(
 /// (Mooncake RFC #1403) shapes from a tiered match result.
 ///
 /// All token counts are scaled from blocks → tokens via `block_size`.
-fn build_score_response(
+pub(super) fn build_score_response(
     tiered: &TieredMatchDetails,
     block_size: u32,
     pod_names: &HashMap<WorkerId, String>,
@@ -337,66 +341,49 @@ fn build_score_response(
     }
 }
 
-/// Run a tiered query and serialize the result, returning the appropriate
-/// HTTP status. Shared between `/query` and `/query_by_hash`.
-async fn run_tiered_query(
-    indexer: &Indexer,
-    block_hashes: Vec<LocalBlockHash>,
-    block_size: u32,
-    pod_names: &HashMap<WorkerId, String>,
-) -> (StatusCode, Json<serde_json::Value>) {
-    match indexer.find_tiered_matches(block_hashes).await {
-        Ok(tiered) => (
-            StatusCode::OK,
-            Json(serde_json::json!(build_score_response(
-                &tiered, block_size, pod_names
-            ))),
-        ),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        ),
-    }
-}
-
 async fn query(State(state): State<Arc<AppState>>, Json(req): Json<QueryRequest>) -> Response {
     let model = req.model_name.clone();
-    let key = RoutingPartitionId::new(req.model_name, req.routing_group);
-    let Some(ie) = state.registry.get_indexer(&key) else {
-        let mut resp = (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({
-                "error": format!(
-                    "no indexer for model={} routing_group={}",
-                    key.model_name, key.routing_group
-                )
-            })),
-        )
-            .into_response();
-        resp.extensions_mut().insert(AccessLogModel(model));
-        return resp;
-    };
-    let block_size = ie.block_size;
-    let indexer = ie.indexer.clone();
-    drop(ie);
+    let trees = state
+        .registry
+        .query_trees(&req.model_name, req.routing_group.as_deref());
+    if trees.is_empty() {
+        return model_not_found(model);
+    }
 
-    let block_hashes = compute_block_hash_for_seq(
-        &req.token_ids,
-        block_size,
-        BlockHashOptions {
-            lora_name: req.lora_name.as_deref(),
-            cache_namespace: req.cache_salt.as_deref(),
-            ..Default::default()
+    // Trees of one model normally share a block size; hash once per size.
+    let mut hashes_by_block_size: HashMap<u32, Vec<LocalBlockHash>> = HashMap::new();
+    let outcome = query_model(
+        trees,
+        |block_size| {
+            hashes_by_block_size
+                .entry(block_size)
+                .or_insert_with(|| {
+                    compute_block_hash_for_seq(
+                        &req.token_ids,
+                        block_size,
+                        BlockHashOptions {
+                            lora_name: req.lora_name.as_deref(),
+                            cache_namespace: req.cache_salt.as_deref(),
+                            ..Default::default()
+                        },
+                    )
+                })
+                .clone()
         },
-    );
-    let (status, json) = run_tiered_query(
-        &indexer,
-        block_hashes,
-        block_size,
         &state.registry.pod_names(),
     )
     .await;
-    let mut resp = (status, json).into_response();
+    let mut resp = (outcome.status, Json(outcome.body)).into_response();
+    resp.extensions_mut().insert(AccessLogModel(model));
+    resp
+}
+
+fn model_not_found(model: String) -> Response {
+    let mut resp = (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({ "error": format!("no indexer for model={model}") })),
+    )
+        .into_response();
     resp.extensions_mut().insert(AccessLogModel(model));
     resp
 }
@@ -418,38 +405,20 @@ async fn query_by_hash(
         return resp;
     }
 
-    let key = RoutingPartitionId::new(req.model_name, req.routing_group);
-    let Some(ie) = state.registry.get_indexer(&key) else {
-        let mut resp = (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({
-                "error": format!(
-                    "no indexer for model={} routing_group={}",
-                    key.model_name, key.routing_group
-                )
-            })),
-        )
-            .into_response();
-        resp.extensions_mut().insert(AccessLogModel(model));
-        return resp;
-    };
-    let block_size = ie.block_size;
-    let indexer = ie.indexer.clone();
-    drop(ie);
+    let trees = state
+        .registry
+        .query_trees(&req.model_name, req.routing_group.as_deref());
+    if trees.is_empty() {
+        return model_not_found(model);
+    }
 
     let block_hashes: Vec<LocalBlockHash> = req
         .block_hashes
         .iter()
         .map(|h| LocalBlockHash(*h as u64))
         .collect();
-    let (status, json) = run_tiered_query(
-        &indexer,
-        block_hashes,
-        block_size,
-        &state.registry.pod_names(),
-    )
-    .await;
-    let mut resp = (status, json).into_response();
+    let outcome = query_model(trees, |_| block_hashes.clone(), &state.registry.pod_names()).await;
+    let mut resp = (outcome.status, Json(outcome.body)).into_response();
     resp.extensions_mut().insert(AccessLogModel(model));
     resp
 }

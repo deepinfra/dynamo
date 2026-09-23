@@ -38,6 +38,7 @@ pub mod kv_recover;
 pub mod listener;
 pub mod logging;
 pub mod metrics;
+mod model_query;
 #[cfg(feature = "kube-discovery")]
 mod pod_watcher;
 pub mod recovery;
