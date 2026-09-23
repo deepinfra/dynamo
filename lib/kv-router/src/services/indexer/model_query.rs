@@ -24,6 +24,8 @@ use super::server::{ScoreResponse, build_score_response};
 pub(super) struct ModelQueryOutcome {
     pub status: StatusCode,
     pub body: serde_json::Value,
+    /// Routing groups whose tree answered.
+    pub queried_groups: Vec<String>,
 }
 
 /// Query every tree in `trees` (non-empty; callers 404 before calling) and
@@ -36,6 +38,7 @@ pub(super) async fn query_model(
 ) -> ModelQueryOutcome {
     let mut merged: Option<ScoreResponse> = None;
     let mut last_error: Option<String> = None;
+    let mut queried_groups = Vec::with_capacity(trees.len());
 
     for (key, indexer, block_size) in trees {
         match indexer.find_tiered_matches(hashes_for(block_size)).await {
@@ -45,6 +48,7 @@ pub(super) async fn query_model(
                     Some(acc) => merge_score_responses(acc, response),
                     None => merged = Some(response),
                 }
+                queried_groups.push(key.routing_group);
             }
             Err(error) => {
                 tracing::warn!(
@@ -67,7 +71,11 @@ pub(super) async fn query_model(
             }),
         ),
     };
-    ModelQueryOutcome { status, body }
+    ModelQueryOutcome {
+        status,
+        body,
+        queried_groups,
+    }
 }
 
 /// Worker sets are disjoint across trees (a worker registers into exactly one

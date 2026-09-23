@@ -11,6 +11,7 @@ use crate::protocols::{KvCacheEventData, RouterEvent, WorkerId, WorkerWithDpRank
 use crate::recovery::{CursorObservation, CursorState};
 use crate::zmq_wire::{ZmqEventNormalizer, decode_event_batch};
 
+use super::audit;
 use super::backend::Indexer;
 use super::block_size::BlockSizeGuard;
 use super::kv_recover::plan_recovery;
@@ -155,6 +156,7 @@ struct ListenerLoop {
     replay_socket: Option<SharedSocket>,
     recover: Option<RecoverTarget>,
     pending_evictions: Option<SharedPendingEvictions>,
+    audit_log: bool,
     watermark: Arc<AtomicU64>,
     normalizer: ZmqEventNormalizer,
     block_size_guard: BlockSizeGuard,
@@ -173,6 +175,7 @@ impl ListenerLoop {
         replay_socket: Option<SharedSocket>,
         recover: Option<RecoverTarget>,
         pending_evictions: Option<SharedPendingEvictions>,
+        audit_log: bool,
         watermark: Arc<AtomicU64>,
     ) -> Self {
         Self {
@@ -184,11 +187,21 @@ impl ListenerLoop {
             replay_socket,
             recover,
             pending_evictions,
+            audit_log,
             watermark,
             normalizer: ZmqEventNormalizer::new(block_size),
             block_size_guard: BlockSizeGuard::new(block_size),
             messages_processed: 0,
         }
+    }
+
+    /// Audit-log `event` (as published) and apply the `--keep-evictions`
+    /// filter. `true` when the event must not reach the tree.
+    fn withhold_from_tree(&self, event: &RouterEvent, seq: u64, source: &'static str) -> bool {
+        if self.audit_log {
+            audit::log_event(event, seq, source);
+        }
+        self.park_kept_eviction(event)
     }
 
     /// `--keep-evictions`: a store cancels any parked eviction of its blocks
@@ -317,7 +330,7 @@ impl ListenerLoop {
                 let router_event = placement_event
                     .into_router_event()
                     .expect("local worker placement must convert to router event");
-                if self.park_kept_eviction(&router_event) {
+                if self.withhold_from_tree(&router_event, seq, "replay") {
                     continue;
                 }
                 indexer
@@ -389,7 +402,7 @@ impl ListenerLoop {
         }
         let mut applied = 0u64;
         for event in plan.events {
-            if self.park_kept_eviction(&event) {
+            if self.withhold_from_tree(&event, event.event.event_id, "recover") {
                 continue;
             }
             self.indexer
@@ -478,7 +491,7 @@ impl ListenerLoop {
             let router_event = placement_event
                 .into_router_event()
                 .expect("local worker placement must convert to router event");
-            if self.park_kept_eviction(&router_event) {
+            if self.withhold_from_tree(&router_event, seq, "live") {
                 continue;
             }
             self.indexer
@@ -645,6 +658,7 @@ async fn run_listener(
         replay_socket,
         record.recover_target(),
         record.pending_evictions(),
+        record.audit_log(),
         watermark,
     )
     .run()
@@ -751,6 +765,7 @@ mod tests {
             Some(replay_socket.clone()),
             None,
             None,
+            false,
             watermark.clone(),
         );
         let replayed = tokio::time::timeout(Duration::from_secs(5), listener.replay_gap(0, 2))

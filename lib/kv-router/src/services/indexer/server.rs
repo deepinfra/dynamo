@@ -21,7 +21,8 @@ use crate::indexer::TieredMatchDetails;
 use crate::protocols::{BlockHashOptions, LocalBlockHash, WorkerId, compute_block_hash_for_seq};
 use crate::services::overlap::{MooncakeOverlapSummary, build_mooncake_overlap_summaries};
 
-use super::model_query::query_model;
+use super::audit;
+use super::model_query::{ModelQueryOutcome, query_model};
 use super::registry::{ListenerControlError, ListenerExtras, RegistryOptions, WorkerRegistry};
 
 /// We need to fit one million tokens as JSON text, this should do it.
@@ -372,9 +373,27 @@ async fn query(State(state): State<Arc<AppState>>, Json(req): Json<QueryRequest>
         &state.registry.pod_names(),
     )
     .await;
+    if state.registry.audit_log_enabled() {
+        let probe = hashes_by_block_size
+            .values()
+            .next()
+            .cloned()
+            .unwrap_or_default();
+        audit_query(&model, &outcome, &probe);
+    }
     let mut resp = (outcome.status, Json(outcome.body)).into_response();
     resp.extensions_mut().insert(AccessLogModel(model));
     resp
+}
+
+fn audit_query(model_name: &str, outcome: &ModelQueryOutcome, probe: &[LocalBlockHash]) {
+    audit::log_query(
+        model_name,
+        &outcome.queried_groups,
+        outcome.status.as_u16(),
+        probe,
+        &outcome.body,
+    );
 }
 
 fn model_not_found(model: String) -> Response {
@@ -417,6 +436,9 @@ async fn query_by_hash(
         .map(|h| LocalBlockHash(*h as u64))
         .collect();
     let outcome = query_model(trees, |_| block_hashes.clone(), &state.registry.pod_names()).await;
+    if state.registry.audit_log_enabled() {
+        audit_query(&model, &outcome, &block_hashes);
+    }
     let mut resp = (outcome.status, Json(outcome.body)).into_response();
     resp.extensions_mut().insert(AccessLogModel(model));
     resp

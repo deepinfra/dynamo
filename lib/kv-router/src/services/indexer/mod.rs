@@ -29,6 +29,7 @@
 //! Tier counts are CUMULATIVE through each tier's walk — see the doc on the
 //! response struct in [`server`] for the exact semantics.
 
+mod audit;
 pub mod backend;
 mod block_size;
 #[cfg(test)]
@@ -80,6 +81,8 @@ pub struct IndexerConfig {
     pub kube_discovery: Option<KubeDiscoveryConfig>,
     /// When set, park evictions and replay aged ones under memory pressure.
     pub keep_evictions: Option<KeepEvictionsConfig>,
+    /// Emit `kv_audit` lines for every query and ingested event.
+    pub audit_log: bool,
 }
 
 pub(super) fn validate_listener_endpoints(
@@ -179,6 +182,7 @@ pub async fn run_server(config: IndexerConfig) -> anyhow::Result<()> {
     let options = RegistryOptions {
         kv_recover: config.kv_recover,
         keep_evictions: config.keep_evictions.is_some(),
+        audit_log: config.audit_log,
     };
     let mut state = AppState::new_with_cancel_token(config.threads, cancel_token.clone(), options)?;
     state.access_log_sink = match config.access_log {
@@ -275,6 +279,13 @@ async fn run_common(
 
     wait_for_min_initial_workers(registry, &cancel_token).await?;
     registry.signal_ready();
+
+    if config.audit_log {
+        tracing::info!(
+            target: "kv_audit",
+            "kv_audit logging enabled: queries and store/evict/clear events will be logged"
+        );
+    }
 
     if let Some(keep) = config.keep_evictions {
         keep.validate()?;

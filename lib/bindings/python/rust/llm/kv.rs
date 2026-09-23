@@ -256,6 +256,12 @@ struct KvIndexerCli {
     #[arg(long, default_value_t = 0.75)]
     evict_memory_threshold: f64,
 
+    /// Emit verbose audit logs on the `kv_audit` tracing target: one line per
+    /// query (block hashes + full response) and one per store/evict/clear
+    /// event ingested from the engines. Filter with RUST_LOG=kv_audit=info.
+    #[arg(long, default_value_t = false)]
+    enable_logging: bool,
+
     /// Kubernetes namespace to watch for engine pods. Together with
     /// --watch-model-name (or --watch-label) this enables pod auto-discovery:
     /// subscribe on Ready, unsubscribe on delete.
@@ -369,6 +375,7 @@ where
                 concurrency: cli.recover_concurrency,
             },
             kube_discovery,
+            audit_log: cli.enable_logging,
             keep_evictions: cli.keep_evictions.then_some(
                 indexer::evictions::KeepEvictionsConfig {
                     retention_s: cli.evict_retention_secs,

@@ -153,6 +153,8 @@ pub struct RegistryOptions {
     pub kv_recover: KvRecoverSettings,
     /// Park evictions instead of applying them (`--keep-evictions`).
     pub keep_evictions: bool,
+    /// Emit `kv_audit` lines for queries and events (`--enable-logging`).
+    pub audit_log: bool,
 }
 
 /// Where and how a listener fetches `/kv_recover` on a gap.
@@ -175,12 +177,18 @@ pub struct ListenerExtras {
 /// Eviction events a `--keep-evictions` listener parks instead of applying.
 pub type SharedPendingEvictions = Arc<Mutex<PendingEvictions>>;
 
-pub struct ListenerRecord {
-    endpoint: String,
-    replay_endpoint: Option<String>,
+/// DeepInfra per-listener ingest behavior, fixed at registration.
+struct ListenerIngest {
     recover: Option<RecoverTarget>,
     /// `Some` only under `--keep-evictions`; drained by the evictions sweep.
     pending_evictions: Option<SharedPendingEvictions>,
+    audit_log: bool,
+}
+
+pub struct ListenerRecord {
+    endpoint: String,
+    replay_endpoint: Option<String>,
+    ingest: ListenerIngest,
     block_size: u32,
     indexer: Indexer,
     watermark: Arc<AtomicU64>,
@@ -191,8 +199,7 @@ impl ListenerRecord {
     fn new(
         endpoint: String,
         replay_endpoint: Option<String>,
-        recover: Option<RecoverTarget>,
-        pending_evictions: Option<SharedPendingEvictions>,
+        ingest: ListenerIngest,
         block_size: u32,
         indexer: Indexer,
         watermark: Arc<AtomicU64>,
@@ -200,8 +207,7 @@ impl ListenerRecord {
         Self {
             endpoint,
             replay_endpoint,
-            recover,
-            pending_evictions,
+            ingest,
             block_size,
             indexer,
             watermark,
@@ -223,11 +229,15 @@ impl ListenerRecord {
     }
 
     pub(super) fn recover_target(&self) -> Option<RecoverTarget> {
-        self.recover.clone()
+        self.ingest.recover.clone()
     }
 
     pub(super) fn pending_evictions(&self) -> Option<SharedPendingEvictions> {
-        self.pending_evictions.clone()
+        self.ingest.pending_evictions.clone()
+    }
+
+    pub(super) fn audit_log(&self) -> bool {
+        self.ingest.audit_log
     }
 
     pub(super) fn block_size(&self) -> u32 {
@@ -373,6 +383,7 @@ pub struct WorkerRegistry {
     retain_empty_indexers: bool,
     kv_recover: Arc<KvRecoverClient>,
     keep_evictions: bool,
+    audit_log: bool,
 }
 
 impl WorkerRegistry {
@@ -426,6 +437,7 @@ impl WorkerRegistry {
                     .expect("default kv_recover client builds"),
             ),
             keep_evictions: false,
+            audit_log: false,
         }
     }
 
@@ -433,7 +445,12 @@ impl WorkerRegistry {
     pub fn with_options(mut self, options: RegistryOptions) -> Result<Self> {
         self.kv_recover = Arc::new(KvRecoverClient::new(options.kv_recover)?);
         self.keep_evictions = options.keep_evictions;
+        self.audit_log = options.audit_log;
         Ok(self)
+    }
+
+    pub fn audit_log_enabled(&self) -> bool {
+        self.audit_log
     }
 
     #[cfg(feature = "standalone-selection")]
@@ -579,8 +596,11 @@ impl WorkerRegistry {
         let record = Arc::new(ListenerRecord::new(
             endpoint,
             replay_endpoint,
-            recover,
-            pending_evictions,
+            ListenerIngest {
+                recover,
+                pending_evictions,
+                audit_log: self.audit_log,
+            },
             bs,
             indexer,
             watermark,
