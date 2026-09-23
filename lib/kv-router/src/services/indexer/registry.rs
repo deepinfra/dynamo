@@ -19,6 +19,7 @@ use crate::indexer::KvIndexerMetrics;
 use crate::protocols::WorkerId;
 
 use super::backend::{Indexer, create_indexer_with_metrics};
+use super::kv_recover::{KvRecoverClient, KvRecoverSettings};
 use super::listener::spawn_zmq_listener;
 
 pub struct IndexerEntry {
@@ -141,9 +142,25 @@ struct ListenerRuntime {
     generation: u64,
 }
 
+/// Where and how a listener fetches `/kv_recover` on a gap.
+#[derive(Clone)]
+pub struct RecoverTarget {
+    pub endpoint: String,
+    pub client: Arc<KvRecoverClient>,
+}
+
+/// Optional registration fields beyond upstream's `register` arguments.
+#[derive(Debug, Clone, Default)]
+pub struct ListenerExtras {
+    /// HTTP base URL of the worker's `GET /kv_recover`. Takes precedence over
+    /// the ZMQ `replay_endpoint` for gap recovery when both are set.
+    pub recover_endpoint: Option<String>,
+}
+
 pub struct ListenerRecord {
     endpoint: String,
     replay_endpoint: Option<String>,
+    recover: Option<RecoverTarget>,
     block_size: u32,
     indexer: Indexer,
     watermark: Arc<AtomicU64>,
@@ -154,6 +171,7 @@ impl ListenerRecord {
     fn new(
         endpoint: String,
         replay_endpoint: Option<String>,
+        recover: Option<RecoverTarget>,
         block_size: u32,
         indexer: Indexer,
         watermark: Arc<AtomicU64>,
@@ -161,6 +179,7 @@ impl ListenerRecord {
         Self {
             endpoint,
             replay_endpoint,
+            recover,
             block_size,
             indexer,
             watermark,
@@ -179,6 +198,10 @@ impl ListenerRecord {
 
     pub(super) fn replay_endpoint(&self) -> Option<&str> {
         self.replay_endpoint.as_deref()
+    }
+
+    pub(super) fn recover_target(&self) -> Option<RecoverTarget> {
+        self.recover.clone()
     }
 
     pub(super) fn block_size(&self) -> u32 {
@@ -321,6 +344,7 @@ pub struct WorkerRegistry {
     ready_rx: watch::Receiver<bool>,
     root_cancel_token: CancellationToken,
     retain_empty_indexers: bool,
+    kv_recover: Arc<KvRecoverClient>,
 }
 
 impl WorkerRegistry {
@@ -369,7 +393,18 @@ impl WorkerRegistry {
             ready_rx,
             root_cancel_token,
             retain_empty_indexers: false,
+            kv_recover: Arc::new(
+                KvRecoverClient::new(KvRecoverSettings::default())
+                    .expect("default kv_recover client builds"),
+            ),
         }
+    }
+
+    /// Replace the `/kv_recover` timeout and concurrency gate shared by every
+    /// listener registered afterwards.
+    pub fn with_kv_recover(mut self, settings: KvRecoverSettings) -> Result<Self> {
+        self.kv_recover = Arc::new(KvRecoverClient::new(settings)?);
+        Ok(self)
     }
 
     #[cfg(feature = "standalone-selection")]
@@ -425,6 +460,32 @@ impl WorkerRegistry {
         block_size: u32,
         replay_endpoint: Option<String>,
     ) -> Result<()> {
+        self.register_with_extras(
+            instance_id,
+            endpoint,
+            dp_rank,
+            model_name,
+            routing_group,
+            block_size,
+            replay_endpoint,
+            ListenerExtras::default(),
+        )
+        .await
+    }
+
+    /// [`Self::register`] plus the DeepInfra-only registration fields.
+    #[expect(clippy::too_many_arguments)]
+    pub async fn register_with_extras(
+        &self,
+        instance_id: WorkerId,
+        endpoint: String,
+        dp_rank: u32,
+        model_name: String,
+        routing_group: String,
+        block_size: u32,
+        replay_endpoint: Option<String>,
+        extras: ListenerExtras,
+    ) -> Result<()> {
         let key = RoutingPartitionId::new(model_name, routing_group);
         let registration = self.indexer_lifecycle.lock().await;
 
@@ -479,9 +540,14 @@ impl WorkerRegistry {
             .or_insert_with(|| Arc::new(AtomicU64::new(u64::MAX)))
             .clone();
 
+        let recover = extras.recover_endpoint.map(|endpoint| RecoverTarget {
+            endpoint,
+            client: self.kv_recover.clone(),
+        });
         let record = Arc::new(ListenerRecord::new(
             endpoint,
             replay_endpoint,
+            recover,
             bs,
             indexer,
             watermark,

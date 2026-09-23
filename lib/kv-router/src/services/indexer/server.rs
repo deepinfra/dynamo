@@ -22,7 +22,8 @@ use crate::protocols::{BlockHashOptions, LocalBlockHash, WorkerId, compute_block
 use crate::services::overlap::{MooncakeOverlapSummary, build_mooncake_overlap_summaries};
 
 use super::backend::Indexer;
-use super::registry::{ListenerControlError, WorkerRegistry};
+use super::kv_recover::KvRecoverSettings;
+use super::registry::{ListenerControlError, ListenerExtras, WorkerRegistry};
 
 /// We need to fit one million tokens as JSON text, this should do it.
 const QUERY_REQUEST_BODY_LIMIT_BYTES: usize = 8 * 1024 * 1024;
@@ -46,12 +47,17 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(indexer_threads: usize) -> anyhow::Result<Self> {
-        Self::new_with_cancel_token(indexer_threads, CancellationToken::new())
+        Self::new_with_cancel_token(
+            indexer_threads,
+            CancellationToken::new(),
+            KvRecoverSettings::default(),
+        )
     }
 
     pub(super) fn new_with_cancel_token(
         indexer_threads: usize,
         root_cancel_token: CancellationToken,
+        kv_recover: KvRecoverSettings,
     ) -> anyhow::Result<Self> {
         #[cfg(feature = "metrics")]
         {
@@ -59,11 +65,14 @@ impl AppState {
             super::metrics::register(&prom_registry)?;
             let indexer_metrics = KvIndexerMetrics::new_registered(&prom_registry)?;
             Ok(Self {
-                registry: Arc::new(WorkerRegistry::new_with_indexer_metrics_and_cancel_token(
-                    indexer_threads,
-                    indexer_metrics,
-                    root_cancel_token,
-                )),
+                registry: Arc::new(
+                    WorkerRegistry::new_with_indexer_metrics_and_cancel_token(
+                        indexer_threads,
+                        indexer_metrics,
+                        root_cancel_token,
+                    )
+                    .with_kv_recover(kv_recover)?,
+                ),
                 access_log_sink: None,
                 prom_registry,
             })
@@ -71,10 +80,10 @@ impl AppState {
 
         #[cfg(not(feature = "metrics"))]
         Ok(Self {
-            registry: Arc::new(WorkerRegistry::new_with_cancel_token(
-                indexer_threads,
-                root_cancel_token,
-            )),
+            registry: Arc::new(
+                WorkerRegistry::new_with_cancel_token(indexer_threads, root_cancel_token)
+                    .with_kv_recover(kv_recover)?,
+            ),
             access_log_sink: None,
         })
     }
@@ -94,6 +103,11 @@ struct RegisterRequest {
     dp_rank: Option<u32>,
     #[serde(default)]
     replay_endpoint: Option<String>,
+    /// HTTP base URL of the worker's `GET /kv_recover`, e.g.
+    /// `http://10.0.0.1:5558`. Used for gap recovery instead of
+    /// `replay_endpoint` when set.
+    #[serde(default)]
+    recover_endpoint: Option<String>,
     /// Optional per-tenant salt (Mooncake RFC #1403 `additionalsalt`).
     /// Currently accepted but not yet mixed into hashes — engines apply
     /// their own salt internally. Plumbed for forward compatibility.
@@ -163,7 +177,11 @@ async fn register(
 ) -> Response {
     let model = req.model_name.clone();
     if let Err(error) =
-        super::validate_listener_endpoints(&req.endpoint, req.replay_endpoint.as_deref())
+        super::validate_listener_endpoints(&req.endpoint, req.replay_endpoint.as_deref()).and(
+            req.recover_endpoint
+                .as_deref()
+                .map_or(Ok(()), super::validate_recover_endpoint),
+        )
     {
         let mut resp = (
             StatusCode::BAD_REQUEST,
@@ -176,7 +194,7 @@ async fn register(
 
     let resp = match state
         .registry
-        .register(
+        .register_with_extras(
             req.instance_id,
             req.endpoint,
             req.dp_rank.unwrap_or(0),
@@ -184,6 +202,9 @@ async fn register(
             req.routing_group,
             req.block_size,
             req.replay_endpoint,
+            ListenerExtras {
+                recover_endpoint: req.recover_endpoint,
+            },
         )
         .await
     {

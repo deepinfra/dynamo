@@ -31,6 +31,7 @@
 
 pub mod backend;
 mod block_size;
+pub mod kv_recover;
 pub mod listener;
 pub mod logging;
 pub mod metrics;
@@ -48,6 +49,7 @@ use tokio_util::sync::CancellationToken;
 use crate::config::min_initial_workers_from_env;
 use crate::services::common::zmq::validate_endpoint as validate_zmq_endpoint;
 use axum::http::header::HeaderName;
+use kv_recover::KvRecoverSettings;
 use logging::AccessLogSink;
 use registry::WorkerRegistry;
 use server::{AppState, create_router};
@@ -63,6 +65,8 @@ pub struct IndexerConfig {
     pub access_log: Option<PathBuf>,
     pub trace_id_header: HeaderName,
     pub access_log_local_time: bool,
+    /// Timeout and concurrency of `/kv_recover` gap-recovery downloads.
+    pub kv_recover: KvRecoverSettings,
 }
 
 pub(super) fn validate_listener_endpoints(
@@ -75,6 +79,23 @@ pub(super) fn validate_listener_endpoints(
             anyhow::anyhow!("invalid replay endpoint `{replay_endpoint}`: {error}")
         })?;
     }
+    Ok(())
+}
+
+/// A `recover_endpoint` is the base URL queried at `<url>/kv_recover`: an
+/// absolute `http`/`https` URL with a host.
+pub(super) fn validate_recover_endpoint(endpoint: &str) -> anyhow::Result<()> {
+    let url = reqwest::Url::parse(endpoint)
+        .map_err(|error| anyhow::anyhow!("invalid recover endpoint `{endpoint}`: {error}"))?;
+    anyhow::ensure!(
+        matches!(url.scheme(), "http" | "https"),
+        "invalid recover endpoint `{endpoint}`: scheme must be http or https, got `{}`",
+        url.scheme()
+    );
+    anyhow::ensure!(
+        url.host().is_some(),
+        "invalid recover endpoint `{endpoint}`: missing host"
+    );
     Ok(())
 }
 
@@ -142,7 +163,8 @@ pub async fn run_server(config: IndexerConfig) -> anyhow::Result<()> {
         "Starting standalone KV cache indexer (HTTP-only mode)"
     );
 
-    let mut state = AppState::new_with_cancel_token(config.threads, cancel_token.clone())?;
+    let mut state =
+        AppState::new_with_cancel_token(config.threads, cancel_token.clone(), config.kv_recover)?;
     state.access_log_sink = match config.access_log {
         Some(ref path) => {
             let s = AccessLogSink::new(
@@ -276,6 +298,14 @@ mod tests {
         validate_zmq_endpoint("tcp://127.0.0.1:0").unwrap();
         validate_zmq_endpoint("inproc://listener").unwrap();
         validate_zmq_endpoint("ipc:///tmp/dynamo.sock").unwrap();
+    }
+
+    #[test]
+    fn recover_endpoint_must_be_an_http_url_with_a_host() {
+        validate_recover_endpoint("http://10.0.0.1:5558").unwrap();
+        validate_recover_endpoint("https://engine.local").unwrap();
+        assert!(validate_recover_endpoint("tcp://10.0.0.1:5558").is_err());
+        assert!(validate_recover_endpoint("10.0.0.1:5558").is_err());
     }
 
     #[test]

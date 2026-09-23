@@ -13,7 +13,8 @@ use crate::zmq_wire::{ZmqEventNormalizer, decode_event_batch};
 
 use super::backend::Indexer;
 use super::block_size::BlockSizeGuard;
-use super::registry::ListenerRecord;
+use super::kv_recover::plan_recovery;
+use super::registry::{ListenerRecord, RecoverTarget};
 use crate::services::common::zmq::{
     MultipartMessage, SharedSocket, connect_dealer_socket, connect_sub_socket, recv_multipart,
     send_multipart,
@@ -152,6 +153,7 @@ struct ListenerLoop {
     cancel: CancellationToken,
     live_socket: SharedSocket,
     replay_socket: Option<SharedSocket>,
+    recover: Option<RecoverTarget>,
     watermark: Arc<AtomicU64>,
     normalizer: ZmqEventNormalizer,
     block_size_guard: BlockSizeGuard,
@@ -168,6 +170,7 @@ impl ListenerLoop {
         cancel: CancellationToken,
         live_socket: SharedSocket,
         replay_socket: Option<SharedSocket>,
+        recover: Option<RecoverTarget>,
         watermark: Arc<AtomicU64>,
     ) -> Self {
         Self {
@@ -177,6 +180,7 @@ impl ListenerLoop {
             cancel,
             live_socket,
             replay_socket,
+            recover,
             watermark,
             normalizer: ZmqEventNormalizer::new(block_size),
             block_size_guard: BlockSizeGuard::new(block_size),
@@ -306,6 +310,74 @@ impl ListenerLoop {
         Ok(replayed)
     }
 
+    /// Recover `[start_seq, end_seq)` over HTTP `/kv_recover` when the worker
+    /// serves it, else over the ZMQ replay socket.
+    async fn recover_gap(&mut self, start_seq: u64, end_seq: u64) -> Result<u64, String> {
+        match self.recover.clone() {
+            Some(target) => self.recover_over_http(&target, start_seq, end_seq).await,
+            None => self.replay_gap(start_seq, end_seq).await,
+        }
+    }
+
+    async fn recover_over_http(
+        &mut self,
+        target: &RecoverTarget,
+        start_seq: u64,
+        end_seq: u64,
+    ) -> Result<u64, String> {
+        let (worker_id, dp_rank) = (self.worker_id, self.dp_rank);
+        tracing::info!(
+            worker_id,
+            dp_rank,
+            start_seq,
+            end_seq,
+            "Requesting recovery from worker via /kv_recover"
+        );
+        let Some(response) = target
+            .client
+            .fetch(
+                &target.endpoint,
+                start_seq,
+                end_seq,
+                worker_id,
+                dp_rank,
+                &self.cancel,
+            )
+            .await
+        else {
+            return Ok(0);
+        };
+
+        let plan = plan_recovery(response, worker_id, dp_rank);
+        if plan.reset_dp_rank {
+            self.indexer.remove_worker_dp_rank(worker_id, dp_rank).await;
+        }
+        let mut applied = 0u64;
+        for event in plan.events {
+            self.indexer
+                .apply_event_routed(event)
+                .await
+                .map_err(|error| {
+                    format!(
+                        "failed to apply recovered event for worker {worker_id} dp_rank {dp_rank}: {error}"
+                    )
+                })?;
+            applied += 1;
+        }
+        if let Some(last_event_id) = plan.resume_at {
+            self.watermark.store(last_event_id, Ordering::Release);
+        }
+        tracing::info!(
+            worker_id,
+            dp_rank,
+            applied,
+            reset = plan.reset_dp_rank,
+            resume_at = ?plan.resume_at,
+            "Recovery via /kv_recover complete"
+        );
+        Ok(applied)
+    }
+
     async fn handle_gap(&mut self, seq: u64) -> Result<(), String> {
         match self.cursor().observe(seq) {
             CursorObservation::Initial { got } if got > 0 => {
@@ -316,7 +388,7 @@ impl ListenerLoop {
                     got,
                     "Gap detected: expected seq 0, got {got}"
                 );
-                self.replay_gap(0, got).await?;
+                self.recover_gap(0, got).await?;
             }
             CursorObservation::Gap { expected, got } => {
                 tracing::warn!(
@@ -326,7 +398,7 @@ impl ListenerLoop {
                     got,
                     "Gap detected: expected seq {expected}, got {got}"
                 );
-                self.replay_gap(expected, got).await?;
+                self.recover_gap(expected, got).await?;
             }
             CursorObservation::Initial { .. }
             | CursorObservation::Contiguous { .. }
@@ -530,6 +602,7 @@ async fn run_listener(
         cancel,
         socket,
         replay_socket,
+        record.recover_target(),
         watermark,
     )
     .run()
@@ -634,6 +707,7 @@ mod tests {
             cancel.clone(),
             live_socket,
             Some(replay_socket.clone()),
+            None,
             watermark.clone(),
         );
         let replayed = tokio::time::timeout(Duration::from_secs(5), listener.replay_gap(0, 2))

@@ -228,6 +228,16 @@ struct KvIndexerCli {
     /// Use local timezone for access log timestamps (default: UTC)
     #[arg(long)]
     access_log_local_time: bool,
+
+    /// Total timeout in seconds for one engine `GET /kv_recover` download
+    /// (connect + body). A full TreeDump of a large engine is tens of MB.
+    #[arg(long, default_value_t = indexer::kv_recover::DEFAULT_RECOVER_TIMEOUT_S)]
+    recover_timeout_secs: u64,
+
+    /// Maximum concurrent `/kv_recover` downloads across all listeners of this
+    /// indexer. Bounds the load a fleet-wide (re)subscription puts on engines.
+    #[arg(long, default_value_t = indexer::kv_recover::DEFAULT_RECOVER_CONCURRENCY)]
+    recover_concurrency: usize,
 }
 
 pub fn run_kv_indexer_cli<I, T>(args: I) -> anyhow::Result<()>
@@ -262,6 +272,10 @@ where
             access_log: cli.access_log,
             trace_id_header,
             access_log_local_time: cli.access_log_local_time,
+            kv_recover: indexer::kv_recover::KvRecoverSettings {
+                timeout_s: cli.recover_timeout_secs,
+                concurrency: cli.recover_concurrency,
+            },
         }))
     }
 
