@@ -40,17 +40,17 @@ TreeDump is tens of MB serialized inside the engine process; with the previous
 10 s timeout and no gate, a fleet-wide (re)subscription lost about a third of
 its recoveries on 39 DP=2 pods.
 
-## Image blocks hash from tokens only
+## Image blocks carry their image id
 
-vLLM attaches each image's identifier to a stored block in `extra_keys`, and the
-shared ZMQ normalizer would mix it into that block's tokens hash. The standalone
-indexer's queriers do not: deepapi's probe hashes plain token ids and the
-engine's local-indexer TreeDumps (`/kv_recover`) carry token-only hashes. With
-the image hash mixed in, every query stopped matching at a conversation's first
-image block. The listener therefore builds its normalizer with
-`with_plain_mm_hashing()`. Trade-off: two prompts that share text but carry
-different images at the same position are indexed as the same prefix, so the
-indexer can over-report a hit the engine will not give.
+A stored block that overlaps an image hashes as its token bytes followed by the
+sorted image ids vLLM publishes in `extra_keys` (`compute_block_hash_for_seq`).
+Queriers must hash the same way; deepapi's DeepSeek-V4.1 probe does. Do not
+switch to token-only image hashing: blocks of different images at the same
+position would share one edge, the tree keeps one engine hash per edge position,
+and the second chain's children would be rejected as `ParentBlockNotFound`.
+Known gap: the engine's local-indexer TreeDumps (`/kv_recover`) carry
+token-only hashes, so image blocks restored at startup stay token-only until
+evicted.
 
 ## Data-parallel engines (`--watch-dp-size`)
 

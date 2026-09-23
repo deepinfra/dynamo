@@ -156,7 +156,7 @@ impl ListenerLoop {
             http_client,
             watermark,
             pending_evictions,
-            normalizer: ZmqEventNormalizer::new(block_size).with_plain_mm_hashing(),
+            normalizer: ZmqEventNormalizer::new(block_size),
             messages_processed: 0,
         }
     }
