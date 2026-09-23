@@ -12,6 +12,7 @@ use crate::recovery::{CursorObservation, CursorState};
 use crate::zmq_wire::{ZmqEventNormalizer, decode_event_batch};
 
 use super::backend::Indexer;
+use super::block_size::BlockSizeGuard;
 use super::registry::ListenerRecord;
 use crate::services::common::zmq::{
     MultipartMessage, SharedSocket, connect_dealer_socket, connect_sub_socket, recv_multipart,
@@ -153,6 +154,7 @@ struct ListenerLoop {
     replay_socket: Option<SharedSocket>,
     watermark: Arc<AtomicU64>,
     normalizer: ZmqEventNormalizer,
+    block_size_guard: BlockSizeGuard,
     messages_processed: u64,
 }
 
@@ -177,6 +179,7 @@ impl ListenerLoop {
             replay_socket,
             watermark,
             normalizer: ZmqEventNormalizer::new(block_size),
+            block_size_guard: BlockSizeGuard::new(block_size),
             messages_processed: 0,
         }
     }
@@ -267,11 +270,17 @@ impl ListenerLoop {
                 .data_parallel_rank
                 .map_or(dp_rank, |rank| rank.cast_unsigned());
             for raw_event in batch.events {
-                let Some(placement_event) = self.normalizer.normalize(
-                    raw_event,
-                    seq,
-                    WorkerWithDpRank::new(worker_id, effective_dp_rank),
-                ) else {
+                let worker = WorkerWithDpRank::new(worker_id, effective_dp_rank);
+                let Some(raw_event) = self.normalizer.preprocess(raw_event, worker) else {
+                    continue;
+                };
+                if !self.block_size_guard.admit(&raw_event, worker) {
+                    continue;
+                }
+                let Some(placement_event) = self
+                    .normalizer
+                    .normalize_preprocessed(raw_event, seq, worker)
+                else {
                     continue;
                 };
                 let router_event = placement_event
@@ -343,11 +352,17 @@ impl ListenerLoop {
             .data_parallel_rank
             .map_or(self.dp_rank, |rank| rank.cast_unsigned());
         for raw_event in batch.events {
-            let Some(placement_event) = self.normalizer.normalize(
-                raw_event,
-                seq,
-                WorkerWithDpRank::new(self.worker_id, effective_dp_rank),
-            ) else {
+            let worker = WorkerWithDpRank::new(self.worker_id, effective_dp_rank);
+            let Some(raw_event) = self.normalizer.preprocess(raw_event, worker) else {
+                continue;
+            };
+            if !self.block_size_guard.admit(&raw_event, worker) {
+                continue;
+            }
+            let Some(placement_event) = self
+                .normalizer
+                .normalize_preprocessed(raw_event, seq, worker)
+            else {
                 continue;
             };
             let router_event = placement_event

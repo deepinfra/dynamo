@@ -30,6 +30,7 @@
 //! response struct in [`server`] for the exact semantics.
 
 pub mod backend;
+mod block_size;
 pub mod listener;
 pub mod logging;
 pub mod metrics;
