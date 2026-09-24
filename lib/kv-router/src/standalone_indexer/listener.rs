@@ -16,6 +16,7 @@ use crate::zmq_wire::{ZmqEventNormalizer, decode_event_batch};
 use super::evictions::PendingEvictions;
 use super::indexer::Indexer;
 use super::registry::ListenerRecord;
+use super::tier_bridge::TierBridge;
 use super::zmq::{MultipartMessage, SharedSocket, connect_sub_socket, recv_multipart};
 
 const WATERMARK_UNSET: u64 = u64::MAX;
@@ -129,6 +130,7 @@ struct ListenerLoop {
     /// drains it through there. Untouched unless `--keep-evictions` is set.
     pending_evictions: Arc<Mutex<PendingEvictions>>,
     normalizer: ZmqEventNormalizer,
+    tier_bridge: TierBridge,
     messages_processed: u64,
 }
 
@@ -157,6 +159,7 @@ impl ListenerLoop {
             watermark,
             pending_evictions,
             normalizer: ZmqEventNormalizer::new(block_size),
+            tier_bridge: TierBridge::new(),
             messages_processed: 0,
         }
     }
@@ -330,6 +333,7 @@ impl ListenerLoop {
                 // them too — replaying them against the snapshot could remove
                 // blocks the dump says are live.
                 self.pending_evictions.lock().clear();
+                self.tier_bridge.reset();
                 self.indexer
                     .remove_worker_dp_rank(self.worker_id, self.dp_rank)
                     .await;
@@ -388,7 +392,7 @@ impl ListenerLoop {
     /// events under the worker that was queried), so they are rewritten before
     /// applying. Returns the count actually applied (after the
     /// `keep_evictions` measurement filter).
-    async fn apply_recovered_events(&self, events: Vec<RouterEvent>) -> u64 {
+    async fn apply_recovered_events(&mut self, events: Vec<RouterEvent>) -> u64 {
         let mut applied = 0;
         for mut event in events {
             event.worker_id = self.worker_id;
@@ -397,6 +401,11 @@ impl ListenerLoop {
             // Audit-log the recovered event before the measurement filter.
             audit_log_event(&event, event.event.event_id, "recover");
 
+            if let Some(promoted) = self.tier_bridge.observe(&event)
+                && !self.keep_evictions_intercept(&promoted)
+            {
+                self.indexer.apply_event_routed(promoted).await;
+            }
             // Feed-layer measurement filter (same as apply_live_batch).
             if self.keep_evictions_intercept(&event) {
                 continue;
@@ -481,6 +490,11 @@ impl ListenerLoop {
             // Audit-log the event as published by the engine, before the
             // measurement filter below can drop it.
             audit_log_event(&router_event, seq, "live");
+            if let Some(promoted) = self.tier_bridge.observe(&router_event)
+                && !self.keep_evictions_intercept(&promoted)
+            {
+                self.indexer.apply_event_routed(promoted).await;
+            }
             // Feed-layer measurement filter.
             if self.keep_evictions_intercept(&router_event) {
                 continue;
