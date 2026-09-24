@@ -29,10 +29,21 @@
 //! Tier counts are CUMULATIVE through each tier's walk — see the doc on the
 //! response struct in [`server`] for the exact semantics.
 
+mod audit;
 pub mod backend;
+mod block_size;
+#[cfg(test)]
+mod deepapi_contract_tests;
+pub mod discovery;
+pub mod evictions;
+pub mod h24;
+pub mod kv_recover;
 pub mod listener;
 pub mod logging;
 pub mod metrics;
+mod model_query;
+#[cfg(feature = "kube-discovery")]
+mod pod_watcher;
 pub mod recovery;
 pub mod registry;
 pub mod server;
@@ -47,8 +58,11 @@ use tokio_util::sync::CancellationToken;
 use crate::config::min_initial_workers_from_env;
 use crate::services::common::zmq::validate_endpoint as validate_zmq_endpoint;
 use axum::http::header::HeaderName;
+use discovery::KubeDiscoveryConfig;
+use evictions::KeepEvictionsConfig;
+use kv_recover::KvRecoverSettings;
 use logging::AccessLogSink;
-use registry::WorkerRegistry;
+use registry::{RegistryOptions, WorkerRegistry};
 use server::{AppState, create_router};
 
 pub struct IndexerConfig {
@@ -62,6 +76,17 @@ pub struct IndexerConfig {
     pub access_log: Option<PathBuf>,
     pub trace_id_header: HeaderName,
     pub access_log_local_time: bool,
+    /// Timeout and concurrency of `/kv_recover` gap-recovery downloads.
+    pub kv_recover: KvRecoverSettings,
+    /// When set, watch Kubernetes and register/deregister engine pods.
+    pub kube_discovery: Option<KubeDiscoveryConfig>,
+    /// When set, park evictions and replay aged ones under memory pressure.
+    pub keep_evictions: Option<KeepEvictionsConfig>,
+    /// Emit `kv_audit` lines for every query and ingested event.
+    pub audit_log: bool,
+    /// Run every indexer as the flat h24 counterfactual with this retention
+    /// horizon (seconds). Exclusive with `keep_evictions`.
+    pub h24_horizon_s: Option<u64>,
 }
 
 pub(super) fn validate_listener_endpoints(
@@ -74,6 +99,23 @@ pub(super) fn validate_listener_endpoints(
             anyhow::anyhow!("invalid replay endpoint `{replay_endpoint}`: {error}")
         })?;
     }
+    Ok(())
+}
+
+/// A `recover_endpoint` is the base URL queried at `<url>/kv_recover`: an
+/// absolute `http`/`https` URL with a host.
+pub(super) fn validate_recover_endpoint(endpoint: &str) -> anyhow::Result<()> {
+    let url = reqwest::Url::parse(endpoint)
+        .map_err(|error| anyhow::anyhow!("invalid recover endpoint `{endpoint}`: {error}"))?;
+    anyhow::ensure!(
+        matches!(url.scheme(), "http" | "https"),
+        "invalid recover endpoint `{endpoint}`: scheme must be http or https, got `{}`",
+        url.scheme()
+    );
+    anyhow::ensure!(
+        url.host().is_some(),
+        "invalid recover endpoint `{endpoint}`: missing host"
+    );
     Ok(())
 }
 
@@ -141,7 +183,20 @@ pub async fn run_server(config: IndexerConfig) -> anyhow::Result<()> {
         "Starting standalone KV cache indexer (HTTP-only mode)"
     );
 
-    let mut state = AppState::new_with_cancel_token(config.threads, cancel_token.clone())?;
+    let options = RegistryOptions {
+        kv_recover: config.kv_recover,
+        keep_evictions: config.keep_evictions.is_some(),
+        audit_log: config.audit_log,
+        h24: config.h24_horizon_s.is_some(),
+    };
+    if let Some(horizon_s) = config.h24_horizon_s {
+        anyhow::ensure!(
+            config.keep_evictions.is_none(),
+            "--h24 and --keep-evictions are mutually exclusive"
+        );
+        anyhow::ensure!(horizon_s > 0, "--h24-horizon-secs must be positive");
+    }
+    let mut state = AppState::new_with_cancel_token(config.threads, cancel_token.clone(), options)?;
     state.access_log_sink = match config.access_log {
         Some(ref path) => {
             let s = AccessLogSink::new(
@@ -237,6 +292,49 @@ async fn run_common(
     wait_for_min_initial_workers(registry, &cancel_token).await?;
     registry.signal_ready();
 
+    if config.audit_log {
+        tracing::info!(
+            target: "kv_audit",
+            "kv_audit logging enabled: queries and store/evict/clear events will be logged"
+        );
+    }
+
+    if let Some(horizon_s) = config.h24_horizon_s {
+        h24::spawn_expiry_loop(state.registry.clone(), horizon_s, cancel_token.clone());
+        tracing::info!(
+            horizon_s,
+            "h24 mode enabled: flat counterfactual indexer, evictions ignored"
+        );
+    }
+
+    if let Some(keep) = config.keep_evictions {
+        keep.validate()?;
+        evictions::spawn_cleanup_loop(
+            state.registry.clone(),
+            keep.retention_s,
+            keep.memory_threshold,
+            cancel_token.clone(),
+        );
+        tracing::info!(
+            retention_s = keep.retention_s,
+            memory_threshold = keep.memory_threshold,
+            "keep-evictions enabled: parking eviction events, sweeping under memory pressure"
+        );
+    }
+
+    if let Some(kube_config) = config.kube_discovery.clone() {
+        #[cfg(feature = "kube-discovery")]
+        pod_watcher::spawn_pod_watcher(kube_config, registry.clone(), cancel_token.clone());
+        #[cfg(not(feature = "kube-discovery"))]
+        {
+            let _ = kube_config;
+            anyhow::bail!(
+                "pod discovery is configured but this binary was built without the \
+                 `kube-discovery` feature"
+            );
+        }
+    }
+
     let app = create_router(state);
     let listener = TcpListener::bind(("0.0.0.0", config.port)).await?;
     tracing::info!("HTTP server listening on 0.0.0.0:{}", config.port);
@@ -275,6 +373,14 @@ mod tests {
         validate_zmq_endpoint("tcp://127.0.0.1:0").unwrap();
         validate_zmq_endpoint("inproc://listener").unwrap();
         validate_zmq_endpoint("ipc:///tmp/dynamo.sock").unwrap();
+    }
+
+    #[test]
+    fn recover_endpoint_must_be_an_http_url_with_a_host() {
+        validate_recover_endpoint("http://10.0.0.1:5558").unwrap();
+        validate_recover_endpoint("https://engine.local").unwrap();
+        assert!(validate_recover_endpoint("tcp://10.0.0.1:5558").is_err());
+        assert!(validate_recover_endpoint("10.0.0.1:5558").is_err());
     }
 
     #[test]

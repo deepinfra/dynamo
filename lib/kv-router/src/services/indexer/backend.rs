@@ -31,6 +31,9 @@ pub enum Indexer {
         primary: Arc<ThreadPoolIndexer<ConcurrentRadixTreeCompressed>>,
         lower_tier: LowerTierIndexers,
     },
+    /// The flat counterfactual indexer (`--h24`): no workers, no evictions,
+    /// no tiers. See [`super::h24`].
+    H24(Arc<super::h24::H24Indexer>),
 }
 
 impl Indexer {
@@ -41,6 +44,7 @@ impl Indexer {
         match self {
             Indexer::Single { primary, .. } => primary.apply_event(event).await,
             Indexer::Concurrent { primary, .. } => primary.apply_event(event).await,
+            Indexer::H24(h24) => h24_apply(h24, &event),
         }
     }
 
@@ -49,6 +53,12 @@ impl Indexer {
     /// indexer otherwise. `Cleared` events fan out to their applicable physical
     /// indexes according to the event's reset scope.
     pub async fn apply_event_routed(&self, event: RouterEvent) -> Result<(), KvRouterError> {
+        // Tier-agnostic on purpose: in the counterfactual a store on ANY tier
+        // means the content existed.
+        if let Indexer::H24(h24) = self {
+            h24_apply(h24, &event);
+            return Ok(());
+        }
         let targets_primary = match event.targets_primary() {
             Ok(targets_primary) => targets_primary,
             Err(_) => {
@@ -56,6 +66,7 @@ impl Indexer {
                     Self::Single { lower_tier, .. } | Self::Concurrent { lower_tier, .. } => {
                         lower_tier.record_unsupported_residency_event(&event);
                     }
+                    Self::H24(_) => unreachable!("h24 events return above"),
                 }
                 return Ok(());
             }
@@ -122,6 +133,7 @@ impl Indexer {
                         .await;
                 }
             }
+            Indexer::H24(_) => unreachable!("h24 events return above"),
         }
         Ok(())
     }
@@ -146,6 +158,8 @@ impl Indexer {
                 }
                 primary.remove_worker(worker_id).await;
             }
+            // The counterfactual keeps content regardless of worker lifecycle.
+            Indexer::H24(_) => {}
         }
     }
 
@@ -169,6 +183,7 @@ impl Indexer {
                 }
                 primary.remove_worker_dp_rank(worker_id, dp_rank).await;
             }
+            Indexer::H24(_) => {}
         }
     }
 
@@ -182,6 +197,7 @@ impl Indexer {
             Indexer::Concurrent { primary, .. } => {
                 primary.find_matches(hashes).await.map_err(Into::into)
             }
+            Indexer::H24(h24) => Ok(h24.find_matches(&hashes)),
         }
     }
 
@@ -215,6 +231,13 @@ impl Indexer {
                     lower_tier: lt,
                 })
             }
+            Indexer::H24(h24) => Ok(TieredMatchDetails {
+                device: MatchDetails {
+                    overlap_scores: h24.find_matches(&sequence),
+                    ..Default::default()
+                },
+                lower_tier: Default::default(),
+            }),
         }
     }
 
@@ -242,6 +265,12 @@ impl Indexer {
                 primary.dump_events().await.map_err(anyhow::Error::from)?,
                 lower_tier.entries(),
             ),
+            // Flat maps cannot reconstruct chains; /dump and peer recovery
+            // are unsupported in h24 mode.
+            Indexer::H24(_) => {
+                tracing::warn!("h24 indexer does not support dump_events; returning empty");
+                return Ok(Vec::new());
+            }
         };
 
         let mut out = primary_events;
@@ -530,7 +559,9 @@ mod tests {
                 lower_tier.get_or_create(StorageTier::HostPinned),
                 lower_tier.get_or_create(StorageTier::Disk),
             ),
-            Indexer::Concurrent { .. } => unreachable!("test creates the single indexer"),
+            Indexer::Concurrent { .. } | Indexer::H24(_) => {
+                unreachable!("test creates the single indexer")
+            }
         };
 
         indexer
@@ -596,6 +627,19 @@ mod tests {
             );
         }
     }
+}
+
+/// Stores chain into the flat h24 maps; evictions and clears are the
+/// counterfactual's no-op and are only counted.
+fn h24_apply(h24: &super::h24::H24Indexer, event: &RouterEvent) {
+    match &event.event.data {
+        KvCacheEventData::Stored(data) => h24.apply_store(data),
+        KvCacheEventData::Removed(_) | KvCacheEventData::Cleared => h24.note_ignored_event(),
+    }
+}
+
+pub fn create_h24_indexer() -> Indexer {
+    Indexer::H24(Arc::new(super::h24::H24Indexer::new()))
 }
 
 pub fn create_indexer(block_size: u32, num_threads: usize) -> Indexer {

@@ -18,7 +18,9 @@ use crate::identity::RoutingPartitionId;
 use crate::indexer::KvIndexerMetrics;
 use crate::protocols::WorkerId;
 
-use super::backend::{Indexer, create_indexer_with_metrics};
+use super::backend::{Indexer, create_h24_indexer, create_indexer_with_metrics};
+use super::evictions::PendingEvictions;
+use super::kv_recover::{KvRecoverClient, KvRecoverSettings};
 use super::listener::spawn_zmq_listener;
 
 pub struct IndexerEntry {
@@ -102,6 +104,10 @@ pub struct ListenerInfo {
 #[derive(Debug, Clone, Serialize)]
 pub struct WorkerInfo {
     instance_id: WorkerId,
+    /// Pod name this worker was registered under, when the registrant knows
+    /// it. `instance_id` stays the canonical key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pod_name: Option<String>,
     source: WorkerSource,
     status: ListenerStatus,
     model_name: String,
@@ -141,9 +147,50 @@ struct ListenerRuntime {
     generation: u64,
 }
 
+/// DeepInfra registry behavior chosen at startup.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RegistryOptions {
+    pub kv_recover: KvRecoverSettings,
+    /// Park evictions instead of applying them (`--keep-evictions`).
+    pub keep_evictions: bool,
+    /// Emit `kv_audit` lines for queries and events (`--enable-logging`).
+    pub audit_log: bool,
+    /// Every indexer is the flat h24 counterfactual, one per model (`--h24`).
+    pub h24: bool,
+}
+
+/// Where and how a listener fetches `/kv_recover` on a gap.
+#[derive(Clone)]
+pub struct RecoverTarget {
+    pub endpoint: String,
+    pub client: Arc<KvRecoverClient>,
+}
+
+/// Optional registration fields beyond upstream's `register` arguments.
+#[derive(Debug, Clone, Default)]
+pub struct ListenerExtras {
+    /// HTTP base URL of the worker's `GET /kv_recover`. Takes precedence over
+    /// the ZMQ `replay_endpoint` for gap recovery when both are set.
+    pub recover_endpoint: Option<String>,
+    /// Pod name, surfaced in `/workers` and in `/query` instances.
+    pub pod_name: Option<String>,
+}
+
+/// Eviction events a `--keep-evictions` listener parks instead of applying.
+pub type SharedPendingEvictions = Arc<Mutex<PendingEvictions>>;
+
+/// DeepInfra per-listener ingest behavior, fixed at registration.
+struct ListenerIngest {
+    recover: Option<RecoverTarget>,
+    /// `Some` only under `--keep-evictions`; drained by the evictions sweep.
+    pending_evictions: Option<SharedPendingEvictions>,
+    audit_log: bool,
+}
+
 pub struct ListenerRecord {
     endpoint: String,
     replay_endpoint: Option<String>,
+    ingest: ListenerIngest,
     block_size: u32,
     indexer: Indexer,
     watermark: Arc<AtomicU64>,
@@ -154,6 +201,7 @@ impl ListenerRecord {
     fn new(
         endpoint: String,
         replay_endpoint: Option<String>,
+        ingest: ListenerIngest,
         block_size: u32,
         indexer: Indexer,
         watermark: Arc<AtomicU64>,
@@ -161,6 +209,7 @@ impl ListenerRecord {
         Self {
             endpoint,
             replay_endpoint,
+            ingest,
             block_size,
             indexer,
             watermark,
@@ -179,6 +228,18 @@ impl ListenerRecord {
 
     pub(super) fn replay_endpoint(&self) -> Option<&str> {
         self.replay_endpoint.as_deref()
+    }
+
+    pub(super) fn recover_target(&self) -> Option<RecoverTarget> {
+        self.ingest.recover.clone()
+    }
+
+    pub(super) fn pending_evictions(&self) -> Option<SharedPendingEvictions> {
+        self.ingest.pending_evictions.clone()
+    }
+
+    pub(super) fn audit_log(&self) -> bool {
+        self.ingest.audit_log
     }
 
     pub(super) fn block_size(&self) -> u32 {
@@ -305,12 +366,15 @@ impl ListenerRecord {
 
 pub struct WorkerEntry {
     key: RoutingPartitionId,
+    pod_name: Option<String>,
     listeners: HashMap<u32, Arc<ListenerRecord>>,
 }
 
 pub struct WorkerRegistry {
     workers: DashMap<WorkerId, WorkerEntry>,
     indexers: DashMap<RoutingPartitionId, IndexerEntry>,
+    // Serialize indexer claims through worker publication with empty-indexer removal.
+    indexer_lifecycle: tokio::sync::Mutex<()>,
     peers: DashMap<String, ()>,
     watermarks: DashMap<(WorkerId, u32), Arc<AtomicU64>>,
     num_threads: usize,
@@ -318,6 +382,11 @@ pub struct WorkerRegistry {
     ready_tx: watch::Sender<bool>,
     ready_rx: watch::Receiver<bool>,
     root_cancel_token: CancellationToken,
+    retain_empty_indexers: bool,
+    kv_recover: Arc<KvRecoverClient>,
+    keep_evictions: bool,
+    audit_log: bool,
+    h24: bool,
 }
 
 impl WorkerRegistry {
@@ -357,6 +426,7 @@ impl WorkerRegistry {
         Self {
             workers: DashMap::new(),
             indexers: DashMap::new(),
+            indexer_lifecycle: tokio::sync::Mutex::new(()),
             peers: DashMap::new(),
             watermarks: DashMap::new(),
             num_threads,
@@ -364,7 +434,60 @@ impl WorkerRegistry {
             ready_tx,
             ready_rx,
             root_cancel_token,
+            retain_empty_indexers: false,
+            kv_recover: Arc::new(
+                KvRecoverClient::new(KvRecoverSettings::default())
+                    .expect("default kv_recover client builds"),
+            ),
+            keep_evictions: false,
+            audit_log: false,
+            h24: false,
         }
+    }
+
+    /// Apply startup options; call before any registration.
+    pub fn with_options(mut self, options: RegistryOptions) -> Result<Self> {
+        self.kv_recover = Arc::new(KvRecoverClient::new(options.kv_recover)?);
+        self.keep_evictions = options.keep_evictions;
+        self.audit_log = options.audit_log;
+        self.h24 = options.h24;
+        Ok(self)
+    }
+
+    fn new_indexer(&self, block_size: u32) -> Indexer {
+        if self.h24 {
+            create_h24_indexer()
+        } else {
+            create_indexer_with_metrics(block_size, self.num_threads, self.indexer_metrics.clone())
+        }
+    }
+
+    /// h24 is worker-less and regime-agnostic ("stored by anyone"), so every
+    /// routing group of a model shares one flat map. Per-group maps would count
+    /// a block matched in N regimes N times against a once-per-request
+    /// denominator (live incident: 120% hit rate). Requires one block size
+    /// across the model's regimes.
+    fn partition_key(&self, model_name: String, routing_group: String) -> RoutingPartitionId {
+        if self.h24 {
+            RoutingPartitionId::new(model_name, "h24")
+        } else {
+            RoutingPartitionId::new(model_name, routing_group)
+        }
+    }
+
+    pub fn h24_enabled(&self) -> bool {
+        self.h24
+    }
+
+    pub fn audit_log_enabled(&self) -> bool {
+        self.audit_log
+    }
+
+    #[cfg(feature = "standalone-selection")]
+    pub(crate) fn with_retained_indexers(mut self) -> Self {
+        // Selection entries and their schedulers retain these indexers across worker updates.
+        self.retain_empty_indexers = true;
+        self
     }
 
     pub fn signal_ready(&self) {
@@ -413,7 +536,34 @@ impl WorkerRegistry {
         block_size: u32,
         replay_endpoint: Option<String>,
     ) -> Result<()> {
-        let key = RoutingPartitionId::new(model_name, routing_group);
+        self.register_with_extras(
+            instance_id,
+            endpoint,
+            dp_rank,
+            model_name,
+            routing_group,
+            block_size,
+            replay_endpoint,
+            ListenerExtras::default(),
+        )
+        .await
+    }
+
+    /// [`Self::register`] plus the DeepInfra-only registration fields.
+    #[expect(clippy::too_many_arguments)]
+    pub async fn register_with_extras(
+        &self,
+        instance_id: WorkerId,
+        endpoint: String,
+        dp_rank: u32,
+        model_name: String,
+        routing_group: String,
+        block_size: u32,
+        replay_endpoint: Option<String>,
+        extras: ListenerExtras,
+    ) -> Result<()> {
+        let key = self.partition_key(model_name.to_string(), routing_group.to_string());
+        let registration = self.indexer_lifecycle.lock().await;
 
         if let Some(entry) = self.workers.get(&instance_id) {
             if entry.key != key {
@@ -437,11 +587,7 @@ impl WorkerRegistry {
                 "Creating new indexer"
             );
             IndexerEntry {
-                indexer: create_indexer_with_metrics(
-                    block_size,
-                    self.num_threads,
-                    self.indexer_metrics.clone(),
-                ),
+                indexer: self.new_indexer(block_size),
                 block_size,
             }
         });
@@ -466,9 +612,21 @@ impl WorkerRegistry {
             .or_insert_with(|| Arc::new(AtomicU64::new(u64::MAX)))
             .clone();
 
+        let recover = extras.recover_endpoint.map(|endpoint| RecoverTarget {
+            endpoint,
+            client: self.kv_recover.clone(),
+        });
+        let pending_evictions = self
+            .keep_evictions
+            .then(|| Arc::new(Mutex::new(PendingEvictions::default())));
         let record = Arc::new(ListenerRecord::new(
             endpoint,
             replay_endpoint,
+            ListenerIngest {
+                recover,
+                pending_evictions,
+                audit_log: self.audit_log,
+            },
             bs,
             indexer,
             watermark,
@@ -481,11 +639,16 @@ impl WorkerRegistry {
                 .entry(instance_id)
                 .or_insert_with(|| WorkerEntry {
                     key: key.clone(),
+                    pod_name: None,
                     listeners: HashMap::new(),
                 });
+            if extras.pod_name.is_some() {
+                entry.pod_name = extras.pod_name;
+            }
             entry.listeners.insert(dp_rank, record.clone());
         }
 
+        drop(registration);
         self.spawn_listener(instance_id, dp_rank, attempt, record);
         Ok(())
     }
@@ -496,7 +659,7 @@ impl WorkerRegistry {
         model_name: &str,
         routing_group: &str,
     ) -> Result<()> {
-        let key = RoutingPartitionId::new(model_name, routing_group);
+        let key = self.partition_key(model_name.to_string(), routing_group.to_string());
 
         if let Some(entry) = self.workers.get(&instance_id) {
             if entry.key != key {
@@ -521,10 +684,12 @@ impl WorkerRegistry {
             }
         }
 
-        if let Some(ie) = self.indexers.get(&key) {
-            ie.indexer.remove_worker(instance_id).await;
+        // Registration needs this map's write lock while removal can wait on indexer queues.
+        let indexer = self.indexers.get(&key).map(|entry| entry.indexer.clone());
+        if let Some(indexer) = indexer {
+            indexer.remove_worker(instance_id).await;
         }
-        self.maybe_remove_indexer(&key);
+        self.maybe_remove_indexer(&key).await;
         Ok(())
     }
 
@@ -535,7 +700,7 @@ impl WorkerRegistry {
         model_name: &str,
         routing_group: &str,
     ) -> Result<()> {
-        let key = RoutingPartitionId::new(model_name, routing_group);
+        let key = self.partition_key(model_name.to_string(), routing_group.to_string());
 
         let (record, remove_worker) = {
             let mut entry = self
@@ -569,13 +734,17 @@ impl WorkerRegistry {
                 .remove_if(&instance_id, |_, entry| entry.listeners.is_empty())
                 .is_some();
             if actually_removed {
-                if let Some(ie) = self.indexers.get(&key) {
-                    ie.indexer.remove_worker(instance_id).await;
+                let indexer = self.indexers.get(&key).map(|entry| entry.indexer.clone());
+                if let Some(indexer) = indexer {
+                    indexer.remove_worker(instance_id).await;
                 }
-                self.maybe_remove_indexer(&key);
+                self.maybe_remove_indexer(&key).await;
             }
-        } else if let Some(ie) = self.indexers.get(&key) {
-            ie.indexer.remove_worker_dp_rank(instance_id, dp_rank).await;
+        } else {
+            let indexer = self.indexers.get(&key).map(|entry| entry.indexer.clone());
+            if let Some(indexer) = indexer {
+                indexer.remove_worker_dp_rank(instance_id, dp_rank).await;
+            }
         }
 
         Ok(())
@@ -610,10 +779,11 @@ impl WorkerRegistry {
             }
         }
 
-        if let Some(ie) = self.indexers.get(&key) {
-            ie.indexer.remove_worker(instance_id).await;
+        let indexer = self.indexers.get(&key).map(|entry| entry.indexer.clone());
+        if let Some(indexer) = indexer {
+            indexer.remove_worker(instance_id).await;
         }
-        self.maybe_remove_indexer(&key);
+        self.maybe_remove_indexer(&key).await;
         Ok(())
     }
 
@@ -715,6 +885,7 @@ impl WorkerRegistry {
                 let status = ListenerStatus::aggregate(listeners.values().map(|info| info.status));
                 Some(WorkerInfo {
                     instance_id: *entry.key(),
+                    pod_name: worker.pod_name.clone(),
                     source: WorkerSource::Zmq,
                     status,
                     model_name: key.model_name.clone(),
@@ -734,7 +905,19 @@ impl WorkerRegistry {
         self.indexers.get(key)
     }
 
+    /// Known pod names by worker id, for enriching query responses.
+    pub fn pod_names(&self) -> HashMap<WorkerId, String> {
+        self.workers
+            .iter()
+            .filter_map(|entry| {
+                let pod_name = entry.value().pod_name.clone()?;
+                Some((*entry.key(), pod_name))
+            })
+            .collect()
+    }
+
     pub fn get_or_create_indexer(&self, key: RoutingPartitionId, block_size: u32) -> Indexer {
+        let key = self.partition_key(key.model_name, key.routing_group);
         let entry = self.indexers.entry(key.clone()).or_insert_with(|| {
             tracing::info!(
                 model_name = %key.model_name,
@@ -743,11 +926,7 @@ impl WorkerRegistry {
                 "Creating indexer from recovery dump"
             );
             IndexerEntry {
-                indexer: create_indexer_with_metrics(
-                    block_size,
-                    self.num_threads,
-                    self.indexer_metrics.clone(),
-                ),
+                indexer: self.new_indexer(block_size),
                 block_size,
             }
         });
@@ -761,6 +940,58 @@ impl WorkerRegistry {
             );
         }
         entry.indexer.clone()
+    }
+
+    /// Every `--keep-evictions` listener as `(worker_id, dp_rank, buffer,
+    /// indexer)`, for the evictions sweep.
+    pub(super) fn listener_records(&self) -> Vec<(WorkerId, u32, SharedPendingEvictions, Indexer)> {
+        self.workers
+            .iter()
+            .flat_map(|entry| {
+                let worker_id = *entry.key();
+                entry
+                    .value()
+                    .listeners
+                    .iter()
+                    .filter_map(|(dp_rank, record)| {
+                        let buffer = record.pending_evictions()?;
+                        Some((worker_id, *dp_rank, buffer, record.indexer()))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// The trees a query for `model_name` reads: the named routing group's,
+    /// or every group's when none is named.
+    pub fn query_trees(
+        &self,
+        model_name: &str,
+        routing_group: Option<&str>,
+    ) -> Vec<(RoutingPartitionId, Indexer, u32)> {
+        let Some(routing_group) = routing_group else {
+            return self.indexers_for_model(model_name);
+        };
+        let key = self.partition_key(model_name.to_string(), routing_group.to_string());
+        self.indexers
+            .get(&key)
+            .map(|entry| vec![(key.clone(), entry.indexer.clone(), entry.block_size)])
+            .unwrap_or_default()
+    }
+
+    /// Every routing group's tree of `model_name`, for model-level queries.
+    pub fn indexers_for_model(&self, model_name: &str) -> Vec<(RoutingPartitionId, Indexer, u32)> {
+        self.indexers
+            .iter()
+            .filter(|entry| entry.key().model_name == model_name)
+            .map(|entry| {
+                (
+                    entry.key().clone(),
+                    entry.value().indexer.clone(),
+                    entry.value().block_size,
+                )
+            })
+            .collect()
     }
 
     pub fn all_indexers_with_block_size(&self) -> Vec<(RoutingPartitionId, Indexer, u32)> {
@@ -807,7 +1038,12 @@ impl WorkerRegistry {
         );
     }
 
-    fn maybe_remove_indexer(&self, key: &RoutingPartitionId) {
+    async fn maybe_remove_indexer(&self, key: &RoutingPartitionId) {
+        if self.retain_empty_indexers {
+            return;
+        }
+
+        let _lifecycle = self.indexer_lifecycle.lock().await;
         if self.workers.iter().any(|entry| entry.value().key == *key) {
             return;
         }
@@ -819,41 +1055,184 @@ impl WorkerRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocols::{LocalBlockHash, StorageTier, WorkerWithDpRank};
+    use crate::services::indexer::backend::test_util::store_event;
+    use std::future::Future;
     use std::sync::atomic::Ordering;
+    use std::task::{Context, Poll, Waker};
+    use std::time::Duration;
 
     fn test_registry() -> WorkerRegistry {
         WorkerRegistry::new(1)
     }
 
+    #[rstest::rstest]
+    #[case("worker")]
+    #[case("all_groups")]
+    #[case("last_rank")]
     #[tokio::test]
-    async fn deregister_removes_watermark() {
+    async fn registration_progresses_while_removal_is_backpressured(#[case] removal: &str) {
         let registry = test_registry();
-        registry.signal_ready();
-
+        let key = RoutingPartitionId::new("test-model", "default");
         registry
             .register(
                 1,
-                "tcp://127.0.0.1:15557".to_string(),
+                "tcp://127.0.0.1:15557".into(),
                 0,
-                "test-model".to_string(),
-                "default".to_string(),
+                "test-model".into(),
+                "default".into(),
+                1,
+                None,
+            )
+            .await
+            .unwrap();
+        let indexer = registry.indexers.get(&key).unwrap().indexer.clone();
+        let Indexer::Single { primary, .. } = indexer else {
+            unreachable!();
+        };
+        let sender = primary.remove_worker_sender();
+        // Reserve the entire queue so removal must yield without blocking the executor.
+        let permits = sender.reserve_many(sender.max_capacity()).await.unwrap();
+        let removal = async {
+            match removal {
+                "worker" => registry.deregister(1, "test-model", "default").await,
+                "all_groups" => {
+                    registry
+                        .deregister_all_routing_groups(1, "test-model")
+                        .await
+                }
+                "last_rank" => {
+                    registry
+                        .deregister_dp_rank(1, 0, "test-model", "default")
+                        .await
+                }
+                _ => unreachable!(),
+            }
+        };
+        tokio::pin!(removal);
+        assert!(matches!(
+            removal
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Pending
+        ));
+        // A nonblocking probe makes the regression fail instead of deadlocking the test.
+        assert!(matches!(
+            registry.indexers.try_get_mut(&key),
+            dashmap::try_result::TryResult::Present(_)
+        ));
+        registry
+            .register(
+                2,
+                "tcp://127.0.0.1:15558".into(),
+                0,
+                "test-model".into(),
+                "default".into(),
+                1,
+                None,
+            )
+            .await
+            .unwrap();
+        drop(permits);
+        tokio::time::timeout(Duration::from_secs(5), removal)
+            .await
+            .expect("removal should finish after queue capacity is released")
+            .unwrap();
+        assert!(registry.workers.contains_key(&2));
+        assert!(registry.indexers.contains_key(&key));
+        registry.root_cancel_token.cancel();
+    }
+
+    #[rstest::rstest]
+    #[case("worker")]
+    #[case("all_groups")]
+    #[case("last_rank")]
+    #[tokio::test]
+    async fn empty_indexer_removal_waits_for_registration(#[case] removal: &str) {
+        let registry = test_registry();
+        let key = RoutingPartitionId::new("test-model", "default");
+        registry
+            .register(
+                1,
+                "tcp://127.0.0.1:15557".into(),
+                0,
+                "test-model".into(),
+                "default".into(),
                 1,
                 None,
             )
             .await
             .unwrap();
 
-        assert!(registry.watermarks.contains_key(&(1, 0)));
+        // Queue registration ahead of pruning, without timing or thread scheduling assumptions.
+        let lifecycle = registry.indexer_lifecycle.lock().await;
+        let registration = registry.register(
+            2,
+            "tcp://127.0.0.1:15558".into(),
+            0,
+            "test-model".into(),
+            "default".into(),
+            1,
+            None,
+        );
+        tokio::pin!(registration);
+        assert!(matches!(
+            registration
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Pending
+        ));
 
-        registry
-            .deregister(1, "test-model", "default")
+        let removal = async {
+            match removal {
+                "worker" => registry.deregister(1, "test-model", "default").await,
+                "all_groups" => {
+                    registry
+                        .deregister_all_routing_groups(1, "test-model")
+                        .await
+                }
+                "last_rank" => {
+                    registry
+                        .deregister_dp_rank(1, 0, "test-model", "default")
+                        .await
+                }
+                _ => unreachable!(),
+            }
+        };
+        tokio::pin!(removal);
+        assert!(matches!(
+            removal
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Pending
+        ));
+        assert!(registry.workers.is_empty());
+        assert!(!registry.watermarks.contains_key(&(1, 0)));
+        assert!(registry.get_indexer(&key).is_some());
+        drop(lifecycle);
+        registration.await.unwrap();
+        removal.await.unwrap();
+
+        // Events written by the new listener must remain visible through the query registry.
+        let listener_indexer = registry.workers.get(&2).unwrap().listeners[&0]
+            .indexer
+            .clone();
+        listener_indexer
+            .apply_event_routed(store_event(2, 0, 0, &[], &[11], StorageTier::Device))
             .await
             .unwrap();
-
-        assert!(
-            !registry.watermarks.contains_key(&(1, 0)),
-            "watermark should be removed after deregister"
-        );
+        listener_indexer.dump_events().await.unwrap();
+        let query_indexer = registry
+            .get_indexer(&key)
+            .expect("registered indexer")
+            .indexer
+            .clone();
+        let scores = query_indexer
+            .find_matches(vec![LocalBlockHash(11)])
+            .await
+            .unwrap();
+        assert_eq!(scores.scores.get(&WorkerWithDpRank::new(2, 0)), Some(&1));
+        registry.root_cancel_token.cancel();
     }
 
     #[tokio::test]
@@ -969,14 +1348,22 @@ mod tests {
             .unwrap();
 
         // Simulate that the listener advanced the watermark.
-        if let Some(wm) = registry.watermarks.get(&(1, 0)) {
-            wm.store(42, Ordering::Release);
-        }
+        registry
+            .watermarks
+            .get(&(1, 0))
+            .unwrap()
+            .store(42, Ordering::Release);
 
         registry
             .deregister(1, "test-model", "default")
             .await
             .unwrap();
+
+        assert!(
+            registry
+                .get_indexer(&RoutingPartitionId::new("test-model", "default"))
+                .is_none()
+        );
 
         registry
             .register(
@@ -999,37 +1386,6 @@ mod tests {
             wm.load(Ordering::Acquire),
             u64::MAX,
             "re-registered watermark should be fresh (u64::MAX)"
-        );
-    }
-
-    #[tokio::test]
-    async fn deregister_all_routing_groups_removes_watermarks() {
-        let registry = test_registry();
-        registry.signal_ready();
-
-        registry
-            .register(
-                1,
-                "tcp://127.0.0.1:15562".to_string(),
-                0,
-                "test-model".to_string(),
-                "default".to_string(),
-                1,
-                None,
-            )
-            .await
-            .unwrap();
-
-        assert!(registry.watermarks.contains_key(&(1, 0)));
-
-        registry
-            .deregister_all_routing_groups(1, "test-model")
-            .await
-            .unwrap();
-
-        assert!(
-            !registry.watermarks.contains_key(&(1, 0)),
-            "watermark should be removed after deregister_all_routing_groups"
         );
     }
 
@@ -1119,6 +1475,7 @@ mod tests {
             99u64,
             WorkerEntry {
                 key,
+                pod_name: None,
                 listeners: HashMap::new(),
             },
         );

@@ -14,15 +14,16 @@ use prometheus::Encoder;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
-use crate::identity::{RoutingPartitionId, default_routing_group};
+use crate::identity::default_routing_group;
 #[cfg(feature = "metrics")]
 use crate::indexer::KvIndexerMetrics;
 use crate::indexer::TieredMatchDetails;
 use crate::protocols::{BlockHashOptions, LocalBlockHash, WorkerId, compute_block_hash_for_seq};
 use crate::services::overlap::{MooncakeOverlapSummary, build_mooncake_overlap_summaries};
 
-use super::backend::Indexer;
-use super::registry::{ListenerControlError, WorkerRegistry};
+use super::audit;
+use super::model_query::{ModelQueryOutcome, query_model};
+use super::registry::{ListenerControlError, ListenerExtras, RegistryOptions, WorkerRegistry};
 
 /// We need to fit one million tokens as JSON text, this should do it.
 const QUERY_REQUEST_BODY_LIMIT_BYTES: usize = 8 * 1024 * 1024;
@@ -46,12 +47,17 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(indexer_threads: usize) -> anyhow::Result<Self> {
-        Self::new_with_cancel_token(indexer_threads, CancellationToken::new())
+        Self::new_with_cancel_token(
+            indexer_threads,
+            CancellationToken::new(),
+            RegistryOptions::default(),
+        )
     }
 
     pub(super) fn new_with_cancel_token(
         indexer_threads: usize,
         root_cancel_token: CancellationToken,
+        options: RegistryOptions,
     ) -> anyhow::Result<Self> {
         #[cfg(feature = "metrics")]
         {
@@ -59,11 +65,14 @@ impl AppState {
             super::metrics::register(&prom_registry)?;
             let indexer_metrics = KvIndexerMetrics::new_registered(&prom_registry)?;
             Ok(Self {
-                registry: Arc::new(WorkerRegistry::new_with_indexer_metrics_and_cancel_token(
-                    indexer_threads,
-                    indexer_metrics,
-                    root_cancel_token,
-                )),
+                registry: Arc::new(
+                    WorkerRegistry::new_with_indexer_metrics_and_cancel_token(
+                        indexer_threads,
+                        indexer_metrics,
+                        root_cancel_token,
+                    )
+                    .with_options(options)?,
+                ),
                 access_log_sink: None,
                 prom_registry,
             })
@@ -71,10 +80,10 @@ impl AppState {
 
         #[cfg(not(feature = "metrics"))]
         Ok(Self {
-            registry: Arc::new(WorkerRegistry::new_with_cancel_token(
-                indexer_threads,
-                root_cancel_token,
-            )),
+            registry: Arc::new(
+                WorkerRegistry::new_with_cancel_token(indexer_threads, root_cancel_token)
+                    .with_options(options)?,
+            ),
             access_log_sink: None,
         })
     }
@@ -94,6 +103,14 @@ struct RegisterRequest {
     dp_rank: Option<u32>,
     #[serde(default)]
     replay_endpoint: Option<String>,
+    /// HTTP base URL of the worker's `GET /kv_recover`, e.g.
+    /// `http://10.0.0.1:5558`. Used for gap recovery instead of
+    /// `replay_endpoint` when set.
+    #[serde(default)]
+    recover_endpoint: Option<String>,
+    /// Optional pod name, surfaced in `/workers` and `/query` instances.
+    #[serde(default)]
+    pod_name: Option<String>,
     /// Optional per-tenant salt (Mooncake RFC #1403 `additionalsalt`).
     /// Currently accepted but not yet mixed into hashes — engines apply
     /// their own salt internally. Plumbed for forward compatibility.
@@ -117,8 +134,10 @@ struct UnregisterRequest {
 struct QueryRequest {
     token_ids: Vec<u32>,
     model_name: String,
-    #[serde(default = "default_routing_group")]
-    routing_group: String,
+    /// Queries only this group's tree when given; absent, the query fans out
+    /// over every routing group of `model_name` (see `model_query`).
+    #[serde(default)]
+    routing_group: Option<String>,
     #[serde(default = "default_routing_group", rename = "tenant_id")]
     _tenant_id: String,
     #[serde(default)]
@@ -132,8 +151,10 @@ struct QueryRequest {
 struct QueryByHashRequest {
     block_hashes: Vec<i64>,
     model_name: String,
-    #[serde(default = "default_routing_group")]
-    routing_group: String,
+    /// Queries only this group's tree when given; absent, the query fans out
+    /// over every routing group of `model_name` (see `model_query`).
+    #[serde(default)]
+    routing_group: Option<String>,
     #[serde(default = "default_routing_group", rename = "tenant_id")]
     _tenant_id: String,
     /// Invalid for `/query_by_hash`. Callers must precompute `block_hashes` with the intended
@@ -150,11 +171,21 @@ struct QueryByHashRequest {
 /// RFC #1403 (kvcache-ai/Mooncake#1403):
 /// `{instance_id: {longest_matched, gpu, dp: {rank: count}, cpu, disk}}`.
 #[derive(Serialize)]
-struct ScoreResponse {
-    scores: HashMap<String, HashMap<String, u32>>,
-    frequencies: Vec<usize>,
+pub(super) struct ScoreResponse {
+    pub(super) scores: HashMap<String, HashMap<String, u32>>,
+    pub(super) frequencies: Vec<usize>,
     /// Per-instance tier breakdown (Mooncake RFC #1403 alignment).
-    instances: HashMap<String, MooncakeOverlapSummary>,
+    pub(super) instances: HashMap<String, InstanceMatch>,
+}
+
+/// One `instances` entry: the shared Mooncake summary plus the worker's pod
+/// name when known (deepapi maps matches back to shards by pod name).
+#[derive(Serialize)]
+pub(super) struct InstanceMatch {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pod_name: Option<String>,
+    #[serde(flatten)]
+    summary: MooncakeOverlapSummary,
 }
 
 async fn register(
@@ -163,7 +194,11 @@ async fn register(
 ) -> Response {
     let model = req.model_name.clone();
     if let Err(error) =
-        super::validate_listener_endpoints(&req.endpoint, req.replay_endpoint.as_deref())
+        super::validate_listener_endpoints(&req.endpoint, req.replay_endpoint.as_deref()).and(
+            req.recover_endpoint
+                .as_deref()
+                .map_or(Ok(()), super::validate_recover_endpoint),
+        )
     {
         let mut resp = (
             StatusCode::BAD_REQUEST,
@@ -176,7 +211,7 @@ async fn register(
 
     let resp = match state
         .registry
-        .register(
+        .register_with_extras(
             req.instance_id,
             req.endpoint,
             req.dp_rank.unwrap_or(0),
@@ -184,6 +219,10 @@ async fn register(
             req.routing_group,
             req.block_size,
             req.replay_endpoint,
+            ListenerExtras {
+                recover_endpoint: req.recover_endpoint,
+                pod_name: req.pod_name,
+            },
         )
         .await
     {
@@ -268,7 +307,11 @@ async fn list_workers(
 /// (Mooncake RFC #1403) shapes from a tiered match result.
 ///
 /// All token counts are scaled from blocks → tokens via `block_size`.
-fn build_score_response(tiered: &TieredMatchDetails, block_size: u32) -> ScoreResponse {
+pub(super) fn build_score_response(
+    tiered: &TieredMatchDetails,
+    block_size: u32,
+    pod_names: &HashMap<WorkerId, String>,
+) -> ScoreResponse {
     // Flat fields (unchanged) come from the device-tier overlap.
     let device = &tiered.device.overlap_scores;
 
@@ -282,7 +325,13 @@ fn build_score_response(tiered: &TieredMatchDetails, block_size: u32) -> ScoreRe
 
     let instances = build_mooncake_overlap_summaries(tiered, block_size, [])
         .into_iter()
-        .map(|(worker_id, summary)| (worker_id.to_string(), summary))
+        .map(|(worker_id, summary)| {
+            let instance = InstanceMatch {
+                pod_name: pod_names.get(&worker_id).cloned(),
+                summary,
+            };
+            (worker_id.to_string(), instance)
+        })
         .collect();
 
     ScoreResponse {
@@ -292,57 +341,67 @@ fn build_score_response(tiered: &TieredMatchDetails, block_size: u32) -> ScoreRe
     }
 }
 
-/// Run a tiered query and serialize the result, returning the appropriate
-/// HTTP status. Shared between `/query` and `/query_by_hash`.
-async fn run_tiered_query(
-    indexer: &Indexer,
-    block_hashes: Vec<LocalBlockHash>,
-    block_size: u32,
-) -> (StatusCode, Json<serde_json::Value>) {
-    match indexer.find_tiered_matches(block_hashes).await {
-        Ok(tiered) => (
-            StatusCode::OK,
-            Json(serde_json::json!(build_score_response(&tiered, block_size))),
-        ),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        ),
-    }
-}
-
 async fn query(State(state): State<Arc<AppState>>, Json(req): Json<QueryRequest>) -> Response {
     let model = req.model_name.clone();
-    let key = RoutingPartitionId::new(req.model_name, req.routing_group);
-    let Some(ie) = state.registry.get_indexer(&key) else {
-        let mut resp = (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({
-                "error": format!(
-                    "no indexer for model={} routing_group={}",
-                    key.model_name, key.routing_group
-                )
-            })),
-        )
-            .into_response();
-        resp.extensions_mut().insert(AccessLogModel(model));
-        return resp;
-    };
-    let block_size = ie.block_size;
-    let indexer = ie.indexer.clone();
-    drop(ie);
+    let trees = state
+        .registry
+        .query_trees(&req.model_name, req.routing_group.as_deref());
+    if trees.is_empty() {
+        return model_not_found(model);
+    }
 
-    let block_hashes = compute_block_hash_for_seq(
-        &req.token_ids,
-        block_size,
-        BlockHashOptions {
-            lora_name: req.lora_name.as_deref(),
-            cache_namespace: req.cache_salt.as_deref(),
-            ..Default::default()
+    // Trees of one model normally share a block size; hash once per size.
+    let mut hashes_by_block_size: HashMap<u32, Vec<LocalBlockHash>> = HashMap::new();
+    let outcome = query_model(
+        trees,
+        |block_size| {
+            hashes_by_block_size
+                .entry(block_size)
+                .or_insert_with(|| {
+                    compute_block_hash_for_seq(
+                        &req.token_ids,
+                        block_size,
+                        BlockHashOptions {
+                            lora_name: req.lora_name.as_deref(),
+                            cache_namespace: req.cache_salt.as_deref(),
+                            ..Default::default()
+                        },
+                    )
+                })
+                .clone()
         },
+        &state.registry.pod_names(),
+    )
+    .await;
+    if state.registry.audit_log_enabled() {
+        let probe = hashes_by_block_size
+            .values()
+            .next()
+            .cloned()
+            .unwrap_or_default();
+        audit_query(&model, &outcome, &probe);
+    }
+    let mut resp = (outcome.status, Json(outcome.body)).into_response();
+    resp.extensions_mut().insert(AccessLogModel(model));
+    resp
+}
+
+fn audit_query(model_name: &str, outcome: &ModelQueryOutcome, probe: &[LocalBlockHash]) {
+    audit::log_query(
+        model_name,
+        &outcome.queried_groups,
+        outcome.status.as_u16(),
+        probe,
+        &outcome.body,
     );
-    let (status, json) = run_tiered_query(&indexer, block_hashes, block_size).await;
-    let mut resp = (status, json).into_response();
+}
+
+fn model_not_found(model: String) -> Response {
+    let mut resp = (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({ "error": format!("no indexer for model={model}") })),
+    )
+        .into_response();
     resp.extensions_mut().insert(AccessLogModel(model));
     resp
 }
@@ -364,32 +423,23 @@ async fn query_by_hash(
         return resp;
     }
 
-    let key = RoutingPartitionId::new(req.model_name, req.routing_group);
-    let Some(ie) = state.registry.get_indexer(&key) else {
-        let mut resp = (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({
-                "error": format!(
-                    "no indexer for model={} routing_group={}",
-                    key.model_name, key.routing_group
-                )
-            })),
-        )
-            .into_response();
-        resp.extensions_mut().insert(AccessLogModel(model));
-        return resp;
-    };
-    let block_size = ie.block_size;
-    let indexer = ie.indexer.clone();
-    drop(ie);
+    let trees = state
+        .registry
+        .query_trees(&req.model_name, req.routing_group.as_deref());
+    if trees.is_empty() {
+        return model_not_found(model);
+    }
 
     let block_hashes: Vec<LocalBlockHash> = req
         .block_hashes
         .iter()
         .map(|h| LocalBlockHash(*h as u64))
         .collect();
-    let (status, json) = run_tiered_query(&indexer, block_hashes, block_size).await;
-    let mut resp = (status, json).into_response();
+    let outcome = query_model(trees, |_| block_hashes.clone(), &state.registry.pod_names()).await;
+    if state.registry.audit_log_enabled() {
+        audit_query(&model, &outcome, &block_hashes);
+    }
+    let mut resp = (outcome.status, Json(outcome.body)).into_response();
     resp.extensions_mut().insert(AccessLogModel(model));
     resp
 }

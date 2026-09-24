@@ -228,6 +228,122 @@ struct KvIndexerCli {
     /// Use local timezone for access log timestamps (default: UTC)
     #[arg(long)]
     access_log_local_time: bool,
+
+    /// Total timeout in seconds for one engine `GET /kv_recover` download
+    /// (connect + body). A full TreeDump of a large engine is tens of MB.
+    #[arg(long, default_value_t = indexer::kv_recover::DEFAULT_RECOVER_TIMEOUT_S)]
+    recover_timeout_secs: u64,
+
+    /// Maximum concurrent `/kv_recover` downloads across all listeners of this
+    /// indexer. Bounds the load a fleet-wide (re)subscription puts on engines.
+    #[arg(long, default_value_t = indexer::kv_recover::DEFAULT_RECOVER_CONCURRENCY)]
+    recover_concurrency: usize,
+
+    /// Park Removed events in a buffer (and drop Cleared) instead of applying
+    /// them, approximating infinite memory (the kv-indexer:routing flavor).
+    /// Buffered evictions older than --evict-retention-secs are replayed into
+    /// the tree once memory use crosses --evict-memory-threshold of the limit.
+    #[arg(long, default_value_t = false)]
+    keep_evictions: bool,
+
+    /// Minimum age (seconds) a parked eviction must reach before the memory
+    /// sweep may apply it. Only meaningful with --keep-evictions.
+    #[arg(long, default_value_t = 1800)]
+    evict_retention_secs: u64,
+
+    /// Fraction of the memory limit (0..1] above which the sweep replays aged
+    /// evictions. Only meaningful with --keep-evictions.
+    #[arg(long, default_value_t = 0.75)]
+    evict_memory_threshold: f64,
+
+    /// Emit verbose audit logs on the `kv_audit` tracing target: one line per
+    /// query (block hashes + full response) and one per store/evict/clear
+    /// event ingested from the engines. Filter with RUST_LOG=kv_audit=info.
+    #[arg(long, default_value_t = false)]
+    enable_logging: bool,
+
+    /// Run as the flat h24 counterfactual (kv-indexer:h24): one map per model
+    /// of every prefix stored by any worker within --h24-horizon-secs,
+    /// ignoring evictions. Exclusive with --keep-evictions.
+    #[arg(long, default_value_t = false)]
+    h24: bool,
+
+    /// Retention horizon of the h24 expiry sweep, in seconds.
+    #[arg(long, default_value_t = 172800)]
+    h24_horizon_secs: u64,
+
+    /// Kubernetes namespace to watch for engine pods. Together with
+    /// --watch-model-name (or --watch-label) this enables pod auto-discovery:
+    /// subscribe on Ready, unsubscribe on delete.
+    #[arg(long)]
+    watch_namespace: Option<String>,
+
+    /// Raw label selector for this model's engine pods, e.g.
+    /// "engine_hash=d4b7a85131172ca6". Overrides the selector derived from
+    /// --watch-model-name.
+    #[arg(long)]
+    watch_label: Option<String>,
+
+    /// ZMQ KV-event port the discovered engines publish on.
+    #[arg(long, default_value_t = 5557)]
+    watch_zmq_port: u16,
+
+    /// HTTP port serving `GET /kv_recover` on the engines, used for gap
+    /// recovery at `http://<pod-ip>:<port>/kv_recover`.
+    #[arg(long)]
+    watch_recover_port: Option<u16>,
+
+    /// Data-parallel ranks per engine pod (vLLM --data-parallel-size). Rank r
+    /// publishes on --watch-zmq-port + r and recovers on
+    /// --watch-recover-port + r. Leaving this at 1 on a DP engine indexes
+    /// only rank 0's cache.
+    #[arg(long, default_value_t = 1)]
+    watch_dp_size: u32,
+
+    /// Model whose engine pods to discover, e.g. "openai/gpt-oss-120b". The
+    /// watch uses `di/model_name=<sanitized name>` unless --watch-label is
+    /// given; discovered pods register under this name (default:
+    /// --model-name).
+    #[arg(long)]
+    watch_model_name: Option<String>,
+}
+
+#[cfg(feature = "kv-indexer")]
+impl KvIndexerCli {
+    /// Pod-discovery config, `None` unless --watch-namespace is set.
+    fn kube_discovery(&self) -> anyhow::Result<Option<indexer::discovery::KubeDiscoveryConfig>> {
+        let Some(namespace) = self.watch_namespace.clone() else {
+            anyhow::ensure!(
+                self.watch_label.is_none() && self.watch_model_name.is_none(),
+                "--watch-label/--watch-model-name require --watch-namespace"
+            );
+            return Ok(None);
+        };
+        let label_selector = match (&self.watch_label, &self.watch_model_name) {
+            (Some(raw), _) => raw.clone(),
+            (None, Some(model_name)) => indexer::discovery::model_name_label_selector(model_name),
+            (None, None) => {
+                anyhow::bail!("--watch-namespace requires --watch-model-name or --watch-label")
+            }
+        };
+        let block_size = self
+            .block_size
+            .ok_or_else(|| anyhow::anyhow!("--block-size is required with --watch-namespace"))?;
+        anyhow::ensure!(self.watch_dp_size >= 1, "--watch-dp-size must be at least 1");
+        Ok(Some(indexer::discovery::KubeDiscoveryConfig {
+            namespace,
+            label_selector,
+            zmq_port: self.watch_zmq_port,
+            recover_port: self.watch_recover_port,
+            dp_size: self.watch_dp_size,
+            model_name: self
+                .watch_model_name
+                .clone()
+                .unwrap_or_else(|| self.model_name.clone()),
+            routing_group: self.routing_group.clone(),
+            block_size,
+        }))
+    }
 }
 
 pub fn run_kv_indexer_cli<I, T>(args: I) -> anyhow::Result<()>
@@ -248,6 +364,8 @@ where
                 anyhow::anyhow!("invalid --trace-id-header '{}': {e}", cli.trace_id_header)
             })?;
 
+        let kube_discovery = cli.kube_discovery()?;
+
         init_standalone_logging();
 
         let rt = tokio::runtime::Runtime::new()?;
@@ -262,6 +380,19 @@ where
             access_log: cli.access_log,
             trace_id_header,
             access_log_local_time: cli.access_log_local_time,
+            kv_recover: indexer::kv_recover::KvRecoverSettings {
+                timeout_s: cli.recover_timeout_secs,
+                concurrency: cli.recover_concurrency,
+            },
+            kube_discovery,
+            audit_log: cli.enable_logging,
+            h24_horizon_s: cli.h24.then_some(cli.h24_horizon_secs),
+            keep_evictions: cli.keep_evictions.then_some(
+                indexer::evictions::KeepEvictionsConfig {
+                    retention_s: cli.evict_retention_secs,
+                    memory_threshold: cli.evict_memory_threshold,
+                },
+            ),
         }))
     }
 
