@@ -32,6 +32,7 @@ pub mod pod_watcher;
 pub mod recovery;
 pub mod registry;
 pub mod server;
+mod tier_bridge;
 mod zmq;
 
 use std::sync::{Arc, OnceLock};
