@@ -327,11 +327,14 @@ pub enum StorageTier {
 }
 
 impl StorageTier {
+    /// Case-insensitive; also accepts vLLM's own medium names ("CPU", "STORAGE",
+    /// sent lowercase by some offload connectors), which otherwise fell back to
+    /// the device tier and turned host-tier evictions into GPU evictions.
     pub fn from_kv_medium(medium: &str) -> Option<Self> {
-        match medium {
+        match medium.to_ascii_uppercase().as_str() {
             "GPU" | "DEVICE" => Some(Self::Device),
-            "CPU_PINNED" | "CPU_TIER1" => Some(Self::HostPinned),
-            "CPU_TIER2" | "DISK" | "NVME" => Some(Self::Disk),
+            "CPU" | "CPU_PINNED" | "CPU_TIER1" => Some(Self::HostPinned),
+            "CPU_TIER2" | "STORAGE" | "DISK" | "NVME" => Some(Self::Disk),
             "EXTERNAL" | "NETWORK" | "REMOTE" | "SHARED" => Some(Self::External),
             _ => None,
         }
