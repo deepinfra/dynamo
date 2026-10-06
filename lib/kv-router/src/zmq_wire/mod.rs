@@ -8,12 +8,12 @@
 //! and can be used by any crate that needs to decode the raw ZMQ payloads.
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use rmp_serde as rmps;
 use rustc_hash::FxHashMap;
 
-use crate::protocols::{DpRank, PlacementEvent, WorkerWithDpRank};
+use crate::protocols::{DpRank, PlacementEvent, StorageTier, WorkerWithDpRank};
 
 mod convert;
 mod deserialize;
@@ -54,6 +54,7 @@ pub enum ZmqEventFilterReason {
     UnknownKind,
     NonMainAttentionGroup,
     UnlearnedGroupIdx,
+    OffloadBlockSizeMismatch,
 }
 
 impl ZmqEventFilterReason {
@@ -64,6 +65,7 @@ impl ZmqEventFilterReason {
             Self::UnknownKind => "unknown_kind",
             Self::NonMainAttentionGroup => "non_main_attention_group",
             Self::UnlearnedGroupIdx => "unlearned_group_idx",
+            Self::OffloadBlockSizeMismatch => "offload_block_size_mismatch",
         }
     }
 }
@@ -105,7 +107,45 @@ impl ZmqEventNormalizer {
         if let Some(reason) = self.filter_reason(metadata, worker.dp_rank) {
             return Err(reason);
         }
+        if let Some(reason) = self.offload_block_size_reason(&raw, worker) {
+            return Err(reason);
+        }
         Ok(raw)
+    }
+
+    /// Offload connectors store lower-tier blocks at their own size (e.g. vLLM's
+    /// CPU offload groups several GPU blocks into one), so a size mismatch there
+    /// is expected and must not trip the fatal GPU block-size check. The blocks
+    /// were already indexed when the GPU tier stored them.
+    fn offload_block_size_reason(
+        &self,
+        raw: &RawKvEvent,
+        worker: WorkerWithDpRank,
+    ) -> Option<ZmqEventFilterReason> {
+        let RawKvEvent::BlockStored {
+            block_size,
+            medium: Some(medium),
+            ..
+        } = raw
+        else {
+            return None;
+        };
+        let on_device =
+            StorageTier::from_kv_medium(&medium.to_ascii_uppercase()) == Some(StorageTier::Device);
+        if on_device || *block_size == self.kv_block_size as usize {
+            return None;
+        }
+        if self.warning_count.fetch_add(1, Ordering::Relaxed) < 3 {
+            tracing::warn!(
+                worker_id = worker.worker_id,
+                dp_rank = worker.dp_rank,
+                medium = %medium,
+                event_block_size = block_size,
+                configured_block_size = self.kv_block_size,
+                "Skipping offload-tier BlockStored with a different block size"
+            );
+        }
+        Some(ZmqEventFilterReason::OffloadBlockSizeMismatch)
     }
 
     pub fn normalize_preprocessed(
