@@ -38,7 +38,6 @@ pub fn decode_event_batch(payload: &[u8]) -> Result<KvEventBatch, rmps::decode::
 pub struct ZmqEventNormalizer {
     kv_block_size: u32,
     warning_count: Arc<AtomicU32>,
-    offload_skip_warnings: Arc<AtomicU32>,
     group_metadata: FxHashMap<(DpRank, u32), KvCacheGroupMetadata>,
 }
 
@@ -76,7 +75,6 @@ impl ZmqEventNormalizer {
         Self {
             kv_block_size,
             warning_count: Arc::new(AtomicU32::new(0)),
-            offload_skip_warnings: Arc::new(AtomicU32::new(0)),
             group_metadata: FxHashMap::default(),
         }
     }
@@ -85,7 +83,6 @@ impl ZmqEventNormalizer {
         Self {
             kv_block_size,
             warning_count,
-            offload_skip_warnings: Arc::new(AtomicU32::new(0)),
             group_metadata: FxHashMap::default(),
         }
     }
@@ -133,11 +130,12 @@ impl ZmqEventNormalizer {
         else {
             return None;
         };
-        let on_device = StorageTier::from_kv_medium_or_default(Some(medium)) == StorageTier::Device;
+        let on_device =
+            StorageTier::from_kv_medium(&medium.to_ascii_uppercase()) == Some(StorageTier::Device);
         if on_device || *block_size == self.kv_block_size as usize {
             return None;
         }
-        if self.offload_skip_warnings.fetch_add(1, Ordering::Relaxed) < 3 {
+        if self.warning_count.fetch_add(1, Ordering::Relaxed) < 3 {
             tracing::warn!(
                 worker_id = worker.worker_id,
                 dp_rank = worker.dp_rank,
