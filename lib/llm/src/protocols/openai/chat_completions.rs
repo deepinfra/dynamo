@@ -1298,6 +1298,20 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_accepts_namespaced_tool_names() {
+        for name in ["mcp-swarm.nmap_quick_scan", "github:create_issue", "fs/read_file"] {
+            let tools: Vec<dynamo_protocols::types::ChatCompletionTool> =
+                serde_json::from_value(json!([{
+                    "type": "function",
+                    "function": {"name": name, "parameters": {"type": "object"}}
+                }]))
+                .unwrap();
+            validate::validate_tools(&Some(tools.as_slice()))
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+        }
+    }
+
+    #[test]
     fn test_validate_rejects_invalid_dynamic_tool_names() {
         for (name, expected_error) in [
             ("bad name".to_string(), "has an invalid name".to_string()),

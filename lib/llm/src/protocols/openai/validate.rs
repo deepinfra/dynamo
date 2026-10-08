@@ -727,15 +727,18 @@ pub fn validate_tools(
         if tool.function.name.trim().is_empty() {
             anyhow::bail!("Function name at index {} cannot be empty", i);
         }
+        // deepinfra: also accept '.', ':' and '/', which MCP clients use to namespace
+        // tools (e.g. "mcp-swarm.nmap_quick_scan"). vLLM serves these names; rejecting
+        // them turned every such request into a 400.
         if !tool
             .function
             .name
             .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b':' | b'/'))
         {
             anyhow::bail!(
                 "Function at index {} has an invalid name: \"{}\". \
-                 Only a-z, A-Z, 0-9, underscores, and dashes are allowed.",
+                 Only a-z, A-Z, 0-9, underscores, dashes, dots, colons, and slashes are allowed.",
                 i,
                 tool.function.name,
             );
