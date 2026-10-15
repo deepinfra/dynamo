@@ -371,9 +371,48 @@ fn merge_score_responses(acc: &mut ScoreResponse, other: ScoreResponse) {
 /// When `kv_audit` logging is enabled (see [`super::logging_enabled`]), emits a
 /// single `QUERY` line per request, before returning to the client, carrying a
 /// timestamp, the queried block hashes, and the full merged JSON response.
+/// Probe length the opt-in hybrid oracle needs to cap a hit at what the engine
+/// can reuse (`(n - 1) / block_size`).
+#[derive(Clone, Copy)]
+enum ProbeLen {
+    /// `/query`: the caller's exact token count.
+    Tokens(usize),
+    /// `/query_by_hash`: callers (deepapi's KV probe) hash only the full
+    /// blocks of a longer prompt, so the prompt extends past the last hashed
+    /// block and every hashed block is reusable: `n = blocks * bs + 1`.
+    FullBlockPrefix,
+}
+
+impl ProbeLen {
+    fn tokens(self, num_blocks: usize, block_size: u32) -> usize {
+        match self {
+            ProbeLen::Tokens(n) => n,
+            ProbeLen::FullBlockPrefix => num_blocks * block_size as usize + 1,
+        }
+    }
+}
+
+/// Replace each worker's device-tier score with the hit the engine will
+/// actually serve per the hybrid oracle, never raising it above the tree's.
+fn apply_hybrid(
+    oracle: &super::hybrid::HybridOracle,
+    tiered: &mut TieredMatchDetails,
+    block_hashes: &[LocalBlockHash],
+    probe_len: ProbeLen,
+    block_size: u32,
+) {
+    let num_tokens = probe_len.tokens(block_hashes.len(), block_size);
+    for (worker, score) in tiered.device.overlap_scores.scores.iter_mut() {
+        if let Some(predicted) = oracle.predict(*worker, block_hashes, num_tokens) {
+            *score = predicted.min(*score);
+        }
+    }
+}
+
 async fn run_fanout_query(
     trees: Vec<(IndexerKey, Indexer, u32)>,
     mut hashes_for: impl FnMut(u32) -> Vec<LocalBlockHash>,
+    probe_len: ProbeLen,
     pod_names: &HashMap<WorkerId, String>,
     audit: QueryAudit<'_>,
 ) -> (StatusCode, Json<serde_json::Value>) {
@@ -389,8 +428,14 @@ async fn run_fanout_query(
         if logging && logged_hashes.is_none() {
             logged_hashes = Some(block_hashes.iter().map(|h| h.0).collect());
         }
-        match indexer.find_tiered_matches(block_hashes).await {
-            Ok(tiered) => {
+        match indexer.find_tiered_matches(block_hashes.clone()).await {
+            Ok(mut tiered) => {
+                // Opt-in hybrid oracle: report the hit the engine will serve
+                // (SWA-aware, MTP-adjusted) instead of the raw chain length.
+                // Applies to `/query` and `/query_by_hash` (deepapi routing).
+                if let Some(oracle) = super::hybrid::oracle() {
+                    apply_hybrid(oracle, &mut tiered, &block_hashes, probe_len, block_size);
+                }
                 let response = build_score_response(&tiered, block_size, pod_names);
                 match merged.as_mut() {
                     Some(acc) => merge_score_responses(acc, response),
@@ -473,6 +518,7 @@ async fn query(
                 })
                 .clone()
         },
+        ProbeLen::Tokens(req.token_ids.len()),
         &state.registry.pod_names(),
         QueryAudit {
             model_name: &req.model_name,
@@ -504,6 +550,7 @@ async fn query_by_hash(
     run_fanout_query(
         trees,
         |_| block_hashes.clone(),
+        ProbeLen::FullBlockPrefix,
         &state.registry.pod_names(),
         QueryAudit {
             model_name: &req.model_name,
@@ -693,6 +740,155 @@ pub fn create_router(state: Arc<AppState>) -> Router {
 
 #[cfg(test)]
 mod tests {
+    mod hybrid_by_hash {
+        use super::super::{ProbeLen, apply_hybrid};
+        use crate::indexer::TieredMatchDetails;
+        use crate::protocols::{
+            ExternalSequenceBlockHash, KvCacheEvent, KvCacheEventData, KvCacheRemoveData,
+            KvCacheStoreData, KvCacheStoredBlockData, LocalBlockHash, RouterEvent, StorageTier,
+            WorkerWithDpRank,
+        };
+        use crate::standalone_indexer::hybrid::{HybridConfig, HybridOracle};
+
+        const BS: u32 = 64;
+        const W: u64 = 7;
+
+        fn oracle() -> HybridOracle {
+            HybridOracle::new(HybridConfig {
+                block_size: BS,
+                mtp_drop_blocks: 1,
+                swa_need_blocks: None,
+            })
+        }
+        /// deepapi's per-block xxh3 local hash stand-in for position `i`.
+        fn lh(i: u64) -> LocalBlockHash {
+            LocalBlockHash(5000 + i)
+        }
+        /// Engine block hash for position `i` (shared across KV groups).
+        fn eh(i: u64) -> u64 {
+            9_000_000 + i
+        }
+        fn store_fa(o: &HybridOracle, n: u64) {
+            let ev = RouterEvent {
+                worker_id: W,
+                storage_tier: StorageTier::Device,
+                event: KvCacheEvent {
+                    event_id: 0,
+                    dp_rank: 0,
+                    data: KvCacheEventData::Stored(KvCacheStoreData {
+                        parent_hash: None,
+                        start_position: None,
+                        blocks: (0..n)
+                            .map(|i| KvCacheStoredBlockData {
+                                block_hash: ExternalSequenceBlockHash(eh(i)),
+                                tokens_hash: lh(i),
+                                mm_extra_info: None,
+                            })
+                            .collect(),
+                    }),
+                },
+            };
+            assert!(o.apply_main(ev).is_some());
+        }
+        fn remove_fa(o: &HybridOracle, i: u64) -> bool {
+            o.apply_main(RouterEvent {
+                worker_id: W,
+                storage_tier: StorageTier::Device,
+                event: KvCacheEvent {
+                    event_id: 1,
+                    dp_rank: 0,
+                    data: KvCacheEventData::Removed(KvCacheRemoveData {
+                        block_hashes: vec![ExternalSequenceBlockHash(eh(i))],
+                    }),
+                },
+            })
+            .is_some()
+        }
+        fn store_swa(o: &HybridOracle, range: std::ops::Range<u64>) {
+            let hashes: Vec<u64> = range.map(eh).collect();
+            for g in 0..4 {
+                o.apply_swa(WorkerWithDpRank::new(W, 0), g, Some(512), true, &hashes);
+            }
+        }
+        /// Tree score as the stock radix tree would report it (full chain).
+        fn by_hash(o: &HybridOracle, probe_blocks: u64, tree_blocks: u32) -> u32 {
+            let mut tiered = TieredMatchDetails::default();
+            tiered
+                .device
+                .overlap_scores
+                .scores
+                .insert(WorkerWithDpRank::new(W, 0), tree_blocks);
+            let hashes: Vec<LocalBlockHash> = (0..probe_blocks).map(lh).collect();
+            apply_hybrid(o, &mut tiered, &hashes, ProbeLen::FullBlockPrefix, BS);
+            tiered.device.overlap_scores.scores[&WorkerWithDpRank::new(W, 0)]
+        }
+
+        #[test]
+        fn full_block_prefix_counts_every_hashed_block_as_reusable() {
+            assert_eq!(ProbeLen::FullBlockPrefix.tokens(10, BS), 641);
+            assert_eq!(ProbeLen::Tokens(640).tokens(10, BS), 640);
+        }
+
+        #[test]
+        fn by_hash_resend_reports_chain_minus_mtp() {
+            // DEEP-309 (c): resend/extension of a long prompt: engine = chain - 1 block.
+            let o = oracle();
+            store_fa(&o, 40);
+            store_swa(&o, 0..40);
+            assert_eq!(by_hash(&o, 40, 40), 39);
+        }
+
+        #[test]
+        fn by_hash_new_scaffold_junction_reports_zero() {
+            // DEEP-309 (b): first reuse of a new junction: no SWA checkpoint there.
+            let o = oracle();
+            store_fa(&o, 60);
+            store_swa(&o, 51..60);
+            assert_eq!(by_hash(&o, 30, 30), 0);
+        }
+
+        #[test]
+        fn by_hash_continuation_stops_at_prompt_checkpoint() {
+            // DEEP-309 (a): chain covers prompt(40)+completion(10); SWA checkpoint at 40.
+            let o = oracle();
+            store_fa(&o, 50);
+            store_swa(&o, 31..40);
+            assert_eq!(by_hash(&o, 60, 50), 39);
+        }
+
+        #[test]
+        fn by_hash_duplicate_copy_keeps_hit_after_first_eviction() {
+            // DEEP-309 eviction: a re-stored duplicate survives its first Removed.
+            let o = oracle();
+            store_fa(&o, 20);
+            store_fa(&o, 20);
+            store_swa(&o, 0..20);
+            assert!(!remove_fa(&o, 10), "removal held back while a copy remains");
+            assert_eq!(by_hash(&o, 20, 20), 19);
+        }
+
+        #[test]
+        fn by_hash_never_raises_tree_score() {
+            let o = oracle();
+            store_fa(&o, 40);
+            store_swa(&o, 0..40);
+            assert_eq!(by_hash(&o, 40, 12), 12);
+        }
+
+        #[test]
+        fn by_hash_unknown_worker_keeps_tree_score() {
+            let o = oracle();
+            let mut tiered = TieredMatchDetails::default();
+            tiered
+                .device
+                .overlap_scores
+                .scores
+                .insert(WorkerWithDpRank::new(99, 0), 8);
+            apply_hybrid(&o, &mut tiered, &[lh(0)], ProbeLen::FullBlockPrefix, BS);
+            assert_eq!(tiered.device.overlap_scores.scores[&WorkerWithDpRank::new(99, 0)], 8);
+        }
+    }
+
     use super::*;
     use crate::indexer::KvIndexerInterface;
     use crate::standalone_indexer::indexer::create_indexer;

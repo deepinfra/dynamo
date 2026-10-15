@@ -135,6 +135,35 @@ impl ZmqEventNormalizer {
         self.normalize_preprocessed(raw, event_id, worker)
     }
 
+    /// Sliding window of a learned non-main group, if the event (or the group
+    /// it belongs to) is a sliding-window group. Used by the opt-in hybrid
+    /// oracle to keep the SWA groups the main path filters out.
+    pub fn sliding_window_group(
+        &self,
+        raw: &RawKvEvent,
+        dp_rank: DpRank,
+    ) -> Option<(u32, Option<u32>)> {
+        let metadata = raw.metadata();
+        let group_idx = metadata.group_idx?;
+        let kind = metadata.kv_cache_spec_kind.or_else(|| {
+            self.group_metadata
+                .get(&(dp_rank, group_idx))
+                .map(|m| m.kind)
+        })?;
+        if !matches!(
+            kind,
+            KvCacheSpecKind::SlidingWindow | KvCacheSpecKind::SlidingWindowMla
+        ) {
+            return None;
+        }
+        let window = metadata.kv_cache_spec_sliding_window.or_else(|| {
+            self.group_metadata
+                .get(&(dp_rank, group_idx))
+                .and_then(|m| m.sliding_window)
+        });
+        Some((group_idx, window))
+    }
+
     fn learn_metadata(&mut self, metadata: KvCacheEventMetadata, dp_rank: DpRank) {
         let (Some(group_idx), Some(kind)) = (metadata.group_idx, metadata.kv_cache_spec_kind)
         else {
