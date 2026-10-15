@@ -96,6 +96,24 @@ struct KvIndexerCli {
     #[arg(long, default_value_t = false)]
     enable_logging: bool,
 
+    /// Opt-in for hybrid-attention engines (e.g. Step-5: SWA groups + full
+    /// attention + MTP): refcount stored block copies, track sliding-window
+    /// groups, and answer /query with the SWA-aware hit the engine actually
+    /// serves. Requires --block-size. Default off: other models are unchanged.
+    #[arg(long, default_value_t = false)]
+    hybrid_swa_hits: bool,
+
+    /// Blocks dropped from predicted hits for EAGLE/MTP speculative decoding.
+    /// Only meaningful with --hybrid-swa-hits.
+    #[arg(long, default_value_t = 1)]
+    mtp_drop_blocks: u32,
+
+    /// Contiguous sliding-window blocks a hit needs. Defaults to
+    /// ceil((window-1)/block_size) + mtp_drop_blocks per SWA group.
+    /// Only meaningful with --hybrid-swa-hits.
+    #[arg(long)]
+    swa_need_blocks: Option<u32>,
+
     /// Kubernetes namespace to watch for engine pods. Providing this together
     /// with --watch-model-name (or --watch-label) enables pod auto-discovery
     /// (subscribe on Ready, unsubscribe on delete).
@@ -193,6 +211,9 @@ where
             evict_retention_secs: cli.evict_retention_secs,
             evict_memory_threshold: cli.evict_memory_threshold,
             enable_logging: cli.enable_logging,
+            hybrid_swa_hits: cli.hybrid_swa_hits,
+            mtp_drop_blocks: cli.mtp_drop_blocks,
+            swa_need_blocks: cli.swa_need_blocks,
             kube_discovery,
         }))
     }

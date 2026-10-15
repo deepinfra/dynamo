@@ -374,6 +374,7 @@ fn merge_score_responses(acc: &mut ScoreResponse, other: ScoreResponse) {
 async fn run_fanout_query(
     trees: Vec<(IndexerKey, Indexer, u32)>,
     mut hashes_for: impl FnMut(u32) -> Vec<LocalBlockHash>,
+    num_tokens: Option<usize>,
     pod_names: &HashMap<WorkerId, String>,
     audit: QueryAudit<'_>,
 ) -> (StatusCode, Json<serde_json::Value>) {
@@ -389,8 +390,19 @@ async fn run_fanout_query(
         if logging && logged_hashes.is_none() {
             logged_hashes = Some(block_hashes.iter().map(|h| h.0).collect());
         }
-        match indexer.find_tiered_matches(block_hashes).await {
-            Ok(tiered) => {
+        match indexer.find_tiered_matches(block_hashes.clone()).await {
+            Ok(mut tiered) => {
+                // Opt-in hybrid oracle: report the hit the engine will serve
+                // (SWA-aware, MTP-adjusted) instead of the raw chain length.
+                // Needs the probe's token count, so `/query_by_hash` is untouched.
+                if let (Some(oracle), Some(num_tokens)) = (super::hybrid::oracle(), num_tokens) {
+                    for (worker, score) in tiered.device.overlap_scores.scores.iter_mut() {
+                        if let Some(predicted) = oracle.predict(*worker, &block_hashes, num_tokens)
+                        {
+                            *score = predicted.min(*score);
+                        }
+                    }
+                }
                 let response = build_score_response(&tiered, block_size, pod_names);
                 match merged.as_mut() {
                     Some(acc) => merge_score_responses(acc, response),
@@ -473,6 +485,7 @@ async fn query(
                 })
                 .clone()
         },
+        Some(req.token_ids.len()),
         &state.registry.pod_names(),
         QueryAudit {
             model_name: &req.model_name,
@@ -504,6 +517,7 @@ async fn query_by_hash(
     run_fanout_query(
         trees,
         |_| block_hashes.clone(),
+        None,
         &state.registry.pod_names(),
         QueryAudit {
             model_name: &req.model_name,

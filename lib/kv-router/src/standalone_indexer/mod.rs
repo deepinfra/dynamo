@@ -24,6 +24,7 @@
 //! response struct in [`server`] for the exact semantics.
 
 pub mod evictions;
+pub mod hybrid;
 pub mod indexer;
 pub mod listener;
 pub mod metrics;
@@ -163,6 +164,17 @@ pub struct IndexerConfig {
     /// Emit verbose per-query and per-event audit logs on the `kv_audit`
     /// tracing target. See [`logging_enabled`].
     pub enable_logging: bool,
+    /// Opt-in hybrid-attention hit prediction (`--hybrid-swa-hits`): refcount
+    /// per stored copy, track sliding-window groups, and answer `/query` with
+    /// the SWA-aware, MTP-adjusted hit the engine actually serves. See
+    /// [`hybrid`]. Requires `block_size`.
+    pub hybrid_swa_hits: bool,
+    /// Blocks dropped for EAGLE/MTP speculative decoding. Only meaningful with
+    /// `hybrid_swa_hits`.
+    pub mtp_drop_blocks: u32,
+    /// Override for the contiguous SWA blocks a hit needs; `None` derives it
+    /// from each group's sliding window. Only meaningful with `hybrid_swa_hits`.
+    pub swa_need_blocks: Option<u32>,
 }
 
 pub(super) fn validate_zmq_endpoint(endpoint: &str) -> anyhow::Result<()> {
@@ -270,6 +282,22 @@ pub async fn run_server(config: IndexerConfig) -> anyhow::Result<()> {
     // run_server is called once, so we discard the result.
     let _ = KEEP_EVICTIONS.set(config.keep_evictions);
     let _ = ENABLE_LOGGING.set(config.enable_logging);
+    if config.hybrid_swa_hits {
+        let block_size = config
+            .block_size
+            .ok_or_else(|| anyhow::anyhow!("--hybrid-swa-hits requires --block-size"))?;
+        hybrid::install(hybrid::HybridConfig {
+            block_size,
+            mtp_drop_blocks: config.mtp_drop_blocks,
+            swa_need_blocks: config.swa_need_blocks,
+        });
+        tracing::info!(
+            block_size,
+            mtp_drop_blocks = config.mtp_drop_blocks,
+            swa_need_blocks = ?config.swa_need_blocks,
+            "hybrid-swa-hits enabled: refcounted copies + SWA-aware /query predictions"
+        );
+    }
     if config.enable_logging {
         tracing::info!(
             target: "kv_audit",

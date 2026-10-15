@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 use crate::indexer::WorkerKvQueryResponse;
 use crate::protocols::{KvCacheEventData, RouterEvent, WorkerId, WorkerWithDpRank};
 use crate::recovery::{CursorObservation, CursorState};
-use crate::zmq_wire::{ZmqEventNormalizer, decode_event_batch};
+use crate::zmq_wire::{RawKvEvent, ZmqEventNormalizer, decode_event_batch};
 
 use super::evictions::PendingEvictions;
 use super::indexer::Indexer;
@@ -348,6 +348,13 @@ impl ListenerLoop {
 
             // Audit-log the recovered event before the measurement filter.
             audit_log_event(&event, event.event.event_id, "recover");
+            let event = match super::hybrid::oracle() {
+                Some(oracle) => match oracle.apply_main(event) {
+                    Some(event) => event,
+                    None => continue,
+                },
+                None => event,
+            };
 
             // Feed-layer measurement filter (same as apply_live_batch).
             if self.keep_evictions_intercept(&event) {
@@ -405,6 +412,32 @@ impl ListenerLoop {
             .data_parallel_rank
             .map_or(self.dp_rank, |rank| rank.cast_unsigned());
         for raw_event in batch.events {
+            // Opt-in hybrid oracle: keep the sliding-window groups the main
+            // path filters out (see `hybrid`). Default off.
+            if let Some(oracle) = super::hybrid::oracle()
+                && let Some((group, window)) = self
+                    .normalizer
+                    .sliding_window_group(&raw_event, effective_dp_rank)
+            {
+                let worker = WorkerWithDpRank::new(self.worker_id, effective_dp_rank);
+                match &raw_event {
+                    RawKvEvent::BlockStored { block_hashes, .. } => {
+                        let hashes: Vec<u64> =
+                            block_hashes.iter().map(|h| (*h).into_u64()).collect();
+                        oracle.apply_swa(worker, group, window, true, &hashes);
+                    }
+                    RawKvEvent::BlockRemoved { block_hashes, .. } => {
+                        let hashes: Vec<u64> =
+                            block_hashes.iter().map(|h| (*h).into_u64()).collect();
+                        oracle.apply_swa(worker, group, window, false, &hashes);
+                    }
+                    _ => {}
+                }
+                // Still run the normalizer so it learns group metadata;
+                // the main path filters this event out as before.
+                let _ = self.normalizer.preprocess_with_reason(raw_event, worker);
+                continue;
+            }
             let placement_event = match self.normalizer.normalize(
                 raw_event,
                 seq,
@@ -433,6 +466,15 @@ impl ListenerLoop {
             // Audit-log the event as published by the engine, before the
             // measurement filter below can drop it.
             audit_log_event(&router_event, seq, "live");
+            // Opt-in hybrid oracle: refcount copies; strip removals of blocks
+            // that still have another cached copy before the tree sees them.
+            let router_event = match super::hybrid::oracle() {
+                Some(oracle) => match oracle.apply_main(router_event) {
+                    Some(event) => event,
+                    None => continue,
+                },
+                None => router_event,
+            };
             // Feed-layer measurement filter.
             if self.keep_evictions_intercept(&router_event) {
                 continue;
