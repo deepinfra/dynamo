@@ -73,10 +73,23 @@ impl PolicyClassConfig {
     }
 }
 
+/// Which per-request token count the `uncached_isl_buckets` thresholds compare
+/// against. `uncached_tokens` (default) is the input length minus the best
+/// worker's cached prefix; `cached_tokens` is that cached prefix itself, which
+/// separates continuing conversations (long cached prefix) from first turns.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BucketKey {
+    #[default]
+    UncachedTokens,
+    CachedTokens,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct PolicyProfile {
     classes: Vec<PolicyClassConfig>,
     classifier: PolicyClassifier,
+    bucket_key: BucketKey,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -155,11 +168,20 @@ impl PolicyProfile {
         Self {
             classes: vec![class],
             classifier: PolicyClassifier::SyntheticSingle { class_index: 0 },
+            bucket_key: BucketKey::UncachedTokens,
         }
     }
 
     pub fn classes(&self) -> &[PolicyClassConfig] {
         &self.classes
+    }
+
+    /// The token count the bucket thresholds apply to, per `bucket_key`.
+    pub fn bucket_tokens(&self, uncached_tokens: usize, cached_tokens: usize) -> usize {
+        match self.bucket_key {
+            BucketKey::UncachedTokens => uncached_tokens,
+            BucketKey::CachedTokens => cached_tokens,
+        }
     }
 
     pub fn default_class(&self) -> &PolicyClassConfig {
@@ -331,6 +353,8 @@ struct RawRouterPolicyConfig {
     policy_classes: Option<Vec<RawPolicyClassConfig>>,
     uncached_isl_buckets: Option<Vec<RawUncachedIslBucket>>,
     #[serde(default)]
+    bucket_key: BucketKey,
+    #[serde(default)]
     models: HashMap<String, RawPolicyProfile>,
     worker_selection: Option<RawWorkerSelectionConfig>,
     request_classifier: Option<RawRequestClassifierConfig>,
@@ -355,6 +379,7 @@ impl RawRouterPolicyConfig {
                         default_policy_family,
                         policy_classes,
                         uncached_isl_buckets,
+                        bucket_key: self.bucket_key,
                     },
                     "root",
                 )?)
@@ -413,6 +438,8 @@ struct RawPolicyProfile {
     default_policy_family: String,
     policy_classes: Vec<RawPolicyClassConfig>,
     uncached_isl_buckets: Vec<RawUncachedIslBucket>,
+    #[serde(default)]
+    bucket_key: BucketKey,
 }
 
 #[derive(Debug, Deserialize)]
@@ -537,6 +564,7 @@ fn resolve_profile(
 
     Ok(PolicyProfile {
         classes,
+        bucket_key: profile.bucket_key,
         classifier: PolicyClassifier::FamilyBucket(FamilyBucketClassifier {
             default_family_index,
             family_indices,
@@ -1120,6 +1148,96 @@ policy_classes:
                 "unexpectedly accepted {yaml}"
             );
         }
+    }
+
+    #[test]
+    fn cached_bucket_key_classifies_on_cached_prefix() {
+        let config = RouterPolicyConfig::from_yaml(
+            r#"
+default_policy_family: standard
+bucket_key: cached_tokens
+uncached_isl_buckets:
+  - min_tokens: 0
+    bucket: fresh
+  - min_tokens: 4096
+    bucket: warm
+policy_classes:
+  - name: standard-fresh
+    policy_family: standard
+    cache_bucket: fresh
+    quantum: 1
+    prefill_busy_threshold_frac: 3
+  - name: standard-warm
+    policy_family: standard
+    cache_bucket: warm
+    quantum: 1
+    prefill_busy_threshold_frac: 3
+  - name: no-queue-fresh
+    policy_family: no-queue
+    cache_bucket: fresh
+    quantum: 1
+    prefill_busy_threshold_frac: 2
+    request_queue_limit_per_worker: 0
+  - name: no-queue-warm
+    policy_family: no-queue
+    cache_bucket: warm
+    quantum: 1
+    prefill_busy_threshold_frac: 6
+    request_queue_limit_per_worker: 0
+"#,
+        )
+        .unwrap();
+        let profile = config.resolve_profile(None, None, RouterQueuePolicy::Fcfs);
+        let class = |requested: Option<&str>, uncached: usize, cached: usize| {
+            profile
+                .class(profile.resolve_class_index(
+                    requested,
+                    profile.bucket_tokens(uncached, cached),
+                ))
+                .name
+                .clone()
+        };
+        // A long first turn: nothing cached, so it stays fresh however long it is.
+        assert_eq!(class(Some("no-queue"), 30_000, 0), "no-queue-fresh");
+        // A continuing conversation: small new suffix on a long cached prefix.
+        assert_eq!(class(Some("no-queue"), 500, 20_000), "no-queue-warm");
+        assert_eq!(class(Some("no-queue"), 500, 4095), "no-queue-fresh");
+        assert_eq!(class(Some("no-queue"), 500, 4096), "no-queue-warm");
+        assert_eq!(class(None, 500, 20_000), "standard-warm");
+        assert_eq!(
+            profile
+                .class(
+                    profile
+                        .resolve_class_index_strict("no-queue", profile.bucket_tokens(10, 9000))
+                        .unwrap()
+                )
+                .name,
+            "no-queue-warm"
+        );
+
+        // The default key is unchanged: uncached tokens.
+        let default = RouterPolicyConfig::from_yaml(
+            r#"
+default_policy_family: standard
+uncached_isl_buckets:
+  - min_tokens: 0
+    bucket: all
+policy_classes:
+  - name: standard
+    policy_family: standard
+    cache_bucket: all
+    quantum: 1
+"#,
+        )
+        .unwrap()
+        .resolve_profile(None, None, RouterQueuePolicy::Fcfs);
+        assert_eq!(default.bucket_tokens(7, 11), 7);
+        assert!(
+            RouterPolicyConfig::from_yaml(
+                "default_policy_family: s\nbucket_key: bogus\nuncached_isl_buckets: []\npolicy_classes: []\n"
+            )
+            .is_err()
+        );
     }
 
     #[test]

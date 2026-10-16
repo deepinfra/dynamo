@@ -895,7 +895,11 @@ impl<
         );
         let class_index = self
             .profile
-            .resolve_class_index(request.policy_class.as_deref(), snapshot.uncached_tokens);
+            .resolve_class_index(
+                request.policy_class.as_deref(),
+                self.profile
+                    .bucket_tokens(snapshot.uncached_tokens, snapshot.cached_tokens),
+            );
         QueueMetadata {
             class_index,
             snapshot,
@@ -948,7 +952,13 @@ impl<
         if let Some(policy_class) = policy_class {
             metadata.class_index = self
                 .profile
-                .resolve_class_index_strict(&policy_class, metadata.snapshot.uncached_tokens)
+                .resolve_class_index_strict(
+                    &policy_class,
+                    self.profile.bucket_tokens(
+                        metadata.snapshot.uncached_tokens,
+                        metadata.snapshot.cached_tokens,
+                    ),
+                )
                 .ok_or_else(|| {
                     KvSchedulerError::InvalidClassificationMetadata(format!(
                         "unknown policy class {policy_class:?}"
