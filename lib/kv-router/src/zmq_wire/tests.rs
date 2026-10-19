@@ -8,7 +8,7 @@ use rmp_serde::{from_slice, to_vec};
 
 use crate::protocols::{
     BlockExtraInfo, BlockHashOptions, BlockMmObjectInfo, ExternalSequenceBlockHash,
-    KvCacheEventData, WorkerWithDpRank, compute_block_hash_for_seq,
+    KvCacheEventData, StorageTier, WorkerWithDpRank, compute_block_hash_for_seq,
 };
 
 use super::filter::KvCacheSpecKind;
@@ -640,4 +640,151 @@ fn test_convert_event_short_token_ids_keeps_parsed_blocks() {
         }
         other => panic!("expected Stored event, got {other:?}"),
     }
+}
+
+#[test]
+fn test_convert_event_cpu_medium_lands_on_host_tier() {
+    // vLLM's SimpleCPUOffloadConnector tags its events medium="CPU". Before
+    // #10368 this string was unknown and fell back to the Device tier, so a
+    // CPU-tier eviction removed a block the GPU still held.
+    for (medium, expected) in [
+        (Some("CPU"), StorageTier::HostPinned),
+        (Some("CPU_PINNED"), StorageTier::HostPinned),
+        (Some("GPU"), StorageTier::Device),
+        (None, StorageTier::Device),
+    ] {
+        let raw_event = RawKvEvent::BlockRemoved {
+            block_hashes: vec![BlockHashValue::Unsigned(201)],
+            medium: medium.map(str::to_string),
+            group_idx: None,
+            kv_cache_spec_kind: None,
+            kv_cache_spec_sliding_window: None,
+        };
+        let warning_count = Arc::new(AtomicU32::new(0));
+        let placement = convert_event(raw_event, 7, 4, WorkerWithDpRank::new(3, 0), &warning_count)
+            .expect("remove event converts")
+            .expect("remove event is kept");
+        assert_eq!(placement.placement.tier, expected, "medium {medium:?}");
+    }
+}
+
+#[derive(serde::Serialize)]
+#[serde(untagged)]
+enum WireExtraKey {
+    Bare(String),
+    WithOffset((String, i64)),
+}
+
+fn stored_tokens_hashes(
+    parent: Option<u64>,
+    lora_name: Option<&str>,
+    extra_keys: Vec<Option<Vec<(String, i64)>>>,
+    bare_keys: Vec<Option<Vec<String>>>,
+) -> Vec<u64> {
+    let extra_keys: Vec<Option<Vec<WireExtraKey>>> = extra_keys
+        .into_iter()
+        .zip(bare_keys)
+        .map(|(tuples, bare)| {
+            let mut items: Vec<WireExtraKey> = bare
+                .unwrap_or_default()
+                .into_iter()
+                .map(WireExtraKey::Bare)
+                .collect();
+            items.extend(tuples.unwrap_or_default().into_iter().map(WireExtraKey::WithOffset));
+            (!items.is_empty()).then_some(items)
+        })
+        .collect();
+    let encoded = to_vec(&(
+        "BlockStored",
+        vec![BlockHashValue::Unsigned(21), BlockHashValue::Unsigned(22)],
+        parent.map(BlockHashValue::Unsigned),
+        vec![10u32, 11, 12, 13],
+        2usize,
+        Option::<u64>::None,
+        Option::<String>::None,
+        lora_name.map(str::to_string),
+        Some(extra_keys),
+    ))
+    .unwrap();
+    let raw_event: RawKvEvent = from_slice(&encoded).unwrap();
+    let warning_count = Arc::new(AtomicU32::new(0));
+    let placement = convert_event(raw_event, 7, 2, WorkerWithDpRank::new(3, 0), &warning_count)
+        .expect("block size matches")
+        .expect("store is kept");
+    match placement.event.data {
+        KvCacheEventData::Stored(store_data) => {
+            store_data.blocks.iter().map(|b| b.tokens_hash.0).collect()
+        }
+        other => panic!("expected Stored event, got {other:?}"),
+    }
+}
+
+// Shared with deepapi's probe tests (tests/test_kv_probe_cache_salt.py).
+const PLAIN_10_11: u64 = 7369860969341005925;
+const SALTED_10_11: u64 = 10774232232830598228;
+const PLAIN_12_13: u64 = 2046086924859723728;
+const SALTED_IMAGE_10_11: u64 = 1881935480998609139;
+
+#[test]
+fn test_cache_salt_extra_hash() {
+    assert_eq!(cache_salt_extra_hash("tenant-a"), 7159698576361518977);
+    assert_eq!(cache_salt_extra_hash(&"ab".repeat(32)), 0xabababababababab);
+}
+
+#[test]
+fn test_cache_salt_hashes_into_first_block_only() {
+    let salted = stored_tokens_hashes(
+        None,
+        None,
+        vec![None, None],
+        vec![Some(vec!["tenant-a".into()]), None],
+    );
+    assert_eq!(salted, vec![SALTED_10_11, PLAIN_12_13]);
+
+    let plain = stored_tokens_hashes(None, None, vec![None, None], vec![None, None]);
+    assert_eq!(plain, vec![PLAIN_10_11, PLAIN_12_13]);
+}
+
+#[test]
+fn test_cache_salt_ignored_when_event_continues_a_sequence() {
+    let hashes = stored_tokens_hashes(
+        Some(9),
+        None,
+        vec![None, None],
+        vec![Some(vec!["tenant-a".into()]), None],
+    );
+    assert_eq!(hashes, vec![PLAIN_10_11, PLAIN_12_13]);
+}
+
+#[test]
+fn test_lora_name_is_not_a_cache_salt() {
+    let lora_only = stored_tokens_hashes(
+        None,
+        Some("adapter"),
+        vec![None, None],
+        vec![Some(vec!["adapter".into()]), Some(vec!["adapter".into()])],
+    );
+    let lora_seed_only = compute_block_hash_for_seq(
+        &[10, 11, 12, 13],
+        2,
+        BlockHashOptions {
+            lora_name: Some("adapter"),
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        lora_only,
+        lora_seed_only.iter().map(|h| h.0).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_cache_salt_combines_with_image_in_first_block() {
+    let hashes = stored_tokens_hashes(
+        None,
+        None,
+        vec![Some(vec![("ab".repeat(32), 0)]), None],
+        vec![Some(vec!["tenant-a".into()]), None],
+    );
+    assert_eq!(hashes, vec![SALTED_IMAGE_10_11, PLAIN_12_13]);
 }

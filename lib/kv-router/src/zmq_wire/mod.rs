@@ -27,7 +27,10 @@ pub use convert::{
     ConvertError, convert_event, create_stored_block_from_parts, create_stored_blocks,
     is_partial_prefix_entry,
 };
-pub use extra_keys::{extra_keys_to_block_mm_infos, parse_mm_hash_from_extra_key};
+pub use extra_keys::{
+    cache_salt_extra_hash, extra_keys_to_block_mm_infos, parse_mm_hash_from_extra_key,
+    stored_extra_keys_to_block_infos,
+};
 pub use filter::KvCacheSpecKind;
 pub use types::{BlockHashValue, ExtraKeyItem, KvEventBatch, KvTokenIds, RawKvEvent};
 

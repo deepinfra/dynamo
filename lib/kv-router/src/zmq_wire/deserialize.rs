@@ -9,7 +9,7 @@ use serde::de::{self, IgnoredAny, MapAccess, SeqAccess, Visitor};
 
 use crate::protocols::BlockExtraInfo;
 
-use super::extra_keys::extra_keys_to_block_mm_infos;
+use super::extra_keys::stored_extra_keys_to_block_infos;
 use super::filter::{BlockStoredTrailingField, KvCacheEventMetadata, KvCacheEventTrailingField};
 use super::types::{BlockHashValue, ExtraKeyItem, KvTokenIds, RawKvEvent};
 
@@ -106,16 +106,22 @@ impl<'de> Visitor<'de> for RawKvEventVisitor {
                 let block_size =
                     block_size.ok_or_else(|| de::Error::missing_field("block_size"))?;
                 let medium = medium.unwrap_or(None);
-                let block_mm_infos = block_mm_infos
-                    .unwrap_or(None)
-                    .or_else(|| extra_keys_to_block_mm_infos(extra_keys.unwrap_or(None)));
+                let parent_block_hash = parent_block_hash.unwrap_or(None);
+                let lora_name = lora_name.unwrap_or(None);
+                let block_mm_infos = block_mm_infos.unwrap_or(None).or_else(|| {
+                    stored_extra_keys_to_block_infos(
+                        extra_keys.unwrap_or(None),
+                        parent_block_hash.is_none(),
+                        lora_name.as_deref(),
+                    )
+                });
                 Ok(RawKvEvent::BlockStored {
                     block_hashes,
-                    parent_block_hash: parent_block_hash.unwrap_or(None),
+                    parent_block_hash,
                     token_ids: raw_token_ids,
                     block_size,
                     medium,
-                    lora_name: lora_name.unwrap_or(None),
+                    lora_name,
                     block_mm_infos,
                     is_eagle: Some(is_eagle),
                     group_idx: metadata.group_idx,
@@ -194,8 +200,13 @@ impl<'de> Visitor<'de> for RawKvEventVisitor {
 
                 while seq.next_element::<IgnoredAny>()?.is_some() {}
 
-                let block_mm_infos =
-                    block_mm_infos.or_else(|| extra_keys_to_block_mm_infos(extra_keys));
+                let block_mm_infos = block_mm_infos.or_else(|| {
+                    stored_extra_keys_to_block_infos(
+                        extra_keys,
+                        parent_block_hash.is_none(),
+                        lora_name.as_deref(),
+                    )
+                });
                 let (raw_token_ids, is_eagle) = normalize_token_ids(token_ids);
 
                 Ok(RawKvEvent::BlockStored {
