@@ -673,6 +673,116 @@ fn test_convert_event_cpu_medium_lands_on_host_tier() {
 enum WireExtraKey {
     Bare(String),
     WithOffset((String, i64)),
+    Tagged((String, String)),
+    TaggedWithOffset((String, String, i64)),
+    TaggedPair((String, String, String)),
+}
+
+fn encode_stored(
+    parent: Option<u64>,
+    lora_name: Option<&str>,
+    extra_keys: Vec<Option<Vec<WireExtraKey>>>,
+) -> Vec<u8> {
+    to_vec(&(
+        "BlockStored",
+        vec![BlockHashValue::Unsigned(21), BlockHashValue::Unsigned(22)],
+        parent.map(BlockHashValue::Unsigned),
+        vec![10u32, 11, 12, 13],
+        2usize,
+        Option::<u64>::None,
+        Option::<String>::None,
+        lora_name.map(str::to_string),
+        Some(extra_keys),
+    ))
+    .unwrap()
+}
+
+fn decoded_tokens_hashes(encoded: &[u8]) -> Vec<u64> {
+    let raw_event: RawKvEvent = from_slice(encoded).expect("event decodes");
+    let warning_count = Arc::new(AtomicU32::new(0));
+    let placement = convert_event(raw_event, 7, 2, WorkerWithDpRank::new(3, 0), &warning_count)
+        .expect("block size matches")
+        .expect("store is kept");
+    match placement.event.data {
+        KvCacheEventData::Stored(store_data) => {
+            store_data.blocks.iter().map(|b| b.tokens_hash.0).collect()
+        }
+        other => panic!("expected Stored event, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_tagged_cache_salt_and_mm_keys() {
+    let salted = encode_stored(
+        None,
+        None,
+        vec![Some(vec![WireExtraKey::Tagged(("cache_salt".into(), "tenant-a".into()))]), None],
+    );
+    assert_eq!(decoded_tokens_hashes(&salted), vec![SALTED_10_11, PLAIN_12_13]);
+
+    let salted_image = encode_stored(
+        None,
+        None,
+        vec![
+            Some(vec![
+                WireExtraKey::TaggedWithOffset(("mm".into(), "ab".repeat(32), 0)),
+                WireExtraKey::Tagged(("cache_salt".into(), "tenant-a".into())),
+            ]),
+            None,
+        ],
+    );
+    assert_eq!(decoded_tokens_hashes(&salted_image), vec![SALTED_IMAGE_10_11, PLAIN_12_13]);
+}
+
+#[test]
+fn test_tagged_lora_key_hashes_through_lora_name_only() {
+    let lora_key = || {
+        Some(vec![WireExtraKey::TaggedPair((
+            "lora".into(),
+            "adapter".into(),
+            "/adapters/a".into(),
+        ))])
+    };
+    let encoded = encode_stored(None, Some("adapter"), vec![lora_key(), lora_key()]);
+    let lora_seed_only = compute_block_hash_for_seq(
+        &[10, 11, 12, 13],
+        2,
+        BlockHashOptions {
+            lora_name: Some("adapter"),
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        decoded_tokens_hashes(&encoded),
+        lora_seed_only.iter().map(|h| h.0).collect::<Vec<_>>()
+    );
+}
+
+#[derive(serde::Serialize)]
+#[serde(untagged)]
+enum OddWireKey {
+    Embeds((String, Vec<u8>)),
+    Quad((String, i64, i64, i64)),
+}
+
+#[test]
+fn test_unknown_extra_key_shapes_do_not_drop_the_event() {
+    let encoded = to_vec(&(
+        "BlockStored",
+        vec![BlockHashValue::Unsigned(21), BlockHashValue::Unsigned(22)],
+        Option::<BlockHashValue>::None,
+        vec![10u32, 11, 12, 13],
+        2usize,
+        Option::<u64>::None,
+        Option::<String>::None,
+        Option::<String>::None,
+        Some(vec![
+            Some(vec![OddWireKey::Embeds(("prompt_embeds".into(), vec![1, 2, 3]))]),
+            Some(vec![OddWireKey::Quad(("future".into(), 1, 2, 3))]),
+        ]),
+    ))
+    .unwrap();
+    assert_eq!(decoded_tokens_hashes(&encoded), vec![PLAIN_10_11, PLAIN_12_13]);
 }
 
 fn stored_tokens_hashes(

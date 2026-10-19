@@ -133,6 +133,13 @@ impl RawKvEvent {
     }
 }
 
+/// One entry of a vLLM BlockStored block's `extra_keys`.
+///
+/// Older vLLM sends bare values (`"<mm id>"`, `["<mm id>", offset]`, the salt
+/// and LoRA name as bare strings). vLLM with #59335 tags every key:
+/// `["mm", id, offset]`, `["cache_salt", salt]`, `["lora", name, path]`,
+/// `["prompt_embeds", <bytes>]`. `Other` keeps any further shape from failing
+/// the whole event's decode.
 #[derive(Debug, Deserialize, Clone)]
 #[serde(untagged)]
 pub enum ExtraKeyItem {
@@ -144,4 +151,9 @@ pub enum ExtraKeyItem {
     Unsigned(u64),
     Float(f64),
     Bool(bool),
+    Tagged((String, String)),
+    TaggedWithSignedOffset((String, String, i64)),
+    TaggedWithUnsignedOffset((String, String, u64)),
+    TaggedPair((String, String, String)),
+    Other(serde::de::IgnoredAny),
 }
