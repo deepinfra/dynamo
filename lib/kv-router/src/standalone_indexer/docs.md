@@ -52,6 +52,15 @@ Known gap: the engine's local-indexer TreeDumps (`/kv_recover`) carry
 token-only hashes, so image blocks restored at startup stay token-only until
 evicted.
 
+A request's vLLM `cache_salt` is hashed the same way: vLLM appends it to the
+extra keys of the sequence's first block only, so in a BlockStored with no
+parent, a bare string in block 0 that is neither an MM id nor the LoRA name
+joins that block's image ids as `cache_salt_extra_hash(salt)` (a 64-hex salt
+parses like an image id, any other salt is its XXH3-64). Salted chains then get
+their own tree path instead of sharing the unsalted one's edges. deepapi's
+probe mixes the salt in under the per-model `kv_probe_cache_salt` flag. The
+`/kv_recover` gap above applies to salted blocks too.
+
 ## Data-parallel engines (`--watch-dp-size`)
 
 A vLLM engine with `--data-parallel-size N` runs N ranks per pod, each with its
