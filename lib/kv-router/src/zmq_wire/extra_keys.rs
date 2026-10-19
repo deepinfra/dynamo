@@ -45,6 +45,9 @@ pub fn extra_keys_to_block_mm_infos(
 /// sequence (no parent), a bare string in block 0 that is neither an MM id nor
 /// the LoRA name is the salt. It joins that block's MM objects via
 /// [`cache_salt_extra_hash`], so salted chains get their own tree path.
+/// Tagged keys (vLLM #59335) name themselves: `("cache_salt", salt)` is the
+/// salt and `("mm", id, offset)` an MM id; LoRA and prompt-embeds keys are
+/// ignored as before (LoRA is hashed through `lora_name`).
 pub fn stored_extra_keys_to_block_infos(
     extra_keys: Option<Vec<Option<Vec<ExtraKeyItem>>>>,
     starts_sequence: bool,
@@ -72,11 +75,25 @@ pub fn stored_extra_keys_to_block_infos(
                     | ExtraKeyItem::HashWithUnsignedOffset((hash, _)) => {
                         parse_mm_hash_from_extra_key(hash)
                     }
+                    ExtraKeyItem::Tagged((tag, salt)) if tag == "cache_salt" => {
+                        Some(cache_salt_extra_hash(salt))
+                    }
+                    ExtraKeyItem::TaggedWithSignedOffset((tag, id, _))
+                    | ExtraKeyItem::TaggedWithUnsignedOffset((tag, id, _))
+                        if tag == "mm" =>
+                    {
+                        parse_mm_hash_from_extra_key(id)
+                    }
                     ExtraKeyItem::Bytes(_)
                     | ExtraKeyItem::Signed(_)
                     | ExtraKeyItem::Unsigned(_)
                     | ExtraKeyItem::Float(_)
-                    | ExtraKeyItem::Bool(_) => None,
+                    | ExtraKeyItem::Bool(_)
+                    | ExtraKeyItem::Tagged(_)
+                    | ExtraKeyItem::TaggedWithSignedOffset(_)
+                    | ExtraKeyItem::TaggedWithUnsignedOffset(_)
+                    | ExtraKeyItem::TaggedPair(_)
+                    | ExtraKeyItem::Other(_) => None,
                 })
                 .map(|mm_hash| BlockMmObjectInfo {
                     mm_hash,
