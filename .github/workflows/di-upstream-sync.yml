@@ -1,0 +1,109 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 DeepInfra
+# SPDX-License-Identifier: Apache-2.0
+#
+# DeepInfra fork upkeep. `main` mirrors ai-dynamo/dynamo main (fast-forward only, never commits of ours). `di-main`
+# is `main` plus DeepInfra's general patches, kept current by merging (never rebasing) upstream, so di-main commit
+# hashes stay valid for submodule pins.
+#
+# Weekdays: fast-forward main, merge upstream main into sync/upstream-<date>, open a PR into di-main. A clean merge
+# that passes `cargo check` is merged by the workflow (GitHub creates and signs the merge commit). A conflict or a
+# failed check leaves an open PR or issue labelled upstream-sync for a person to finish.
+#
+# Scheduled workflows run only from the default branch, so this needs di-main to be the repository default.
+name: di-upstream-sync
+
+on:
+  schedule:
+    - cron: "17 14 * * 1-5"  # 07:17 PT on weekdays
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: di-upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository == 'deepinfra/dynamo'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      GH_TOKEN: ${{ github.token }}
+      UPSTREAM: https://github.com/ai-dynamo/dynamo.git
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: di-main
+          fetch-depth: 0
+
+      - name: Fast-forward main to upstream
+        run: |
+          git remote add up "$UPSTREAM"
+          git fetch --no-tags up main
+          # A plain push refuses anything but a fast-forward, so a diverged main fails loudly instead of being reset.
+          git push origin refs/remotes/up/main:refs/heads/main
+
+      - name: Merge upstream main into a sync branch
+        id: merge
+        run: |
+          git config user.name "di-upstream-sync"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git merge-base --is-ancestor up/main HEAD; then
+            echo "di-main already contains upstream $(git rev-parse --short up/main)"; echo "result=current" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          branch="sync/upstream-$(date -u +%Y%m%d)"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          echo "upstream=$(git rev-parse --short up/main)" >> "$GITHUB_OUTPUT"
+          git checkout -B "$branch"
+          if git merge --no-ff --no-edit -m "Merge upstream main $(git rev-parse --short up/main) into di-main" up/main; then
+            echo "result=clean" >> "$GITHUB_OUTPUT"
+          else
+            {
+              echo "conflicts<<EOF"
+              git diff --name-only --diff-filter=U
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+            git merge --abort
+            echo "result=conflict" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build check
+        id: check
+        if: steps.merge.outputs.result == 'clean'
+        continue-on-error: true
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler libclang-dev > /dev/null
+          cargo check --locked -p dynamo-runtime -p dynamo-kv-router -p dynamo-llm
+
+      - name: Open and merge the sync PR
+        if: steps.merge.outputs.result == 'clean'
+        run: |
+          branch="${{ steps.merge.outputs.branch }}"
+          git push --force origin "$branch"
+          gh label create upstream-sync --color 0e8a16 --force > /dev/null
+          url=$(gh pr list --head "$branch" --base di-main --json url --jq '.[0].url')
+          if [ -z "$url" ]; then
+            url=$(gh pr create --base di-main --head "$branch" --label upstream-sync \
+              --title "Merge upstream main ${{ steps.merge.outputs.upstream }} into di-main" \
+              --body "Automated weekday merge of ai-dynamo/dynamo main. Build check: ${{ steps.check.outcome }}.")
+          fi
+          if [ "${{ steps.check.outcome }}" = "success" ]; then
+            gh pr merge "$url" --merge --delete-branch
+          else
+            gh pr comment "$url" --body "cargo check failed after the merge; needs a person. Log: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          fi
+
+      - name: Report conflicts
+        if: steps.merge.outputs.result == 'conflict'
+        run: |
+          gh label create upstream-sync --color 0e8a16 --force > /dev/null
+          title="Upstream merge conflict: ai-dynamo/dynamo ${{ steps.merge.outputs.upstream }} into di-main"
+          if [ -z "$(gh issue list --label upstream-sync --state open --search "$title" --json number --jq '.[0].number')" ]; then
+            printf 'Merging upstream main %s into di-main conflicts in:\n\n```\n%s\n```\n\nResolve on a sync/upstream-* branch with a merge (not a rebase) and open a PR into di-main.\n' \
+              "${{ steps.merge.outputs.upstream }}" "${{ steps.merge.outputs.conflicts }}" > body.md
+            gh issue create --label upstream-sync --title "$title" --body-file body.md
+          fi
