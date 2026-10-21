@@ -96,6 +96,17 @@ def enables_cache_before_compile(trtllm_version: str) -> bool:
     return Version(trtllm_version) < Version(_FIRST_COMPILE_THEN_CACHE_RELEASE)
 
 
+def set_wan22_low_noise_max_cached_steps(steps: int) -> None:
+    """Override the reused-step budget VisualGen hard-codes for Wan 2.2's low-noise expert."""
+    from tensorrt_llm._torch.visual_gen.cache import cache_dit_enablers
+
+    if not hasattr(cache_dit_enablers, "_WAN22_LOW_NOISE_MAX_CACHED_STEPS"):
+        raise RuntimeError(
+            "--cache-dit-low-noise-max-cached-steps is unsupported by this TensorRT-LLM"
+        )
+    cache_dit_enablers._WAN22_LOW_NOISE_MAX_CACHED_STEPS = steps
+
+
 def _compile_transformer_blocks_in_place() -> None:
     """Make BasePipeline.torch_compile swap compiled blocks into the existing ModuleList."""
     from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
@@ -209,6 +220,14 @@ class DiffusionEngine:
             f"{self._pipeline.__class__.__name__}"
         )
 
+    def _cache_dit_overrides(self) -> dict:
+        """CacheDiTConfig kwargs for the cache_dit flags that were set."""
+        overrides = {
+            "residual_diff_threshold": self.config.cache_dit_residual_diff_threshold,
+            "max_continuous_cached_steps": self.config.cache_dit_max_continuous_cached_steps,
+        }
+        return {k: v for k, v in overrides.items() if v is not None}
+
     def _build_diffusion_args(self) -> "VisualGenArgs":
         """Build VisualGenArgs from DiffusionConfig.
 
@@ -278,7 +297,11 @@ class DiffusionEngine:
             # DBCache/TaylorSeer/SCM step-skip. VisualGen's CacheDiTConfig defaults
             # are tuned for few-step runs (warmup 4, L1 thresh 0.24, <=3 continuous
             # cached) -> ~2x skip. Wan 2.2 supports cache_dit and rejects teacache.
-            args_kwargs["cache"] = CacheDiTConfig()
+            args_kwargs["cache"] = CacheDiTConfig(**self._cache_dit_overrides())
+            if self.config.cache_dit_low_noise_max_cached_steps is not None:
+                set_wan22_low_noise_max_cached_steps(
+                    self.config.cache_dit_low_noise_max_cached_steps
+                )
         elif self.config.enable_teacache or self.config.cache_backend == "teacache":
             args_kwargs["cache"] = TeaCacheConfig(
                 use_ret_steps=self.config.teacache_use_ret_steps,
