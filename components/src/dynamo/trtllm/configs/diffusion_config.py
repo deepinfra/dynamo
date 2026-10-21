@@ -89,6 +89,9 @@ class DiffusionConfig:
     enable_layerwise_nvtx_marker: bool = False
     # Skip warmup inference during initialization (default: run warmup)
     skip_warmup: bool = False
+    # Warmup shapes as raw CLI strings ("720x1280,480x832" / "81"); empty = pipeline defaults
+    warmup_resolutions: str = ""
+    warmup_num_frames: str = ""
 
     # ── Attention config (maps to AttentionConfig) ──
     # Attention backend: "VANILLA" (PyTorch SDPA) or "TRTLLM"
@@ -170,6 +173,8 @@ class DiffusionConfig:
             f"quant_algo={self.quant_algo}, "
             f"enable_cuda_graph={self.enable_cuda_graph}, "
             f"skip_warmup={self.skip_warmup}, "
+            f"warmup_resolutions={self.warmup_resolutions!r}, "
+            f"warmup_num_frames={self.warmup_num_frames!r}, "
             f"dit_dp_size={self.dit_dp_size}, "
             f"dit_tp_size={self.dit_tp_size})"
         )
