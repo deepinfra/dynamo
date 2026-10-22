@@ -258,6 +258,13 @@ impl OAIChatLikeRequest for NvCreateChatCompletionRequest {
         }
     }
 
+    fn raw_tools(&self) -> Option<serde_json::Value> {
+        self.inner
+            .tools
+            .as_ref()
+            .and_then(|tools| serde_json::to_value(tools).ok())
+    }
+
     fn tool_choice(&self) -> Option<Value> {
         if self.inner.tool_choice.is_none() {
             None

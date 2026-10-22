@@ -1424,6 +1424,10 @@ impl<R: OAIChatLikeRequest> OAIChatLikeRequest for NormalizedArgsRequest<'_, R> 
         self.inner.tools()
     }
 
+    fn raw_tools(&self) -> Option<serde_json::Value> {
+        self.inner.raw_tools()
+    }
+
     fn tool_choice(&self) -> Option<minijinja::value::Value> {
         self.inner.tool_choice()
     }

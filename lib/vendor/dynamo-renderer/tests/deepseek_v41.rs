@@ -19,6 +19,9 @@ impl dynamo_renderer::OAIChatLikeRequest for Request {
     fn tools(&self) -> Option<minijinja::Value> {
         self.request.tools()
     }
+    fn raw_tools(&self) -> Option<Value> {
+        self.request.raw_tools()
+    }
     fn tool_choice(&self) -> Option<minijinja::Value> {
         self.request.tool_choice()
     }
@@ -57,15 +60,19 @@ fn render(fields: Value) -> anyhow::Result<String> {
 
 #[test]
 fn api_reasoning_effort_matches_the_reference_encoder() {
-    for (effort, budget) in [("low", 50), ("high", 75), ("max", 100)] {
+    for (effort, budget) in [("low", 25), ("high", 50), ("max", 100)] {
         let output = render(json!({"reasoning_effort":effort})).unwrap();
         assert!(output.starts_with(&format!(
             "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: {budget} "
         )));
         assert!(output.ends_with("<｜Assistant｜><think>"));
     }
-    assert!(render(json!({})).unwrap().contains("Reasoning Effort: 75 "));
-    assert!(render(json!({"reasoning_effort":"xhigh"})).is_err());
+    assert!(render(json!({})).unwrap().contains("Reasoning Effort: 50 "));
+    assert!(
+        render(json!({"chat_template_kwargs":{"reasoning_effort":"xhigh"}}))
+            .unwrap()
+            .contains("Reasoning Effort: 75 ")
+    );
     assert_eq!(
         render(json!({"reasoning_effort":"none"})).unwrap(),
         "<｜begin▁of▁sentence｜><｜User｜>Hello<｜Assistant｜></think>"
@@ -88,7 +95,7 @@ fn template_options_set_numeric_effort_and_disable_thinking() {
             json!(101),
             json!(1.5),
             json!(true),
-            json!("xhigh"),
+            json!("medium"),
         ] {
             assert!(render(json!({(field):{"reasoning_effort":invalid}})).is_err());
         }
@@ -122,7 +129,7 @@ fn mid_system_preserves_generation_header_and_reasoning_cutoff() {
 }
 
 #[test]
-fn tool_choice_none_omits_schema_and_keeps_response_format() {
+fn tool_choice_none_omits_schema_and_response_format() {
     let output = render(
         json!({"reasoning_effort":"none", "tool_choice":"none", "tools":[
         {"type":"function","function":{"name":"weather","parameters":{"type":"object"}}}
@@ -130,7 +137,7 @@ fn tool_choice_none_omits_schema_and_keeps_response_format() {
     )
     .unwrap();
     assert!(!output.contains("weather"));
-    assert!(output.contains("## Response Format:"));
+    assert!(!output.contains("## Response Format:"));
 }
 
 #[test]
@@ -226,7 +233,7 @@ fn qualified_tool_names_remain_verbatim() {
 
 #[test]
 fn normalized_effort_uses_the_api_mapping() {
-    for (effort, budget) in [("low", 50), ("high", 75), ("max", 100)] {
+    for (effort, budget) in [("low", 25), ("high", 50), ("xhigh", 75), ("max", 100)] {
         assert!(
             render(json!({"chat_template_args": {"reasoning_effort": effort}}))
                 .unwrap()
@@ -238,9 +245,50 @@ fn normalized_effort_uses_the_api_mapping() {
         "chat_template_args": {"reasoning_effort": "max"}
     }))
     .unwrap();
-    assert!(output.contains("Reasoning Effort: 50 "));
+    assert!(output.contains("Reasoning Effort: 25 "));
     assert!(!output.contains("Reasoning Effort: 100 "));
     let output = render(json!({"reasoning_effort": "none", "chat_template_args": {"reasoning_effort": "none", "thinking": false}})).unwrap();
     assert!(!output.contains("Reasoning Effort:"));
     assert!(output.ends_with("</think>"));
+}
+
+#[test]
+fn vllm_parity_tools_developer_and_floats() {
+    let tools = json!([
+        {"type":"function","function":{"name":"lookup","parameters":{"type":"object","properties":{
+            "x":{"type":"number","minimum":1e-05,"maximum":1e16,"default":0.0001}}}}},
+        {"type":"function","function":{"name":"strict_one","description":"d","parameters":{},"strict":true}}
+    ]);
+    let output = render(json!({"tools":tools,"messages":[
+        {"role":"user","content":"Hello"},
+        {"role":"system","content":"Mid"}
+    ]}))
+    .unwrap();
+    assert!(output.contains(
+        r#"{"name": "lookup", "description": null, "parameters": {"type": "object", "properties": {"x": {"type": "number", "minimum": 1e-05, "maximum": 1e+16, "default": 0.0001}}}}"#
+    ));
+    assert!(output.contains(
+        r#"{"name": "strict_one", "description": "d", "parameters": {}, "strict": true}"#
+    ));
+    assert!(output.contains("<｜System｜>Mid\n\n## Tools"));
+    assert!(output.starts_with("<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 50 "));
+
+    let output = render(json!({"messages":[
+        {"role":"developer","content":"Dev"},
+        {"role":"user","content":"Q1"},
+        {"role":"assistant","content":"A1","reasoning_content":"R1"},
+        {"role":"user","content":"Q2"}
+    ]}))
+    .unwrap();
+    assert!(!output.contains("Dev"));
+    assert!(!output.contains("R1"));
+    let output = render(json!({"chat_template_kwargs":{"thinking":false},"messages":[
+        {"role":"developer","content":"Dev"},
+        {"role":"user","content":"Q1"}
+    ]}))
+    .unwrap();
+    assert_eq!(
+        output,
+        "<｜begin▁of▁sentence｜><｜User｜>Dev<｜User｜>Q1<｜Assistant｜></think>"
+    );
 }

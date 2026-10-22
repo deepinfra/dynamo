@@ -206,6 +206,11 @@ pub trait OAIChatLikeRequest {
     fn tools(&self) -> Option<Value> {
         None
     }
+    /// The tool list as the client sent it, without the template schema
+    /// backfills `tools()` applies (empty `description`, `type`/`properties`).
+    fn raw_tools(&self) -> Option<serde_json::Value> {
+        None
+    }
     fn tool_choice(&self) -> Option<Value> {
         None
     }

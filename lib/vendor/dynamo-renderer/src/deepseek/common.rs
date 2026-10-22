@@ -169,6 +169,10 @@ pub(crate) fn to_json(value: &JsonValue) -> String {
         fn begin_object_value<W: ?Sized + io::Write>(&mut self, writer: &mut W) -> io::Result<()> {
             writer.write_all(b": ")
         }
+
+        fn write_f64<W: ?Sized + io::Write>(&mut self, writer: &mut W, value: f64) -> io::Result<()> {
+            writer.write_all(python_float_repr(value).as_bytes())
+        }
     }
 
     // Serializing a JsonValue into Vec<u8> is infallible; the output is always UTF-8.
@@ -178,6 +182,47 @@ pub(crate) fn to_json(value: &JsonValue) -> String {
         .serialize(&mut ser)
         .expect("JsonValue serialization to Vec<u8> is infallible");
     String::from_utf8(buf).expect("serde_json output is always valid UTF-8")
+}
+
+/// Python's `repr(float)`: shortest round-trip digits, scientific notation when
+/// the decimal exponent is below -4 or at least 16 (`1e-05`, `1e+16`), and a
+/// trailing `.0` on integral values.
+pub(crate) fn python_float_repr(value: f64) -> String {
+    if !value.is_finite() {
+        return if value.is_nan() {
+            "NaN".into()
+        } else if value > 0.0 {
+            "Infinity".into()
+        } else {
+            "-Infinity".into()
+        };
+    }
+    let sci = format!("{value:e}");
+    let (sign, sci) = sci
+        .strip_prefix('-')
+        .map_or(("", sci.as_str()), |rest| ("-", rest));
+    let (mantissa, exponent) = sci.split_once('e').expect("LowerExp always has an exponent");
+    let exponent: i32 = exponent.parse().expect("LowerExp exponent is an integer");
+    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
+    let point = exponent + 1;
+    let body = if !(-4..16).contains(&exponent) {
+        let (head, tail) = digits.split_at(1);
+        let fraction = if tail.is_empty() {
+            String::new()
+        } else {
+            format!(".{tail}")
+        };
+        let exp_sign = if exponent < 0 { '-' } else { '+' };
+        format!("{head}{fraction}e{exp_sign}{:02}", exponent.abs())
+    } else if point <= 0 {
+        format!("0.{}{digits}", "0".repeat((-point) as usize))
+    } else if point as usize >= digits.len() {
+        format!("{digits}{}.0", "0".repeat(point as usize - digits.len()))
+    } else {
+        let (int, frac) = digits.split_at(point as usize);
+        format!("{int}.{frac}")
+    };
+    format!("{sign}{body}")
 }
 
 pub(crate) fn render_tools(template: &str, tools: &[JsonValue]) -> String {

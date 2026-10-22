@@ -19,10 +19,9 @@ fn render(fields: Value) -> anyhow::Result<String> {
 
 #[test]
 fn normalized_effort_matches_the_reference_encoder_for_both_request_fields() {
-    assert!(render(json!({})).unwrap().contains("Reasoning Effort: 75 "));
-    assert!(render(json!({"reasoning_effort":"xhigh"})).is_err());
+    assert!(render(json!({})).unwrap().contains("Reasoning Effort: 50 "));
     for field in ["chat_template_args", "chat_template_kwargs"] {
-        for (effort, budget) in [("low", 50), ("high", 75), ("max", 100)] {
+        for (effort, budget) in [("low", 25), ("high", 50), ("max", 100)] {
             for fields in [
                 json!({"reasoning_effort":effort}),
                 json!({(field):{"reasoning_effort":effort}}),
@@ -40,7 +39,12 @@ fn normalized_effort_matches_the_reference_encoder_for_both_request_fields() {
         assert!(
             render(json!({"reasoning_effort":"low",(field):{"reasoning_effort":37}}))
                 .unwrap()
-                .contains("Reasoning Effort: 50 ")
+                .contains("Reasoning Effort: 25 ")
+        );
+        assert!(
+            render(json!({(field):{"reasoning_effort":"xhigh"}}))
+                .unwrap()
+                .contains("Reasoning Effort: 75 ")
         );
         for fields in [
             json!({"reasoning_effort":"none"}),
@@ -56,7 +60,7 @@ fn normalized_effort_matches_the_reference_encoder_for_both_request_fields() {
             json!(101),
             json!(true),
             json!(1.5),
-            json!("xhigh"),
+            json!("medium"),
         ] {
             assert!(render(json!({(field):{"reasoning_effort":invalid}})).is_err());
         }

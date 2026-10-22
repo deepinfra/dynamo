@@ -6,25 +6,80 @@
 use anyhow::{Context, Result, ensure};
 use serde_json::Value;
 
-use super::common::{ThinkingMode, resolve_thinking_mode, to_json};
+use super::common::{ThinkingMode, to_json};
 use super::v4::{Encoding, encode_messages_with_encoding};
+
+/// vLLM `deepseek_v41_encoding.REASONING_EFFORT_MAPPINGS`, the same table the
+/// checkpoint's reference `encoding/encoding.py` ships.
+const REASONING_EFFORT_MAPPINGS: [(&str, u8); 4] =
+    [("low", 25), ("high", 50), ("xhigh", 75), ("max", 100)];
+const DEFAULT_REASONING_EFFORT: u8 = 50;
+const EFFORT_ERROR: &str = concat!(
+    "DeepSeek V4.1 reasoning_effort must be low, high, xhigh, max, ",
+    "or an integer within [1, 100] in chat_template_kwargs"
+);
 
 pub(super) fn find_last_user_index(messages: &[Value]) -> Option<usize> {
     messages.iter().enumerate().rposition(|(index, message)| {
         let role = message.get("role").and_then(Value::as_str);
-        role == Some("user") || (role == Some("system") && index > 0)
+        matches!(role, Some("user" | "developer")) || (role == Some("system") && index > 0)
     })
 }
 
-pub(super) fn drop_thinking_messages(mut messages: Vec<Value>) -> Vec<Value> {
-    if let Some(last_user) = find_last_user_index(&messages) {
-        for message in &mut messages[..last_user] {
-            if message.get("role").and_then(Value::as_str) == Some("assistant") {
+/// Before the last user turn, assistant reasoning is removed and every role
+/// other than user/system/tool/latest_reminder/direct_search_results (in
+/// practice: developer) is dropped, as in vLLM's `_drop_thinking_messages`.
+pub(super) fn drop_thinking_messages(messages: Vec<Value>) -> Vec<Value> {
+    let Some(last_user) = find_last_user_index(&messages) else {
+        return messages;
+    };
+    messages
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, mut message)| {
+            let role = message.get("role").and_then(Value::as_str).unwrap_or("");
+            let keep = matches!(
+                role,
+                "user" | "system" | "tool" | "latest_reminder" | "direct_search_results"
+            );
+            if keep || index >= last_user {
+                Some(message)
+            } else if role == "assistant" {
                 message.as_object_mut().unwrap().remove("reasoning_content");
+                Some(message)
+            } else {
+                None
             }
+        })
+        .collect()
+}
+
+fn python_truthy(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(b) => *b,
+        Value::Number(n) => n.as_f64().is_some_and(|f| f != 0.0),
+        Value::String(s) => !s.is_empty(),
+        Value::Array(a) => !a.is_empty(),
+        Value::Object(o) => !o.is_empty(),
+    }
+}
+
+/// vLLM's `FunctionDefinition.model_dump()`: name, description, parameters
+/// (both null when absent), then strict/defer_loading only when set.
+fn vllm_tool(tool: &Value) -> Option<Value> {
+    let function = tool.get("function")?.as_object()?;
+    let mut out = serde_json::Map::new();
+    out.insert("name".into(), function.get("name").cloned().unwrap_or(Value::Null));
+    for key in ["description", "parameters"] {
+        out.insert(key.into(), function.get(key).cloned().unwrap_or(Value::Null));
+    }
+    for key in ["strict", "defer_loading"] {
+        if let Some(value) = function.get(key).filter(|v| !v.is_null()) {
+            out.insert(key.into(), value.clone());
         }
     }
-    messages
+    Some(serde_json::json!({"type": "function", "function": Value::Object(out)}))
 }
 
 pub(super) fn encode_arguments(tool_call: &Value) -> Result<String> {
@@ -92,8 +147,8 @@ fn normalize_text(messages: &mut [Value]) -> Result<()> {
                 .is_some_and(|text| text.contains("<｜deepseek_image｜>")),
             "DeepSeek V4.1 native formatter supports text content only"
         );
-        if message.get("role").and_then(Value::as_str) == Some("developer") {
-            message["role"] = Value::String("system".into());
+        if let Some(reasoning) = message.get("reasoning").cloned() {
+            message["reasoning_content"] = reasoning;
         }
         if let Some(content) = message.get("content") {
             let text = match content {
@@ -149,8 +204,8 @@ pub fn encode_messages(
     )
 }
 
-/// Native text formatter with OpenAI reasoning-effort names mapped as in the
-/// DeepSeek V4.1 reference encoder.
+/// Native text formatter with reasoning-effort names mapped as in the DeepSeek
+/// V4.1 reference encoder and vLLM (low 25, high 50, xhigh 75, max 100; default high).
 #[derive(Debug, Default)]
 pub struct DeepSeekV41Formatter;
 
@@ -160,63 +215,70 @@ impl crate::OAIPromptFormatter for DeepSeekV41Formatter {
     }
 
     fn render(&self, req: &dyn crate::OAIChatLikeRequest) -> Result<String> {
+        // Serving controls follow vLLM's deepseek_v41 tokenizer wrapper, the
+        // reference this frontend must match token for token.
         let args = req.chat_template_args();
+        let arg = |key: &str| args.and_then(|args| args.get(key));
         let effort = req
             .reasoning_effort()
             .map(|value| serde_json::to_value(value).context("Serialize reasoning effort"))
             .transpose()?
-            .or_else(|| args.and_then(|args| args.get("reasoning_effort").cloned()));
-        let mut thinking_mode = resolve_thinking_mode(args, ThinkingMode::Thinking);
+            .or_else(|| arg("reasoning_effort").cloned());
+        let mut thinking = if arg("thinking").is_none() && arg("enable_thinking").is_none() {
+            true
+        } else {
+            arg("thinking").is_some_and(python_truthy)
+                || arg("enable_thinking").is_some_and(python_truthy)
+        };
         let budget = match effort.as_ref() {
-            None | Some(Value::Null) => 75,
-            Some(value) => match value.as_str() {
-                Some("none") => {
-                    thinking_mode = ThinkingMode::Chat;
-                    75
-                }
-                Some("low") => 50,
-                Some("high") => 75,
-                Some("max") => 100,
-                _ => value
-                    .as_u64()
-                    .filter(|v| (1..=100).contains(v))
-                    .context("DeepSeek V4.1 reasoning effort must be low, high, max, none, or an integer within 1–100")?
-                    as u8,
-            },
+            None | Some(Value::Null) => DEFAULT_REASONING_EFFORT,
+            Some(Value::String(name)) if name == "none" => {
+                thinking = false;
+                DEFAULT_REASONING_EFFORT
+            }
+            Some(Value::String(name)) => REASONING_EFFORT_MAPPINGS
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, budget)| *budget)
+                .context(EFFORT_ERROR)?,
+            Some(value) => value
+                .as_u64()
+                .filter(|v| (1..=100).contains(v))
+                .context(EFFORT_ERROR)? as u8,
         };
-        let drop_thinking = match args.and_then(|args| args.get("drop_thinking")) {
-            None => true,
-            Some(value) => value.as_bool().context("drop_thinking must be a boolean")?,
+        let thinking_mode = if thinking {
+            ThinkingMode::Thinking
+        } else {
+            ThinkingMode::Chat
         };
+        let drop_thinking = arg("drop_thinking").is_none_or(python_truthy);
         let mut messages: Vec<Value> =
             serde_json::from_value(serde_json::to_value(req.messages())?)?;
         let tools_enabled =
             req.tool_choice().as_ref().and_then(|value| value.as_str()) != Some("none");
-        let tools = req
-            .tools()
-            .filter(|tools| tools_enabled && tools.len().is_some_and(|length| length > 0))
-            .map(serde_json::to_value)
-            .transpose()?;
-        let response_format = req
-            .response_format()
-            .map(serde_json::to_value)
-            .transpose()?;
-        if tools.is_some() || response_format.is_some() {
-            if !matches!(
-                messages
-                    .first()
-                    .and_then(|m| m.get("role"))
-                    .and_then(Value::as_str),
-                Some("system" | "developer")
-            ) {
-                messages.insert(0, serde_json::json!({"role": "system", "content": ""}));
-            }
-            if let Some(tools) = tools {
-                messages[0]["tools"] = tools;
-            }
-            if let Some(response_format) = response_format {
-                messages[0]["response_format"] = response_format;
-            }
+        let raw_tools = match req.raw_tools() {
+            Some(tools) => Some(tools),
+            None => req.tools().map(serde_json::to_value).transpose()?,
+        };
+        let tools: Vec<Value> = raw_tools
+            .as_ref()
+            .and_then(Value::as_array)
+            .filter(|_| tools_enabled)
+            .map(|tools| tools.iter().filter_map(vllm_tool).collect())
+            .unwrap_or_default();
+        // response_format is enforced by guided decoding; vLLM never renders it.
+        if !tools.is_empty() {
+            let system = match messages
+                .iter()
+                .position(|m| m.get("role").and_then(Value::as_str) == Some("system"))
+            {
+                Some(index) => index,
+                None => {
+                    messages.insert(0, serde_json::json!({"role": "system", "content": ""}));
+                    0
+                }
+            };
+            messages[system]["tools"] = Value::Array(tools);
         }
         encode_messages(&messages, thinking_mode, drop_thinking, budget)
     }
