@@ -140,13 +140,8 @@ fn normalize_text(messages: &mut [Value]) -> Result<()> {
             message.get("content_blocks").is_none(),
             "DeepSeek V4.1 expects OpenAI text content blocks in content"
         );
-        ensure!(
-            !message
-                .get("reasoning_content")
-                .and_then(Value::as_str)
-                .is_some_and(|text| text.contains("<｜deepseek_image｜>")),
-            "DeepSeek V4.1 native formatter supports text content only"
-        );
+        // Literal "<｜deepseek_image｜>" text (e.g. source code in a tool result)
+        // renders as text, as in vLLM; only image content parts are refused.
         if let Some(reasoning) = message.get("reasoning").cloned() {
             message["reasoning_content"] = reasoning;
         }
@@ -172,10 +167,6 @@ fn normalize_text(messages: &mut [Value]) -> Result<()> {
                 }
                 _ => anyhow::bail!("DeepSeek V4.1 message content must be text"),
             };
-            ensure!(
-                !text.contains("<｜deepseek_image｜>"),
-                "DeepSeek V4.1 native formatter supports text content only"
-            );
             message["content"] = Value::String(text);
         }
     }

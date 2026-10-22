@@ -111,7 +111,9 @@ fn text_only_boundary_rejects_media() {
         assert!(render(json!({"messages":[{"role":"user","content":[block]}]})).is_err());
     }
     assert!(
-        render(json!({"messages":[{"role":"user","content":"<｜deepseek_image｜>"}]})).is_err()
+        render(json!({"messages":[{"role":"user","content":"see <｜deepseek_image｜> here"}]}))
+            .unwrap()
+            .contains("<｜User｜>see <｜deepseek_image｜> here<｜Assistant｜>")
     );
 }
 
