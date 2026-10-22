@@ -522,6 +522,13 @@ struct ChoiceReasoningState {
 struct ReasoningUsageEstimator {
     total: u32,
     active_choices: HashSet<u32>,
+    // Unified parsers stream reasoning as it is decoded. A chunk that carries
+    // none while a choice is reasoning is either reasoning the parser is still
+    // holding back (counted once more reasoning arrives) or a consumed
+    // `</think>` / a tool call held until its invocation closes (dropped once
+    // visible output arrives), so tool-call tokens stay out of `reasoning_tokens`.
+    reasoning_chunks_only: bool,
+    pending: u32,
 }
 
 impl ReasoningUsageEstimator {
@@ -544,7 +551,18 @@ impl ReasoningUsageEstimator {
         let usage_chunk_while_reasoning =
             chunk.inner.choices.is_empty() && !self.active_choices.is_empty();
 
-        if token_count > 0
+        if self.reasoning_chunks_only {
+            if has_reasoning {
+                self.total = self
+                    .total
+                    .saturating_add(token_count)
+                    .saturating_add(std::mem::take(&mut self.pending));
+            } else if chunk.inner.choices.iter().any(choice_has_visible_output) {
+                self.pending = 0;
+            } else if active_without_visible_output {
+                self.pending = self.pending.saturating_add(token_count);
+            }
+        } else if token_count > 0
             && (has_reasoning || active_without_visible_output || usage_chunk_while_reasoning)
         {
             self.total = self.total.saturating_add(token_count);
@@ -582,7 +600,16 @@ fn annotate_reasoning_usage<S>(
 where
     S: Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send + 'static,
 {
-    let mut estimator = ReasoningUsageEstimator::default();
+    annotate_reasoning_usage_with(stream, ReasoningUsageEstimator::default())
+}
+
+fn annotate_reasoning_usage_with<S>(
+    stream: S,
+    mut estimator: ReasoningUsageEstimator,
+) -> impl Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send
+where
+    S: Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send + 'static,
+{
     stream.map(move |mut response| {
         if let Some(chunk) = response.data.as_mut() {
             estimator.observe(chunk);
@@ -4498,7 +4525,13 @@ impl OpenAIPreprocessor {
         // reasoning delta. The annotated usage trailer can still be held below until
         // every deferred recovery chunk has been emitted.
         let stream: Pin<Box<dyn Stream<Item = _> + Send>> =
-            Box::pin(annotate_reasoning_usage(stream));
+            Box::pin(annotate_reasoning_usage_with(
+                stream,
+                ReasoningUsageEstimator {
+                    reasoning_chunks_only: true,
+                    ..Default::default()
+                },
+            ));
         let stream: Pin<Box<dyn Stream<Item = _> + Send>> = if defer_reasoning_for_nonempty_content
         {
             Box::pin(Self::defer_unified_reasoning_for_nonempty_content(stream))
@@ -7605,6 +7638,63 @@ mod tests {
                 .as_ref()
                 .and_then(|details| details.reasoning_tokens),
             Some(3)
+        );
+    }
+
+    #[tokio::test]
+    async fn unified_reasoning_usage_skips_held_back_tool_call_chunks() {
+        let output = annotate_reasoning_usage_with(
+            stream::iter(vec![
+                reasoning_usage_chunk(Some("think"), None, 1),
+                reasoning_usage_chunk(Some(" more"), None, 1),
+                reasoning_usage_chunk(None, None, 1),
+                reasoning_usage_chunk(None, None, 5),
+                reasoning_usage_trailer(8, None),
+            ]),
+            ReasoningUsageEstimator {
+                reasoning_chunks_only: true,
+                ..Default::default()
+            },
+        )
+        .collect::<Vec<_>>()
+        .await;
+        assert_eq!(
+            output
+                .last()
+                .and_then(|response| response.data.as_ref())
+                .and_then(|chunk| chunk.inner.usage.as_ref())
+                .and_then(|usage| usage.completion_tokens_details.as_ref())
+                .and_then(|details| details.reasoning_tokens),
+            Some(2)
+        );
+        let output = annotate_reasoning_usage_with(
+            stream::iter(vec![
+                reasoning_usage_chunk(Some("a"), None, 1),
+                reasoning_usage_chunk(None, None, 2),
+                reasoning_usage_chunk(Some("b"), None, 1),
+                reasoning_usage_chunk(None, None, 1),
+                reasoning_usage_chunk(None, Some("answer"), 1),
+                reasoning_usage_trailer(6, None),
+            ]),
+            ReasoningUsageEstimator {
+                reasoning_chunks_only: true,
+                ..Default::default()
+            },
+        )
+        .collect::<Vec<_>>()
+        .await;
+
+        let usage = output
+            .last()
+            .and_then(|response| response.data.as_ref())
+            .and_then(|chunk| chunk.inner.usage.as_ref())
+            .unwrap();
+        assert_eq!(
+            usage
+                .completion_tokens_details
+                .as_ref()
+                .and_then(|details| details.reasoning_tokens),
+            Some(4)
         );
     }
 
