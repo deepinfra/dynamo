@@ -2258,7 +2258,8 @@ impl OpenAIPreprocessor {
             );
         };
         let model_info = model_info.get_model_info()?;
-        let tool_call_parser = mdc.runtime_config.tool_call_parser.clone();
+        let runtime_config = mdc.frontend_runtime_config()?;
+        let tool_call_parser = runtime_config.tool_call_parser.clone();
         let normalize_tool_call_args = mdc.runtime_config.tool_call_arguments_format
             == crate::local_model::runtime_config::ToolCallArgumentsFormat::JsonObject
             || mdc.runtime_config.tool_call_parser.as_deref() == Some("glm47");
@@ -2267,8 +2268,6 @@ impl OpenAIPreprocessor {
             tracing::info!(model = %mdc.display_name, lora_name, "LoRA adapter detected in MDC");
         }
 
-        // // Initialize runtime config from the ModelDeploymentCard
-        let runtime_config = mdc.runtime_config.clone();
         let token_budget = match runtime_config
             .get_engine_specific::<TokenBudget>(TOKEN_BUDGET_RUNTIME_KEY)
         {
@@ -7384,6 +7383,45 @@ mod tests {
         ChatChoiceStream, ChatCompletionStreamResponseDelta, CreateChatCompletionStreamResponse,
         FinishReason, Role,
     };
+
+    #[test]
+    fn deepseek_v41_defaults_missing_worker_parser_metadata() {
+        let mut mdc = ModelDeploymentCard::load_from_disk(
+            "tests/data/sample-models/mock-llama-3.1-8b-instruct",
+            None,
+        )
+        .unwrap();
+        mdc.model_type = crate::model_type::ModelType::Chat;
+        let model_dir = tempfile::tempdir().unwrap();
+        let mut config: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                "tests/data/sample-models/mock-llama-3.1-8b-instruct/config.json",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        config["model_type"] = serde_json::json!("deepseek_v41");
+        std::fs::write(model_dir.path().join("config.json"), config.to_string()).unwrap();
+        mdc.model_info =
+            Some(crate::model_card::ModelInfoType::from_disk(model_dir.path()).unwrap());
+        let preprocessor = OpenAIPreprocessor::new(mdc.clone()).unwrap();
+        assert_eq!(
+            preprocessor.tool_call_parser.as_deref(),
+            Some("deepseek_v41")
+        );
+        assert_eq!(
+            preprocessor.runtime_config.reasoning_parser.as_deref(),
+            Some("deepseek_v41")
+        );
+        mdc.runtime_config.tool_call_parser = Some("qwen3_coder".into());
+        mdc.runtime_config.reasoning_parser = Some("qwen3".into());
+        let explicit = OpenAIPreprocessor::new(mdc).unwrap();
+        assert_eq!(explicit.tool_call_parser.as_deref(), Some("qwen3_coder"));
+        assert_eq!(
+            explicit.runtime_config.reasoning_parser.as_deref(),
+            Some("qwen3")
+        );
+    }
 
     #[test]
     fn deepseek_v41_preserves_markers_and_initializes_backend_reasoning() {
