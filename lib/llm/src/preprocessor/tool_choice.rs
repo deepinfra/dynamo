@@ -108,6 +108,17 @@ impl OpenAIPreprocessor {
             return Ok(GuidedToolConstraint::StructuralTag);
         }
 
+        if is_forced_tool_choice
+            && parses_forced_tool_calls_natively(self.tool_call_parser.as_deref())
+        {
+            // vLLM's DeepSeek V4.1 tool parser sets `supports_required_and_named = False`:
+            // the model answers a forced choice in native DSML, which the unified parser
+            // extracts, and no tool-call grammar is installed (vLLM's adjust_request and
+            // Dynamo's vLLM processor both skip it). A generic JSON schema here would
+            // constrain the wrong wire format and send the worker grammars it rejects.
+            return Ok(GuidedToolConstraint::None);
+        }
+
         let uses_kimi_k3_parser = uses_kimi_k3_parser(
             self.tool_call_parser.as_deref(),
             self.runtime_config.reasoning_parser.as_deref(),
@@ -242,6 +253,9 @@ pub(crate) fn guided_tool_constraint(
     if uses_kimi_k3_parser(tool_call_parser, reasoning_parser) {
         return Ok(GuidedToolConstraint::None);
     }
+    if parses_forced_tool_calls_natively(tool_call_parser) {
+        return Ok(GuidedToolConstraint::None);
+    }
     // Validate the forced choice against the actual tools the same way
     // `apply_tool_choice_guided_decoding` does, instead of blindly installing a
     // constraint for a `tool_choice` that names a tool absent from `tools` (or an
@@ -256,6 +270,15 @@ pub(crate) fn guided_tool_constraint(
         Ok(None) => Ok(GuidedToolConstraint::None),
         Err(e) => Err(invalid_argument(e.to_string())),
     }
+}
+
+/// Parsers whose forced (`required` / named) tool calls stay in the model's native
+/// syntax, mirroring vLLM tool parsers with `supports_required_and_named = False`.
+fn parses_forced_tool_calls_natively(tool_call_parser: Option<&str>) -> bool {
+    tool_call_parser
+        == Some(
+            crate::protocols::openai::chat_completions::unified_parser::DEEPSEEK_V41_UNIFIED_FAMILY,
+        )
 }
 
 /// True when either configured parser is Kimi K3.
@@ -324,6 +347,25 @@ mod tests {
         assert!(!OpenAIPreprocessor::tool_call_parsing_enabled(&request(
             json!({"tool_choice": "required"})
         )));
+    }
+
+    #[test]
+    fn deepseek_v41_forced_tool_choice_installs_no_json_constraint() {
+        for tool_choice in [
+            json!("required"),
+            json!({"type": "function", "function": {"name": "get_weather"}}),
+        ] {
+            let request = request(json!({"tools": tools(), "tool_choice": tool_choice}));
+            assert_eq!(
+                guided_tool_constraint(&request, Some("deepseek_v41"), Some("deepseek_v41"), false)
+                    .unwrap(),
+                GuidedToolConstraint::None
+            );
+            assert_ne!(
+                guided_tool_constraint(&request, None, None, false).unwrap(),
+                GuidedToolConstraint::None
+            );
+        }
     }
 
     #[test]
