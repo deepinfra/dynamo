@@ -67,6 +67,64 @@ _PIPELINE_MODALITY_MAP: dict[str, DiffusionModality] = {
 # Default when the pipeline is not yet loaded or the class name is unknown.
 _DEFAULT_MODALITY = DiffusionModality.VIDEO
 
+# First TRT-LLM release that enables cache_dit after torch.compile (NVIDIA/TensorRT-LLM#16508).
+_FIRST_COMPILE_THEN_CACHE_RELEASE = "1.3.0rc23"
+
+
+def parse_warmup_resolutions(spec: str) -> Optional[list[tuple[int, int]]]:
+    """Parse '720x1280,480x832' into [(720, 1280), (480, 832)]; empty gives None."""
+    if not spec.strip():
+        return None
+    shapes = []
+    for item in spec.split(","):
+        height, width = item.strip().lower().split("x")
+        shapes.append((int(height), int(width)))
+    return shapes
+
+
+def parse_warmup_num_frames(spec: str) -> Optional[list[int]]:
+    """Parse '33,81' into [33, 81]; empty gives None."""
+    if not spec.strip():
+        return None
+    return [int(item) for item in spec.split(",")]
+
+
+def enables_cache_before_compile(trtllm_version: str) -> bool:
+    """Whether this TRT-LLM attaches cache_dit before torch.compile replaces the blocks."""
+    from packaging.version import Version
+
+    return Version(trtllm_version) < Version(_FIRST_COMPILE_THEN_CACHE_RELEASE)
+
+
+def _compile_transformer_blocks_in_place() -> None:
+    """Make BasePipeline.torch_compile swap compiled blocks into the existing ModuleList."""
+    from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
+
+    replace_list = BasePipeline.torch_compile
+
+    def torch_compile(self: "BasePipeline") -> None:
+        models = {
+            name: getattr(self, name, None) for name in self.transformer_components
+        }
+        block_names = {
+            name: self._find_transformer_blocks(model) if model is not None else []
+            for name, model in models.items()
+        }
+        if not all(block_names.values()):
+            replace_list(self)
+            return
+        fullgraph = self.model_config.torch_compile.enable_fullgraph
+        for name, model in models.items():
+            for block_name in block_names[name]:
+                blocks = getattr(model, block_name)
+                for i, block in enumerate(blocks):
+                    blocks[i] = torch.compile(
+                        block, mode="default", dynamic=None, fullgraph=fullgraph
+                    )
+            logger.info("torch.compile: %s blocks compiled in place", name)
+
+    BasePipeline.torch_compile = torch_compile
+
 
 class DiffusionEngine:
     """Generic wrapper for TensorRT-LLM visual_gen diffusion pipelines.
@@ -123,7 +181,18 @@ class DiffusionEngine:
         )
 
         # Import TensorRT-LLM visual_gen components
+        from importlib.metadata import version
+
         from tensorrt_llm._torch.visual_gen import PipelineLoader
+
+        if (
+            self.config.cache_backend == "cache_dit"
+            and not self.config.disable_torch_compile
+            and enables_cache_before_compile(version("tensorrt_llm"))
+        ):
+            # cache_dit keeps the block list it saw at enable time; a new compiled list
+            # swapped in afterwards would leave every computed step running eager.
+            _compile_transformer_blocks_in_place()
 
         # Build VisualGenArgs from DiffusionConfig
         diffusion_args = self._build_diffusion_args()
@@ -214,6 +283,14 @@ class DiffusionEngine:
             args_kwargs["cache"] = TeaCacheConfig(
                 use_ret_steps=self.config.teacache_use_ret_steps,
                 teacache_thresh=self.config.teacache_thresh,
+            )
+        warmup_resolutions = parse_warmup_resolutions(self.config.warmup_resolutions)
+        warmup_num_frames = parse_warmup_num_frames(self.config.warmup_num_frames)
+        if warmup_resolutions is not None or warmup_num_frames is not None:
+            from tensorrt_llm._torch.visual_gen.config import CompilationConfig
+
+            args_kwargs["compilation"] = CompilationConfig(
+                resolutions=warmup_resolutions, num_frames=warmup_num_frames
             )
         if self.config.revision:
             args_kwargs["revision"] = self.config.revision

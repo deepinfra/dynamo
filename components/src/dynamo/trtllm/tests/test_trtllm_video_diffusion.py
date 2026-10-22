@@ -1042,3 +1042,130 @@ class TestVideoHandlerOutputFormat:
         _, kwargs = mock_enc.call_args
         assert "output_format" in kwargs
         assert kwargs["output_format"] == "mp4"
+
+
+# =============================================================================
+# Warmup shapes and cache_dit + torch.compile ordering
+# =============================================================================
+
+
+class TestWarmupShapes:
+    """CLI warmup strings map onto VisualGen's CompilationConfig."""
+
+    def test_parse_resolutions(self):
+        from dynamo.trtllm.engines.diffusion_engine import parse_warmup_resolutions
+
+        assert parse_warmup_resolutions("720x1280, 480X832") == [
+            (720, 1280),
+            (480, 832),
+        ]
+        assert parse_warmup_resolutions("") is None
+
+    def test_parse_num_frames(self):
+        from dynamo.trtllm.engines.diffusion_engine import parse_warmup_num_frames
+
+        assert parse_warmup_num_frames("33,81") == [33, 81]
+        assert parse_warmup_num_frames(" ") is None
+
+    def _build_args(self, **config_kwargs):
+        from dynamo.trtllm.engines.diffusion_engine import DiffusionEngine
+
+        visual_gen = MagicMock()
+        config_module = MagicMock()
+        with patch.dict(
+            "sys.modules",
+            {
+                "tensorrt_llm._torch.visual_gen": visual_gen,
+                "tensorrt_llm._torch.visual_gen.config": config_module,
+            },
+        ):
+            DiffusionEngine(DiffusionConfig(**config_kwargs))._build_diffusion_args()
+        return visual_gen.VisualGenArgs.call_args.kwargs, config_module
+
+    def test_configured_shapes_become_compilation_config(self):
+        kwargs, config_module = self._build_args(
+            warmup_resolutions="720x1280", warmup_num_frames="81"
+        )
+        config_module.CompilationConfig.assert_called_once_with(
+            resolutions=[(720, 1280)], num_frames=[81]
+        )
+        assert kwargs["compilation"] is config_module.CompilationConfig.return_value
+
+    def test_unset_shapes_keep_pipeline_defaults(self):
+        kwargs, config_module = self._build_args()
+        assert "compilation" not in kwargs
+        config_module.CompilationConfig.assert_not_called()
+
+
+class TestCompileBlocksInPlace:
+    """cache_dit holds the block list it was enabled on, so compile must mutate that list."""
+
+    def test_version_gate(self):
+        from dynamo.trtllm.engines.diffusion_engine import enables_cache_before_compile
+
+        assert enables_cache_before_compile("1.3.0rc14")
+        assert enables_cache_before_compile("1.3.0rc22")
+        assert not enables_cache_before_compile("1.3.0rc23")
+        assert not enables_cache_before_compile("1.4.0rc1")
+
+    def _fake_pipeline_module(self):
+        class BasePipeline:
+            def __init__(self):
+                self.transformer = SimpleNamespace(
+                    blocks=torch.nn.ModuleList(
+                        [torch.nn.Identity(), torch.nn.Identity()]
+                    )
+                )
+                self.model_config = SimpleNamespace(
+                    torch_compile=SimpleNamespace(enable_fullgraph=False)
+                )
+                self.original_called = False
+
+            @property
+            def transformer_components(self):
+                return ["transformer"]
+
+            def _find_transformer_blocks(self, model):
+                return ["blocks"] if hasattr(model, "blocks") else []
+
+            def torch_compile(self):
+                self.original_called = True
+
+        return SimpleNamespace(BasePipeline=BasePipeline)
+
+    def test_compiled_blocks_land_in_the_list_cache_dit_holds(self):
+        from dynamo.trtllm.engines import diffusion_engine
+
+        module = self._fake_pipeline_module()
+        compiled = []
+
+        def fake_compile(block, **_kwargs):
+            wrapped = torch.nn.Sequential(block)
+            compiled.append(wrapped)
+            return wrapped
+
+        with patch.dict(
+            "sys.modules", {"tensorrt_llm._torch.visual_gen.pipeline": module}
+        ), patch.object(diffusion_engine.torch, "compile", fake_compile):
+            diffusion_engine._compile_transformer_blocks_in_place()
+            pipeline = module.BasePipeline()
+            held_by_cache_dit = pipeline.transformer.blocks
+            pipeline.torch_compile()
+
+        assert pipeline.transformer.blocks is held_by_cache_dit
+        assert list(held_by_cache_dit) == compiled
+        assert not pipeline.original_called
+
+    def test_falls_back_when_a_component_has_no_block_list(self):
+        from dynamo.trtllm.engines import diffusion_engine
+
+        module = self._fake_pipeline_module()
+        with patch.dict(
+            "sys.modules", {"tensorrt_llm._torch.visual_gen.pipeline": module}
+        ):
+            diffusion_engine._compile_transformer_blocks_in_place()
+            pipeline = module.BasePipeline()
+            pipeline.transformer = SimpleNamespace()
+            pipeline.torch_compile()
+
+        assert pipeline.original_called

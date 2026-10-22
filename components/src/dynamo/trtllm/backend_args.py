@@ -399,6 +399,26 @@ class DynamoTrtllmArgGroup(ArgGroup):
             default=False,
             help="Skip warmup inference during initialization.",
         )
+        add_argument(
+            diffusion_group,
+            flag_name="--warmup-resolutions",
+            env_var="DYN_TRTLLM_WARMUP_RESOLUTIONS",
+            default="",
+            help=(
+                "Comma-separated HEIGHTxWIDTH shapes to compile at warmup, e.g. '720x1280'. "
+                "Empty keeps the pipeline's default list."
+            ),
+        )
+        add_argument(
+            diffusion_group,
+            flag_name="--warmup-num-frames",
+            env_var="DYN_TRTLLM_WARMUP_NUM_FRAMES",
+            default="",
+            help=(
+                "Comma-separated frame counts to compile at warmup, e.g. '81'. "
+                "Warmup runs every resolution x frame-count pair. Empty keeps the pipeline's default list."
+            ),
+        )
         add_negatable_bool_argument(
             diffusion_group,
             flag_name="--enable-async-cpu-offload",
@@ -550,6 +570,8 @@ class DynamoTrtllmConfig(ConfigBase):
     enable_cuda_graph: bool
     enable_layerwise_nvtx_marker: bool
     skip_warmup: bool
+    warmup_resolutions: str
+    warmup_num_frames: str
     dit_dp_size: int
     dit_tp_size: int
     dit_ulysses_size: int
