@@ -1215,13 +1215,22 @@ class TestFlowShift:
         with pytest.raises(RuntimeError, match="--flow-shift"):
             apply_flow_shift(SimpleNamespace(scheduler=self._NoShift()), 12.0)
 
-    def test_low_noise_budget_below_minus_one_is_rejected(self):
-        from dynamo.trtllm.engines.diffusion_engine import (
-            set_wan22_low_noise_max_cached_steps,
-        )
+    @pytest.mark.parametrize("cache_backend", ["cache_dit", "none"])
+    def test_low_noise_budget_below_minus_one_is_rejected(self, cache_backend):
+        from dynamo.trtllm.configs.diffusion_config import DiffusionConfig
+        from dynamo.trtllm.engines.diffusion_engine import DiffusionEngine
 
-        with pytest.raises(ValueError, match=">= -1"):
-            set_wan22_low_noise_max_cached_steps(-2)
+        config = DiffusionConfig(
+            cache_backend=cache_backend, cache_dit_low_noise_max_cached_steps=-2
+        )
+        with patch.dict(
+            "sys.modules",
+            {
+                "tensorrt_llm._torch.visual_gen": MagicMock(),
+                "tensorrt_llm._torch.visual_gen.config": MagicMock(),
+            },
+        ), pytest.raises(ValueError, match=">= -1"):
+            DiffusionEngine(config)._build_diffusion_args()
 
 
 class TestCompileBlocksInPlace:

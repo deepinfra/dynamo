@@ -127,12 +127,16 @@ def apply_flow_shift(pipeline: "BasePipeline", shift: float) -> None:
     )
 
 
-def set_wan22_low_noise_max_cached_steps(steps: int) -> None:
-    """Override the reused-step budget VisualGen hard-codes for Wan 2.2's low-noise expert."""
+def check_low_noise_max_cached_steps(steps: int) -> None:
+    """Raise unless the low-noise budget is -1 (unlimited) or a non-negative count."""
     if steps < -1:
         raise ValueError(
             f"--cache-dit-low-noise-max-cached-steps must be >= -1 (-1 = unlimited), got {steps}"
         )
+
+
+def set_wan22_low_noise_max_cached_steps(steps: int) -> None:
+    """Override the reused-step budget VisualGen hard-codes for Wan 2.2's low-noise expert."""
     from tensorrt_llm._torch.visual_gen.cache import cache_dit_enablers
 
     if not hasattr(cache_dit_enablers, "_WAN22_LOW_NOISE_MAX_CACHED_STEPS"):
@@ -307,6 +311,11 @@ class DiffusionEngine:
                 "quant_algo": self.config.quant_algo,
                 "dynamic": self.config.quant_dynamic,
             }
+
+        if self.config.cache_dit_low_noise_max_cached_steps is not None:
+            check_low_noise_max_cached_steps(
+                self.config.cache_dit_low_noise_max_cached_steps
+            )
 
         args_kwargs: dict = dict(
             checkpoint_path=self.config.model_path,
