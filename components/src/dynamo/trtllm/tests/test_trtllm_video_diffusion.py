@@ -1162,6 +1162,77 @@ class TestCacheDitOverrides:
             set_wan22_low_noise_max_cached_steps(24)
 
 
+class TestFlowShift:
+    """--flow-shift rebuilds the loaded scheduler with only the shift changed."""
+
+    class _SchedulerBase:
+        def __init__(self, **config):
+            self.config = config
+
+        @classmethod
+        def from_config(cls, config, **overrides):
+            return cls(**{**config, **overrides})
+
+    class _UniPC(_SchedulerBase):
+        def __init__(self, flow_shift=1.0, **config):
+            super().__init__(flow_shift=flow_shift, **config)
+
+    class _FlowMatchEuler(_SchedulerBase):
+        def __init__(self, shift=1.0, **config):
+            super().__init__(shift=shift, **config)
+
+    class _NoShift(_SchedulerBase):
+        def __init__(self, beta_start=0.1, **config):
+            super().__init__(beta_start=beta_start, **config)
+
+    def test_flow_shift_key_is_replaced_and_the_rest_kept(self):
+        from dynamo.trtllm.engines.diffusion_engine import apply_flow_shift
+
+        pipeline = SimpleNamespace(scheduler=self._UniPC(flow_shift=3.0, solver_order=2))
+        apply_flow_shift(pipeline, 12.0)
+        assert pipeline.scheduler.config == {"flow_shift": 12.0, "solver_order": 2}
+
+    def test_shift_key_used_by_flow_match_euler(self):
+        from dynamo.trtllm.engines.diffusion_engine import apply_flow_shift
+
+        pipeline = SimpleNamespace(scheduler=self._FlowMatchEuler(shift=5.0))
+        apply_flow_shift(pipeline, 12.0)
+        assert pipeline.scheduler.config == {"shift": 12.0}
+
+    def test_stray_flow_shift_key_does_not_hide_the_real_shift(self):
+        """Wan's FlowMatchEuler configs carry an ignored flow_shift beside shift."""
+        from dynamo.trtllm.engines.diffusion_engine import apply_flow_shift
+
+        pipeline = SimpleNamespace(
+            scheduler=self._FlowMatchEuler(shift=5.0, flow_shift=3.0)
+        )
+        apply_flow_shift(pipeline, 12.0)
+        assert pipeline.scheduler.config["shift"] == 12.0
+
+    def test_scheduler_without_a_shift_fails_loudly(self):
+        from dynamo.trtllm.engines.diffusion_engine import apply_flow_shift
+
+        with pytest.raises(RuntimeError, match="--flow-shift"):
+            apply_flow_shift(SimpleNamespace(scheduler=self._NoShift()), 12.0)
+
+    @pytest.mark.parametrize("cache_backend", ["cache_dit", "none"])
+    def test_low_noise_budget_below_minus_one_is_rejected(self, cache_backend):
+        from dynamo.trtllm.configs.diffusion_config import DiffusionConfig
+        from dynamo.trtllm.engines.diffusion_engine import DiffusionEngine
+
+        config = DiffusionConfig(
+            cache_backend=cache_backend, cache_dit_low_noise_max_cached_steps=-2
+        )
+        with patch.dict(
+            "sys.modules",
+            {
+                "tensorrt_llm._torch.visual_gen": MagicMock(),
+                "tensorrt_llm._torch.visual_gen.config": MagicMock(),
+            },
+        ), pytest.raises(ValueError, match=">= -1"):
+            DiffusionEngine(config)._build_diffusion_args()
+
+
 class TestCompileBlocksInPlace:
     """cache_dit holds the block list it was enabled on, so compile must mutate that list."""
 
