@@ -2298,7 +2298,7 @@ mod tests {
     async fn deepseek_v41_batch_recovers_malformed_closed_arguments_as_text() {
         let text = concat!(
             "<｜DSML｜ calls><｜DSML｜ invoke name=\"get_weather\">",
-            "<｜DSML｜ parameter name=\"count\" string=\"false\">not-json</｜DSML｜ parameter>",
+            "<｜DSML｜ parameter name=\"count\" string=\"false\">1",
             "</｜DSML｜ invoke></｜DSML｜ calls>"
         );
         let annotated_delta = create_test_delta(

@@ -829,9 +829,15 @@ pub(crate) fn parse_complete(
                     // `assemble` already parsed the argument fragments into a typed
                     // object, so this re-serializes rather than passing the model's
                     // bytes through. Formatting is normalized as a result.
+                    // DeepSeek V4.1 keeps vLLM's `json.dumps` formatting so batch and
+                    // streaming arguments are byte-identical to the vLLM processor's.
                     function: FunctionCall {
                         name,
-                        arguments: serde_json::to_string(&arguments)?,
+                        arguments: if family == DEEPSEEK_V41_UNIFIED_FAMILY {
+                            dynamo_parsers_v2::unified::deepseek_v41::python_json(&arguments)
+                        } else {
+                            serde_json::to_string(&arguments)?
+                        },
                     },
                 });
             }
@@ -1462,7 +1468,7 @@ mod tests {
             .unwrap();
             assert_eq!(batch.reasoning, reasoning);
             assert_eq!(batch.tool_calls.len(), 1);
-            assert_eq!(batch.tool_calls[0].function.arguments, r#"{"city":"東京"}"#);
+            assert_eq!(batch.tool_calls[0].function.arguments, r#"{"city": "東京"}"#);
             for split in input.char_indices().map(|(index, _)| index) {
                 let (first, second) = input.split_at(split);
                 let responses = apply_stream(
@@ -1523,7 +1529,7 @@ mod tests {
         assert_eq!(batch.tool_calls[0].function.name, "get_weather");
         assert_eq!(
             batch.tool_calls[0].function.arguments,
-            r#"{"city":"Tokyo"}"#
+            r#"{"city": "Tokyo"}"#
         );
 
         let responses = apply_stream(
@@ -1542,7 +1548,7 @@ mod tests {
             vec![LogicalEvent::Tool {
                 index: 0,
                 name: Some("get_weather".to_string()),
-                arguments: r#"{"city":"Tokyo"}"#.to_string(),
+                arguments: r#"{"city": "Tokyo"}"#.to_string(),
             }]
         );
         assert_eq!(
@@ -1552,10 +1558,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deepseek_v41_recovers_malformed_closed_arguments_as_text() {
+    async fn deepseek_v41_non_json_value_is_kept_as_text_like_vllm() {
         let text = concat!(
             "<｜DSML｜ calls><｜DSML｜ invoke name=\"get_weather\">",
             "<｜DSML｜ parameter name=\"count\" string=\"false\">not-json</｜DSML｜ parameter>",
+            "</｜DSML｜ invoke></｜DSML｜ calls>"
+        );
+        let responses = apply_stream(
+            stream::iter([chunk(text, true)]),
+            Some(weather_tools()),
+            None,
+            false,
+            UnifiedParserStartingState::Response,
+            DEEPSEEK_V41_UNIFIED_FAMILY,
+        )
+        .collect::<Vec<_>>()
+        .await;
+        assert_eq!(
+            logical_events(&responses),
+            vec![LogicalEvent::Tool {
+                index: 0,
+                name: Some("get_weather".to_string()),
+                arguments: r#"{"count": "not-json"}"#.to_string(),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn deepseek_v41_recovers_malformed_closed_arguments_as_text() {
+        let text = concat!(
+            "<｜DSML｜ calls><｜DSML｜ invoke name=\"get_weather\">",
+            "<｜DSML｜ parameter name=\"count\" string=\"false\">1",
             "</｜DSML｜ invoke></｜DSML｜ calls>"
         );
         let responses = apply_stream(

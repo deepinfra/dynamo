@@ -9,7 +9,9 @@ use crate::tool_calling::scan::{
     WrappedBlockScanner, WrappedBlockSpec,
 };
 use crate::tool_calling::traits::{Tool, ToolCallDelta};
-use crate::unified::{GuidedRouted, ScannerUnified, UnifiedParser};
+use crate::unified::{
+    GuidedRouted, ScannerUnified, UnifiedParser, UnifiedParserEvent, UnifiedParserOutput,
+};
 
 const BLOCK_START: &str = "<｜DSML｜ calls>";
 const BLOCK_END: &str = "</｜DSML｜ calls>";
@@ -38,18 +40,211 @@ pub(crate) fn deepseek_v41_unified(_tools: &[Tool]) -> Box<dyn UnifiedParser> {
         preserve_special_tokens: true,
         ..Default::default()
     });
-    Box::new(GuidedRouted::new(ScannerUnified::new(scanner)))
+    Box::new(VllmWhitespace::new(Box::new(GuidedRouted::new(
+        ScannerUnified::new(scanner),
+    ))))
 }
 
+/// vLLM's DeepSeek V4/V4.1 parser-engine whitespace rules
+/// (`strip_trailing_reasoning_whitespace`, `drop_whitespace_only_content_before_tools`):
+/// reasoning never ends in whitespace, and content that is only whitespace before
+/// any visible text is held back, then dropped if a tool-call block follows, even
+/// one truncated before its first call completes (kept at EOF otherwise).
+struct VllmWhitespace {
+    inner: Box<dyn UnifiedParser>,
+    deferred_reasoning: String,
+    deferred_text: String,
+    content_has_text: bool,
+    tool_seen: bool,
+    block_started: bool,
+    raw_tail: String,
+}
+
+impl VllmWhitespace {
+    fn new(inner: Box<dyn UnifiedParser>) -> Self {
+        Self {
+            inner,
+            deferred_reasoning: String::new(),
+            deferred_text: String::new(),
+            content_has_text: false,
+            tool_seen: false,
+            block_started: false,
+            raw_tail: String::new(),
+        }
+    }
+
+    fn watch_block_start(&mut self, delta: &str) {
+        if self.block_started {
+            return;
+        }
+        self.raw_tail.push_str(delta);
+        if self.raw_tail.contains(BLOCK_START) {
+            self.block_started = true;
+            self.raw_tail.clear();
+            return;
+        }
+        let mut keep = self.raw_tail.len().saturating_sub(BLOCK_START.len() - 1);
+        while !self.raw_tail.is_char_boundary(keep) {
+            keep -= 1;
+        }
+        self.raw_tail.drain(..keep);
+    }
+
+    fn clear(&mut self) {
+        self.deferred_reasoning.clear();
+        self.deferred_text.clear();
+        self.content_has_text = false;
+        self.tool_seen = false;
+        self.block_started = false;
+        self.raw_tail.clear();
+    }
+
+    fn shape(&mut self, events: Vec<UnifiedParserEvent>, out: &mut UnifiedParserOutput) {
+        for event in events {
+            match event {
+                UnifiedParserEvent::Reasoning(text) => {
+                    let combined = std::mem::take(&mut self.deferred_reasoning) + &text;
+                    let trimmed = combined.trim_end();
+                    self.deferred_reasoning = combined[trimmed.len()..].to_string();
+                    if !trimmed.is_empty() {
+                        out.push_reasoning(trimmed);
+                    }
+                }
+                UnifiedParserEvent::Text(text) => {
+                    self.deferred_reasoning.clear();
+                    if self.content_has_text {
+                        out.push_text(text);
+                        continue;
+                    }
+                    let combined = std::mem::take(&mut self.deferred_text) + &text;
+                    if !combined.trim().is_empty() {
+                        self.content_has_text = true;
+                        out.push_text(combined);
+                    } else if !self.tool_seen {
+                        self.deferred_text = combined;
+                    }
+                }
+                UnifiedParserEvent::ToolCall(call) => {
+                    self.deferred_reasoning.clear();
+                    self.deferred_text.clear();
+                    self.tool_seen = true;
+                    out.push_call(call);
+                }
+            }
+        }
+    }
+}
+
+impl UnifiedParser for VllmWhitespace {
+    fn initialize_request(&mut self, init: crate::unified::UnifiedParserInit) -> anyhow::Result<()> {
+        self.clear();
+        self.inner.initialize_request(init)
+    }
+
+    fn parse_into(&mut self, delta: &str, output: &mut UnifiedParserOutput) -> anyhow::Result<()> {
+        self.watch_block_start(delta);
+        let mut raw = UnifiedParserOutput::default();
+        let result = self.inner.parse_into(delta, &mut raw);
+        self.shape(raw.events, output);
+        result
+    }
+
+    fn finish(&mut self) -> anyhow::Result<UnifiedParserOutput> {
+        let raw = self.inner.finish()?;
+        let mut out = UnifiedParserOutput::default();
+        self.shape(raw.events, &mut out);
+        if !self.deferred_text.is_empty() && !self.tool_seen && !self.block_started {
+            out.push_text(std::mem::take(&mut self.deferred_text));
+        }
+        Ok(out)
+    }
+
+    fn reset(&mut self) -> String {
+        self.clear();
+        self.inner.reset()
+    }
+
+    fn preserve_special_tokens(&self) -> bool {
+        self.inner.preserve_special_tokens()
+    }
+
+    fn tool_call_id(&self, tool_index: usize) -> Option<&str> {
+        self.inner.tool_call_id(tool_index)
+    }
+}
+
+/// A parameter header. As in vLLM's `_dsml_arg_converter`, only `string="true"`
+/// marks a literal string; a missing or other `string` attribute means "JSON if it
+/// parses, else the literal text".
 fn parameter_header(text: &str) -> Option<(&str, bool, &str)> {
     let (name, rest) = text.strip_prefix(PARAMETER_START)?.split_once('"')?;
+    if let Some(value) = rest.strip_prefix('>') {
+        return Some((name, false, value));
+    }
     let (string, value) = rest.strip_prefix(" string=\"")?.split_once("\">")?;
-    let string = match string {
-        "true" => true,
-        "false" => false,
-        _ => return None,
+    Some((name, string == "true", value))
+}
+
+/// `json.dumps(value, ensure_ascii=False)`: `", "`/`": "` separators and Python
+/// float repr, so arguments are byte-identical to vLLM's deepseek_v41 parser.
+pub fn python_json(value: &Value) -> String {
+    use serde::Serialize;
+    use serde_json::ser::Formatter;
+    use std::io;
+
+    struct PythonFormatter;
+
+    impl Formatter for PythonFormatter {
+        fn begin_array_value<W: ?Sized + io::Write>(&mut self, w: &mut W, first: bool) -> io::Result<()> {
+            if first { Ok(()) } else { w.write_all(b", ") }
+        }
+
+        fn begin_object_key<W: ?Sized + io::Write>(&mut self, w: &mut W, first: bool) -> io::Result<()> {
+            if first { Ok(()) } else { w.write_all(b", ") }
+        }
+
+        fn begin_object_value<W: ?Sized + io::Write>(&mut self, w: &mut W) -> io::Result<()> {
+            w.write_all(b": ")
+        }
+
+        fn write_f64<W: ?Sized + io::Write>(&mut self, w: &mut W, value: f64) -> io::Result<()> {
+            w.write_all(python_float_repr(value).as_bytes())
+        }
+    }
+
+    let mut buf = Vec::with_capacity(64);
+    value
+        .serialize(&mut serde_json::Serializer::with_formatter(&mut buf, PythonFormatter))
+        .expect("JSON value serialization into a Vec is infallible");
+    String::from_utf8(buf).expect("serde_json writes UTF-8")
+}
+
+/// Python `repr(float)`: shortest round-trip digits, exponent form below 1e-4 or
+/// from 1e16 (`1e-05`, `1e+16`), `.0` on integral values.
+fn python_float_repr(value: f64) -> String {
+    if !value.is_finite() {
+        return if value.is_nan() { "NaN".into() } else if value > 0.0 { "Infinity".into() } else { "-Infinity".into() };
+    }
+    let sci = format!("{value:e}");
+    let (sign, sci) = sci.strip_prefix('-').map_or(("", sci.as_str()), |rest| ("-", rest));
+    let (mantissa, exponent) = sci.split_once('e').expect("LowerExp has an exponent");
+    let exponent: i32 = exponent.parse().expect("LowerExp exponent is an integer");
+    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
+    let point = exponent + 1;
+    let body = if !(-4..16).contains(&exponent) {
+        let (head, tail) = digits.split_at(1);
+        let fraction = if tail.is_empty() { String::new() } else { format!(".{tail}") };
+        let exp_sign = if exponent < 0 { '-' } else { '+' };
+        format!("{head}{fraction}e{exp_sign}{:02}", exponent.abs())
+    } else if point <= 0 {
+        format!("0.{}{digits}", "0".repeat((-point) as usize))
+    } else if point as usize >= digits.len() {
+        format!("{digits}{}.0", "0".repeat(point as usize - digits.len()))
+    } else {
+        let (int, frac) = digits.split_at(point as usize);
+        format!("{int}.{frac}")
     };
-    Some((name, string, value))
+    format!("{sign}{body}")
 }
 
 #[cfg(test)]
@@ -236,18 +431,16 @@ impl InvokeEmitter for DeepSeekV41 {
             let value = if string {
                 Value::String(raw.to_string())
             } else {
-                serde_json::from_str(raw)?
+                serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
             };
-            anyhow::ensure!(
-                arguments.insert(name.to_string(), value).is_none(),
-                "duplicate DeepSeek V4.1 parameter {name:?}"
-            );
+            // A repeated name keeps its first position with the last value (a Python dict).
+            arguments.insert(name.to_string(), value);
             body = remainder;
         }
         Ok(Some(ToolCallDelta {
             tool_index,
             name: Some(name.to_string()),
-            arguments: serde_json::to_string(&arguments)?,
+            arguments: python_json(&Value::Object(arguments)),
             complete: true,
         }))
     }
@@ -337,10 +530,7 @@ mod tests {
             UnifiedParserStartingState::Reasoning,
             vec![
                 UnifiedEvent::Reasoning {
-                    text: "Check the tools.\n".into(),
-                },
-                UnifiedEvent::Text {
-                    text: "\n\n".into(),
+                    text: "Check the tools.".into(),
                 },
                 UnifiedEvent::ToolCall {
                     name: "weather".into(),
@@ -354,6 +544,30 @@ mod tests {
                 },
             ],
         );
+    }
+
+    #[test]
+    fn whitespace_follows_vllm_parser_engine() {
+        let call = "<｜DSML｜ calls><｜DSML｜ invoke name=\"run\"></｜DSML｜ invoke></｜DSML｜ calls>";
+        let run = || UnifiedEvent::ToolCall {
+            name: "run".into(),
+            arguments: serde_json::json!({}),
+        };
+        let reasoning = |text: &str| UnifiedEvent::Reasoning { text: text.into() };
+        let text = |text: &str| UnifiedEvent::Text { text: text.into() };
+        for (input, expected) in [
+            (format!("plan \n</think>\n\n{call}"), vec![reasoning("plan"), run()]),
+            (format!("a \n b\t</think>Sure.\n\n{call}"), vec![reasoning("a \n b"), text("Sure.\n\n"), run()]),
+            ("plan</think>\n\n".to_string(), vec![reasoning("plan"), text("\n\n")]),
+            (
+                "plan</think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"run\">\n<｜DSML｜ parameter name=\"a\" string=\"true\">x".to_string(),
+                vec![reasoning("plan")],
+            ),
+            ("plan</think> \n answer".to_string(), vec![reasoning("plan"), text(" \n answer")]),
+            ("r</think>Use <think> tags </think> ok".to_string(), vec![reasoning("r"), text("Use "), reasoning(" tags"), text(" ok")]),
+        ] {
+            assert_every_split(&input, UnifiedParserStartingState::Reasoning, expected);
+        }
     }
 
     #[test]
@@ -402,7 +616,9 @@ mod tests {
             assert_every_split(
                 input,
                 UnifiedParserStartingState::Reasoning,
-                vec![UnifiedEvent::Reasoning { text: input.into() }],
+                vec![UnifiedEvent::Reasoning {
+                    text: input.trim_end().into(),
+                }],
             );
         }
     }
@@ -470,27 +686,52 @@ mod tests {
     }
 
     #[test]
-    fn malformed_invocation_is_an_error_without_tool_deltas() {
-        for input in [
-            "<｜DSML｜ calls><｜DSML｜ invoke name=\"run\"><｜DSML｜ parameter name=\"x\" string=\"true\">first</｜DSML｜ parameter><｜DSML｜ parameter name=\"x\" string=\"true\">second</｜DSML｜ parameter></｜DSML｜ invoke></｜DSML｜ calls>",
-            "<｜DSML｜ calls><｜DSML｜ invoke name=\"run\"><｜DSML｜ parameter name=\"value\" string=\"false\">invalid</｜DSML｜ parameter></｜DSML｜ invoke></｜DSML｜ calls>",
+    fn lenient_parameters_decode_like_vllm() {
+        let call = |params: &str| {
+            format!(
+                "<｜DSML｜ calls><｜DSML｜ invoke name=\"run\">{params}</｜DSML｜ invoke></｜DSML｜ calls>"
+            )
+        };
+        for (params, expected) in [
+            (
+                "<｜DSML｜ parameter name=\"x\" string=\"true\">first</｜DSML｜ parameter><｜DSML｜ parameter name=\"y\" string=\"false\">2</｜DSML｜ parameter><｜DSML｜ parameter name=\"x\" string=\"true\">second</｜DSML｜ parameter>",
+                serde_json::json!({"x": "second", "y": 2}),
+            ),
+            (
+                "<｜DSML｜ parameter name=\"value\" string=\"false\">invalid</｜DSML｜ parameter>",
+                serde_json::json!({"value": "invalid"}),
+            ),
+            (
+                "<｜DSML｜ parameter name=\"value\" string=\"maybe\">1</｜DSML｜ parameter>",
+                serde_json::json!({"value": 1}),
+            ),
+            (
+                "<｜DSML｜ parameter name=\"value\">[1, 2.5e-05]</｜DSML｜ parameter>",
+                serde_json::json!({"value": [1, 2.5e-05]}),
+            ),
         ] {
-            for split in (0..=input.len()).filter(|&i| input.is_char_boundary(i)) {
-                let mut parser = deepseek_v41_unified(&[]);
-                let mut output = UnifiedParserOutput::default();
-                let result = parser
-                    .parse_into(&input[..split], &mut output)
-                    .and_then(|()| parser.parse_into(&input[split..], &mut output));
-                assert!(result.is_err(), "split {split}");
-                assert!(output.events.is_empty(), "split {split}");
-            }
+            assert_every_split(
+                &call(params),
+                UnifiedParserStartingState::None,
+                vec![UnifiedEvent::ToolCall {
+                    name: "run".into(),
+                    arguments: expected,
+                }],
+            );
         }
+        let mut parser = deepseek_v41_unified(&[]);
+        let events = parser
+            .push(&call("<｜DSML｜ parameter name=\"a\" string=\"false\">{\"k\":[1,0.00001,true]}</｜DSML｜ parameter><｜DSML｜ parameter name=\"b\" string=\"true\">東京</｜DSML｜ parameter>"))
+            .unwrap();
+        let Some(crate::unified::UnifiedParserEvent::ToolCall(call)) = events.first() else {
+            panic!("expected a tool call, got {events:?}");
+        };
+        assert_eq!(call.arguments, r#"{"a": {"k": [1, 1e-05, true]}, "b": "東京"}"#);
     }
 
     #[test]
     fn closed_malformed_parameter_is_an_error_at_eof() {
         for input in [
-            "<｜DSML｜ calls><｜DSML｜ invoke name=\"run\"><｜DSML｜ parameter name=\"value\" string=\"maybe\">1</｜DSML｜ parameter></｜DSML｜ invoke></｜DSML｜ calls>",
             "<｜DSML｜ calls><｜DSML｜ invoke name=\"run\"><｜DSML｜ parameter name=\"value\" string=\"false\">1</｜DSML｜ invoke></｜DSML｜ calls>",
         ] {
             for split in (0..=input.len()).filter(|&i| input.is_char_boundary(i)) {
