@@ -196,6 +196,10 @@ tokio-rustls = { version = "0.26" }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-pemfile = { version = "2" }
 
+# DeepSeek V4.1 prompt-parity fixes on top of crates.io dynamo-renderer 5.2.0.
+[patch.crates-io]
+dynamo-renderer = { path = "lib/vendor/dynamo-renderer" }
+
 [profile.dev.package]
 insta.opt-level = 3
 

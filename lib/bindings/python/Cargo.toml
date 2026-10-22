@@ -134,6 +134,10 @@ dynamo-llm = { path = "../../llm", default-features = false }
 opentelemetry_sdk = { version = "0.31.0", features = ["trace"] }
 tracing-subscriber = { version = "0.3", features = ["registry"] }
 
+# DeepSeek V4.1 prompt-parity fixes on top of crates.io dynamo-renderer 5.2.0.
+[patch.crates-io]
+dynamo-renderer = { path = "../../vendor/dynamo-renderer" }
+
 [profile.profiling]
 inherits = "release"
 debug = true
