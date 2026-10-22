@@ -116,6 +116,7 @@ impl OpenAIPreprocessor {
             // extracts, and no tool-call grammar is installed (vLLM's adjust_request and
             // Dynamo's vLLM processor both skip it). A generic JSON schema here would
             // constrain the wrong wire format and send the worker grammars it rejects.
+            drop_constraintless_guided_decoding(common_request);
             return Ok(GuidedToolConstraint::None);
         }
 
@@ -135,6 +136,7 @@ impl OpenAIPreprocessor {
             // channel. Generic JSON guided decoding would constrain the wrong
             // wire format and prevent the Rust K3 parser from seeing it. No JSON
             // schema is installed, so this is NOT a guided-JSON request.
+            drop_constraintless_guided_decoding(common_request);
             return Ok(GuidedToolConstraint::None);
         }
 
@@ -167,6 +169,22 @@ impl OpenAIPreprocessor {
         // Auto/None requests can reach here when neither structural tags nor a
         // tool-choice JSON fallback were needed.
         Ok(GuidedToolConstraint::None)
+    }
+}
+
+/// Clearing a forced choice's `response_format` JSON can leave guided decoding with
+/// no constraint at all; vLLM rejects such options ("You must use one kind of
+/// structured outputs constraint"), and the Python processor sends none.
+fn drop_constraintless_guided_decoding(common_request: &mut PreprocessedRequest) {
+    let options = &mut common_request.sampling_options.guided_decoding;
+    if options.as_ref().is_some_and(|gd| {
+        gd.json.is_none()
+            && gd.regex.is_none()
+            && gd.choice.as_ref().is_none_or(Vec::is_empty)
+            && gd.grammar.is_none()
+            && gd.structural_tag.is_none()
+    }) {
+        *options = None;
     }
 }
 
