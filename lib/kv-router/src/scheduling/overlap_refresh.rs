@@ -64,6 +64,12 @@ pub trait OverlapScoresRefresh: Send + Sync {
         block_hashes: &[LocalBlockHash],
         retain_kv_transfer_chain: bool,
     ) -> Option<RefreshedOverlap>;
+
+    /// Weight the queue re-applies to the request's shared-cache hits after a
+    /// refresh replaced its overlap signals. Zero keeps refreshed signals as-is.
+    fn shared_cache_hit_weight(&self) -> f64 {
+        0.0
+    }
 }
 
 pub struct TieredOverlapRefresher<P> {
@@ -116,6 +122,10 @@ impl<P: TieredMatchProvider> OverlapScoresRefresh for TieredOverlapRefresher<P> 
             overlap,
             kv_transfer_candidates,
         })
+    }
+
+    fn shared_cache_hit_weight(&self) -> f64 {
+        self.config.shared_cache_hit_weight
     }
 }
 

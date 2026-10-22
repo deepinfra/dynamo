@@ -4,6 +4,7 @@
 use std::{sync::Arc, time::Duration};
 
 use anyhow::Result;
+use dynamo_kv_router::SharedKvCache;
 use dynamo_kv_router::protocols::{KV_EVENT_SUBJECT, RouterEvent};
 use dynamo_runtime::{
     component::{Component, Endpoint},
@@ -414,6 +415,7 @@ pub async fn start_subscriber(
     worker_role: Option<WorkerType>,
     source_requirement: KvEventSourceRequirement,
     worker_type: &'static str,
+    shared_cache: Option<Arc<dyn SharedKvCache>>,
     cancellation_token: CancellationToken,
 ) -> Result<KvEventSubscriptionHandle> {
     let runtime = endpoint.component().drt().runtime().secondary();
@@ -447,7 +449,7 @@ pub async fn start_subscriber(
     };
     let client = WorkerQueryClient::spawn(
         endpoint.component().clone(),
-        IndexerRecoveryTarget::new(indexer),
+        IndexerRecoveryTarget::new(indexer).with_shared_cache(shared_cache),
         membership_watch.fork_receiver(),
         cancel.child_token(),
     )

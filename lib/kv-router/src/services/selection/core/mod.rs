@@ -20,7 +20,8 @@ use tracing::Instrument;
 
 use crate::identity::RoutingPartitionId;
 use crate::indexer::{
-    LowerTierQueryOptions, RoutingDecisionHashes, SharedKvCache, TieredMatchDetails,
+    LowerTierQueryOptions, RoutingDecisionHashes, SharedCacheQuery, SharedKvCache,
+    TieredMatchDetails,
 };
 use crate::kv_hints::{
     KvHint, KvHintAction, KvSourceLocationsPayload, KvTransferCandidateSource, KvTransferCandidates,

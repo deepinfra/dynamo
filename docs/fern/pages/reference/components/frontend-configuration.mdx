@@ -195,11 +195,17 @@ Configure scoring through [default policy parameters](../../developer-guide/know
 </ParamField>
 
 <ParamField path="--shared-cache-type" type="string" default="none">
-  **Experimental.** External shared KV-cache implementation.
+  **Experimental.** External shared KV-cache implementation. `mooncake-store` follows vLLM `MooncakeStoreConnector` stores and credits each worker with the store it announces.
 
-  <span className="enum-values"><span className="enum-label">Allowed values:</span> <Badge intent="note" minimal>none</Badge> <Badge intent="note" minimal>hicache</Badge></span>
+  <span className="enum-values"><span className="enum-label">Allowed values:</span> <Badge intent="note" minimal>none</Badge> <Badge intent="note" minimal>hicache</Badge> <Badge intent="note" minimal>mooncake-store</Badge></span>
 
   Environment variable: `DYN_SHARED_CACHE_TYPE`
+</ParamField>
+
+<ParamField path="--router-shared-cache-hit-weight" type="float" default="0.0">
+  **Experimental.** Weight from `0.0` through `1.0` of shared-cache hits beyond a worker's own cached prefix in its cached-token estimate, which admission and queueing use. `0` leaves shared hits to worker selection.
+
+  Environment variable: `DYN_ROUTER_SHARED_CACHE_HIT_WEIGHT`
 </ParamField>
 
 <ParamField path="--router-temperature" type="float" default="0.0">

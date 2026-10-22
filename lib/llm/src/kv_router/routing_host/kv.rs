@@ -438,6 +438,7 @@ impl RoutingHost {
             kv_route,
             selection.request_lifecycle.take(),
         );
+        guard.set_cache_prediction(selection.cache_prediction);
 
         let record_result: Result<(), Error> = async {
             if !is_query_only && chooser.indexer().records_routing_decisions() {

@@ -13,8 +13,8 @@ use anyhow::Result;
 use dynamo_kv_router::WorkerSelectionPolicy;
 use dynamo_kv_router::{
     DEFAULT_ROUTING_GROUP, KvSchedulerError, PrefillLoadEstimator, RoutingPartitionRef,
-    SessionPrefixIndexer, SharedKvCache, TrackingHashAlgorithm, TrackingHashContext,
-    TrackingHashScope, WorkerSelectionPolicyFactory,
+    SessionPrefixIndexer, SharedCacheQuery, SharedKvCache, TrackingHashAlgorithm,
+    TrackingHashContext, TrackingHashScope, WorkerSelectionPolicyFactory,
     config::{KvRouterConfig, RouterConfigOverride, min_initial_workers_from_env},
     indexer::{
         ApproximateLruIncarnation, ApproximateLruStats, KvRouterError, RoutingDecisionHashes,
@@ -23,8 +23,8 @@ use dynamo_kv_router::{
     protocols::KV_EVENT_SUBJECT,
     protocols::{
         BlockExtraInfo, BlockHashOptions, PrefillLoadHint, RouterEvent, RouterRequest,
-        RouterResponse, RoutingConstraints, TokensWithHashes, WorkerConfigLike, WorkerId,
-        WorkerWithDpRank, compute_block_hash_for_seq,
+        RouterResponse, RoutingConstraints, SharedCacheHits, TokensWithHashes, WorkerConfigLike,
+        WorkerId, WorkerWithDpRank, compute_block_hash_for_seq,
     },
     scheduling::{
         CacheHitEstimates, OverlapAnalysis, OverloadedWorkerProvider, PotentialLoad,
@@ -465,10 +465,55 @@ pub enum FindBestMatchOutcome {
         potential_decode_blocks: u64,
         routing_hashes: Option<RoutingDecisionHashes>,
         kv_hint: Option<KvHint>,
+        /// Set when a shared cache answered the lookup; compared with the
+        /// worker-reported cached tokens once the response arrives.
+        cache_prediction: Option<CachePrediction>,
     },
     QueueRejected {
         rejection: scheduling::QueueRejection,
     },
+}
+
+/// The router's cached-token prediction for the selected worker, with and
+/// without the shared-cache hits that worker can load, independent of the
+/// admission weight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CachePrediction {
+    pub isl_tokens: usize,
+    /// Device and per-worker lower tiers only (weighted like admission).
+    pub without_shared: usize,
+    /// Plus every shared hit beyond the worker's own tiered prefix at full weight.
+    pub with_shared: usize,
+}
+
+impl CachePrediction {
+    /// `effective_overlap_blocks` is the selected worker's accounting estimate,
+    /// which already includes `shared_cache_hit_weight` x the shared blocks
+    /// beyond `tiered_prefix_blocks`. `shared_hits` is that worker's own view
+    /// ([`SharedCacheHits::for_worker`]).
+    pub fn for_selection(
+        isl_tokens: usize,
+        block_size: u32,
+        effective_overlap_blocks: f64,
+        tiered_prefix_blocks: u32,
+        shared_hits: &SharedCacheHits,
+        shared_cache_hit_weight: f64,
+    ) -> Self {
+        let shared_blocks = shared_hits.hits_beyond(tiered_prefix_blocks) as f64;
+        let weight = if shared_cache_hit_weight > 0.0 {
+            shared_cache_hit_weight
+        } else {
+            0.0
+        };
+        let base_blocks = (effective_overlap_blocks - weight * shared_blocks).max(0.0);
+        let tokens =
+            |blocks: f64| ((blocks * block_size as f64).round().max(0.0) as usize).min(isl_tokens);
+        Self {
+            isl_tokens,
+            without_shared: tokens(base_blocks),
+            with_shared: tokens(base_blocks + shared_blocks),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -764,6 +809,7 @@ impl KvRouter {
             kv_source_membership,
             cancellation_token: cancellation_token.clone(),
             session_prefix_index: session_prefix_index.clone(),
+            shared_cache: shared_cache.clone(),
         })
         .await?;
         let indexer = ingress.indexer().clone();
@@ -1490,8 +1536,12 @@ impl KvRouter {
                     total_elapsed,
                 );
             }
-            if let (Some(hits), Some(m)) = (shared_cache_hits, metrics::RouterRequestMetrics::get())
-            {
+            if let (Some(hits), Some(m)) = (
+                shared_cache_hits
+                    .as_ref()
+                    .map(|hits| hits.for_worker(response.best_worker.worker_id)),
+                metrics::RouterRequestMetrics::get(),
+            ) {
                 let num_blocks = isl_tokens / self.block_size as usize;
                 if num_blocks > 0 {
                     m.shared_cache_hit_rate
@@ -1509,6 +1559,16 @@ impl KvRouter {
             !is_admitted_routing,
             "advisory load is set exactly for without-admission selection"
         );
+        let cache_prediction = shared_cache_hits.as_ref().map(|hits| {
+            CachePrediction::for_selection(
+                isl_tokens,
+                self.block_size,
+                response.effective_overlap_blocks,
+                response.selected_worker_tiers.disk_blocks,
+                hits.for_worker(response.best_worker.worker_id),
+                self.kv_router_config.shared_cache_hit_weight,
+            )
+        });
         Ok(AdmittedFindBestMatchOutcome {
             outcome: FindBestMatchOutcome::Routed {
                 worker: response.best_worker,
@@ -1520,6 +1580,7 @@ impl KvRouter {
                 potential_decode_blocks: response.potential_decode_blocks as u64,
                 routing_hashes,
                 kv_hint,
+                cache_prediction,
             },
             booking,
             advisory_load,
@@ -1813,12 +1874,20 @@ impl KvRouter {
         let block_hashes = compute_block_hash_for_seq(tokens, self.block_size, hash_options);
         let num_blocks = block_hashes.len();
 
-        let tiered_matches = self.indexer.find_matches_by_tier(block_hashes).await?;
+        let tiered_matches = self
+            .indexer
+            .find_matches_by_tier(block_hashes.clone())
+            .await?;
 
         let (shared_hits, shared_error) = if include_shared {
             if let Some(shared_cache) = self.shared_cache.as_ref() {
                 match shared_cache
-                    .check_blocks(tokens, self.block_size, cache_namespace)
+                    .check_blocks(SharedCacheQuery {
+                        tokens,
+                        block_hashes: &block_hashes,
+                        block_size: self.block_size,
+                        cache_namespace,
+                    })
                     .await
                 {
                     Ok(hits) => (Some(hits), None),
@@ -2151,9 +2220,7 @@ mod tests {
     impl SharedKvCache for FakeSharedCache {
         async fn check_blocks(
             &self,
-            _tokens: &[u32],
-            _block_size: u32,
-            _cache_namespace: Option<&str>,
+            _query: SharedCacheQuery<'_>,
         ) -> Result<dynamo_kv_router::protocols::SharedCacheHits, KvRouterError> {
             if self.should_error {
                 Err(KvRouterError::IndexerOffline)
@@ -3658,5 +3725,42 @@ mod tests {
         prefill.override_discovered_instances(vec![PREFILL_WORKER, PREFILL_PEER]);
         let available = prefill.available_instance_ids().unwrap();
         assert!(validate(available.as_ref(), PREFILL_WORKER).is_ok());
+    }
+
+    #[test]
+    fn cache_prediction_separates_shared_hits_from_admission_weight() {
+        #[allow(clippy::single_range_in_vec_init)]
+        let shared = SharedCacheHits::from_ranges(vec![0..10]);
+
+        // Observe-only: the admission estimate holds 2 own blocks; the shared
+        // store adds 8 blocks beyond them.
+        let observe_only = CachePrediction::for_selection(1000, 64, 2.0, 2, &shared, 0.0);
+        assert_eq!(observe_only.without_shared, 128);
+        assert_eq!(observe_only.with_shared, 640);
+
+        // With weight 0.5 the estimate already holds half the shared blocks;
+        // the prediction pair is unchanged.
+        let weighted = CachePrediction::for_selection(1000, 64, 6.0, 2, &shared, 0.5);
+        assert_eq!(weighted, observe_only);
+
+        // Predictions never exceed the prompt.
+        let short = CachePrediction::for_selection(300, 64, 2.0, 2, &shared, 0.0);
+        assert_eq!(short.with_shared, 300);
+    }
+
+    /// A GPU-cold worker whose store holds a 143-block prefix is predicted to
+    /// load all of it; a worker with another store is predicted to load nothing.
+    #[test]
+    fn cache_prediction_uses_the_selected_workers_hits() {
+        #[allow(clippy::single_range_in_vec_init)]
+        let scoped = SharedCacheHits::scoped(
+            SharedCacheHits::default(),
+            [(1, SharedCacheHits::from_ranges(vec![0..143]))],
+        );
+        let near = CachePrediction::for_selection(9300, 64, 0.0, 0, scoped.for_worker(1), 0.0);
+        assert_eq!(near.with_shared, 9152);
+        assert_eq!(near.without_shared, 0);
+        let far = CachePrediction::for_selection(9300, 64, 0.0, 0, scoped.for_worker(2), 0.0);
+        assert_eq!(far.with_shared, 0);
     }
 }

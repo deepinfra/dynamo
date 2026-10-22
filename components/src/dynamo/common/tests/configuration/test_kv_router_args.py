@@ -1050,6 +1050,68 @@ def test_shared_cache_weight_default_is_left_to_the_policy(
     assert kwargs["shared_cache_multiplier"] is None
 
 
+@pytest.mark.parametrize("source", ["default", "cli", "env", "yaml"])
+def test_mooncake_store_shared_cache_and_hit_weight_flow_to_binding_kwargs(
+    monkeypatch, tmp_path, source
+):
+    for name in (
+        "DYN_SHARED_CACHE_MULTIPLIER",
+        "DYN_SHARED_CACHE_TYPE",
+        "DYN_ROUTER_SHARED_CACHE_HIT_WEIGHT",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    args = []
+    if source == "cli":
+        args = [
+            "--shared-cache-type",
+            "mooncake-store",
+            "--router-shared-cache-hit-weight",
+            "0.5",
+        ]
+    elif source == "env":
+        monkeypatch.setenv("DYN_SHARED_CACHE_TYPE", "mooncake-store")
+        monkeypatch.setenv("DYN_ROUTER_SHARED_CACHE_HIT_WEIGHT", "0.5")
+    elif source == "yaml":
+        path = tmp_path / "policy.yaml"
+        path.write_text(
+            "router:\n  shared_cache_type: mooncake-store\n"
+            "  shared_cache_hit_weight: 0.5\n"
+        )
+        args = ["--router-policy-config", str(path)]
+    parser = argparse.ArgumentParser()
+    KvRouterArgGroup().add_arguments(parser)
+    kwargs = KvRouterConfigBase.from_cli_args(
+        parser.parse_args(args)
+    ).kv_router_kwargs()
+    if source == "default":
+        # Off unless configured.
+        assert kwargs["shared_cache_type"] == "none"
+        assert kwargs["shared_cache_hit_weight"] == 0.0
+    else:
+        assert kwargs["shared_cache_type"] == "mooncake-store"
+        assert kwargs["shared_cache_hit_weight"] == 0.5
+    # The selection credit stays with the policy default.
+    assert kwargs["shared_cache_multiplier"] is None
+
+
+def test_load_aware_clears_shared_cache_hit_weight() -> None:
+    parser = argparse.ArgumentParser()
+    KvRouterArgGroup().add_arguments(parser)
+    kwargs = KvRouterConfigBase.from_cli_args(
+        parser.parse_args(
+            [
+                "--load-aware",
+                "--shared-cache-type",
+                "mooncake-store",
+                "--router-shared-cache-hit-weight",
+                "1.0",
+            ]
+        )
+    ).kv_router_kwargs()
+    assert kwargs["shared_cache_type"] == "none"
+    assert kwargs["shared_cache_hit_weight"] == 0.0
+
+
 def test_no_load_aware_overrides_deprecated_environment(monkeypatch):
     monkeypatch.setenv("DYN_ROUTER_LOAD_AWARE", "true")
     parser = argparse.ArgumentParser()

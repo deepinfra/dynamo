@@ -1864,6 +1864,7 @@ class KvRouterConfig:
         enable_session_prefix_index: bool = False,
         shared_cache_multiplier: Optional[float] = None,
         shared_cache_type: str = "none",
+        shared_cache_hit_weight: float = 0.0,
         router_predicted_ttl_secs: Optional[float] = None,
         conditional_disagg_enabled: bool = False,
         conditional_disagg_policy: str = "isl_bounding",
@@ -1941,7 +1942,9 @@ class KvRouterConfig:
                 The index neither holds nor restores KV cache, so a match is a routing hint rather than a guarantee that the blocks are still resident.
                 The index retains at most 16,384 least-recently-used sessions and opportunistically reclaims unreferenced logical leaves.
             shared_cache_multiplier: Deprecated; set this in the default policy parameters. Omitted values use the policy default (0.5 when shared cache is enabled).
-            shared_cache_type: External shared KV cache type, "none" or "hicache" (default: "none").
+            shared_cache_type: External shared KV cache type, "none", "hicache", or "mooncake-store" (default: "none").
+                "mooncake-store" follows vLLM MooncakeStoreConnector stores through their masters' KV events and credits each worker only with the store it announces.
+            shared_cache_hit_weight: Weight of shared-cache hits beyond a worker's own tiered prefix in the admission estimate (effective cached tokens), 0.0-1.0 (default: 0.0).
             conditional_disagg_enabled: Enable conditional-disagg bypass from prefill to decode (default: False).
             conditional_disagg_policy: Conditional-disagg policy, one of "isl_bounding", "prefill_load", or "isl_or_load" (default: "isl_bounding").
             conditional_disagg_eff_isl_threshold: For "isl_bounding" and the ISL arm of "isl_or_load", require effective ISL to be below this many tokens (default: 2048).

@@ -684,6 +684,8 @@ struct CapturingPicker {
 struct SelectionObservation {
     session_context: Option<SessionContext>,
     shared_beyond_device_blocks: Vec<u32>,
+    /// Candidate workers, index-aligned with `shared_beyond_device_blocks`.
+    workers: Vec<WorkerId>,
 }
 
 impl crate::scheduling::selector::WorkerPicker for CapturingPicker {
@@ -707,6 +709,11 @@ impl crate::scheduling::selector::WorkerPicker for CapturingPicker {
                         hits.hits_beyond(cache.device_overlap_blocks().round().max(0.0) as u32)
                     })
                 })
+                .collect(),
+            workers: input
+                .candidates()
+                .iter()
+                .map(|candidate| candidate.worker().worker_id)
                 .collect(),
         });
         Ok(0)
@@ -777,16 +784,14 @@ struct RecordingSharedCache {
 impl SharedKvCache for RecordingSharedCache {
     async fn check_blocks(
         &self,
-        tokens: &[u32],
-        block_size: u32,
-        cache_namespace: Option<&str>,
+        query: SharedCacheQuery<'_>,
     ) -> Result<SharedCacheHits, crate::indexer::KvRouterError> {
         self.calls.lock().push((
-            tokens.to_vec(),
-            block_size,
-            cache_namespace.map(str::to_string),
+            query.tokens.to_vec(),
+            query.block_size,
+            query.cache_namespace.map(str::to_string),
         ));
-        let blocks = (tokens.len() / block_size as usize) as u32;
+        let blocks = (query.tokens.len() / query.block_size as usize) as u32;
         Ok(SharedCacheHits::from_hits(&vec![true; blocks as usize]))
     }
 }
@@ -845,9 +850,7 @@ async fn shutdown_interrupts_shared_cache_wait(#[case] shutdown: bool) {
     impl SharedKvCache for PausedSharedCache {
         async fn check_blocks(
             &self,
-            _: &[u32],
-            _: u32,
-            _: Option<&str>,
+            _: SharedCacheQuery<'_>,
         ) -> Result<SharedCacheHits, crate::indexer::KvRouterError> {
             self.entered.notify_one();
             self.release.notified().await;
@@ -956,6 +959,113 @@ async fn shared_cache_hits_reach_worker_selection() {
     core.select(request).await.expect("select");
     assert_eq!(calls.lock().len(), 1);
     assert_eq!(observed.lock()[1].shared_beyond_device_blocks, vec![0]);
+}
+
+/// Shared hits feed the admission estimate only through `shared_cache_hit_weight`.
+#[tokio::test]
+async fn shared_cache_hit_weight_scales_admission_estimate() {
+    async fn effective_prefill(weight: f64) -> (usize, usize) {
+        let calls: SharedCacheCalls = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let core = core_with(
+            crate::config::KvRouterConfig {
+                shared_cache_hit_weight: weight,
+                ..test_config(false)
+            },
+            SelectionHost {
+                cache: HostCache {
+                    shared: Some(Arc::new(RecordingSharedCache {
+                        calls: Arc::clone(&calls),
+                    })),
+                    ..HostCache::default()
+                },
+                ..SelectionHost::default()
+            },
+            None,
+            WorkerType::Aggregated,
+            None,
+        );
+        core.upsert_worker(worker(1)).await.expect("worker upsert");
+        let mut request = select_request();
+        // Two full blocks and a partial one: the shared cache holds both blocks.
+        request.prompt.token_ids = Some(vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        let response = core.select(request).await.expect("select");
+        assert_eq!(calls.lock().len(), 1);
+        (
+            response.effective_prefill_tokens,
+            response.isl_tokens.unwrap_or(9),
+        )
+    }
+
+    // Weight 0 (default): observe-only, the whole prompt counts as uncached.
+    assert_eq!(effective_prefill(0.0).await, (9, 9));
+    // Weight 1: both shared blocks count as cached.
+    assert_eq!(effective_prefill(1.0).await, (1, 9));
+    // Weight 0.5: half of each shared block.
+    assert_eq!(effective_prefill(0.5).await, (5, 9));
+}
+
+/// A partitioned cache answers per worker: worker 2's store holds the prompt,
+/// worker 1's store holds nothing.
+struct ScopedSharedCache;
+
+#[async_trait::async_trait]
+impl SharedKvCache for ScopedSharedCache {
+    async fn check_blocks(
+        &self,
+        query: SharedCacheQuery<'_>,
+    ) -> Result<SharedCacheHits, crate::indexer::KvRouterError> {
+        let blocks = query.tokens.len() / query.block_size as usize;
+        Ok(SharedCacheHits::scoped(
+            SharedCacheHits::default(),
+            [(2, SharedCacheHits::from_hits(&vec![true; blocks]))],
+        ))
+    }
+}
+
+#[tokio::test]
+async fn scoped_shared_hits_reach_only_their_workers() {
+    let (factory, observed) = capturing_policy_factory();
+    let core = core_with(
+        crate::config::KvRouterConfig {
+            shared_cache_hit_weight: 1.0,
+            ..test_config(false)
+        },
+        SelectionHost {
+            cache: HostCache {
+                shared: Some(Arc::new(ScopedSharedCache)),
+                ..HostCache::default()
+            },
+            ..SelectionHost::default()
+        },
+        Some(factory),
+        WorkerType::Aggregated,
+        None,
+    );
+    core.upsert_worker(worker(1)).await.expect("worker upsert");
+    core.upsert_worker(worker(2)).await.expect("worker upsert");
+
+    let mut request = select_request();
+    request.prompt.token_ids = Some(vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    core.select(request).await.expect("select");
+    let observation = observed.lock()[0].clone();
+    let by_worker: HashMap<WorkerId, u32> = observation
+        .workers
+        .iter()
+        .copied()
+        .zip(observation.shared_beyond_device_blocks.iter().copied())
+        .collect();
+    // Selection credit inputs: only worker 2 can load the store's blocks.
+    assert_eq!(by_worker, HashMap::from([(1, 0), (2, 2)]));
+
+    // Admission estimate: the same scoping applies to the cached-token credit.
+    for (worker_id, expected_prefill) in [(1, 9), (2, 1)] {
+        let mut request = select_request();
+        request.prompt.token_ids = Some(vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        request.pinned_worker = Some(WorkerWithDpRank::new(worker_id, 0));
+        let response = core.select(request).await.expect("select");
+        assert_eq!(response.worker_id, worker_id);
+        assert_eq!(response.effective_prefill_tokens, expected_prefill);
+    }
 }
 
 #[tokio::test]

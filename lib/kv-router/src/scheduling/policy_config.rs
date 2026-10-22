@@ -269,6 +269,7 @@ impl RouterSettings {
             serve_indexer,
             enable_session_prefix_index,
             shared_cache_type,
+            shared_cache_hit_weight,
             router_predicted_ttl_secs,
         );
         Ok(())

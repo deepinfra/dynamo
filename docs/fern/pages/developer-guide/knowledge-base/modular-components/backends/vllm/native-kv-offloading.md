@@ -23,7 +23,7 @@ Status legend: ✅ validated end to end · ⚠️ available but not yet validate
 | Tensor parallelism (TP > 1) | ✅ | Validated with TP=2, including GPU eviction, CPU reload, and one event stream per engine. |
 | Models with sliding-window or Mamba/SSM layers | ✅ | Validated with Gemma-2 and Falcon-H1. The router sees only full-attention KV cache groups. |
 | Disk and multi-tier offloading (`TieringOffloadingSpec`) | ⚠️ | vLLM main emits a unified `STORAGE` medium (FS/OBJ media removed in [vLLM #48123](https://github.com/vllm-project/vllm/pull/48123)); Dynamo maps `STORAGE` to the Disk lower tier. Cache-salted requests: see [Known Limitations](#known-limitations). |
-| Shared-pool routing | 🚧 | Dynamo consumes per-event locality (`LOCAL` or absent → worker-local; `REMOTE` or unknown → dropped). A shared-pool index is still planned. |
+| Shared-pool routing | 🚧 | Dynamo consumes per-event locality (`LOCAL` or absent → worker-local; `REMOTE` or unknown → dropped). A shared-pool index for these events is still planned. vLLM's `MooncakeStoreConnector` is covered by the [Mooncake store shared cache](../../router/offloading-support-matrix.md#mooncake-store-shared-cache). |
 
 ## Requirements
 

@@ -35,7 +35,7 @@ use dynamo_runtime::{
 use crate::{
     kv_router::{
         KvEventSourceRequirement, KvRouter, SelectionPolicySource,
-        shared_cache::HicacheSharedKvCache,
+        shared_cache::{HicacheSharedKvCache, MooncakeStoreMetrics, MooncakeStoreSharedKvCache},
     },
     local_model::runtime_config::{
         DisaggregatedEndpoint, ModelRuntimeConfig, VLLM_INFERENCE_V1_GENERATE_CAPABILITY,
@@ -183,6 +183,9 @@ pub struct ModelManager {
     /// Per-endpoint HiCache state and its one Mooncake event subscriber.
     hicache_caches: DashMap<EndpointId, HicacheSharedKvCache>,
 
+    /// Per-endpoint Mooncake stores of vLLM workers and their event subscribers.
+    mooncake_store_caches: DashMap<EndpointId, MooncakeStoreSharedKvCache>,
+
     /// Shared KV-source membership coordinators, scoped by exact serving endpoint.
     /// Weak ownership lets the discovery loop stop when its last consumer goes away.
     kv_source_memberships: DashMap<EndpointId, Weak<KvSourceMembershipCoordinator>>,
@@ -283,6 +286,7 @@ impl ModelManager {
             worker_inventory: Default::default(),
             runtime_configs: DashMap::new(),
             hicache_caches: DashMap::new(),
+            mooncake_store_caches: DashMap::new(),
             kv_source_memberships: DashMap::new(),
             lora_domains: DashMap::new(),
             committed_lora_endpoints: parking_lot::Mutex::new(HashSet::new()),
@@ -2073,6 +2077,24 @@ impl ModelManager {
             .clone()
     }
 
+    fn mooncake_store_cache_for(
+        &self,
+        endpoint: &Endpoint,
+        runtime_configs: RuntimeConfigWatch,
+    ) -> MooncakeStoreSharedKvCache {
+        self.mooncake_store_caches
+            .entry(endpoint.id())
+            .or_insert_with(|| {
+                let cache = MooncakeStoreSharedKvCache::new(
+                    MooncakeStoreMetrics::from_component(endpoint.component()),
+                    endpoint.component().drt().child_token(),
+                );
+                cache.start(runtime_configs);
+                cache
+            })
+            .clone()
+    }
+
     pub fn remove_hicache_caches(&self, namespace: &str, component: &str) {
         let endpoint_ids = self
             .hicache_caches
@@ -2360,6 +2382,16 @@ impl ModelManager {
                     Some(Arc::new(
                         self.hicache_cache_for(&endpoint, workers_with_configs.clone()),
                     ))
+                }
+                dynamo_kv_router::SharedCacheType::MooncakeStore => {
+                    tracing::info!(
+                        worker_component = %endpoint.id().component,
+                        "Using vLLM Mooncake store shared KV cache"
+                    );
+                    Some(Arc::new(self.mooncake_store_cache_for(
+                        &endpoint,
+                        workers_with_configs.clone(),
+                    )))
                 }
             }
         } else {

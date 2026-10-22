@@ -4,7 +4,7 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::ops::Range;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use dynamo_tokens::{SequenceHash, Token, compute_hash_v2, compute_next_sequence_hash};
@@ -1654,20 +1654,83 @@ impl RouterEvent {
 /// Using ranges instead of `Vec<bool>` avoids iterating over potentially thousands
 /// of blocks per worker. Typical shared cache patterns produce few contiguous regions,
 /// making `hits_beyond` O(num_ranges) ~ O(1-5).
+///
+/// A cache whose stores only some workers can load from (for example one store
+/// per node) answers per worker through `by_worker`; read a worker's view with
+/// [`SharedCacheHits::for_worker`].
 #[derive(Debug, Clone, Default)]
 pub struct SharedCacheHits {
     /// Ranges of block positions that exist in the shared cache.
     /// Half-open ranges [start, end), sorted and non-overlapping.
+    /// With `by_worker` set, these are the hits of every worker not listed there.
     pub ranges: Vec<Range<u32>>,
     /// Total number of hits (sum of range lengths).
     pub total_hits: u32,
+    /// Per-worker hits of a worker-scoped cache. `None`: one pool every worker
+    /// reaches, so every worker sees `ranges`. Entries are never scoped themselves.
+    pub by_worker: Option<Arc<FxHashMap<WorkerId, SharedCacheHits>>>,
 }
 
 impl SharedCacheHits {
     /// Create from sorted, non-overlapping ranges.
     pub fn from_ranges(ranges: Vec<Range<u32>>) -> Self {
         let total_hits = ranges.iter().map(|r| r.end - r.start).sum();
-        Self { ranges, total_hits }
+        Self {
+            ranges,
+            total_hits,
+            by_worker: None,
+        }
+    }
+
+    /// Hits that differ per worker: a listed worker sees its own entry, every
+    /// other worker sees `fallback`. Nested scopes in the entries are dropped.
+    pub fn scoped(
+        fallback: SharedCacheHits,
+        by_worker: impl IntoIterator<Item = (WorkerId, SharedCacheHits)>,
+    ) -> Self {
+        let by_worker: FxHashMap<WorkerId, SharedCacheHits> = by_worker
+            .into_iter()
+            .map(|(worker_id, hits)| (worker_id, hits.unscoped()))
+            .collect();
+        Self {
+            by_worker: Some(Arc::new(by_worker)),
+            ..fallback.unscoped()
+        }
+    }
+
+    /// Whether some workers see different hits than others.
+    pub fn is_scoped(&self) -> bool {
+        self.by_worker.is_some()
+    }
+
+    /// The hits `worker_id` can load from the shared cache.
+    pub fn for_worker(&self, worker_id: WorkerId) -> &SharedCacheHits {
+        self.by_worker
+            .as_deref()
+            .and_then(|by_worker| by_worker.get(&worker_id))
+            .unwrap_or(self)
+    }
+
+    /// The view with the most hits, for summaries that are not about one worker.
+    pub fn widest(&self) -> &SharedCacheHits {
+        self.by_worker
+            .as_deref()
+            .into_iter()
+            .flat_map(|by_worker| by_worker.values())
+            .fold(self, |widest, hits| {
+                if hits.total_hits > widest.total_hits {
+                    hits
+                } else {
+                    widest
+                }
+            })
+    }
+
+    fn unscoped(self) -> Self {
+        Self {
+            by_worker: None,
+            ..self
+        }
     }
 
     /// Create from a boolean hit vector (convenience for tests and simple backends).
@@ -2544,6 +2607,40 @@ mod tests {
         assert_eq!(hits.hits_beyond(6), 2);
         // from_position=8 => nothing
         assert_eq!(hits.hits_beyond(8), 0);
+    }
+
+    #[test]
+    #[allow(clippy::single_range_in_vec_init)]
+    fn test_shared_cache_hits_scoped_per_worker() {
+        let pool = SharedCacheHits::from_ranges(vec![0..4]);
+        assert!(!pool.is_scoped());
+        // An unscoped pool answers every worker with the same hits.
+        assert_eq!(pool.for_worker(1).total_hits, 4);
+        assert_eq!(pool.for_worker(2).total_hits, 4);
+        assert_eq!(pool.widest().total_hits, 4);
+
+        let nested = SharedCacheHits::scoped(
+            SharedCacheHits::default(),
+            [(9, SharedCacheHits::from_ranges(vec![0..1]))],
+        );
+        let scoped = SharedCacheHits::scoped(
+            SharedCacheHits::default(),
+            [
+                (1, SharedCacheHits::from_ranges(vec![0..6])),
+                (2, SharedCacheHits::from_ranges(vec![0..2])),
+                (3, nested),
+            ],
+        );
+        assert!(scoped.is_scoped());
+        assert_eq!(scoped.total_hits, 0);
+        assert_eq!(scoped.for_worker(1).total_hits, 6);
+        assert_eq!(scoped.for_worker(1).hits_beyond(4), 2);
+        assert_eq!(scoped.for_worker(2).hits_beyond(0), 2);
+        // Unlisted workers see the fallback.
+        assert_eq!(scoped.for_worker(7).total_hits, 0);
+        // Entries are flattened: a worker's view is never scoped again.
+        assert!(!scoped.for_worker(3).is_scoped());
+        assert_eq!(scoped.widest().ranges, vec![0..6]);
     }
 
     #[test]

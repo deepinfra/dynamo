@@ -53,6 +53,7 @@ _ROUTER_SETTINGS = (
     "serve_indexer",
     "enable_session_prefix_index",
     "shared_cache_type",
+    "shared_cache_hit_weight",
     "router_predicted_ttl_secs",
 )
 
@@ -106,6 +107,7 @@ _LOAD_AWARE_KWARG_OVERRIDES = {
     "serve_indexer": False,
     "shared_cache_multiplier": 0.0,
     "shared_cache_type": "none",
+    "shared_cache_hit_weight": 0.0,
     "router_predicted_ttl_secs": None,
 }
 
@@ -205,6 +207,7 @@ class KvRouterConfigBase(ConfigBase):
     enable_session_prefix_index: bool = False
     shared_cache_multiplier: Optional[float] = None
     shared_cache_type: str = "none"
+    shared_cache_hit_weight: float = 0.0
     conditional_disagg_enabled: bool = False
     conditional_disagg_config: Optional[dict[str, Any]] = None
     conditional_disagg_policy: str = "isl_bounding"
@@ -739,10 +742,28 @@ class KvRouterArgGroup(ArgGroup):
                 "[EXPERIMENTAL] KV Router: Type of external shared KV cache to query. "
                 "'none' (default): disabled. "
                 "'hicache': query Mooncake master directly for SGLang L3 (HiCache) state "
-                "using SGLang-compatible Mooncake key derivation."
+                "using SGLang-compatible Mooncake key derivation. "
+                "'mooncake-store': follow the Mooncake stores of vLLM's "
+                "MooncakeStoreConnector through their masters' KV events; each worker is "
+                "credited only with the store it announces (DYN_MOONCAKE_KV_EVENTS_ENDPOINT "
+                "on the worker)."
             ),
             arg_type=str,
-            choices=["none", "hicache"],
+            choices=["none", "hicache", "mooncake-store"],
+        )
+        add_argument(
+            g,
+            flag_name="--router-shared-cache-hit-weight",
+            env_var="DYN_ROUTER_SHARED_CACHE_HIT_WEIGHT",
+            default=0.0,
+            help=(
+                "[EXPERIMENTAL] KV Router: Weight (0.0-1.0) of shared-cache hits beyond a "
+                "worker's own cached prefix in the admission estimate (effective cached "
+                "tokens used by cache buckets, queue ordering and prefill-load booking). "
+                "Default 0.0: shared hits affect worker selection only."
+            ),
+            arg_type=float,
+            dest="shared_cache_hit_weight",
         )
         add_argument(
             g,

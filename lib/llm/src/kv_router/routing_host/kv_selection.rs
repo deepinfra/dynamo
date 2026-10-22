@@ -18,7 +18,9 @@ use dynamo_kv_router::{
 use dynamo_runtime::{dynamo_nvtx_range, pipeline::Error};
 
 use crate::{
-    kv_router::{FindBestMatchAdmission, FindBestMatchOutcome, routing_host::RoutingHost},
+    kv_router::{
+        CachePrediction, FindBestMatchAdmission, FindBestMatchOutcome, routing_host::RoutingHost,
+    },
     preprocessor::PreprocessedRequest,
     protocols::{
         TokenIdType,
@@ -42,6 +44,7 @@ pub(super) struct WorkerSelection {
     pub(super) routing_hashes: Option<RoutingDecisionHashes>,
     pub(super) kv_hint: Option<KvHint>,
     pub(super) request_lifecycle: Option<Box<RequestLifecycle>>,
+    pub(super) cache_prediction: Option<CachePrediction>,
 }
 
 // Transient return value; `Routed` is moved into `WorkerSelection` right away.
@@ -141,6 +144,7 @@ impl RoutingHost {
                 potential_decode_blocks,
                 routing_hashes,
                 kv_hint,
+                cache_prediction,
             } => Ok(SelectionOutcome::Routed(WorkerSelection {
                 worker,
                 booking: admitted.booking,
@@ -154,6 +158,7 @@ impl RoutingHost {
                 routing_hashes,
                 kv_hint,
                 request_lifecycle: None,
+                cache_prediction,
             })),
             FindBestMatchOutcome::QueueRejected { rejection } => {
                 Ok(SelectionOutcome::QueueRejected(rejection))

@@ -13,7 +13,7 @@ Legend: ✅ tier-aware routing · ⚠️ available but not fully validated · �
 
 | Framework | Version gates | GPU | CPU RAM | Disk | Shared pool |
 | --- | --- | --- | --- | --- | --- |
-| [**vLLM**](#vllm) | vLLM v0.24.0+; Dynamo v1.3.0+ | ✅ KV events | ✅ `OffloadingConnector` + self-describing KV events (aggregated) | ⚠️ Unified `STORAGE` events map to the Disk tier with locality gating; available but not fully validated | 🚧 Remote locality is dropped; shared-pool indexing is still planned |
+| [**vLLM**](#vllm) | vLLM v0.24.0+; Dynamo v1.3.0+ | ✅ KV events | ✅ `OffloadingConnector` + self-describing KV events (aggregated) | ⚠️ Unified `STORAGE` events map to the Disk tier with locality gating; available but not fully validated | ⚠️ `MooncakeStoreConnector` + Mooncake master KV events + `--shared-cache-type mooncake-store`; available but not fully validated |
 | [**SGLang**](#sglang) | SGLang v0.5.11+; v0.5.13+ with Mooncake; Dynamo v1.2+ | ✅ KV events | ✅ HiCache + KV events | — no separate disk tier; HiCache's third tier is the shared pool (next column) | ✅ HiCache + Mooncake + `--shared-cache-type hicache` |
 | [**TensorRT-LLM**](#tensorrt-llm) | Dynamo v1.3.0+ for the current event flag | 🟡 `--publish-kv-events`; merged GPU + RAM view | 🟡 native host cache shares one router view with GPU; per-tier weights do not apply | — no native disk tier | — |
 
@@ -62,10 +62,36 @@ PYTHONHASHSEED=0 python3 -m dynamo.vllm \
 
 - Versions: vLLM v0.24.0 or later. Earlier versions publish placeholder CPU events that the router silently drops — offloading still works engine-side, but the router only sees the GPU tier.
 - Disk and multi-tier offloading (`TieringOffloadingSpec`): vLLM emits a unified `STORAGE` medium. Dynamo maps worker-local `STORAGE` events to the Disk tier. The path is available but not yet fully validated.
-- Shared pools: `LOCAL` or absent locality remains worker-local; `REMOTE` or unknown locality is dropped. Dynamo does not yet build a shared-pool index from these events.
+- Shared pools: `LOCAL` or absent locality remains worker-local; `REMOTE` or unknown locality is dropped. For vLLM's `MooncakeStoreConnector`, use the [Mooncake store shared cache](#mooncake-store-shared-cache).
 - Cache-salted requests do not currently reuse `STORAGE`-tier entries for routing because those events omit the extra cache-namespace keys. See [Known Limitations](../backends/vllm/native-kv-offloading.md#known-limitations).
 
 See [Native KV Offloading](../backends/vllm/native-kv-offloading.md) for the full support matrix (including disaggregated and tensor-parallel status), setup commands, verification, and troubleshooting.
+
+### Mooncake store shared cache
+
+vLLM's `MooncakeStoreConnector` saves prompt chunks into a Mooncake store, and every worker using that store can load them. With `--shared-cache-type mooncake-store`, the router credits each worker with the leading chunks of a prompt that its own store holds. Workers share hits exactly when they announce the same store, so one store per node, per rack, or per deployment all work.
+
+1. Build the Mooncake master with `-DENABLE_KV_EVENTS=ON` and start it with KV events:
+
+   ```bash
+   mooncake_master --enable_kv_events --kv_events_bind_endpoint=tcp://0.0.0.0:5558 \
+     --kv_events_backend_id=store-a ...
+   ```
+
+2. On each vLLM worker, announce the store's event endpoint as the frontend reaches it, and publish KV events (the router learns vLLM's block hashes from them):
+
+   ```bash
+   DYN_MOONCAKE_KV_EVENTS_ENDPOINT=tcp://mooncake-master-a:5558 PYTHONHASHSEED=0 python3 -m dynamo.vllm \
+     --model Qwen/Qwen3-0.6B \
+     --kv-transfer-config '{"kv_connector":"MooncakeStoreConnector","kv_role":"kv_both"}' \
+     --kv-events-config '{"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:20080","enable_kv_cache_events":true}'
+   ```
+
+3. Start the frontend with `--router-mode kv --shared-cache-type mooncake-store`. Store hits beyond a worker's device-local prefix earn the selection credit `shared_cache_multiplier` (default `0.5`). `--router-shared-cache-hit-weight` (default `0`) also counts hits beyond the worker's own cached prefix in the cached-token estimate that admission and queueing use.
+
+The router learns a store's contents from its master's events only. After the frontend connects or reconnects to a master, or misses an event batch, chunks stored earlier count again once they are stored again. The connector's chunk size must equal the KV block size, which is its default.
+
+To verify, watch `router_mooncake_store_chunks`, `router_mooncake_store_chain_links`, and `router_mooncake_store_lookup_stops_total` on the frontend. A rising `reason="unlinked"` count means the router has not seen the GPU stores of those prefixes yet. `router_cache_prediction_tokens_total` compares the router's predicted cached tokens with the cached tokens the workers report.
 
 ## SGLang
 
@@ -140,6 +166,7 @@ These flags only affect routing. Values range from 0 to 1: 0 ignores lower-tier 
 | `--router-host-cache-hit-weight` | `0.75` | Credit for each matched host-pinned block |
 | `--router-disk-cache-hit-weight` | `0.25` | Credit for each matched disk or external-tier block |
 | `--shared-cache-type` / `--shared-cache-multiplier` | `none` / `0.5` | **Experimental.** Enable shared-cache lookup and credit matches beyond the device-local prefix |
+| `--router-shared-cache-hit-weight` | `0` | **Experimental.** Count shared-cache hits beyond each worker's own prefix in its cached-token estimate (admission and queueing) |
 
 See [Configuration and Tuning](configuration-and-tuning.md) for the cache-hit weight semantics, [Using HiCache](../backends/sglang/hicache.md#configuration) for the shared-cache flags, and [Router Operations](router-operations.md) for enabling event publishing per backend.
 

@@ -1056,9 +1056,17 @@ pub struct RouterRequestMetrics {
     pub kv_selected_cached_prefix_tokens: IntCounterVec,
     /// Backend-reported reused tokens, counted once per attempt; same labels.
     pub kv_worker_reused_tokens: IntCounterVec,
+    /// (predicted - worker-reported) cached tokens / prompt tokens, per prediction.
+    pub cache_prediction_error_ratio: HistogramVec,
+    /// Token sums behind `cache_prediction_error_ratio`, for aggregate ratios.
+    pub cache_prediction_tokens_total: IntCounterVec,
 }
 
 const KV_PHASE_LABEL: &str = "phase";
+
+/// `prediction` label values of the cache-prediction metrics.
+const CACHE_PREDICTION_WITH_SHARED: &str = "with_shared";
+const CACHE_PREDICTION_WITHOUT_SHARED: &str = "without_shared";
 
 static ROUTER_REQUEST_METRICS: OnceLock<Arc<RouterRequestMetrics>> = OnceLock::new();
 
@@ -1208,6 +1216,37 @@ impl RouterRequestMetrics {
             frontend_service::KV_WORKER_REUSED_TOKENS_TOTAL,
             "Worker-reported reused tokens per routing attempt",
         );
+        let cache_prediction_error_ratio = metrics
+            .create_histogramvec(
+                &router_metric("cache_prediction_error_ratio"),
+                "(predicted - worker-reported) cached prompt tokens / prompt tokens for the selected worker; prediction=with_shared|without_shared the shared-cache hits it can load",
+                &["prediction"],
+                extra_labels,
+                Some(prometheus::linear_buckets(-1.0, 0.1, 21).unwrap()),
+            )
+            .expect("failed to create router_cache_prediction_error_ratio");
+        let cache_prediction_tokens_total = metrics
+            .create_intcountervec(
+                &router_metric("cache_prediction_tokens_total"),
+                "Prompt, worker-reported cached, and router-predicted cached tokens of requests with a shared-cache lookup",
+                &["kind"],
+                extra_labels,
+            )
+            .expect("failed to create router_cache_prediction_tokens_total");
+        for prediction in [
+            CACHE_PREDICTION_WITH_SHARED,
+            CACHE_PREDICTION_WITHOUT_SHARED,
+        ] {
+            cache_prediction_error_ratio.with_label_values(&[prediction]);
+        }
+        for kind in [
+            "prompt",
+            "actual_cached",
+            "predicted_cached_with_shared",
+            "predicted_cached_without_shared",
+        ] {
+            cache_prediction_tokens_total.with_label_values(&[kind]);
+        }
         Self {
             requests_started_total,
             requests_total,
@@ -1224,6 +1263,39 @@ impl RouterRequestMetrics {
             kv_best_eligible_cached_prefix_tokens,
             kv_selected_cached_prefix_tokens,
             kv_worker_reused_tokens,
+            cache_prediction_error_ratio,
+            cache_prediction_tokens_total,
+        }
+    }
+
+    /// Compare the router's cached-token prediction with what the worker reported.
+    pub fn observe_cache_prediction(
+        &self,
+        prediction: crate::kv_router::CachePrediction,
+        actual_cached_tokens: usize,
+    ) {
+        if prediction.isl_tokens == 0 {
+            return;
+        }
+        let isl = prediction.isl_tokens as f64;
+        let actual = actual_cached_tokens.min(prediction.isl_tokens);
+        for (label, predicted) in [
+            (CACHE_PREDICTION_WITH_SHARED, prediction.with_shared),
+            (CACHE_PREDICTION_WITHOUT_SHARED, prediction.without_shared),
+        ] {
+            self.cache_prediction_error_ratio
+                .with_label_values(&[label])
+                .observe((predicted as f64 - actual as f64) / isl);
+        }
+        for (kind, tokens) in [
+            ("prompt", prediction.isl_tokens),
+            ("actual_cached", actual),
+            ("predicted_cached_with_shared", prediction.with_shared),
+            ("predicted_cached_without_shared", prediction.without_shared),
+        ] {
+            self.cache_prediction_tokens_total
+                .with_label_values(&[kind])
+                .inc_by(tokens as u64);
         }
     }
 

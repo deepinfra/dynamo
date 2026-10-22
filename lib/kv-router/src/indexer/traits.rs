@@ -11,23 +11,37 @@ use super::{
 };
 use crate::protocols::*;
 
+/// One request's lookup in a [`SharedKvCache`].
+#[derive(Clone, Copy, Debug)]
+pub struct SharedCacheQuery<'a> {
+    pub tokens: &'a [u32],
+    /// The router's per-block hashes of `tokens`, as the indexer uses them.
+    pub block_hashes: &'a [LocalBlockHash],
+    pub block_size: u32,
+    /// Must be honored by implementations to avoid scoring shared-cache hits
+    /// across isolated cache namespaces.
+    pub cache_namespace: Option<&'a str>,
+}
+
 /// Trait for querying an external shared KV cache pool.
 ///
 /// Implementations check which blocks/pages from a request's token sequence
 /// exist in the shared cache. The returned `SharedCacheHits` describes which
 /// block positions are available externally (and thus cheaper to prefill).
+/// A cache whose stores only some workers can load from (for example one store
+/// per node) answers per worker; see [`SharedCacheHits::scoped`].
 #[async_trait]
 pub trait SharedKvCache: Send + Sync {
     /// Query which blocks exist in the shared cache for the given token sequence.
-    ///
-    /// `cache_namespace` must be honored by implementations to avoid scoring
-    /// shared-cache hits across isolated cache namespaces.
     async fn check_blocks(
         &self,
-        tokens: &[u32],
-        block_size: u32,
-        cache_namespace: Option<&str>,
+        query: SharedCacheQuery<'_>,
     ) -> Result<SharedCacheHits, KvRouterError>;
+
+    /// Called with every device-tier store a worker announces, before the
+    /// indexer applies it. Caches that name blocks by the engine's own hashes
+    /// learn them here.
+    fn observe_stored(&self, _worker: WorkerWithDpRank, _data: &KvCacheStoreData) {}
 }
 
 #[async_trait]

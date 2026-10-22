@@ -3,7 +3,7 @@
 
 //! Worker input groups, stored snapshots, and component-scoped borrowed views.
 
-use crate::protocols::{SharedCacheHits, WorkerWithDpRank};
+use crate::protocols::{SharedCacheHits, WorkerId, WorkerWithDpRank};
 use std::ops::BitOr;
 
 /// Host-owned row materialized once for the union of component input requirements.
@@ -171,6 +171,8 @@ pub(crate) struct CacheSnapshot<'a> {
 /// Numeric cache row retained in host buffers between selections.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct WorkerCacheData {
+    /// Selects this worker's view of worker-scoped shared-cache hits.
+    pub(crate) worker_id: WorkerId,
     pub(crate) effective_overlap_blocks: f64,
     pub(crate) estimated_cached_tokens: usize,
     pub(crate) device_overlap_blocks: f64,
@@ -290,11 +292,15 @@ impl ScoredWorkerCandidate {
 }
 
 impl<'a> WorkerCacheInput<'a> {
-    /// Unweighted shared-cache ranges in KV block positions, or None if no result was supplied.
+    /// Unweighted shared-cache ranges in KV block positions that this worker can load,
+    /// or None if no result was supplied. A cache whose stores only some workers can load
+    /// from answers each worker with its own hits.
     /// The host owns this snapshot. It does not change during the callback, and may lag engine state.
     /// Use `hits_beyond(prefix)` to exclude hits already covered by the policy's chosen prefix.
     pub fn shared_hits(self) -> Option<&'a SharedCacheHits> {
-        self.snapshot.shared_hits
+        self.snapshot
+            .shared_hits
+            .map(|hits| hits.for_worker(self.data.worker_id))
     }
 
     /// Whether the request snapshot contains any tier-specific matches before worker filtering.

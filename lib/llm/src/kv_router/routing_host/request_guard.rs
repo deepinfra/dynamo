@@ -7,7 +7,7 @@ use prometheus::IntCounter;
 
 use crate::{
     kv_router::{
-        KvRouter, indexer::ApproximateRequestLease, metrics::RouterRequestMetrics,
+        CachePrediction, KvRouter, indexer::ApproximateRequestLease, metrics::RouterRequestMetrics,
         prefill_router::BYPASS_REMOTE_PREFILL_ANNOTATION, request_lease::RequestAttemptLease,
     },
     lora::LoadEstimator,
@@ -609,6 +609,8 @@ pub(super) struct RequestGuard {
     migration_state: Option<MigrationState>,
     kv_hit: Option<KvHitTracking>,
     _lora_load: Option<LoraLoadGuard>,
+    /// Compared once with the first worker-reported cached-token count.
+    cache_prediction: Option<CachePrediction>,
 }
 
 impl RequestGuard {
@@ -667,6 +669,7 @@ impl RequestGuard {
             migration_state: request.migration_state.clone(),
             kv_hit,
             _lora_load: None,
+            cache_prediction: None,
         }
     }
 
@@ -697,7 +700,12 @@ impl RequestGuard {
             migration_state: request.migration_state.clone(),
             kv_hit: None,
             _lora_load: lora_load,
+            cache_prediction: None,
         }
+    }
+
+    pub(super) fn set_cache_prediction(&mut self, prediction: Option<CachePrediction>) {
+        self.cache_prediction = prediction;
     }
 
     pub(super) fn retarget_worker(&mut self, worker_id: u64) -> Option<u64> {
@@ -761,6 +769,18 @@ impl RequestGuard {
 
     pub(super) async fn on_item(&mut self, item: &Annotated<LLMEngineOutput>) {
         self.observability.observe_response();
+        if self.cache_prediction.is_some()
+            && let Some(actual_cached_tokens) = item
+                .data
+                .as_ref()
+                .and_then(|data| data.completion_usage.as_ref())
+                .and_then(|usage| usage.prompt_tokens_details.as_ref())
+                .and_then(|details| details.cached_tokens)
+            && let Some(prediction) = self.cache_prediction.take()
+        {
+            self.request_metrics()
+                .observe_cache_prediction(prediction, actual_cached_tokens as usize);
+        }
 
         let new_tokens = item.data.as_ref().map_or(0, |data| data.token_ids.len());
         if new_tokens > 0
@@ -1176,6 +1196,41 @@ mod prefill_start_tests {
 
     fn test_metrics() -> Arc<RouterRequestMetrics> {
         RouterRequestMetrics::for_test(&dynamo_runtime::MetricsRegistry::new())
+    }
+
+    #[test]
+    fn cache_prediction_compares_with_and_without_shared_hits() {
+        let metrics = test_metrics();
+        let prediction = CachePrediction {
+            isl_tokens: 1000,
+            without_shared: 200,
+            with_shared: 600,
+        };
+        metrics.observe_cache_prediction(prediction, 620);
+
+        let tokens = |kind: &str| {
+            metrics
+                .cache_prediction_tokens_total
+                .with_label_values(&[kind])
+                .get()
+        };
+        assert_eq!(tokens("prompt"), 1000);
+        assert_eq!(tokens("actual_cached"), 620);
+        assert_eq!(tokens("predicted_cached_with_shared"), 600);
+        assert_eq!(tokens("predicted_cached_without_shared"), 200);
+
+        let error = |prediction: &str| {
+            let histogram = metrics
+                .cache_prediction_error_ratio
+                .with_label_values(&[prediction]);
+            (histogram.get_sample_count(), histogram.get_sample_sum())
+        };
+        let (count, sum) = error("with_shared");
+        assert_eq!(count, 1);
+        assert!((sum - (-0.02)).abs() < 1e-9);
+        let (count, sum) = error("without_shared");
+        assert_eq!(count, 1);
+        assert!((sum - (-0.42)).abs() < 1e-9);
     }
 
     async fn dispatch_once(phase: RequestPhase, annotations: Vec<String>) -> Arc<RequestTracker> {

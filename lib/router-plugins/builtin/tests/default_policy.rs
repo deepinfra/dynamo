@@ -768,6 +768,8 @@ fn shared_cache_credit_defaults_and_legacy_precedence_apply_to_selection() {
         ("hicache", Some(0.3), "{}", 0),
         ("hicache", Some(0.0), "{shared_cache_multiplier: 0.5}", 1),
         ("hicache", Some(0.5), "{shared_cache_multiplier: 0}", 0),
+        ("mooncake-store", None, "{}", 1),
+        ("mooncake-store", Some(0.0), "{}", 0),
     ] {
         let file = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(file.path(), format!(
@@ -800,5 +802,45 @@ fn shared_cache_credit_defaults_and_legacy_precedence_apply_to_selection() {
         if parameters == "{}" {
             assert_eq!(select(default_policy(config, "prefill")), expected_worker);
         }
+    }
+
+    // A scoped cache answers per worker: the cold worker earns the shared
+    // credit only when its own store holds the prefix.
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(
+        file.path(),
+        "router:\n  shared_cache_type: mooncake-store\n",
+    )
+    .unwrap();
+    let mut config = KvRouterConfig {
+        router_policy_config: Some(file.path().display().to_string()),
+        ..Default::default()
+    };
+    config.apply_policy_config().unwrap();
+    let factory = registry.resolve(&config).unwrap().unwrap();
+    for (store_reader, expected_worker) in [(1, 1), (0, 0)] {
+        #[allow(clippy::single_range_in_vec_init)]
+        let scoped = dynamo_kv_router::SharedCacheHits::scoped(
+            Default::default(),
+            [(
+                store_reader,
+                dynamo_kv_router::SharedCacheHits::from_ranges(vec![0..4]),
+            )],
+        );
+        request.shared_cache_hits = Some(scoped);
+        let policy = factory(
+            &config,
+            WorkerType::Aggregated,
+            RoutingPartitionRef::new("model", "default"),
+        );
+        let worker = policy
+            .select_worker(support::selection_input(&workers, &request, 16))
+            .unwrap()
+            .worker
+            .worker_id;
+        assert_eq!(
+            worker, expected_worker,
+            "store readable by worker {store_reader}"
+        );
     }
 }

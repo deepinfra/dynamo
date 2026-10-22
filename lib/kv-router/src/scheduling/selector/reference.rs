@@ -222,10 +222,7 @@ fn selection_weights(
             .as_ref()
             .and_then(|config| config.shared_cache_multiplier)
             .or(kv_router_config.shared_cache_multiplier)
-            .unwrap_or(match kv_router_config.shared_cache_type {
-                crate::config::SharedCacheType::None => 0.0,
-                crate::config::SharedCacheType::Hicache => 0.5,
-            }),
+            .unwrap_or(kv_router_config.shared_cache_type.default_multiplier()),
     }
 }
 
@@ -297,13 +294,15 @@ impl<C: Borrow<KvRouterConfig>> DefaultWorkerScorer<C> {
         let load = &row.load;
         let effective_overlap_blocks = cache.effective_overlap_blocks;
         let device_overlap_blocks = cache.device_overlap_blocks;
-        let shared_beyond_device_blocks = context
-            .request
-            .shared_cache_hits
-            .as_ref()
-            .map_or(0, |hits| {
-                hits.hits_beyond(device_overlap_blocks.round().max(0.0) as u32)
-            });
+        let device_prefix_blocks = device_overlap_blocks.round().max(0.0) as u32;
+        // Scoped caches answer per worker: only the stores this worker can load
+        // from count.
+        let shared_beyond_device_blocks = match context.request.shared_cache_hits.as_ref() {
+            Some(hits) => hits
+                .for_worker(worker.worker_id)
+                .hits_beyond(device_prefix_blocks),
+            None => 0,
+        };
         let shared_overlap_blocks =
             weights.shared_cache_multiplier * shared_beyond_device_blocks as f64;
         // Normalize backlog above the least-loaded eligible worker by this request's

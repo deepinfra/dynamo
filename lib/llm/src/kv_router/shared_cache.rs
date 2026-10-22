@@ -32,13 +32,17 @@ use crate::{
     utils::zmq::{connect_sub_socket, multipart_message},
 };
 use dynamo_kv_router::{
-    SharedKvCache,
+    SharedCacheQuery, SharedKvCache,
     indexer::KvRouterError,
     protocols::{SharedCacheHits, WorkerId},
 };
 
+mod mooncake_store;
+
+pub use mooncake_store::{MooncakeStoreMetrics, MooncakeStoreSharedKvCache};
+
 const SGLANG_HICACHE_MOONCAKE_RUNTIME_KEY: &str = "sglang_hicache_mooncake";
-const MOONCAKE_EVENT_RECONNECT_DELAY: Duration = Duration::from_secs(1);
+pub(super) const MOONCAKE_EVENT_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const MAX_MOONCAKE_INDEX_ENTRIES: usize = 1_000_000;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -108,10 +112,6 @@ struct MooncakeObjectEvent {
     #[serde(default)]
     group_id: Option<String>,
 }
-
-/// Mooncake KV publisher payload: `(timestamp_ms, events, dp_rank)` after the empty-topic and
-/// big-endian sequence ZMQ frames.
-type MooncakeEventBatch = (i64, Vec<MooncakeObjectEvent>, u32);
 
 #[derive(Debug, Clone, Copy)]
 enum QueryToken {
@@ -412,6 +412,15 @@ impl HicacheSharedKvCache {
 fn parse_mooncake_event_frames(
     frames: &[Vec<u8>],
 ) -> anyhow::Result<(u64, Vec<MooncakeObjectEvent>)> {
+    parse_mooncake_event_batch(frames)
+}
+
+/// Split a Mooncake master KV-event message into its batch sequence number and events. The
+/// payload is `(timestamp_ms, events, dp_rank)` after the empty-topic and big-endian sequence
+/// ZMQ frames.
+fn parse_mooncake_event_batch<E: serde::de::DeserializeOwned>(
+    frames: &[Vec<u8>],
+) -> anyhow::Result<(u64, Vec<E>)> {
     let [_, sequence, payload] = frames else {
         anyhow::bail!("expected three frames, got {}", frames.len());
     };
@@ -421,7 +430,7 @@ fn parse_mooncake_event_frames(
             .try_into()
             .map_err(|_| anyhow::anyhow!("expected an 8-byte sequence frame"))?,
     );
-    let (_, events, _) = rmp_serde::from_slice::<MooncakeEventBatch>(payload)?;
+    let (_, events, _) = rmp_serde::from_slice::<(i64, Vec<E>, u32)>(payload)?;
     Ok((sequence, events))
 }
 
@@ -429,10 +438,14 @@ fn parse_mooncake_event_frames(
 impl SharedKvCache for HicacheSharedKvCache {
     async fn check_blocks(
         &self,
-        tokens: &[u32],
-        block_size: u32,
-        cache_namespace: Option<&str>,
+        query: SharedCacheQuery<'_>,
     ) -> Result<SharedCacheHits, KvRouterError> {
+        let SharedCacheQuery {
+            tokens,
+            block_size,
+            cache_namespace,
+            ..
+        } = query;
         if cache_namespace
             .filter(|namespace| !namespace.is_empty())
             .is_some()
@@ -655,6 +668,19 @@ mod tests {
     use super::*;
     use tokio::sync::watch;
 
+    fn query<'a>(
+        tokens: &'a [u32],
+        block_size: u32,
+        cache_namespace: Option<&'a str>,
+    ) -> SharedCacheQuery<'a> {
+        SharedCacheQuery {
+            tokens,
+            block_hashes: &[],
+            block_size,
+            cache_namespace,
+        }
+    }
+
     fn mooncake_config() -> SglangHicacheMooncakeConfig {
         SglangHicacheMooncakeConfig {
             backend: "mooncake".to_string(),
@@ -696,7 +722,7 @@ mod tests {
 
     async fn hits(cache: &HicacheSharedKvCache) -> u32 {
         cache
-            .check_blocks(&[1, 2, 3, 4], 4, None)
+            .check_blocks(query(&[1, 2, 3, 4], 4, None))
             .await
             .unwrap()
             .total_hits
@@ -930,7 +956,7 @@ mod tests {
         );
         assert_eq!(
             cache
-                .check_blocks(&[1, 2, 3, 4], config.page_size, None)
+                .check_blocks(query(&[1, 2, 3, 4], config.page_size, None))
                 .await
                 .unwrap()
                 .total_hits,
@@ -947,7 +973,7 @@ mod tests {
 
         assert_eq!(
             cache
-                .check_blocks(&[1, 2, 3, 4], 4, None)
+                .check_blocks(query(&[1, 2, 3, 4], 4, None))
                 .await
                 .unwrap()
                 .total_hits,
@@ -987,7 +1013,7 @@ mod tests {
             ],
         );
         let hits = cache
-            .check_blocks(&[1, 2, 3, 4, 5, 6, 7, 8], 4, None)
+            .check_blocks(query(&[1, 2, 3, 4, 5, 6, 7, 8], 4, None))
             .await
             .unwrap();
 
@@ -1005,7 +1031,7 @@ mod tests {
             }],
         );
         let hits = cache
-            .check_blocks(&[1, 2, 3, 4, 5, 6, 7, 8], 4, None)
+            .check_blocks(query(&[1, 2, 3, 4, 5, 6, 7, 8], 4, None))
             .await
             .unwrap();
         assert_eq!(hits.total_hits, 0);
@@ -1144,7 +1170,10 @@ mod tests {
             ),
         );
 
-        let hits = cache.check_blocks(&[1, 2, 3, 4], 4, None).await.unwrap();
+        let hits = cache
+            .check_blocks(query(&[1, 2, 3, 4], 4, None))
+            .await
+            .unwrap();
         assert_eq!(hits.total_hits, 1);
         assert!(
             cache
@@ -1181,7 +1210,10 @@ mod tests {
             ],
         );
 
-        let hits = cache.check_blocks(&[1, 2, 3, 4], 4, None).await.unwrap();
+        let hits = cache
+            .check_blocks(query(&[1, 2, 3, 4], 4, None))
+            .await
+            .unwrap();
         assert_eq!(hits.total_hits, 1);
         assert!(
             cache
@@ -1201,7 +1233,10 @@ mod tests {
             }],
         );
         assert!(cache.group_states.is_empty());
-        let hits = cache.check_blocks(&[1, 2, 3, 4], 4, None).await.unwrap();
+        let hits = cache
+            .check_blocks(query(&[1, 2, 3, 4], 4, None))
+            .await
+            .unwrap();
         assert_eq!(hits.total_hits, 0);
     }
 
@@ -1229,7 +1264,7 @@ mod tests {
         );
         assert_eq!(
             cache
-                .check_blocks(&[1, 2, 3, 4, 5, 6, 7, 8], 4, None)
+                .check_blocks(query(&[1, 2, 3, 4, 5, 6, 7, 8], 4, None))
                 .await
                 .unwrap()
                 .total_hits,
@@ -1479,7 +1514,7 @@ mod tests {
     async fn test_check_blocks_skips_mooncake_for_cache_namespace() {
         let cache = HicacheSharedKvCache::new(runtime_watch_with_config(mooncake_config()));
         let hits = cache
-            .check_blocks(&[1, 2, 3, 4, 5, 6, 7, 8], 4, Some("tenant-a"))
+            .check_blocks(query(&[1, 2, 3, 4, 5, 6, 7, 8], 4, Some("tenant-a")))
             .await
             .unwrap();
 

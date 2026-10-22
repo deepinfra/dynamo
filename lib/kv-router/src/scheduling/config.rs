@@ -209,6 +209,7 @@ fn log_env_config(config: &KvRouterConfig) {
         use_remote_indexer = config.use_remote_indexer,
         shared_cache_multiplier = ?config.shared_cache_multiplier,
         shared_cache_type = %config.shared_cache_type,
+        shared_cache_hit_weight = config.shared_cache_hit_weight,
         host_cache_hit_weight = config.host_cache_hit_weight,
         disk_cache_hit_weight = config.disk_cache_hit_weight,
         router_prefill_load_model = %config.router_prefill_load_model,
@@ -395,6 +396,9 @@ fn kv_router_config_from_lookup(
     if let Some(value) = get_env("DYN_SHARED_CACHE_TYPE") {
         config.shared_cache_type = value.parse()?;
     }
+    if let Some(value) = parse_f64(&get_env, "DYN_ROUTER_SHARED_CACHE_HIT_WEIGHT") {
+        config.shared_cache_hit_weight = value;
+    }
     if let Some(value) = parse_f64(&get_env, "DYN_ROUTER_HOST_CACHE_HIT_WEIGHT") {
         config.host_cache_hit_weight = value;
     }
@@ -429,6 +433,21 @@ pub enum SharedCacheType {
     None,
     /// HiCache L3 shared cache — queries sglang workers via the request plane.
     Hicache,
+    /// vLLM `MooncakeStoreConnector` stores, each shared by the workers that
+    /// announce it; hits come from the store masters' KV events.
+    #[serde(rename = "mooncake-store")]
+    MooncakeStore,
+}
+
+impl SharedCacheType {
+    /// Selection credit per shared hit beyond a worker's device prefix when
+    /// neither the policy nor the router config sets `shared_cache_multiplier`.
+    pub fn default_multiplier(self) -> f64 {
+        match self {
+            Self::None => 0.0,
+            Self::Hicache | Self::MooncakeStore => 0.5,
+        }
+    }
 }
 
 /// Retention policy for a router-local primary approximate indexer.
@@ -473,6 +492,7 @@ impl fmt::Display for SharedCacheType {
         match self {
             Self::None => f.write_str("none"),
             Self::Hicache => f.write_str("hicache"),
+            Self::MooncakeStore => f.write_str("mooncake-store"),
         }
     }
 }
@@ -484,8 +504,9 @@ impl FromStr for SharedCacheType {
         match s {
             "none" => Ok(Self::None),
             "hicache" => Ok(Self::Hicache),
+            "mooncake-store" => Ok(Self::MooncakeStore),
             _ => Err(format!(
-                "unknown shared_cache_type: {s:?}, expected 'none' or 'hicache'"
+                "unknown shared_cache_type: {s:?}, expected 'none', 'hicache', or 'mooncake-store'"
             )),
         }
     }
@@ -733,6 +754,7 @@ struct KvRouterConfigSerde {
     enable_session_prefix_index: bool,
     shared_cache_multiplier: Option<f64>,
     shared_cache_type: SharedCacheType,
+    shared_cache_hit_weight: f64,
     router_predicted_ttl_secs: Option<f64>,
     conditional_disagg_enabled: bool,
     conditional_disagg_policy: ConditionalDisaggPolicyKind,
@@ -778,6 +800,7 @@ impl Default for KvRouterConfigSerde {
             enable_session_prefix_index: config.enable_session_prefix_index,
             shared_cache_multiplier: config.shared_cache_multiplier,
             shared_cache_type: config.shared_cache_type,
+            shared_cache_hit_weight: config.shared_cache_hit_weight,
             router_predicted_ttl_secs: config.router_predicted_ttl_secs,
             conditional_disagg_enabled: config.conditional_disagg_enabled,
             conditional_disagg_policy: config.conditional_disagg_policy,
@@ -936,7 +959,15 @@ pub struct KvRouterConfig {
 
     /// Type of external shared KV cache to query during routing.
     /// "none" (default): disabled. "hicache": query sglang workers for L3 cache state.
+    /// "mooncake-store": vLLM Mooncake store state, scoped to the store each worker announces.
     pub shared_cache_type: SharedCacheType,
+
+    /// Weight of shared-cache hits beyond a worker's own tiered prefix in the
+    /// admission/accounting estimate (`effective_cached_tokens`). Range 0.0 to 1.0.
+    /// Default 0.0: shared hits change worker selection only, through
+    /// `shared_cache_multiplier`.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub shared_cache_hit_weight: f64,
 
     /// TTL in seconds applied to entries in the local predict-on-route side
     /// indexer. `None` disables predict-on-route. A value requires
@@ -1032,6 +1063,7 @@ impl Default for KvRouterConfig {
             enable_session_prefix_index: false,
             shared_cache_multiplier: None,
             shared_cache_type: SharedCacheType::default(),
+            shared_cache_hit_weight: 0.0,
             router_predicted_ttl_secs: None,
             conditional_disagg_enabled: false,
             conditional_disagg_policy: ConditionalDisaggPolicyKind::default(),
@@ -1097,6 +1129,7 @@ impl TryFrom<KvRouterConfigSerde> for KvRouterConfig {
             enable_session_prefix_index: compat.enable_session_prefix_index,
             shared_cache_multiplier: compat.shared_cache_multiplier,
             shared_cache_type: compat.shared_cache_type,
+            shared_cache_hit_weight: compat.shared_cache_hit_weight,
             router_predicted_ttl_secs: compat.router_predicted_ttl_secs,
             conditional_disagg_enabled: compat.conditional_disagg_enabled,
             conditional_disagg_policy: compat.conditional_disagg_policy,
@@ -1472,6 +1505,12 @@ impl KvRouterConfig {
         if let Some(value) = self.shared_cache_multiplier {
             validate_range("shared_cache_multiplier", value, 0.0, 1.0)?;
         }
+        validate_range(
+            "shared_cache_hit_weight",
+            self.shared_cache_hit_weight,
+            0.0,
+            1.0,
+        )?;
         if let Some(value) = self.router_predicted_ttl_secs {
             validate_duration_secs("router_predicted_ttl_secs", value)?;
         }
@@ -1653,6 +1692,7 @@ mod tests {
         assert_eq!(config.router_event_threads, 2);
         assert_eq!(config.router_ttl_secs, 42.0);
         assert_eq!(config.host_cache_hit_weight, 0.6);
+        assert_eq!(config.shared_cache_hit_weight, 0.25);
         assert_eq!(config.router_predicted_ttl_secs, None);
         assert!(!config.router_assume_kv_reuse);
         assert!(config.router_track_output_blocks);
@@ -1942,7 +1982,7 @@ mod tests {
         assert!(error.contains("expected 'fcfs', 'lcfs', or 'wspt'"));
 
         let error = try_config_from_values(&[("DYN_SHARED_CACHE_TYPE", "rdma")]).unwrap_err();
-        assert!(error.contains("expected 'none' or 'hicache'"));
+        assert!(error.contains("expected 'none', 'hicache', or 'mooncake-store'"));
 
         let error =
             try_config_from_values(&[("DYN_ROUTER_PREFILL_LOAD_MODEL", "fast")]).unwrap_err();
@@ -2111,6 +2151,66 @@ mod tests {
                 assert_eq!(config.shared_cache_multiplier, Some(expected));
             }
         }
+    }
+
+    #[test]
+    fn mooncake_store_shared_cache_type_and_hit_weight() {
+        let store = config_from_values(&[("DYN_SHARED_CACHE_TYPE", "mooncake-store")]);
+        assert_eq!(store.shared_cache_type, SharedCacheType::MooncakeStore);
+        assert_eq!(store.shared_cache_multiplier, None);
+        assert_eq!(SharedCacheType::MooncakeStore.default_multiplier(), 0.5);
+        assert_eq!(SharedCacheType::Hicache.default_multiplier(), 0.5);
+        assert_eq!(SharedCacheType::None.default_multiplier(), 0.0);
+        assert_eq!(store.shared_cache_hit_weight, 0.0);
+
+        let weighted = config_from_values(&[
+            ("DYN_SHARED_CACHE_TYPE", "mooncake-store"),
+            ("DYN_ROUTER_SHARED_CACHE_HIT_WEIGHT", "1.0"),
+        ]);
+        assert_eq!(weighted.shared_cache_hit_weight, 1.0);
+
+        assert_eq!(SharedCacheType::MooncakeStore.to_string(), "mooncake-store");
+        assert_eq!(
+            serde_json::to_string(&SharedCacheType::MooncakeStore).unwrap(),
+            "\"mooncake-store\""
+        );
+        for value in ["mooncake_store", "MooncakeStore", "vllm-kv-events"] {
+            assert!(value.parse::<SharedCacheType>().is_err());
+        }
+
+        let config = KvRouterConfig {
+            shared_cache_type: SharedCacheType::MooncakeStore,
+            shared_cache_hit_weight: 0.5,
+            ..Default::default()
+        };
+        let restored: KvRouterConfig =
+            serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
+        assert_eq!(restored.shared_cache_type, SharedCacheType::MooncakeStore);
+        assert_eq!(restored.shared_cache_hit_weight, 0.5);
+
+        // A default weight is omitted, so older readers keep parsing the config.
+        let default_json = serde_json::to_value(KvRouterConfig::default()).unwrap();
+        assert!(default_json.get("shared_cache_hit_weight").is_none());
+
+        let too_large = KvRouterConfig {
+            shared_cache_hit_weight: 1.5,
+            ..Default::default()
+        };
+        assert!(too_large.validate().is_err());
+    }
+
+    #[test]
+    fn yaml_router_settings_accept_mooncake_store_and_hit_weight() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            file.path(),
+            "router:\n  shared_cache_type: mooncake-store\n  shared_cache_hit_weight: 0.75\n",
+        )
+        .unwrap();
+        let config =
+            config_from_values(&[("DYN_ROUTER_POLICY_CONFIG", file.path().to_str().unwrap())]);
+        assert_eq!(config.shared_cache_type, SharedCacheType::MooncakeStore);
+        assert_eq!(config.shared_cache_hit_weight, 0.75);
     }
 
     #[test]

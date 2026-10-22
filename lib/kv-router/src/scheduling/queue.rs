@@ -1668,6 +1668,20 @@ impl<
                     "refreshed overlap scores after long queue wait"
                 );
                 queued.request.overlap = snapshot.overlap;
+                // The refreshed signals no longer hold the shared-cache credit.
+                if let (Some(refresher), Some(shared_hits)) = (
+                    self.overlap_scores_refresh.as_deref(),
+                    queued.request.shared_cache_hits.as_ref(),
+                ) && refresher.shared_cache_hit_weight() > 0.0
+                {
+                    let workers = self.workers_with_configs.borrow();
+                    queued.request.overlap.apply_shared_cache_credit(
+                        shared_hits,
+                        refresher.shared_cache_hit_weight(),
+                        self.block_size,
+                        super::overlap::worker_ranks(&workers),
+                    );
+                }
                 queued.request.kv_transfer_candidates = if queued.request.retain_kv_transfer_chain {
                     snapshot.kv_transfer_candidates
                 } else {
@@ -2085,10 +2099,11 @@ mod tests {
     use super::*;
     use crate::kv_hints::KvTransferCandidates;
     use crate::protocols::{
-        ActiveSequenceEvent, ExternalSequenceBlockHash, WorkerSelectionResult, WorkerWithDpRank,
+        ActiveSequenceEvent, ExternalSequenceBlockHash, SharedCacheHits, WorkerSelectionResult,
+        WorkerWithDpRank,
     };
     use crate::scheduling::OverlapSignals;
-    use crate::scheduling::types::{KvSchedulerError, ScheduleMode};
+    use crate::scheduling::types::{KvSchedulerError, ScheduleMode, TierOverlapBlocks};
     use crate::scheduling::{RefreshedOverlap, RouterPolicyConfig};
     use crate::sequences::topology::WorkerDpRange;
     use crate::sequences::{ActiveSequencesMultiWorker, SequencePublisher};
@@ -2557,6 +2572,7 @@ mod tests {
         calls: AtomicUsize,
         last_retain_kv_transfer_chain: AtomicBool,
         response: RefreshedOverlap,
+        shared_cache_hit_weight: f64,
     }
 
     #[async_trait]
@@ -2570,6 +2586,10 @@ mod tests {
             self.last_retain_kv_transfer_chain
                 .store(retain_kv_transfer_chain, Ordering::Relaxed);
             Some(self.response.clone())
+        }
+
+        fn shared_cache_hit_weight(&self) -> f64 {
+            self.shared_cache_hit_weight
         }
     }
 
@@ -5025,6 +5045,7 @@ policy_classes:
         let block_size = 16u32;
         let isl = 64usize;
         let refresher = Arc::new(CountingRefresher {
+            shared_cache_hit_weight: 0.0,
             calls: AtomicUsize::new(0),
             last_retain_kv_transfer_chain: AtomicBool::new(false),
             response: RefreshedOverlap {
@@ -5120,12 +5141,67 @@ policy_classes:
         assert_eq!(queue.pending_count(), 0);
     }
 
+    /// A refresh replaces the overlap signals; the request's shared-cache hits
+    /// are credited again at the refresher's weight, per worker.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn update_refresh_reapplies_shared_cache_credit() {
+        let block_size = 16u32;
+        let isl = 64usize;
+        let worker = WorkerWithDpRank::new(0, 0);
+        let mut device = FxHashMap::default();
+        device.insert(worker, 1usize);
+        let refresher = Arc::new(CountingRefresher {
+            calls: AtomicUsize::new(0),
+            last_retain_kv_transfer_chain: AtomicBool::new(false),
+            shared_cache_hit_weight: 1.0,
+            response: RefreshedOverlap::from_overlap(OverlapSignals {
+                tier_overlap_blocks: TierOverlapBlocks {
+                    device,
+                    ..Default::default()
+                },
+                effective_overlap_blocks: FxHashMap::from_iter([(worker, 1.0)]),
+                effective_cached_tokens: FxHashMap::from_iter([(worker, 16)]),
+            }),
+        });
+        let (queue, slots) =
+            make_queue_with_refresher(1, block_size, isl, Some(0.0), refresher.clone());
+
+        let (req1, rx1) = make_request("req-1", isl);
+        queue.enqueue(req1).await;
+        let _ = rx1.await.expect("rx1 dropped").expect("req-1 failed");
+
+        let (mut req2, rx2) = make_request("req-2", isl);
+        // Worker 0's store holds blocks 0..3; another worker's store holds more.
+        req2.shared_cache_hits = Some(SharedCacheHits::scoped(
+            SharedCacheHits::default(),
+            [
+                (0, SharedCacheHits::from_hits(&[true, true, true])),
+                (9, SharedCacheHits::from_hits(&[true; 4])),
+            ],
+        ));
+        queue
+            .enqueue_with_block_hashes(req2, Some(vec![LocalBlockHash(42)]))
+            .await;
+        assert_eq!(queue.pending_count(), 1);
+
+        tokio::time::advance(Duration::from_secs(11)).await;
+        slots.free(&"req-1".to_string(), decay_now()).unwrap();
+        queue.update().await;
+
+        let resp2 = rx2.await.expect("rx2 dropped").expect("req-2 failed");
+        assert_eq!(refresher.calls.load(Ordering::Relaxed), 1);
+        // 1 device block + worker 0's shared blocks 1..3 at weight 1.
+        assert_eq!(resp2.effective_overlap_blocks, 3.0);
+        assert_eq!(resp2.cached_tokens, 48);
+    }
+
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn update_refresh_drops_kv_transfer_candidates_when_retention_disabled() {
         let block_size = 16u32;
         let isl = 64usize;
         let worker = WorkerWithDpRank::new(0, 0);
         let refresher = Arc::new(CountingRefresher {
+            shared_cache_hit_weight: 0.0,
             calls: AtomicUsize::new(0),
             last_retain_kv_transfer_chain: AtomicBool::new(true),
             response: RefreshedOverlap {

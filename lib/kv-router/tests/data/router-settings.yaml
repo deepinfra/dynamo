@@ -21,4 +21,5 @@ router:
   serve_indexer: false
   enable_session_prefix_index: true
   shared_cache_type: none
+  shared_cache_hit_weight: 0.25
   router_predicted_ttl_secs: null

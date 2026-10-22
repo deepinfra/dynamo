@@ -752,7 +752,12 @@ impl SelectionCore {
             };
             let started = Instant::now();
             let result = shared_cache
-                .check_blocks(tokens, entry.block_size, prompt.cache_namespace)
+                .check_blocks(SharedCacheQuery {
+                    tokens,
+                    block_hashes: &normalized.block_hashes,
+                    block_size: entry.block_size,
+                    cache_namespace: prompt.cache_namespace,
+                })
                 .instrument(tracing::info_span!("kv_router.shared_cache_check"))
                 .await;
             let elapsed = started.elapsed();
@@ -779,8 +784,21 @@ impl SelectionCore {
         // when the index lookup fails.
         *lookup = Some(timings);
         let tiered = tiered?;
-        let overlap =
+        let mut overlap =
             OverlapAnalysis::new(&self.kv_router_config, entry.block_size, &tiered).signals();
+        let shared_cache_hit_weight = self.kv_router_config.shared_cache_hit_weight;
+        // Weight 0 (the default) leaves the estimate untouched.
+        if let Some(shared_hits) = shared_cache_hits.as_ref()
+            && shared_cache_hit_weight > 0.0
+        {
+            let workers = entry.workers_tx.borrow();
+            overlap.apply_shared_cache_credit(
+                shared_hits,
+                shared_cache_hit_weight,
+                entry.block_size,
+                crate::scheduling::overlap::worker_ranks(&workers),
+            );
+        }
         let kv_transfer_candidates = retain_kv_transfer_chain
             .then(|| tiered.kv_transfer_candidates().cloned())
             .flatten();

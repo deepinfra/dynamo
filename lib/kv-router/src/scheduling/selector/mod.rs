@@ -255,6 +255,7 @@ impl<'a> MaterializedSelectionInput<'a> {
             let device_overlap_blocks =
                 select_device_overlap(effective_overlap_blocks, reported_device_overlap_blocks);
             WorkerCacheData {
+                worker_id: worker.worker_id,
                 effective_overlap_blocks,
                 estimated_cached_tokens: cached_tokens,
                 device_overlap_blocks,

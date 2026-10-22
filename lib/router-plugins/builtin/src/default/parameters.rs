@@ -4,7 +4,6 @@
 //! Startup parameters and provider registration for the default policy.
 
 use dynamo_kv_router::KvRouterConfig;
-use dynamo_kv_router::config::SharedCacheType;
 use dynamo_kv_router::plugins::{
     RouterPluginRegistry, WorkerSelectionPolicyProviderError, WorkerSelectionPolicyRegistryError,
 };
@@ -100,12 +99,11 @@ impl Parameters {
                 .disk_cache_hit_weight
                 .unwrap_or(inherited_cache_weight(config.disk_cache_hit_weight)),
             shared_cache_multiplier: self.shared_cache_multiplier.unwrap_or_else(|| {
-                inherited_cache_weight(config.shared_cache_multiplier.unwrap_or(
-                    match config.shared_cache_type {
-                        SharedCacheType::None => 0.0,
-                        SharedCacheType::Hicache => 0.5,
-                    },
-                ))
+                inherited_cache_weight(
+                    config
+                        .shared_cache_multiplier
+                        .unwrap_or(config.shared_cache_type.default_multiplier()),
+                )
             }),
             router_temperature: self.router_temperature.unwrap_or(config.router_temperature),
         }

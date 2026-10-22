@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::config::KvRouterConfig;
 use crate::indexer::TieredMatchDetails;
@@ -28,6 +28,50 @@ pub struct OverlapSignals {
 }
 
 impl OverlapSignals {
+    /// Raw prefix length, in blocks, that `worker` already holds in its own
+    /// tiers: device plus the host-pinned and disk extensions after it.
+    pub fn tiered_prefix_blocks(&self, worker: WorkerWithDpRank) -> u32 {
+        let blocks = |tier: &FxHashMap<WorkerWithDpRank, usize>| {
+            saturating_u32(tier.get(&worker).copied().unwrap_or(0))
+        };
+        blocks(&self.tier_overlap_blocks.device)
+            .saturating_add(blocks(&self.tier_overlap_blocks.host_pinned))
+            .saturating_add(blocks(&self.tier_overlap_blocks.disk))
+    }
+
+    /// Credit shared-cache hits in the accounting estimate.
+    ///
+    /// Each listed worker rank gets `weight` per hit it can load (its own view
+    /// of a worker-scoped cache, see [`SharedCacheHits::for_worker`]) at or
+    /// beyond its own tiered prefix, so blocks it already holds are not counted
+    /// twice. `effective_cached_tokens` is recomputed from the credited overlap
+    /// with the same rounding as [`cache_hit_estimates_from_tiered_matches`].
+    /// A zero weight is a no-op, so an unconfigured router keeps its estimates
+    /// bit-for-bit.
+    pub fn apply_shared_cache_credit(
+        &mut self,
+        shared_hits: &SharedCacheHits,
+        weight: f64,
+        block_size: u32,
+        workers: impl IntoIterator<Item = WorkerWithDpRank>,
+    ) {
+        if weight.is_nan() || weight <= 0.0 {
+            return;
+        }
+        for worker in workers {
+            let extra_blocks = shared_hits
+                .for_worker(worker.worker_id)
+                .hits_beyond(self.tiered_prefix_blocks(worker));
+            if extra_blocks == 0 {
+                continue;
+            }
+            let overlap = self.effective_overlap_blocks.entry(worker).or_insert(0.0);
+            *overlap += weight * extra_blocks as f64;
+            let cached_tokens = (*overlap * block_size as f64).round().max(0.0) as usize;
+            self.effective_cached_tokens.insert(worker, cached_tokens);
+        }
+    }
+
     pub fn selected_worker_tiers<C: WorkerConfigLike>(
         &self,
         worker: WorkerWithDpRank,
@@ -312,8 +356,10 @@ pub fn build_overlap_scores_response(
                     .unwrap_or(0);
             let host_pinned_blocks = device_blocks + host_pinned_extension_blocks;
             let disk_blocks = host_pinned_blocks + disk_extension_blocks;
-            let shared_beyond_device_blocks =
-                shared_cache_hits.map(|hits| hits.hits_beyond(device_blocks as u32));
+            let shared_beyond_device_blocks = shared_cache_hits.map(|hits| {
+                hits.for_worker(worker.worker_id)
+                    .hits_beyond(device_blocks as u32)
+            });
 
             WorkerOverlapScore {
                 worker_id: worker.worker_id,
@@ -329,7 +375,9 @@ pub fn build_overlap_scores_response(
         .collect();
     workers.sort_by_key(|worker| (worker.worker_id, worker.dp_rank));
 
-    let shared_cache = match shared_cache_hits {
+    // A worker-scoped cache reports its widest view here; the rows above
+    // carry each worker's own.
+    let shared_cache = match shared_cache_hits.map(SharedCacheHits::widest) {
         Some(hits) => SharedCacheOverlapScore {
             enabled: shared_cache_enabled,
             total_hit_blocks: hits.total_hits,
@@ -354,6 +402,17 @@ pub fn build_overlap_scores_response(
         workers,
         shared_cache,
     }
+}
+
+/// Every DP rank of every worker, for credits that apply to all workers.
+pub fn worker_ranks<C: WorkerConfigLike>(
+    workers: &HashMap<WorkerId, C>,
+) -> impl Iterator<Item = WorkerWithDpRank> + '_ {
+    workers.iter().flat_map(|(&worker_id, config)| {
+        let start = config.data_parallel_start_rank();
+        let end = start.saturating_add(config.data_parallel_size().max(1));
+        (start..end).map(move |dp_rank| WorkerWithDpRank::new(worker_id, dp_rank))
+    })
 }
 
 fn saturating_u32(value: usize) -> u32 {
@@ -480,6 +539,156 @@ mod tests {
         assert_eq!(warm_score.shared_beyond_device_blocks, Some(2));
         assert!(response.shared_cache.enabled);
         assert_eq!(response.shared_cache.total_hit_blocks, 4);
+    }
+
+    #[test]
+    #[allow(clippy::single_range_in_vec_init)]
+    fn score_response_rows_use_each_workers_scoped_hits() {
+        let near = WorkerWithDpRank::new(1, 0);
+        let far = WorkerWithDpRank::new(2, 0);
+        let shared = SharedCacheHits::scoped(
+            SharedCacheHits::default(),
+            [(near.worker_id, SharedCacheHits::from_ranges(vec![0..5]))],
+        );
+
+        let response = build_overlap_scores_response(
+            &TieredMatchDetails::default(),
+            16,
+            9,
+            [near, far],
+            true,
+            Some(&shared),
+            None,
+        );
+
+        assert_eq!(response.workers[0].shared_beyond_device_blocks, Some(5));
+        assert_eq!(response.workers[1].shared_beyond_device_blocks, Some(0));
+        // The summary reports the widest view.
+        assert_eq!(response.shared_cache.total_hit_blocks, 5);
+        assert_eq!(response.shared_cache.ranges, vec![(0, 5)]);
+    }
+
+    fn shared_credit_signals() -> (OverlapSignals, WorkerWithDpRank, WorkerWithDpRank) {
+        let warm = WorkerWithDpRank::new(1, 0);
+        let cold = WorkerWithDpRank::new(2, 0);
+        let mut device = OverlapScores::new();
+        device.scores.insert(warm, 2);
+        let mut host = LowerTierMatchDetails::default();
+        host.hits.insert(warm, 1);
+        let tiered = TieredMatchDetails {
+            device: MatchDetails {
+                overlap_scores: device,
+                ..Default::default()
+            },
+            lower_tier: HashMap::from([(StorageTier::HostPinned, host)]),
+        };
+        let config = KvRouterConfig {
+            host_cache_hit_weight: 1.0,
+            ..Default::default()
+        };
+        (
+            OverlapAnalysis::new(&config, 16, &tiered).signals(),
+            warm,
+            cold,
+        )
+    }
+
+    #[test]
+    fn shared_cache_credit_weight_zero_is_a_no_op() {
+        let (mut signals, warm, cold) = shared_credit_signals();
+        let before_tokens = signals.effective_cached_tokens.clone();
+        let before_blocks = signals.effective_overlap_blocks.clone();
+        #[allow(clippy::single_range_in_vec_init)]
+        let shared = SharedCacheHits::from_ranges(vec![0..8]);
+
+        signals.apply_shared_cache_credit(&shared, 0.0, 16, [warm, cold]);
+
+        assert_eq!(signals.effective_cached_tokens, before_tokens);
+        assert_eq!(signals.effective_overlap_blocks, before_blocks);
+        assert_eq!(signals.effective_cached_tokens[&warm], 48);
+        assert!(!signals.effective_cached_tokens.contains_key(&cold));
+    }
+
+    #[test]
+    fn shared_cache_credit_weight_one_counts_blocks_beyond_tiered_prefix() {
+        let (mut signals, warm, cold) = shared_credit_signals();
+        #[allow(clippy::single_range_in_vec_init)]
+        let shared = SharedCacheHits::from_ranges(vec![0..8]);
+
+        assert_eq!(signals.tiered_prefix_blocks(warm), 3);
+        signals.apply_shared_cache_credit(&shared, 1.0, 16, [warm, cold]);
+
+        // warm holds 2 device + 1 host blocks; the store adds blocks 3..8.
+        assert_eq!(signals.effective_overlap_blocks[&warm], 8.0);
+        assert_eq!(signals.effective_cached_tokens[&warm], 128);
+        // A worker with nothing cached can still load the whole shared prefix.
+        assert_eq!(signals.effective_overlap_blocks[&cold], 8.0);
+        assert_eq!(signals.effective_cached_tokens[&cold], 128);
+        // The raw tier snapshot used for selection is untouched.
+        assert_eq!(signals.tier_overlap_blocks.device[&warm], 2);
+        assert!(!signals.tier_overlap_blocks.device.contains_key(&cold));
+    }
+
+    #[test]
+    fn shared_cache_credit_is_weighted_and_skips_covered_workers() {
+        let (mut signals, warm, cold) = shared_credit_signals();
+        #[allow(clippy::single_range_in_vec_init)]
+        let short = SharedCacheHits::from_ranges(vec![0..2]);
+
+        signals.apply_shared_cache_credit(&short, 0.5, 16, [warm, cold]);
+
+        // warm already covers the shared prefix: no double counting.
+        assert_eq!(signals.effective_overlap_blocks[&warm], 3.0);
+        assert_eq!(signals.effective_cached_tokens[&warm], 48);
+        assert_eq!(signals.effective_overlap_blocks[&cold], 1.0);
+        assert_eq!(signals.effective_cached_tokens[&cold], 16);
+    }
+
+    /// A store credits only the workers that can load from it.
+    #[test]
+    #[allow(clippy::single_range_in_vec_init)]
+    fn shared_cache_credit_uses_each_workers_scoped_hits() {
+        let (mut signals, warm, cold) = shared_credit_signals();
+        // Only `cold`'s store holds the prefix; `warm`'s store holds nothing.
+        let shared = SharedCacheHits::scoped(
+            SharedCacheHits::default(),
+            [
+                (cold.worker_id, SharedCacheHits::from_ranges(vec![0..8])),
+                (warm.worker_id, SharedCacheHits::default()),
+            ],
+        );
+
+        signals.apply_shared_cache_credit(&shared, 1.0, 16, [warm, cold]);
+
+        assert_eq!(signals.effective_overlap_blocks[&warm], 3.0);
+        assert_eq!(signals.effective_cached_tokens[&warm], 48);
+        assert_eq!(signals.effective_overlap_blocks[&cold], 8.0);
+        assert_eq!(signals.effective_cached_tokens[&cold], 128);
+    }
+
+    #[test]
+    fn worker_ranks_expand_data_parallel_ranks() {
+        let workers = HashMap::from([
+            (
+                7,
+                SimpleWorkerConfig {
+                    data_parallel_start_rank: 2,
+                    data_parallel_size: 2,
+                    ..Default::default()
+                },
+            ),
+            (8, SimpleWorkerConfig::default()),
+        ]);
+        let mut ranks: Vec<_> = worker_ranks(&workers).collect();
+        ranks.sort();
+        assert_eq!(
+            ranks,
+            vec![
+                WorkerWithDpRank::new(7, 2),
+                WorkerWithDpRank::new(7, 3),
+                WorkerWithDpRank::new(8, 0),
+            ]
+        );
     }
 
     #[test]
