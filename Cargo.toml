@@ -196,9 +196,11 @@ tokio-rustls = { version = "0.26" }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-pemfile = { version = "2" }
 
-# DeepSeek V4.1 prompt-parity fixes on top of crates.io dynamo-renderer 5.2.0.
+# DeepSeek V4.1 parity fixes (vs vLLM's deepseek_v41 encoder/parser) on top of the
+# crates.io dynamo-renderer 5.2.0 and dynamo-parsers-v2 0.5.3 packages.
 [patch.crates-io]
 dynamo-renderer = { path = "lib/vendor/dynamo-renderer" }
+dynamo-parsers-v2 = { path = "lib/vendor/dynamo-parsers-v2" }
 
 [profile.dev.package]
 insta.opt-level = 3
