@@ -254,17 +254,22 @@ fn build_required_schema(
     tools: &[ChatCompletionTool],
     parallel_tool_calls: Option<bool>,
 ) -> Result<Value, ToolChoiceError> {
-    // Accumulator for all shared type definitions ($defs) across tools
+    // Accumulators for shared type definitions across tools: `$defs` (2019-09+) and
+    // draft-07 `definitions` (what zod-to-json-schema emits), each hoisted to the root
+    // under its own keyword so `#/$defs/...` and `#/definitions/...` refs resolve.
     let mut defs: BTreeMap<String, Value> = BTreeMap::new();
+    let mut definitions: BTreeMap<String, Value> = BTreeMap::new();
     let mut any_of = Vec::with_capacity(tools.len());
 
     for tool in tools {
-        // Extract parameter schema and its $defs (if any)
+        // Extract parameter schema and its $defs / definitions (if any)
         let ParamsAndDefs {
             schema,
             defs: new_defs,
+            definitions: new_definitions,
         } = split_defs(&tool.function)?;
         merge_defs(&mut defs, new_defs)?;
+        merge_defs(&mut definitions, new_definitions)?;
         any_of.push(json!({
             "properties": {
                 "name": {
@@ -307,6 +312,14 @@ fn build_required_schema(
             Value::Object(defs.into_iter().collect()),
         );
     }
+    if !definitions.is_empty()
+        && let Value::Object(map) = &mut result
+    {
+        map.insert(
+            "definitions".to_string(),
+            Value::Object(definitions.into_iter().collect()),
+        );
+    }
 
     Ok(result)
 }
@@ -321,6 +334,8 @@ struct ParamsAndDefs {
     schema: Value,
     /// Extracted `$defs` map, or None if the schema had no definitions
     defs: Option<BTreeMap<String, Value>>,
+    /// Extracted draft-07 `definitions` map, or None
+    definitions: Option<BTreeMap<String, Value>>,
 }
 
 /// Extracts `$defs` from a function's parameter schema, returning both the
@@ -349,18 +364,21 @@ struct ParamsAndDefs {
 /// - defs: `Some({"Location": {...}})`
 fn split_defs(function: &FunctionObject) -> Result<ParamsAndDefs, ToolChoiceError> {
     let mut schema = clone_parameters(function);
-    let defs = match &mut schema {
-        Value::Object(obj) => {
-            if let Some(value) = obj.remove("$defs") {
-                Some(convert_defs(function, value)?)
-            } else {
-                None
-            }
-        }
-        _ => None,
+    let mut take = |keyword: &str| match &mut schema {
+        Value::Object(obj) => obj
+            .remove(keyword)
+            .map(|value| convert_defs(function, value))
+            .transpose(),
+        _ => Ok(None),
     };
+    let defs = take("$defs")?;
+    let definitions = take("definitions")?;
 
-    Ok(ParamsAndDefs { schema, defs })
+    Ok(ParamsAndDefs {
+        schema,
+        defs,
+        definitions,
+    })
 }
 
 fn convert_defs(
@@ -648,6 +666,34 @@ mod tests {
         );
         let err = get_json_schema_from_tools(Some(&tool_choice), Some(&tools), None).unwrap_err();
         assert_eq!(err, ToolChoiceError::ToolNotFound("unknown".to_string()));
+    }
+
+    #[test]
+    fn required_schema_hoists_draft07_definitions_to_the_root() {
+        let tool = |name: &str, defs_keyword: &str| ChatCompletionTool {
+            r#type: ChatCompletionToolType::Function,
+            function: FunctionObject {
+                name: name.to_string(),
+                description: None,
+                parameters: Some(json!({
+                    "type": "object",
+                    "properties": {"a": {"$ref": format!("#/{defs_keyword}/__schema0")}},
+                    (defs_keyword): {"__schema0": {"type": "string"}}
+                })),
+                strict: None,
+            },
+        };
+        let schema =
+            build_required_schema(&[tool("t1", "definitions"), tool("t2", "$defs")], None).unwrap();
+        assert_eq!(
+            schema["definitions"],
+            json!({"__schema0": {"type": "string"}})
+        );
+        assert_eq!(schema["$defs"], json!({"__schema0": {"type": "string"}}));
+        for call in schema["items"]["anyOf"].as_array().unwrap() {
+            let parameters = call["properties"]["parameters"].as_object().unwrap();
+            assert!(!parameters.contains_key("definitions") && !parameters.contains_key("$defs"));
+        }
     }
 
     #[test]
