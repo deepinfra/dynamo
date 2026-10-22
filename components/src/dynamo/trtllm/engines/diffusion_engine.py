@@ -105,8 +105,31 @@ def enables_cache_before_compile(trtllm_version: str) -> bool:
     return Version(trtllm_version) < Version(_FIRST_COMPILE_THEN_CACHE_RELEASE)
 
 
+def apply_flow_shift(pipeline: "BasePipeline", shift: float) -> None:
+    """Rebuild the pipeline's scheduler with a different flow-matching shift."""
+    scheduler = pipeline.scheduler
+    config = dict(scheduler.config)
+    keys = [key for key in ("flow_shift", "shift") if key in config]
+    if not keys:
+        raise RuntimeError(
+            f"--flow-shift: scheduler {type(scheduler).__name__} has no flow_shift/shift setting"
+        )
+    pipeline.scheduler = type(scheduler).from_config(config, **{keys[0]: shift})
+    logger.info(
+        "Scheduler %s: %s %s -> %s",
+        type(scheduler).__name__,
+        keys[0],
+        config[keys[0]],
+        shift,
+    )
+
+
 def set_wan22_low_noise_max_cached_steps(steps: int) -> None:
     """Override the reused-step budget VisualGen hard-codes for Wan 2.2's low-noise expert."""
+    if steps < -1:
+        raise ValueError(
+            f"--cache-dit-low-noise-max-cached-steps must be >= -1 (-1 = unlimited), got {steps}"
+        )
     from tensorrt_llm._torch.visual_gen.cache import cache_dit_enablers
 
     if not hasattr(cache_dit_enablers, "_WAN22_LOW_NOISE_MAX_CACHED_STEPS"):
@@ -222,6 +245,18 @@ class DiffusionEngine:
         #   VisualGenArgs → DiffusionModelConfig → AutoPipeline → BasePipeline
         loader = PipelineLoader(diffusion_args)
         self._pipeline = loader.load(skip_warmup=self.config.skip_warmup)
+        if self.config.flow_shift is not None:
+            apply_flow_shift(self._pipeline, self.config.flow_shift)
+        if self.config.cache_dit_low_noise_max_cached_steps is not None and (
+            self.config.cache_backend != "cache_dit"
+            or getattr(self._pipeline, "transformer_2", None) is None
+        ):
+            logger.warning(
+                "--cache-dit-low-noise-max-cached-steps is ignored: it only applies to "
+                "cache_dit on a two-expert Wan 2.2 pipeline (cache_backend=%s, pipeline=%s)",
+                self.config.cache_backend,
+                self._pipeline.__class__.__name__,
+            )
 
         self._initialized = True
         logger.info(

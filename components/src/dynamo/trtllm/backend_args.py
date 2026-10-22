@@ -312,6 +312,14 @@ class DynamoTrtllmArgGroup(ArgGroup):
         )
         add_argument(
             diffusion_group,
+            flag_name="--flow-shift",
+            env_var="DYN_TRTLLM_FLOW_SHIFT",
+            default=None,
+            arg_type=float,
+            help="Flow-matching shift for the scheduler (Wan 2.2 A14B official: 12.0). None = the checkpoint's scheduler config.",
+        )
+        add_argument(
+            diffusion_group,
             flag_name="--torch-dtype",
             env_var="DYN_TRTLLM_TORCH_DTYPE",
             default="bfloat16",
@@ -585,6 +593,7 @@ class DynamoTrtllmConfig(ConfigBase):
     cache_dit_residual_diff_threshold: Optional[float] = None
     cache_dit_max_continuous_cached_steps: Optional[int] = None
     cache_dit_low_noise_max_cached_steps: Optional[int] = None
+    flow_shift: Optional[float] = None
     enable_teacache: bool
     teacache_use_ret_steps: bool
     teacache_thresh: float

@@ -1162,6 +1162,50 @@ class TestCacheDitOverrides:
             set_wan22_low_noise_max_cached_steps(24)
 
 
+class TestFlowShift:
+    """--flow-shift rebuilds the loaded scheduler with only the shift changed."""
+
+    class _Scheduler:
+        def __init__(self, **config):
+            self.config = config
+
+        @classmethod
+        def from_config(cls, config, **overrides):
+            return cls(**{**config, **overrides})
+
+    def test_flow_shift_key_is_replaced_and_the_rest_kept(self):
+        from dynamo.trtllm.engines.diffusion_engine import apply_flow_shift
+
+        pipeline = SimpleNamespace(
+            scheduler=self._Scheduler(flow_shift=3.0, solver_order=2)
+        )
+        apply_flow_shift(pipeline, 12.0)
+        assert pipeline.scheduler.config == {"flow_shift": 12.0, "solver_order": 2}
+
+    def test_shift_key_used_by_flow_match_euler(self):
+        from dynamo.trtllm.engines.diffusion_engine import apply_flow_shift
+
+        pipeline = SimpleNamespace(scheduler=self._Scheduler(shift=5.0))
+        apply_flow_shift(pipeline, 12.0)
+        assert pipeline.scheduler.config == {"shift": 12.0}
+
+    def test_scheduler_without_a_shift_fails_loudly(self):
+        from dynamo.trtllm.engines.diffusion_engine import apply_flow_shift
+
+        with pytest.raises(RuntimeError, match="--flow-shift"):
+            apply_flow_shift(
+                SimpleNamespace(scheduler=self._Scheduler(beta_start=0.1)), 12.0
+            )
+
+    def test_low_noise_budget_below_minus_one_is_rejected(self):
+        from dynamo.trtllm.engines.diffusion_engine import (
+            set_wan22_low_noise_max_cached_steps,
+        )
+
+        with pytest.raises(ValueError, match=">= -1"):
+            set_wan22_low_noise_max_cached_steps(-2)
+
+
 class TestCompileBlocksInPlace:
     """cache_dit holds the block list it was enabled on, so compile must mutate that list."""
 
