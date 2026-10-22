@@ -111,6 +111,10 @@ class DiffusionConfig:
     # teacache -- and VisualGen's CacheDiTConfig defaults are already tuned for
     # few-step runs, so no extra knobs are needed here.
     cache_backend: str = "none"
+    # cache_dit overrides; None keeps VisualGen's defaults
+    cache_dit_residual_diff_threshold: Optional[float] = None
+    cache_dit_max_continuous_cached_steps: Optional[int] = None
+    cache_dit_low_noise_max_cached_steps: Optional[int] = None
 
     # ── TeaCache optimization config (maps to TeaCacheConfig) ──
     enable_teacache: bool = False
@@ -168,6 +172,9 @@ class DiffusionConfig:
             f"default_guidance_scale_2={self.default_guidance_scale_2}, "
             f"default_boundary_ratio={self.default_boundary_ratio}, "
             f"cache_backend={self.cache_backend}, "
+            f"cache_dit_residual_diff_threshold={self.cache_dit_residual_diff_threshold}, "
+            f"cache_dit_max_continuous_cached_steps={self.cache_dit_max_continuous_cached_steps}, "
+            f"cache_dit_low_noise_max_cached_steps={self.cache_dit_low_noise_max_cached_steps}, "
             f"enable_teacache={self.enable_teacache}, "
             f"attn_backend={self.attn_backend}, "
             f"quant_algo={self.quant_algo}, "

@@ -288,6 +288,30 @@ class DynamoTrtllmArgGroup(ArgGroup):
         )
         add_argument(
             diffusion_group,
+            flag_name="--cache-dit-residual-diff-threshold",
+            env_var="DYN_TRTLLM_CACHE_DIT_RESIDUAL_DIFF_THRESHOLD",
+            default=None,
+            arg_type=float,
+            help="cache_dit: reuse a step when the first block's relative change is below this. None = VisualGen default.",
+        )
+        add_argument(
+            diffusion_group,
+            flag_name="--cache-dit-max-continuous-cached-steps",
+            env_var="DYN_TRTLLM_CACHE_DIT_MAX_CONTINUOUS_CACHED_STEPS",
+            default=None,
+            arg_type=int,
+            help="cache_dit: most reused steps in a row before a full compute. None = VisualGen default.",
+        )
+        add_argument(
+            diffusion_group,
+            flag_name="--cache-dit-low-noise-max-cached-steps",
+            env_var="DYN_TRTLLM_CACHE_DIT_LOW_NOISE_MAX_CACHED_STEPS",
+            default=None,
+            arg_type=int,
+            help="cache_dit, Wan 2.2 A14B: total reused-step budget of the low-noise expert. None = VisualGen default.",
+        )
+        add_argument(
+            diffusion_group,
             flag_name="--torch-dtype",
             env_var="DYN_TRTLLM_TORCH_DTYPE",
             default="bfloat16",
@@ -558,6 +582,9 @@ class DynamoTrtllmConfig(ConfigBase):
     torch_dtype: str
     revision: Optional[str] = None
     cache_backend: str
+    cache_dit_residual_diff_threshold: Optional[float] = None
+    cache_dit_max_continuous_cached_steps: Optional[int] = None
+    cache_dit_low_noise_max_cached_steps: Optional[int] = None
     enable_teacache: bool
     teacache_use_ret_steps: bool
     teacache_thresh: float

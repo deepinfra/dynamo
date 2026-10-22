@@ -1061,6 +1061,19 @@ class TestWarmupShapes:
         ]
         assert parse_warmup_resolutions("") is None
 
+    @pytest.mark.parametrize("spec", ["720*1280", "720x1280x81", "720x", "axb"])
+    def test_malformed_resolutions_name_the_flag(self, spec):
+        from dynamo.trtllm.engines.diffusion_engine import parse_warmup_resolutions
+
+        with pytest.raises(ValueError, match="--warmup-resolutions"):
+            parse_warmup_resolutions(spec)
+
+    def test_malformed_num_frames_name_the_flag(self):
+        from dynamo.trtllm.engines.diffusion_engine import parse_warmup_num_frames
+
+        with pytest.raises(ValueError, match="--warmup-num-frames"):
+            parse_warmup_num_frames("81,abc")
+
     def test_parse_num_frames(self):
         from dynamo.trtllm.engines.diffusion_engine import parse_warmup_num_frames
 
@@ -1095,6 +1108,58 @@ class TestWarmupShapes:
         kwargs, config_module = self._build_args()
         assert "compilation" not in kwargs
         config_module.CompilationConfig.assert_not_called()
+
+
+class TestCacheDitOverrides:
+    """cache_dit flags reach VisualGen; unset flags leave its defaults alone."""
+
+    def _build(self, **config_kwargs):
+        from dynamo.trtllm.engines.diffusion_engine import DiffusionEngine
+
+        visual_gen = MagicMock()
+        config_module = MagicMock()
+        cache_module = SimpleNamespace(
+            cache_dit_enablers=SimpleNamespace(_WAN22_LOW_NOISE_MAX_CACHED_STEPS=20)
+        )
+        with patch.dict(
+            "sys.modules",
+            {
+                "tensorrt_llm._torch.visual_gen": visual_gen,
+                "tensorrt_llm._torch.visual_gen.config": config_module,
+                "tensorrt_llm._torch.visual_gen.cache": cache_module,
+            },
+        ):
+            DiffusionEngine(
+                DiffusionConfig(cache_backend="cache_dit", **config_kwargs)
+            )._build_diffusion_args()
+        return config_module.CacheDiTConfig, cache_module.cache_dit_enablers
+
+    def test_unset_flags_keep_visualgen_defaults(self):
+        cache_dit_config, enablers = self._build()
+        cache_dit_config.assert_called_once_with()
+        assert enablers._WAN22_LOW_NOISE_MAX_CACHED_STEPS == 20
+
+    def test_set_flags_reach_cache_config_and_low_noise_budget(self):
+        cache_dit_config, enablers = self._build(
+            cache_dit_residual_diff_threshold=0.32,
+            cache_dit_max_continuous_cached_steps=4,
+            cache_dit_low_noise_max_cached_steps=24,
+        )
+        cache_dit_config.assert_called_once_with(
+            residual_diff_threshold=0.32, max_continuous_cached_steps=4
+        )
+        assert enablers._WAN22_LOW_NOISE_MAX_CACHED_STEPS == 24
+
+    def test_low_noise_budget_fails_loudly_on_unknown_trtllm(self):
+        from dynamo.trtllm.engines.diffusion_engine import (
+            set_wan22_low_noise_max_cached_steps,
+        )
+
+        cache_module = SimpleNamespace(cache_dit_enablers=SimpleNamespace())
+        with patch.dict(
+            "sys.modules", {"tensorrt_llm._torch.visual_gen.cache": cache_module}
+        ), pytest.raises(RuntimeError):
+            set_wan22_low_noise_max_cached_steps(24)
 
 
 class TestCompileBlocksInPlace:
