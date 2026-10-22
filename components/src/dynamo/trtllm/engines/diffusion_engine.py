@@ -77,8 +77,12 @@ def parse_warmup_resolutions(spec: str) -> Optional[list[tuple[int, int]]]:
         return None
     shapes = []
     for item in spec.split(","):
-        height, width = item.strip().lower().split("x")
-        shapes.append((int(height), int(width)))
+        parts = item.strip().lower().split("x")
+        if len(parts) != 2 or not all(p.isdigit() for p in parts):
+            raise ValueError(
+                f"--warmup-resolutions: expected HEIGHTxWIDTH items like '720x1280', got {item!r}"
+            )
+        shapes.append((int(parts[0]), int(parts[1])))
     return shapes
 
 
@@ -86,7 +90,12 @@ def parse_warmup_num_frames(spec: str) -> Optional[list[int]]:
     """Parse '33,81' into [33, 81]; empty gives None."""
     if not spec.strip():
         return None
-    return [int(item) for item in spec.split(",")]
+    items = [item.strip() for item in spec.split(",")]
+    if not all(item.isdigit() for item in items):
+        raise ValueError(
+            f"--warmup-num-frames: expected comma-separated integers like '81', got {spec!r}"
+        )
+    return [int(item) for item in items]
 
 
 def enables_cache_before_compile(trtllm_version: str) -> bool:

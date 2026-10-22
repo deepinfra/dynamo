@@ -1061,6 +1061,19 @@ class TestWarmupShapes:
         ]
         assert parse_warmup_resolutions("") is None
 
+    @pytest.mark.parametrize("spec", ["720*1280", "720x1280x81", "720x", "axb"])
+    def test_malformed_resolutions_name_the_flag(self, spec):
+        from dynamo.trtllm.engines.diffusion_engine import parse_warmup_resolutions
+
+        with pytest.raises(ValueError, match="--warmup-resolutions"):
+            parse_warmup_resolutions(spec)
+
+    def test_malformed_num_frames_name_the_flag(self):
+        from dynamo.trtllm.engines.diffusion_engine import parse_warmup_num_frames
+
+        with pytest.raises(ValueError, match="--warmup-num-frames"):
+            parse_warmup_num_frames("81,abc")
+
     def test_parse_num_frames(self):
         from dynamo.trtllm.engines.diffusion_engine import parse_warmup_num_frames
 
