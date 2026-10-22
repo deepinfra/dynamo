@@ -22,6 +22,7 @@ Note on imports:
        without requiring tensorrt_llm to be installed
 """
 
+import inspect
 import logging
 import random
 from enum import Enum
@@ -109,7 +110,9 @@ def apply_flow_shift(pipeline: "BasePipeline", shift: float) -> None:
     """Rebuild the pipeline's scheduler with a different flow-matching shift."""
     scheduler = pipeline.scheduler
     config = dict(scheduler.config)
-    keys = [key for key in ("flow_shift", "shift") if key in config]
+    # diffusers keeps unknown keys in config, so a stray flow_shift can sit beside the real shift
+    accepted = inspect.signature(type(scheduler).__init__).parameters
+    keys = [key for key in ("flow_shift", "shift") if key in accepted]
     if not keys:
         raise RuntimeError(
             f"--flow-shift: scheduler {type(scheduler).__name__} has no flow_shift/shift setting"
@@ -119,7 +122,7 @@ def apply_flow_shift(pipeline: "BasePipeline", shift: float) -> None:
         "Scheduler %s: %s %s -> %s",
         type(scheduler).__name__,
         keys[0],
-        config[keys[0]],
+        config.get(keys[0]),
         shift,
     )
 
