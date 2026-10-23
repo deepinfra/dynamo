@@ -877,8 +877,7 @@ class TestVideoHandlerResponseFormats:
 
     @pytest.mark.asyncio
     async def test_guidance_defaults_forwarded_to_engine(self):
-        """The handler forwards config default_guidance_scale_2 / default_boundary_ratio
-        to engine.generate() -- dual guidance isn't carried in the /v1/videos nvext."""
+        """Without request values the handler forwards the config's dual-guidance defaults."""
         from dynamo.trtllm.request_handlers.diffusion.video_handler import (
             VideoGenerationHandler,
         )
@@ -913,6 +912,48 @@ class TestVideoHandlerResponseFormats:
 
         assert mock_engine.generate.call_args.kwargs["guidance_scale_2"] == 3.0
         assert mock_engine.generate.call_args.kwargs["boundary_ratio"] == 0.875
+
+    @pytest.mark.asyncio
+    async def test_request_guidance_overrides_config_defaults(self):
+        """A per-request guidance_scale / guidance_scale_2 wins over the config defaults."""
+        from dynamo.trtllm.request_handlers.diffusion.video_handler import (
+            VideoGenerationHandler,
+        )
+
+        mock_output = SimpleNamespace(
+            video=torch.zeros((1, 4, 64, 64, 3), dtype=torch.uint8),
+            image=None,
+            audio=None,
+        )
+        mock_engine = MagicMock()
+        mock_engine.generate = MagicMock(return_value=mock_output)
+        config = DiffusionConfig(
+            media_output_fs_url="file:///tmp/test_media",
+            default_guidance_scale=4.0,
+            default_guidance_scale_2=3.0,
+            default_boundary_ratio=0.875,
+        )
+        with patch(
+            "dynamo.trtllm.request_handlers.diffusion.video_handler.get_fs",
+            return_value=MagicMock(),
+        ):
+            handler = VideoGenerationHandler(engine=mock_engine, config=config)
+
+        request = {
+            "prompt": "p",
+            "model": "m",
+            "response_format": "b64_json",
+            "nvext": {"guidance_scale": 3.5, "guidance_scale_2": 4.0},
+        }
+        with patch(
+            "dynamo.trtllm.request_handlers.diffusion.video_handler.encode_to_video_bytes",
+            return_value=b"fake_mp4",
+        ):
+            async for _ in handler.generate(request, MagicMock()):
+                pass
+
+        kwargs = mock_engine.generate.call_args.kwargs
+        assert (kwargs["guidance_scale"], kwargs["guidance_scale_2"]) == (3.5, 4.0)
 
     @pytest.mark.asyncio
     async def test_error_response_on_failure(self):
@@ -1143,10 +1184,13 @@ class TestCacheDitOverrides:
         cache_dit_config, enablers = self._build(
             cache_dit_residual_diff_threshold=0.32,
             cache_dit_max_continuous_cached_steps=4,
+            cache_dit_max_warmup_steps=8,
             cache_dit_low_noise_max_cached_steps=24,
         )
         cache_dit_config.assert_called_once_with(
-            residual_diff_threshold=0.32, max_continuous_cached_steps=4
+            residual_diff_threshold=0.32,
+            max_continuous_cached_steps=4,
+            max_warmup_steps=8,
         )
         assert enablers._WAN22_LOW_NOISE_MAX_CACHED_STEPS == 24
 

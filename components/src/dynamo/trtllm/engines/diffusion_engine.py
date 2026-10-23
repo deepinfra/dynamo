@@ -276,6 +276,7 @@ class DiffusionEngine:
         overrides = {
             "residual_diff_threshold": self.config.cache_dit_residual_diff_threshold,
             "max_continuous_cached_steps": self.config.cache_dit_max_continuous_cached_steps,
+            "max_warmup_steps": self.config.cache_dit_max_warmup_steps,
         }
         return {k: v for k, v in overrides.items() if v is not None}
 
