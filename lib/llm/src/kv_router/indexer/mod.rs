@@ -306,15 +306,17 @@ pub(crate) async fn build(
                     Some(retention),
                 ),
             );
-            let session_updates = session_prefix_index
-                .map(|index| SessionUpdateSender::for_concurrent(index, Arc::clone(&primary)));
+            let lower_tier = LowerTierIndexers::new_with_metrics(
+                kv_router_config.router_event_threads as usize,
+                block_size,
+                Some(kv_indexer_metrics),
+            );
+            let session_updates = session_prefix_index.map(|index| {
+                SessionUpdateSender::for_concurrent(index, Arc::clone(&primary), lower_tier.clone())
+            });
             return Ok(Indexer::Concurrent {
                 primary,
-                lower_tier: LowerTierIndexers::new_with_metrics(
-                    kv_router_config.router_event_threads as usize,
-                    block_size,
-                    Some(kv_indexer_metrics),
-                ),
+                lower_tier,
                 approx: None,
                 primary_records_routing_decisions: true,
                 session_updates,
@@ -327,15 +329,14 @@ pub(crate) async fn build(
             kv_indexer_metrics.clone(),
             Some(retention),
         );
-        let session_updates = session_prefix_index
-            .map(|index| SessionUpdateSender::for_legacy(index, primary.clone()));
+        let lower_tier =
+            LowerTierIndexers::new_with_metrics(1, block_size, Some(kv_indexer_metrics));
+        let session_updates = session_prefix_index.map(|index| {
+            SessionUpdateSender::for_legacy(index, primary.clone(), lower_tier.clone())
+        });
         return Ok(Indexer::Single {
             primary,
-            lower_tier: LowerTierIndexers::new_with_metrics(
-                1,
-                block_size,
-                Some(kv_indexer_metrics),
-            ),
+            lower_tier,
             approx: None,
             primary_records_routing_decisions: true,
             session_updates,
@@ -361,15 +362,17 @@ pub(crate) async fn build(
         // has no worker-departure purge, so churned/restarted workers leak
         // their block sets forever. Reconcile against discovery to drop them.
         spawn_zmq_worker_reconciliation(component.clone(), primary.clone());
-        let session_updates = session_prefix_index
-            .map(|index| SessionUpdateSender::for_concurrent(index, Arc::clone(&primary)));
+        let lower_tier = LowerTierIndexers::new_with_metrics(
+            kv_router_config.router_event_threads as usize,
+            block_size,
+            Some(kv_indexer_metrics),
+        );
+        let session_updates = session_prefix_index.map(|index| {
+            SessionUpdateSender::for_concurrent(index, Arc::clone(&primary), lower_tier.clone())
+        });
         return Ok(Indexer::Concurrent {
             primary,
-            lower_tier: LowerTierIndexers::new_with_metrics(
-                kv_router_config.router_event_threads as usize,
-                block_size,
-                Some(kv_indexer_metrics),
-            ),
+            lower_tier,
             approx,
             primary_records_routing_decisions: false,
             session_updates,
@@ -388,11 +391,12 @@ pub(crate) async fn build(
     // workers leak their block sets forever. (KvIndexer is cheap to clone —
     // it's just channel senders.)
     spawn_zmq_worker_reconciliation(component.clone(), Arc::new(primary.clone()));
-    let session_updates =
-        session_prefix_index.map(|index| SessionUpdateSender::for_legacy(index, primary.clone()));
+    let lower_tier = LowerTierIndexers::new_with_metrics(1, block_size, Some(kv_indexer_metrics));
+    let session_updates = session_prefix_index
+        .map(|index| SessionUpdateSender::for_legacy(index, primary.clone(), lower_tier.clone()));
     Ok(Indexer::Single {
         primary,
-        lower_tier: LowerTierIndexers::new_with_metrics(1, block_size, Some(kv_indexer_metrics)),
+        lower_tier,
         approx,
         primary_records_routing_decisions: false,
         session_updates,

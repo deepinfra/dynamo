@@ -11,6 +11,8 @@ use dynamo_runtime::config::{
 };
 use serde_json::Value;
 
+use crate::frontend_config::DISABLE_OPENAI_STRICT_SCHEMA_VALIDATION;
+
 use super::{
     common_ext::{CommonExt, CommonExtProvider, extract_guided_decoding_options},
     tools::{ToolChoiceError, validate_openai_tool_choice},
@@ -738,6 +740,7 @@ pub fn validate_tools(
         );
     }
 
+    let skip_strict_schema_validation = *DISABLE_OPENAI_STRICT_SCHEMA_VALIDATION;
     for (i, tool) in tools.iter().enumerate() {
         if tool.function.name.len() > MAX_FUNCTION_NAME_LENGTH {
             anyhow::bail!(
@@ -750,9 +753,8 @@ pub fn validate_tools(
         if tool.function.name.trim().is_empty() {
             anyhow::bail!("Function name at index {} cannot be empty", i);
         }
-        // deepinfra: also accept '.', ':' and '/', which MCP clients use to namespace
-        // tools (e.g. "mcp-swarm.nmap_quick_scan"). vLLM serves these names; rejecting
-        // them turned every such request into a 400.
+        // deepinfra: beyond upstream's dots, also accept ':' and '/', which MCP clients
+        // use to namespace tools (e.g. "github:create_issue"). vLLM serves these names.
         if !tool
             .function
             .name
@@ -775,7 +777,10 @@ pub fn validate_tools(
                 tool.function.name,
             );
         }
-        super::strict_schema::validate_strict_function(&tool.function)?;
+        super::strict_schema::validate_strict_function(
+            &tool.function,
+            skip_strict_schema_validation,
+        )?;
     }
     Ok(())
 }
