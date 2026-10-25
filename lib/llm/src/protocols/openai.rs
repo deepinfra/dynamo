@@ -226,29 +226,31 @@ impl<T: OpenAIStopConditionsProvider> StopConditionsProvider for T {
     fn extract_stop_conditions(&self) -> Result<common::StopConditions> {
         let max_tokens = self.get_max_tokens();
         let min_tokens = self.get_min_tokens();
-        let stop = self.get_stop();
-        let stop_token_ids = self.get_stop_token_ids();
+        let mut stop = self.get_stop();
+        let mut stop_token_ids = self.get_stop_token_ids();
         let max_thinking_tokens = self
             .get_thinking_token_budget()
             .or_else(|| self.get_max_thinking_tokens());
 
-        if let Some(stop) = &stop
+        // Clients routinely send more stop sequences than the engines take;
+        // keep the first MAX_STOP_SEQUENCES instead of failing the request.
+        if let Some(stop) = &mut stop
             && stop.len() > MAX_STOP_SEQUENCES
         {
-            return Err(common::invalid_argument_error(format!(
-                "Maximum of {} stop sequences allowed, got {}",
-                MAX_STOP_SEQUENCES,
-                stop.len()
-            )));
+            tracing::debug!(
+                got = stop.len(),
+                "truncating stop sequences to {MAX_STOP_SEQUENCES}"
+            );
+            stop.truncate(MAX_STOP_SEQUENCES);
         }
-        if let Some(stop_token_ids) = &stop_token_ids
+        if let Some(stop_token_ids) = &mut stop_token_ids
             && stop_token_ids.len() > MAX_STOP_SEQUENCES
         {
-            return Err(common::invalid_argument_error(format!(
-                "Maximum of {} stop token IDs allowed, got {}",
-                MAX_STOP_SEQUENCES,
-                stop_token_ids.len()
-            )));
+            tracing::debug!(
+                got = stop_token_ids.len(),
+                "truncating stop token IDs to {MAX_STOP_SEQUENCES}"
+            );
+            stop_token_ids.truncate(MAX_STOP_SEQUENCES);
         }
 
         // Use the trait method to get ignore_eos, which handles precedence

@@ -95,7 +95,8 @@ pub const MAX_BEST_OF: u8 = 20;
 /// Allowed range of values for `best_of`
 pub const BEST_OF_RANGE: (u8, u8) = (MIN_BEST_OF, MAX_BEST_OF);
 
-/// Maximum allowed number of stop sequences.
+/// Maximum number of stop sequences (or stop token IDs) passed to the engine;
+/// longer lists are truncated to this many, not rejected.
 pub const MAX_STOP_SEQUENCES: usize = 32;
 /// Maximum allowed number of tools.
 pub const MAX_TOOLS: usize = 1536;
@@ -182,15 +183,9 @@ fn validate_no_unsupported_fields_with_ignore(
         anyhow::bail!("`cache_salt` must be a string");
     }
     if let Some(value) = unsupported_fields.get("stop_token_ids") {
-        let token_ids: Vec<crate::types::TokenIdType> = serde_json::from_value(value.clone())
+        // Longer lists are truncated when the stop conditions are extracted.
+        serde_json::from_value::<Vec<crate::types::TokenIdType>>(value.clone())
             .map_err(|_| anyhow::anyhow!("`stop_token_ids` must be an array of token IDs"))?;
-        if token_ids.len() > MAX_STOP_SEQUENCES {
-            return Err(crate::protocols::common::invalid_argument_error(format!(
-                "Maximum of {} stop token IDs allowed, got {}",
-                MAX_STOP_SEQUENCES,
-                token_ids.len()
-            )));
-        }
     }
     if let Some(value) = unsupported_fields.get("detokenize")
         && !value.is_boolean()
@@ -547,30 +542,17 @@ pub fn validate_stop(stop: &Option<dynamo_protocols::types::Stop>) -> Result<(),
             }
             dynamo_protocols::types::Stop::StringArray(sequences) => {
                 // An empty stop array means "no stop sequences" (OpenAI/vLLM
-                // semantics); accept it as a no-op instead of rejecting.
-                if sequences.len() > MAX_STOP_SEQUENCES {
-                    return Err(crate::protocols::common::invalid_argument_error(format!(
-                        "Maximum of {} stop sequences allowed, got {}",
-                        MAX_STOP_SEQUENCES,
-                        sequences.len()
-                    )));
-                }
+                // semantics); accept it as a no-op instead of rejecting. More
+                // than MAX_STOP_SEQUENCES are truncated at extraction.
                 for (i, sequence) in sequences.iter().enumerate() {
                     if sequence.is_empty() {
                         anyhow::bail!("Stop sequence at index {} cannot be empty", i);
                     }
                 }
             }
-            dynamo_protocols::types::Stop::TokenIdArray(token_ids) => {
-                // An empty stop-token-id array means "no stop sequences";
-                // accept it as a no-op instead of rejecting.
-                if token_ids.len() > MAX_STOP_SEQUENCES {
-                    return Err(crate::protocols::common::invalid_argument_error(format!(
-                        "Maximum of {} stop token IDs allowed, got {}",
-                        MAX_STOP_SEQUENCES,
-                        token_ids.len()
-                    )));
-                }
+            dynamo_protocols::types::Stop::TokenIdArray(_) => {
+                // Empty means "no stop sequences"; more than
+                // MAX_STOP_SEQUENCES are truncated at extraction.
             }
         }
     }
@@ -1500,51 +1482,26 @@ mod tests {
     }
 
     #[test]
-    fn validate_stop_rejects_over_max_sequences() {
+    fn validate_stop_accepts_over_max_sequences() {
+        // Truncated at extraction, not rejected.
         let over_max_strings = Some(dynamo_protocols::types::Stop::StringArray(
             (0..=MAX_STOP_SEQUENCES).map(|i| i.to_string()).collect(),
         ));
-        let err = validate_stop(&over_max_strings).unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            format!(
-                "InvalidRequest: Maximum of {} stop sequences allowed, got {}",
-                MAX_STOP_SEQUENCES,
-                MAX_STOP_SEQUENCES + 1
-            )
-        );
+        validate_stop(&over_max_strings).unwrap();
 
         let over_max_token_ids = Some(dynamo_protocols::types::Stop::TokenIdArray(
             (0..=MAX_STOP_SEQUENCES as u32).collect(),
         ));
-        let err = validate_stop(&over_max_token_ids).unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            format!(
-                "InvalidRequest: Maximum of {} stop token IDs allowed, got {}",
-                MAX_STOP_SEQUENCES,
-                MAX_STOP_SEQUENCES + 1
-            )
-        );
+        validate_stop(&over_max_token_ids).unwrap();
     }
 
     #[test]
-    fn validate_no_unsupported_fields_rejects_over_max_stop_token_ids() {
+    fn validate_no_unsupported_fields_accepts_over_max_stop_token_ids() {
         let over_max: Vec<u32> = (0..=MAX_STOP_SEQUENCES as u32).collect();
         let unsupported_fields = HashMap::from([("stop_token_ids".to_string(), json!(over_max))]);
+        validate_no_unsupported_fields(&unsupported_fields).unwrap();
 
-        let err = validate_no_unsupported_fields(&unsupported_fields).unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            format!(
-                "InvalidRequest: Maximum of {} stop token IDs allowed, got {}",
-                MAX_STOP_SEQUENCES,
-                MAX_STOP_SEQUENCES + 1
-            )
-        );
-
-        let at_max: Vec<u32> = (0..MAX_STOP_SEQUENCES as u32).collect();
-        let ok_fields = HashMap::from([("stop_token_ids".to_string(), json!(at_max))]);
-        validate_no_unsupported_fields(&ok_fields).unwrap();
+        let not_ids = HashMap::from([("stop_token_ids".to_string(), json!(["a"]))]);
+        validate_no_unsupported_fields(&not_ids).unwrap_err();
     }
 }
