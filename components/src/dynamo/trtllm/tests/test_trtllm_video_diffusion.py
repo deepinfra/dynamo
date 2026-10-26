@@ -1232,7 +1232,9 @@ class TestFlowShift:
     def test_flow_shift_key_is_replaced_and_the_rest_kept(self):
         from dynamo.trtllm.engines.diffusion_engine import apply_flow_shift
 
-        pipeline = SimpleNamespace(scheduler=self._UniPC(flow_shift=3.0, solver_order=2))
+        pipeline = SimpleNamespace(
+            scheduler=self._UniPC(flow_shift=3.0, solver_order=2)
+        )
         apply_flow_shift(pipeline, 12.0)
         assert pipeline.scheduler.config == {"flow_shift": 12.0, "solver_order": 2}
 
@@ -1296,7 +1298,9 @@ class TestFlowShiftBySteps:
     def _engine(self):
         from dynamo.trtllm.engines.diffusion_engine import DiffusionEngine
 
-        engine = DiffusionEngine(DiffusionConfig(flow_shift=12.0, flow_shift_by_steps="27:20,40:12"))
+        engine = DiffusionEngine(
+            DiffusionConfig(flow_shift=12.0, flow_shift_by_steps="27:20,40:12")
+        )
         engine._initialized = True
         engine._pipeline = MagicMock()
         engine._pipeline.default_generation_params = {}

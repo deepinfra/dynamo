@@ -225,7 +225,9 @@ class DiffusionEngine:
         self.config = config
         self._pipeline: Optional["BasePipeline"] = None
         self._initialized = False
-        self._flow_shift_by_steps = parse_flow_shift_by_steps(config.flow_shift_by_steps)
+        self._flow_shift_by_steps = parse_flow_shift_by_steps(
+            config.flow_shift_by_steps
+        )
         self._scheduler_shift = config.flow_shift
 
     async def initialize(self) -> None:
