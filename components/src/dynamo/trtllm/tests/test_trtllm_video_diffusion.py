@@ -1288,7 +1288,9 @@ class TestFlowShiftBySteps:
         assert parse_flow_shift_by_steps("") is None
         assert parse_flow_shift_by_steps("27:20, 40:12") == {27: 20.0, 40: 12.0}
 
-    @pytest.mark.parametrize("spec", ["27-20", "27:", "x:12", "27:20,40"])
+    @pytest.mark.parametrize(
+        "spec", ["27-20", "27:", "x:12", "27:20,40", "27:20,27:12", "27:0", "27:-3"]
+    )
     def test_parse_rejects_malformed(self, spec):
         from dynamo.trtllm.engines.diffusion_engine import parse_flow_shift_by_steps
 

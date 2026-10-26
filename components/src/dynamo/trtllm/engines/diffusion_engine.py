@@ -103,15 +103,20 @@ def parse_flow_shift_by_steps(spec: str) -> Optional[dict[int, float]]:
     """Parse '27:20,40:12' into {27: 20.0, 40: 12.0}; empty gives None."""
     if not spec.strip():
         return None
-    table = {}
+    table: dict[int, float] = {}
     for item in spec.split(","):
-        steps, _, shift = item.strip().partition(":")
+        steps_text, _, shift_text = item.strip().partition(":")
         try:
-            table[int(steps)] = float(shift)
+            steps, shift = int(steps_text), float(shift_text)
         except ValueError:
             raise ValueError(
                 f"--flow-shift-by-steps: expected STEPS:SHIFT items like '27:20', got {item!r}"
             ) from None
+        if steps in table or shift <= 0:
+            raise ValueError(
+                f"--flow-shift-by-steps: {item!r} repeats a step count or has a shift <= 0"
+            )
+        table[steps] = shift
     return table
 
 
