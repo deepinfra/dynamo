@@ -304,6 +304,14 @@ class DynamoTrtllmArgGroup(ArgGroup):
         )
         add_argument(
             diffusion_group,
+            flag_name="--cache-dit-max-warmup-steps",
+            env_var="DYN_TRTLLM_CACHE_DIT_MAX_WARMUP_STEPS",
+            default=None,
+            arg_type=int,
+            help="cache_dit: leading steps always computed before reuse starts (Wan 2.2 A14B: the high-noise expert's). None = VisualGen default.",
+        )
+        add_argument(
+            diffusion_group,
             flag_name="--cache-dit-low-noise-max-cached-steps",
             env_var="DYN_TRTLLM_CACHE_DIT_LOW_NOISE_MAX_CACHED_STEPS",
             default=None,
@@ -317,6 +325,14 @@ class DynamoTrtllmArgGroup(ArgGroup):
             default=None,
             arg_type=float,
             help="Flow-matching shift for the scheduler (Wan 2.2 A14B official: 12.0). None = the checkpoint's scheduler config.",
+        )
+        add_argument(
+            diffusion_group,
+            flag_name="--flow-shift-by-steps",
+            env_var="DYN_TRTLLM_FLOW_SHIFT_BY_STEPS",
+            default="",
+            arg_type=str,
+            help="Per-request shift by step count, e.g. '27:20,40:12'; other step counts are rejected. Empty = --flow-shift for all.",
         )
         add_argument(
             diffusion_group,
@@ -592,8 +608,10 @@ class DynamoTrtllmConfig(ConfigBase):
     cache_backend: str
     cache_dit_residual_diff_threshold: Optional[float] = None
     cache_dit_max_continuous_cached_steps: Optional[int] = None
+    cache_dit_max_warmup_steps: Optional[int] = None
     cache_dit_low_noise_max_cached_steps: Optional[int] = None
     flow_shift: Optional[float] = None
+    flow_shift_by_steps: str = ""
     enable_teacache: bool
     teacache_use_ret_steps: bool
     teacache_thresh: float

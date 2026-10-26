@@ -877,8 +877,7 @@ class TestVideoHandlerResponseFormats:
 
     @pytest.mark.asyncio
     async def test_guidance_defaults_forwarded_to_engine(self):
-        """The handler forwards config default_guidance_scale_2 / default_boundary_ratio
-        to engine.generate() -- dual guidance isn't carried in the /v1/videos nvext."""
+        """Without request values the handler forwards the config's dual-guidance defaults."""
         from dynamo.trtllm.request_handlers.diffusion.video_handler import (
             VideoGenerationHandler,
         )
@@ -913,6 +912,48 @@ class TestVideoHandlerResponseFormats:
 
         assert mock_engine.generate.call_args.kwargs["guidance_scale_2"] == 3.0
         assert mock_engine.generate.call_args.kwargs["boundary_ratio"] == 0.875
+
+    @pytest.mark.asyncio
+    async def test_request_guidance_overrides_config_defaults(self):
+        """A per-request guidance_scale / guidance_scale_2 wins over the config defaults."""
+        from dynamo.trtllm.request_handlers.diffusion.video_handler import (
+            VideoGenerationHandler,
+        )
+
+        mock_output = SimpleNamespace(
+            video=torch.zeros((1, 4, 64, 64, 3), dtype=torch.uint8),
+            image=None,
+            audio=None,
+        )
+        mock_engine = MagicMock()
+        mock_engine.generate = MagicMock(return_value=mock_output)
+        config = DiffusionConfig(
+            media_output_fs_url="file:///tmp/test_media",
+            default_guidance_scale=4.0,
+            default_guidance_scale_2=3.0,
+            default_boundary_ratio=0.875,
+        )
+        with patch(
+            "dynamo.trtllm.request_handlers.diffusion.video_handler.get_fs",
+            return_value=MagicMock(),
+        ):
+            handler = VideoGenerationHandler(engine=mock_engine, config=config)
+
+        request = {
+            "prompt": "p",
+            "model": "m",
+            "response_format": "b64_json",
+            "nvext": {"guidance_scale": 3.5, "guidance_scale_2": 4.0},
+        }
+        with patch(
+            "dynamo.trtllm.request_handlers.diffusion.video_handler.encode_to_video_bytes",
+            return_value=b"fake_mp4",
+        ):
+            async for _ in handler.generate(request, MagicMock()):
+                pass
+
+        kwargs = mock_engine.generate.call_args.kwargs
+        assert (kwargs["guidance_scale"], kwargs["guidance_scale_2"]) == (3.5, 4.0)
 
     @pytest.mark.asyncio
     async def test_error_response_on_failure(self):
@@ -1143,10 +1184,13 @@ class TestCacheDitOverrides:
         cache_dit_config, enablers = self._build(
             cache_dit_residual_diff_threshold=0.32,
             cache_dit_max_continuous_cached_steps=4,
+            cache_dit_max_warmup_steps=8,
             cache_dit_low_noise_max_cached_steps=24,
         )
         cache_dit_config.assert_called_once_with(
-            residual_diff_threshold=0.32, max_continuous_cached_steps=4
+            residual_diff_threshold=0.32,
+            max_continuous_cached_steps=4,
+            max_warmup_steps=8,
         )
         assert enablers._WAN22_LOW_NOISE_MAX_CACHED_STEPS == 24
 
@@ -1188,7 +1232,9 @@ class TestFlowShift:
     def test_flow_shift_key_is_replaced_and_the_rest_kept(self):
         from dynamo.trtllm.engines.diffusion_engine import apply_flow_shift
 
-        pipeline = SimpleNamespace(scheduler=self._UniPC(flow_shift=3.0, solver_order=2))
+        pipeline = SimpleNamespace(
+            scheduler=self._UniPC(flow_shift=3.0, solver_order=2)
+        )
         apply_flow_shift(pipeline, 12.0)
         assert pipeline.scheduler.config == {"flow_shift": 12.0, "solver_order": 2}
 
@@ -1231,6 +1277,62 @@ class TestFlowShift:
             },
         ), pytest.raises(ValueError, match=">= -1"):
             DiffusionEngine(config)._build_diffusion_args()
+
+
+class TestFlowShiftBySteps:
+    """Each request runs with the shift mapped to its step count; unmapped counts are refused."""
+
+    def test_parse(self):
+        from dynamo.trtllm.engines.diffusion_engine import parse_flow_shift_by_steps
+
+        assert parse_flow_shift_by_steps("") is None
+        assert parse_flow_shift_by_steps("27:20, 40:12") == {27: 20.0, 40: 12.0}
+
+    @pytest.mark.parametrize(
+        "spec", ["27-20", "27:", "x:12", "27:20,40", "27:20,27:12", "27:0", "27:-3"]
+    )
+    def test_parse_rejects_malformed(self, spec):
+        from dynamo.trtllm.engines.diffusion_engine import parse_flow_shift_by_steps
+
+        with pytest.raises(ValueError, match="--flow-shift-by-steps"):
+            parse_flow_shift_by_steps(spec)
+
+    def _engine(self):
+        from dynamo.trtllm.engines.diffusion_engine import DiffusionEngine
+
+        engine = DiffusionEngine(
+            DiffusionConfig(flow_shift=12.0, flow_shift_by_steps="27:20,40:12")
+        )
+        engine._initialized = True
+        engine._pipeline = MagicMock()
+        engine._pipeline.default_generation_params = {}
+        engine._pipeline.extra_param_specs = {}
+        return engine
+
+    def _generate(self, engine, steps):
+        with patch.dict(
+            "sys.modules",
+            {
+                "tensorrt_llm._torch.visual_gen.executor": MagicMock(),
+                "tensorrt_llm.visual_gen.params": MagicMock(),
+            },
+        ):
+            engine.generate(prompt="p", num_inference_steps=steps)
+
+    def test_generate_switches_shift_only_when_it_changes(self):
+        engine = self._engine()
+        with patch("dynamo.trtllm.engines.diffusion_engine.apply_flow_shift") as apply:
+            for steps in (27, 27, 40, 40, 27):
+                self._generate(engine, steps)
+        assert [c.args[1] for c in apply.call_args_list] == [20.0, 12.0, 20.0]
+
+    def test_generate_refuses_unmapped_step_count(self):
+        engine = self._engine()
+        with patch("dynamo.trtllm.engines.diffusion_engine.apply_flow_shift") as apply:
+            with pytest.raises(ValueError, match="no shift for 33 steps"):
+                self._generate(engine, 33)
+        apply.assert_not_called()
+        engine._pipeline.infer.assert_not_called()
 
 
 class TestCompileBlocksInPlace:

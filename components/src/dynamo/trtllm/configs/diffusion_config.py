@@ -114,9 +114,12 @@ class DiffusionConfig:
     # cache_dit overrides; None keeps VisualGen's defaults
     cache_dit_residual_diff_threshold: Optional[float] = None
     cache_dit_max_continuous_cached_steps: Optional[int] = None
+    cache_dit_max_warmup_steps: Optional[int] = None
     cache_dit_low_noise_max_cached_steps: Optional[int] = None
     # Scheduler flow-matching shift; None keeps the checkpoint's scheduler config
     flow_shift: Optional[float] = None
+    # Raw '27:20,40:12' (steps:shift); empty = one shift for every step count
+    flow_shift_by_steps: str = ""
 
     # ── TeaCache optimization config (maps to TeaCacheConfig) ──
     enable_teacache: bool = False
@@ -176,8 +179,10 @@ class DiffusionConfig:
             f"cache_backend={self.cache_backend}, "
             f"cache_dit_residual_diff_threshold={self.cache_dit_residual_diff_threshold}, "
             f"cache_dit_max_continuous_cached_steps={self.cache_dit_max_continuous_cached_steps}, "
+            f"cache_dit_max_warmup_steps={self.cache_dit_max_warmup_steps}, "
             f"cache_dit_low_noise_max_cached_steps={self.cache_dit_low_noise_max_cached_steps}, "
             f"flow_shift={self.flow_shift}, "
+            f"flow_shift_by_steps={self.flow_shift_by_steps!r}, "
             f"enable_teacache={self.enable_teacache}, "
             f"attn_backend={self.attn_backend}, "
             f"quant_algo={self.quant_algo}, "

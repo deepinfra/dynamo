@@ -205,9 +205,11 @@ class VideoGenerationHandler(BaseGenerativeHandler):
                 if nvext.guidance_scale is not None
                 else self.config.default_guidance_scale
             )
-            # Dual-guidance / boundary are config-only (not carried in the /v1/videos
-            # nvext); None → engine/pipeline default (single guidance).
-            guidance_scale_2 = self.config.default_guidance_scale_2
+            guidance_scale_2 = (
+                nvext.guidance_scale_2
+                if nvext.guidance_scale_2 is not None
+                else self.config.default_guidance_scale_2
+            )
             boundary_ratio = self.config.default_boundary_ratio
 
             guidance_desc = (

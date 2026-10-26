@@ -99,6 +99,27 @@ def parse_warmup_num_frames(spec: str) -> Optional[list[int]]:
     return [int(item) for item in items]
 
 
+def parse_flow_shift_by_steps(spec: str) -> Optional[dict[int, float]]:
+    """Parse '27:20,40:12' into {27: 20.0, 40: 12.0}; empty gives None."""
+    if not spec.strip():
+        return None
+    table: dict[int, float] = {}
+    for item in spec.split(","):
+        steps_text, _, shift_text = item.strip().partition(":")
+        try:
+            steps, shift = int(steps_text), float(shift_text)
+        except ValueError:
+            raise ValueError(
+                f"--flow-shift-by-steps: expected STEPS:SHIFT items like '27:20', got {item!r}"
+            ) from None
+        if steps in table or shift <= 0:
+            raise ValueError(
+                f"--flow-shift-by-steps: {item!r} repeats a step count or has a shift <= 0"
+            )
+        table[steps] = shift
+    return table
+
+
 def enables_cache_before_compile(trtllm_version: str) -> bool:
     """Whether this TRT-LLM attaches cache_dit before torch.compile replaces the blocks."""
     from packaging.version import Version
@@ -209,6 +230,10 @@ class DiffusionEngine:
         self.config = config
         self._pipeline: Optional["BasePipeline"] = None
         self._initialized = False
+        self._flow_shift_by_steps = parse_flow_shift_by_steps(
+            config.flow_shift_by_steps
+        )
+        self._scheduler_shift = config.flow_shift
 
     async def initialize(self) -> None:
         """Load and configure the diffusion pipeline via PipelineLoader.
@@ -276,6 +301,7 @@ class DiffusionEngine:
         overrides = {
             "residual_diff_threshold": self.config.cache_dit_residual_diff_threshold,
             "max_continuous_cached_steps": self.config.cache_dit_max_continuous_cached_steps,
+            "max_warmup_steps": self.config.cache_dit_max_warmup_steps,
         }
         return {k: v for k, v in overrides.items() if v is not None}
 
@@ -378,6 +404,21 @@ class DiffusionEngine:
 
         return VisualGenArgs(**args_kwargs)
 
+    def _use_flow_shift_for(self, num_inference_steps: int) -> None:
+        """Switch the scheduler to the shift --flow-shift-by-steps maps this step count to."""
+        if self._flow_shift_by_steps is None:
+            return
+        shift = self._flow_shift_by_steps.get(num_inference_steps)
+        if shift is None:
+            raise ValueError(
+                f"--flow-shift-by-steps has no shift for {num_inference_steps} steps "
+                f"(configured: {sorted(self._flow_shift_by_steps)})"
+            )
+        if shift != self._scheduler_shift:
+            # Replaces the shared scheduler: safe only because the handler serializes generate().
+            apply_flow_shift(self._pipeline, shift)
+            self._scheduler_shift = shift
+
     def generate(
         self,
         prompt: str,
@@ -422,6 +463,7 @@ class DiffusionEngine:
         """
         if not self._initialized or self._pipeline is None:
             raise RuntimeError("Engine not initialized. Call initialize() first.")
+        self._use_flow_shift_for(num_inference_steps)
 
         logger.info(
             f"Generating: prompt='{prompt[:50]}...', "
