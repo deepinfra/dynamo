@@ -14,6 +14,8 @@ use super::v4::{Encoding, encode_messages_with_encoding};
 const REASONING_EFFORT_MAPPINGS: [(&str, u8); 4] =
     [("low", 25), ("high", 50), ("xhigh", 75), ("max", 100)];
 const DEFAULT_REASONING_EFFORT: u8 = 50;
+/// vLLM `deepseek_v41_encoding.IMAGE_PLACEHOLDER`.
+const IMAGE_PLACEHOLDER: &str = "<｜deepseek_image｜>";
 const EFFORT_ERROR: &str = concat!(
     "DeepSeek V4.1 reasoning_effort must be low, high, xhigh, max, ",
     "or an integer within [1, 100] in chat_template_kwargs"
@@ -141,7 +143,7 @@ fn normalize_text(messages: &mut [Value]) -> Result<()> {
             "DeepSeek V4.1 expects OpenAI text content blocks in content"
         );
         // Literal "<｜deepseek_image｜>" text (e.g. source code in a tool result)
-        // renders as text, as in vLLM; only image content parts are refused.
+        // renders as text, as in vLLM.
         if let Some(reasoning) = message.get("reasoning").cloned() {
             message["reasoning_content"] = reasoning;
         }
@@ -150,18 +152,22 @@ fn normalize_text(messages: &mut [Value]) -> Result<()> {
                 Value::Null => String::new(),
                 Value::String(text) => text.clone(),
                 Value::Array(blocks) => {
+                    // vLLM `deepseek_v41._normalize_messages`: each image part is one
+                    // placeholder, matched to the request's images by order.
                     let mut texts = Vec::with_capacity(blocks.len());
                     for block in blocks {
-                        ensure!(
-                            block.get("type").and_then(Value::as_str) == Some("text"),
-                            "DeepSeek V4.1 native formatter supports text content only"
-                        );
-                        texts.push(
-                            block
-                                .get("text")
-                                .and_then(Value::as_str)
-                                .context("Text block requires text")?,
-                        );
+                        match block.get("type").and_then(Value::as_str) {
+                            Some("text" | "input_text" | "output_text") => texts.push(
+                                block.get("text").and_then(Value::as_str).unwrap_or(""),
+                            ),
+                            Some("image_url" | "input_image" | "image_pil") => {
+                                texts.push(IMAGE_PLACEHOLDER)
+                            }
+                            other => anyhow::bail!(
+                                "DeepSeek V4.1 supports text and image content only; got {:?}",
+                                other.unwrap_or("")
+                            ),
+                        }
                     }
                     texts.join("\n\n")
                 }

@@ -103,13 +103,41 @@ fn template_options_set_numeric_effort_and_disable_thinking() {
 }
 
 #[test]
-fn text_only_boundary_rejects_media() {
-    for block in [
-        json!({"type":"image_url","image_url":{"url":"https://example.com/image.png"}}),
-        json!({"type":"input_audio","input_audio":{"data":"AAAA","format":"wav"}}),
-    ] {
-        assert!(render(json!({"messages":[{"role":"user","content":[block]}]})).is_err());
-    }
+fn image_parts_render_as_placeholders_like_vllm() {
+    // Expected strings are vLLM's `deepseek_v41_encoding.encode_messages` output.
+    let image = |name: &str| json!({"type":"image_url","image_url":{"url":format!("https://example.com/{name}.png")}});
+    let effort = "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 50 (range 1-100, the higher the value, the more thorough the reasoning)\n\n";
+    assert_eq!(
+        render(json!({"messages":[{"role":"user","content":[
+            {"type":"text","text":"Describe"}, image("a"), {"type":"text","text":"briefly"}
+        ]}]}))
+        .unwrap(),
+        format!("{effort}<｜User｜>Describe\n\n<｜deepseek_image｜>\n\nbriefly<｜Assistant｜><think>")
+    );
+    assert_eq!(
+        render(json!({"reasoning_effort":"none","messages":[{"role":"user","content":[
+            image("a"), image("b"), {"type":"text","text":"Same?"}
+        ]}]}))
+        .unwrap(),
+        "<｜begin▁of▁sentence｜><｜User｜><｜deepseek_image｜>\n\n<｜deepseek_image｜>\n\nSame?<｜Assistant｜></think>"
+    );
+    assert_eq!(
+        render(json!({"messages":[
+            {"role":"user","content":[image("a"), {"type":"text","text":"What is it?"}]},
+            {"role":"assistant","content":"A cat.","reasoning_content":"Looks like a cat."},
+            {"role":"user","content":"And its color?"}
+        ]}))
+        .unwrap(),
+        format!(
+            "{effort}<｜User｜><｜deepseek_image｜>\n\nWhat is it?<｜Assistant｜></think>A cat.<｜end▁of▁sentence｜><｜User｜>And its color?<｜Assistant｜><think>"
+        )
+    );
+}
+
+#[test]
+fn non_text_non_image_parts_are_rejected() {
+    let audio = json!({"type":"input_audio","input_audio":{"data":"AAAA","format":"wav"}});
+    assert!(render(json!({"messages":[{"role":"user","content":[audio]}]})).is_err());
     assert!(
         render(json!({"messages":[{"role":"user","content":"see <｜deepseek_image｜> here"}]}))
             .unwrap()
