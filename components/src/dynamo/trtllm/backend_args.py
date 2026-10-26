@@ -328,6 +328,14 @@ class DynamoTrtllmArgGroup(ArgGroup):
         )
         add_argument(
             diffusion_group,
+            flag_name="--flow-shift-by-steps",
+            env_var="DYN_TRTLLM_FLOW_SHIFT_BY_STEPS",
+            default="",
+            arg_type=str,
+            help="Per-request shift by step count, e.g. '27:20,40:12'; other step counts are rejected. Empty = --flow-shift for all.",
+        )
+        add_argument(
+            diffusion_group,
             flag_name="--torch-dtype",
             env_var="DYN_TRTLLM_TORCH_DTYPE",
             default="bfloat16",
@@ -603,6 +611,7 @@ class DynamoTrtllmConfig(ConfigBase):
     cache_dit_max_warmup_steps: Optional[int] = None
     cache_dit_low_noise_max_cached_steps: Optional[int] = None
     flow_shift: Optional[float] = None
+    flow_shift_by_steps: str = ""
     enable_teacache: bool
     teacache_use_ret_steps: bool
     teacache_thresh: float

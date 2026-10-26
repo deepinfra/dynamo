@@ -1277,6 +1277,58 @@ class TestFlowShift:
             DiffusionEngine(config)._build_diffusion_args()
 
 
+class TestFlowShiftBySteps:
+    """Each request runs with the shift mapped to its step count; unmapped counts are refused."""
+
+    def test_parse(self):
+        from dynamo.trtllm.engines.diffusion_engine import parse_flow_shift_by_steps
+
+        assert parse_flow_shift_by_steps("") is None
+        assert parse_flow_shift_by_steps("27:20, 40:12") == {27: 20.0, 40: 12.0}
+
+    @pytest.mark.parametrize("spec", ["27-20", "27:", "x:12", "27:20,40"])
+    def test_parse_rejects_malformed(self, spec):
+        from dynamo.trtllm.engines.diffusion_engine import parse_flow_shift_by_steps
+
+        with pytest.raises(ValueError, match="--flow-shift-by-steps"):
+            parse_flow_shift_by_steps(spec)
+
+    def _engine(self):
+        from dynamo.trtllm.engines.diffusion_engine import DiffusionEngine
+
+        engine = DiffusionEngine(DiffusionConfig(flow_shift=12.0, flow_shift_by_steps="27:20,40:12"))
+        engine._initialized = True
+        engine._pipeline = MagicMock()
+        engine._pipeline.default_generation_params = {}
+        engine._pipeline.extra_param_specs = {}
+        return engine
+
+    def _generate(self, engine, steps):
+        with patch.dict(
+            "sys.modules",
+            {
+                "tensorrt_llm._torch.visual_gen.executor": MagicMock(),
+                "tensorrt_llm.visual_gen.params": MagicMock(),
+            },
+        ):
+            engine.generate(prompt="p", num_inference_steps=steps)
+
+    def test_generate_switches_shift_only_when_it_changes(self):
+        engine = self._engine()
+        with patch("dynamo.trtllm.engines.diffusion_engine.apply_flow_shift") as apply:
+            for steps in (27, 27, 40, 40, 27):
+                self._generate(engine, steps)
+        assert [c.args[1] for c in apply.call_args_list] == [20.0, 12.0, 20.0]
+
+    def test_generate_refuses_unmapped_step_count(self):
+        engine = self._engine()
+        with patch("dynamo.trtllm.engines.diffusion_engine.apply_flow_shift") as apply:
+            with pytest.raises(ValueError, match="no shift for 33 steps"):
+                self._generate(engine, 33)
+        apply.assert_not_called()
+        engine._pipeline.infer.assert_not_called()
+
+
 class TestCompileBlocksInPlace:
     """cache_dit holds the block list it was enabled on, so compile must mutate that list."""
 
