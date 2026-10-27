@@ -17,7 +17,9 @@ use tokio::sync::Notify;
 use tokio::time::{Duration, timeout};
 
 use super::crd::DynamoWorkerMetadata;
-use super::utils::{KubeDiscoveryMode, PodInfo, extract_endpoint_info, extract_ready_containers};
+use super::utils::{
+    KubeDiscoveryMode, KubeDiscoveryTarget, PodInfo, extract_endpoint_info, extract_ready_containers,
+};
 
 const DEBOUNCE_DURATION: Duration = Duration::from_millis(500);
 
@@ -146,6 +148,13 @@ impl DiscoverySource {
                 .collect(),
         }
     }
+}
+
+/// DI: `<base>-dp<N>`, the CR of data-parallel rank N of the worker whose ready entry key is `base`.
+fn is_dp_rank_cr_name(name: &str, base: &str) -> bool {
+    name.strip_prefix(base)
+        .and_then(|rest| rest.strip_prefix("-dp"))
+        .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Discovers and aggregates metadata from DynamoWorkerMetadata CRs in the cluster
@@ -284,7 +293,7 @@ impl DiscoveryDaemon {
     ) -> Result<AggregatedSnapshot> {
         let start = std::time::Instant::now();
 
-        let ready_entries = source.ready_entries();
+        let mut ready_entries = source.ready_entries();
 
         tracing::trace!(
             "Daemon found {} ready entries (mode={:?})",
@@ -293,6 +302,21 @@ impl DiscoveryDaemon {
         );
 
         let cr_state = cr_reader.state();
+
+        // DI: a pod that runs one dynamo process per data-parallel rank registers each rank in
+        // container mode as "dp<N>", so its CRs are "<ready entry key>-dp<N>". Admit those while
+        // the pod (or container) they hang off is ready; an instance id is the hash of the CR
+        // name for every target kind, so the Pod target reproduces the worker's id.
+        let base_keys: Vec<String> = ready_entries.iter().map(|(_, key)| key.clone()).collect();
+        for arc_cr in cr_state.iter() {
+            let Some(name) = arc_cr.metadata.name.as_deref() else {
+                continue;
+            };
+            if base_keys.iter().any(|base| is_dp_rank_cr_name(name, base)) {
+                let target = KubeDiscoveryTarget::Pod(name.to_string());
+                ready_entries.push((target.instance_id(), name.to_string()));
+            }
+        }
         let mut cr_map: HashMap<String, CachedCrMetadata> = HashMap::new();
         let mut invalid_crs: HashMap<String, Option<String>> = HashMap::new();
         let mut observed_crs: HashSet<String> = HashSet::new();
