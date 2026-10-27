@@ -374,10 +374,14 @@ fn build_selection_trace(
 
 /// Log every scored candidate at TRACE, one row per worker and rank, stamped with
 /// `request_id` and `worker_type` because the scheduler actor task has no request span.
+/// Each row carries the inputs its cost came from, so a decision can be explained
+/// after the fact. `inputs` is empty for picker-only policies; rows then log the cost alone.
 fn log_scored_candidates(
     request: &SchedulingRequest,
     worker_type: &'static str,
     candidates: &[ScoredWorkerCandidate],
+    inputs: &[CandidateData],
+    cache_snapshot: &CacheSnapshot<'_>,
     selected_row: usize,
 ) {
     if !tracing::enabled!(tracing::Level::TRACE) {
@@ -385,6 +389,11 @@ fn log_scored_candidates(
     }
     let request_id = request.mode.request_id().unwrap_or("-");
     for (row, candidate) in candidates.iter().enumerate() {
+        let data = inputs.get(row);
+        let shared_hits = cache_snapshot
+            .shared_hits
+            .zip(data)
+            .map(|(hits, data)| hits.for_worker(data.worker.worker_id).total_hits);
         tracing::trace!(
             request_id,
             worker_type,
@@ -392,6 +401,17 @@ fn log_scored_candidates(
             dp_rank = candidate.worker.dp_rank,
             cost = candidate.cost,
             selected = row == selected_row,
+            isl_tokens = request.isl_tokens,
+            device_blocks = data.map(|d| d.cache.device_overlap_blocks),
+            host_blocks = data.map(|d| d.cache.host_overlap_blocks),
+            disk_blocks = data.map(|d| d.cache.disk_overlap_blocks),
+            effective_blocks = data.map(|d| d.cache.effective_overlap_blocks),
+            cached_tokens = data.map(|d| d.cache.estimated_cached_tokens),
+            shared_hits,
+            active_prefill_tokens = data.map(|d| d.load.active_prefill_tokens),
+            decode_blocks = data.map(|d| d.load.decode_cost_blocks),
+            active_requests = data.map(|d| d.load.active_requests),
+            load_available = data.map(|d| d.load.available),
             "Scored worker candidate"
         );
     }
@@ -511,6 +531,7 @@ fn select_worker_with_policy<C: WorkerConfigLike>(
                 candidates,
                 cache_inputs,
                 load_inputs,
+                unscored_candidates,
                 ..
             } = &mut *state;
             if candidates.is_empty() {
@@ -547,7 +568,14 @@ fn select_worker_with_policy<C: WorkerConfigLike>(
                     }
                     .into());
                 };
-                log_scored_candidates(request, worker_type, candidates, row);
+                log_scored_candidates(
+                    request,
+                    worker_type,
+                    candidates,
+                    unscored_candidates,
+                    &input.cache_snapshot,
+                    row,
+                );
                 let trace = trace.map(|spec| {
                     build_selection_trace(
                         candidates,
