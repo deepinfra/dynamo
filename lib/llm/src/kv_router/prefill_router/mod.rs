@@ -625,9 +625,15 @@ where
         let topology_constraints =
             self.preflight_kv_transfer_constraints(Some(endpoint_id), worker_id)?;
 
-        let bootstrap_info = self
-            .model_manager
-            .get_disaggregated_endpoint(endpoint_id, worker_id)
+        // DI decode-first: a request carrying media stays on the prefill-first path,
+        // since the decode needs prefill's expanded prompt tokens for it.
+        let bootstrap_endpoint = if request.multi_modal_data.is_some() {
+            None
+        } else {
+            self.model_manager
+                .get_disaggregated_endpoint(endpoint_id, worker_id)
+        };
+        let bootstrap_info = bootstrap_endpoint
             .map(|endpoint| (endpoint_id, endpoint))
             .and_then(|(endpoint_id, endpoint)| {
                 let host = endpoint.bootstrap_host?;
