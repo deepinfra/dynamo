@@ -22,8 +22,9 @@
 //!   replica medium, with the chunk's group id
 //!   `vllm-mooncake-store:[{cache_prefix}@]{model}@{chunk hash hex}`. A chunk
 //!   counts while any medium holds it. Events are the only source: after the
-//!   subscriber (re)connects or misses a batch, the store's earlier chunks are
-//!   unknown until stored again.
+//!   subscriber (re)connects, the store's earlier chunks are unknown until
+//!   stored again. A missed batch is only counted: forgetting a whole store
+//!   over it would cost more hits than the few chunks it leaves wrong.
 //!
 //! A worker's hits are the leading chunks of the prompt its store holds, as the
 //! connector loads one prefix. A chunk must be one router block (the connector's
@@ -46,7 +47,7 @@ use dynamo_runtime::{component::Component, metrics::MetricsHierarchy};
 use futures::StreamExt;
 use lru::LruCache;
 use parking_lot::{Mutex, RwLock};
-use prometheus::{IntCounterVec, IntGauge};
+use prometheus::{IntCounter, IntCounterVec, IntGauge};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
@@ -266,13 +267,16 @@ impl MooncakeStoreSharedKvCache {
             }
             // The master numbers batches consecutively: anything else lost some.
             if sequence != previous.wrapping_add(1) {
-                tracing::warn!(
+                let missed = sequence.wrapping_sub(previous).wrapping_sub(1);
+                tracing::debug!(
                     endpoint = %store.announcement.kv_events_endpoint,
                     previous,
                     sequence,
-                    "Mooncake store KV event sequence gap; forgetting the store's chunks"
+                    "Mooncake store KV event sequence gap"
                 );
-                self.clear(&mut state, "gap");
+                if let Some(metrics) = &self.inner.metrics {
+                    metrics.missed_batches.inc_by(missed);
+                }
             }
         }
         state.sequence = Some(sequence);
@@ -520,6 +524,7 @@ pub struct MooncakeStoreMetrics {
     chunks: IntGauge,
     chain_links: IntGauge,
     events: IntCounterVec,
+    missed_batches: IntCounter,
     resets: IntCounterVec,
     lookup_stops: IntCounterVec,
 }
@@ -564,9 +569,14 @@ impl MooncakeStoreMetrics {
                 &["result"],
                 &[],
             )?,
+            missed_batches: metrics.create_intcounter(
+                "router_mooncake_store_missed_batches_total",
+                "Mooncake store KV event batches lost between master and router (sequence gaps)",
+                &[],
+            )?,
             resets: metrics.create_intcountervec(
                 "router_mooncake_store_resets_total",
-                "Times a store's chunks were forgotten (connect, gap or size)",
+                "Times a store's chunks were forgotten (connect or size)",
                 &["reason"],
                 &[],
             )?,
@@ -808,7 +818,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sequence_gaps_forget_the_store_and_duplicates_are_skipped() {
+    async fn sequence_gaps_keep_the_store_and_duplicates_are_skipped() {
         let (cache, a, b) = cache_with_stores();
         cache.observe_stored(WorkerWithDpRank::new(1, 0), &stored(2));
         cache.apply(&a, 5, vec![event("stored", 101, "cpu")]);
@@ -817,13 +827,13 @@ mod tests {
         cache.apply(&a, 5, vec![event("removed", 101, "cpu")]);
         assert_eq!(hits(&cache, 2).await[&1], 1);
 
-        // Batch 6 was lost: store a's chunks are unknown, store b is untouched.
+        // Batch 6 was lost: store a keeps what it had and takes batch 7.
         cache.apply(&a, 7, vec![event("stored", 102, "cpu")]);
         assert_eq!(
             hits(&cache, 2).await,
-            HashMap::from([(1, 0), (2, 0), (3, 1), (4, 0)])
+            HashMap::from([(1, 2), (2, 2), (3, 1), (4, 0)])
         );
-        assert_eq!(cache.inner.store_chunks.load(Ordering::Relaxed), 2);
+        assert_eq!(cache.inner.store_chunks.load(Ordering::Relaxed), 3);
     }
 
     #[test]
