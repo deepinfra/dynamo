@@ -11,31 +11,38 @@
 //! announce the same store share its hits, and no other worker gets them.
 //!
 //! Two maps answer a lookup:
-//! - **Chain.** The connector names a chunk by vLLM's chained block hash, which
-//!   the router cannot compute from tokens. Device-tier `Stored` events carry it
-//!   next to the router's block hash, so the cache learns
-//!   `(parent block hash, router block hash) -> block hash` from them
-//!   ([`SharedKvCache::observe_stored`]). Links outlive the GPU copy; the least
-//!   recently used are dropped beyond twice the chunks of all stores.
+//! - **Chain.** The connector names a chunk by vLLM's chained block hash. With
+//!   the workers' hash scheme ([`BlockHashScheme`], announced or set with
+//!   [`BLOCK_HASH_ENV`]) the cache computes it from the prompt's tokens.
+//!   Otherwise, and as a check, it uses links learned from device-tier `Stored`
+//!   events, which carry it next to the router's block hash:
+//!   `(parent block hash, router block hash) -> block hash`
+//!   ([`SharedKvCache::observe_stored`]). Learned links outlive the GPU copy; the
+//!   least recently used are dropped beyond twice the chunks of all stores.
 //! - **Presence.** One subscriber per store follows its master's KV events
 //!   (`mooncake_master --enable_kv_events`): `stored`/`removed` per object and
 //!   replica medium, with the chunk's group id
 //!   `vllm-mooncake-store:[{cache_prefix}@]{model}@{chunk hash hex}`. A chunk
-//!   counts while any medium holds it. Events are the only source: after the
-//!   subscriber (re)connects or misses a batch, the store's earlier chunks are
-//!   unknown until stored again.
+//!   counts while any medium holds it. After the subscriber (re)connects or
+//!   misses a batch, it reads the master's snapshot (`GET /kv_events/snapshot`
+//!   on its admin server) and applies the batches from the snapshot's sequence
+//!   on, so a new router knows the whole store within seconds. Until a snapshot
+//!   loads, or from a master that serves none, only chunks stored since the
+//!   subscriber connected are known. A complete store is read again every 30
+//!   minutes; what differs is what the master changed without an event.
 //!
 //! A worker's hits are the leading chunks of the prompt its store holds, as the
 //! connector loads one prefix. A chunk must be one router block (the connector's
 //! default chunk size); other chunk sizes find no hits.
 
-use std::collections::{HashMap, hash_map::Entry};
+use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::sync::{
     Arc, OnceLock,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
+use std::time::{Duration, Instant};
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use async_trait::async_trait;
 use dynamo_kv_router::{
     SharedCacheQuery, SharedKvCache,
@@ -47,7 +54,9 @@ use futures::StreamExt;
 use lru::LruCache;
 use parking_lot::{Mutex, RwLock};
 use prometheus::{IntCounterVec, IntGauge};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::IgnoredAny};
+use sha2::{Digest, Sha256};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::{MOONCAKE_EVENT_RECONNECT_DELAY, parse_mooncake_event_batch};
@@ -60,12 +69,30 @@ use crate::{
 
 /// Runtime-config key under which a vLLM worker announces its Mooncake store.
 pub const VLLM_MOONCAKE_STORE_RUNTIME_KEY: &str = "vllm_mooncake_store";
+/// The hash scheme of workers that announce none: `{algo}:{NONE_HASH hex}[:{hash block size}]`,
+/// e.g. `sha256:1973e2…` for vLLM's default algo under `PYTHONHASHSEED=0`.
+pub const BLOCK_HASH_ENV: &str = "DYN_MOONCAKE_STORE_BLOCK_HASH";
 
 /// Bounds of the chain: at least this many links, at most this many.
 const MIN_CHAIN_LINKS: usize = 1 << 18;
 const MAX_CHAIN_LINKS: usize = 1 << 24;
 /// A store with more chunks than this is forgotten and relearned (memory guard).
 const MAX_STORE_CHUNKS: usize = 1 << 25;
+/// `mooncake_master --metrics_port` default, where it serves its admin API.
+const MOONCAKE_ADMIN_PORT: u16 = 9003;
+const SNAPSHOT_PAGE_OBJECTS: usize = 65536;
+const SNAPSHOT_PAGE_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long a new subscription may stay silent before the snapshot is read anyway.
+const SUBSCRIBE_GRACE: Duration = Duration::from_secs(1);
+const SNAPSHOT_RETRY_MIN: Duration = Duration::from_secs(1);
+const SNAPSHOT_RETRY_MAX: Duration = Duration::from_secs(60);
+/// Retry delay for a master that serves no snapshot (older masters).
+const SNAPSHOT_UNSUPPORTED_RETRY: Duration = Duration::from_secs(600);
+/// Events kept for replay while a snapshot loads; a load that outlasts them starts over.
+const MAX_PENDING_EVENTS: usize = 1 << 22;
+/// How often a complete store is read again. The difference it finds is what
+/// the master changed without an event; it heals then.
+const SNAPSHOT_RESYNC: Duration = Duration::from_secs(1800);
 
 /// The store a worker's `MooncakeStoreConnector` writes to and loads from.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -75,10 +102,169 @@ pub struct StoreAnnouncement {
     /// Group id of the worker's chunks up to the chunk hash:
     /// `vllm-mooncake-store:[{cache_prefix}@]{model}@`.
     pub group_prefix: String,
+    /// The master's admin server (`mooncake_master --metrics_port`), as the router
+    /// reaches it. Defaults to the KV events host at port 9003.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admin_url: Option<String>,
+}
+
+impl StoreAnnouncement {
+    fn snapshot_url(&self) -> Option<String> {
+        let admin_url = match &self.admin_url {
+            Some(url) => url.trim_end_matches('/').to_string(),
+            None => {
+                let address = self.kv_events_endpoint.strip_prefix("tcp://")?;
+                let (host, _) = address.rsplit_once(':')?;
+                if host.is_empty() || host == "*" {
+                    return None;
+                }
+                format!("http://{host}:{MOONCAKE_ADMIN_PORT}")
+            }
+        };
+        Some(format!("{admin_url}/kv_events/snapshot"))
+    }
+}
+
+/// How a worker's vLLM names blocks: `--prefix-caching-hash-algo` and the hash
+/// its first block chains from.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct BlockHashScheme {
+    pub algo: String,
+    /// vLLM's `NONE_HASH`, in hex.
+    pub none_hash: String,
+    /// Tokens per block hash (`prefix_match_unit`) when finer than the router's block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash_block_size: Option<u32>,
+}
+
+impl BlockHashScheme {
+    fn from_env(value: &str) -> Option<Self> {
+        let mut parts = value.split(':');
+        let algo = parts.next()?.to_string();
+        let none_hash = parts.next()?.to_string();
+        let hash_block_size = match parts.next() {
+            Some(size) => Some(size.parse().ok()?),
+            None => None,
+        };
+        parts.next().is_none().then_some(Self {
+            algo,
+            none_hash,
+            hash_block_size,
+        })
+    }
+
+    /// Only vLLM's default "sha256" is computed; other algos keep learned links.
+    fn hasher(&self) -> Option<VllmBlockHasher> {
+        if self.algo != "sha256" || self.none_hash.len() != 64 {
+            return None;
+        }
+        let mut none_hash = [0_u8; 32];
+        for (byte, pair) in none_hash
+            .iter_mut()
+            .zip(self.none_hash.as_bytes().chunks(2))
+        {
+            *byte = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
+        }
+        Some(VllmBlockHasher {
+            none_hash,
+            hash_block_size: self.hash_block_size.map(|size| size as usize),
+        })
+    }
+}
+
+/// What a worker announces under [`VLLM_MOONCAKE_STORE_RUNTIME_KEY`].
+#[derive(Debug, Deserialize)]
+struct WorkerAnnouncement {
+    #[serde(flatten)]
+    store: StoreAnnouncement,
+    #[serde(default)]
+    block_hash: Option<BlockHashScheme>,
+}
+
+/// vLLM's block hashes for the "sha256" algo (`hash_block_tokens`): SHA-256 of
+/// `pickle.dumps((parent hash, tuple(token ids), None), protocol=5)`, chained
+/// from `NONE_HASH`. Prompts with extra keys (LoRA, multimodal, cache salt)
+/// hash differently; their lookups fall back to learned links.
+#[derive(Debug, PartialEq, Eq)]
+struct VllmBlockHasher {
+    none_hash: [u8; 32],
+    hash_block_size: Option<usize>,
+}
+
+impl VllmBlockHasher {
+    /// The chunk hash (low 64 bits, as vLLM's int block hashes) of each of the
+    /// first `blocks` router blocks of `tokens`.
+    fn chunk_hashes(&self, tokens: &[u32], block_size: usize, blocks: usize) -> Option<Vec<u64>> {
+        let hash_block_size = self.hash_block_size.unwrap_or(block_size);
+        if hash_block_size == 0 || !block_size.is_multiple_of(hash_block_size) {
+            return None;
+        }
+        let mut parent = self.none_hash;
+        let mut pickled = Vec::with_capacity(48 + 5 * hash_block_size);
+        let mut hashes = Vec::with_capacity(blocks);
+        for block in tokens.chunks_exact(block_size).take(blocks) {
+            for part in block.chunks_exact(hash_block_size) {
+                if !pickle_block(&parent, part, &mut pickled) {
+                    return (!hashes.is_empty()).then_some(hashes);
+                }
+                parent = Sha256::digest(&pickled).into();
+            }
+            hashes.push(u64::from_be_bytes(parent[24..].try_into().unwrap()));
+        }
+        Some(hashes)
+    }
+}
+
+/// `pickle.dumps((parent, tuple(tokens), None), protocol=5)` byte for byte as
+/// CPython writes it. False for a token pickle would not write as a 4-byte int.
+fn pickle_block(parent: &[u8; 32], tokens: &[u32], out: &mut Vec<u8>) -> bool {
+    const MEMOIZE: u8 = 0x94;
+    out.clear();
+    // PROTO 5, then one FRAME whose length is filled in last.
+    out.extend_from_slice(&[0x80, 5, 0x95, 0, 0, 0, 0, 0, 0, 0, 0]);
+    // SHORT_BINBYTES
+    out.extend_from_slice(&[b'C', 32]);
+    out.extend_from_slice(parent);
+    out.push(MEMOIZE);
+    if tokens.is_empty() {
+        // EMPTY_TUPLE, which is not memoized.
+        out.push(b')');
+    } else {
+        if tokens.len() > 3 {
+            out.push(b'(');
+        }
+        for &token in tokens {
+            match token {
+                0..=0xff => out.extend_from_slice(&[b'K', token as u8]),
+                0x100..=0xffff => {
+                    out.push(b'M');
+                    out.extend_from_slice(&(token as u16).to_le_bytes());
+                }
+                0x1_0000..=0x7fff_ffff => {
+                    out.push(b'J');
+                    out.extend_from_slice(&token.to_le_bytes());
+                }
+                _ => return false,
+            }
+        }
+        // TUPLE, or TUPLE1-3 for short tuples.
+        out.push(match tokens.len() {
+            1 => 0x85,
+            2 => 0x86,
+            3 => 0x87,
+            _ => b't',
+        });
+        out.push(MEMOIZE);
+    }
+    // NONE, TUPLE3, STOP.
+    out.extend_from_slice(&[b'N', 0x87, MEMOIZE, b'.']);
+    let frame = (out.len() - 11) as u64;
+    out[3..11].copy_from_slice(&frame.to_le_bytes());
+    true
 }
 
 /// One object event of a Mooncake master; other fields are ignored.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct StoreEvent {
     event_type: String,
     #[serde(default)]
@@ -96,6 +282,22 @@ struct Link {
 struct Store {
     announcement: StoreAnnouncement,
     state: RwLock<StoreState>,
+    /// A snapshot was installed: from then on a gap or reconnect keeps the
+    /// chunks, stale until the next snapshot replaces them.
+    snapshots: AtomicBool,
+    /// The chunks are a snapshot plus every batch since.
+    complete: AtomicBool,
+}
+
+impl Store {
+    fn new(announcement: StoreAnnouncement) -> Self {
+        Self {
+            announcement,
+            state: RwLock::default(),
+            snapshots: AtomicBool::new(false),
+            complete: AtomicBool::new(false),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -120,14 +322,87 @@ impl StoreState {
         };
         1 << index
     }
+
+    /// Applies object events; returns how many changed a chunk and how many were ignored.
+    fn apply_events(&mut self, group_prefix: &str, events: Vec<StoreEvent>) -> (u64, u64) {
+        let (mut applied, mut ignored) = (0, 0);
+        for event in events {
+            let Some(chunk) = event
+                .group_id
+                .as_deref()
+                .and_then(|group_id| chunk_hash(group_id, group_prefix))
+            else {
+                ignored += 1;
+                continue;
+            };
+            let bit = self.medium_bit(event.medium.as_deref().unwrap_or_default());
+            match event.event_type.as_str() {
+                "stored" => *self.chunks.entry(chunk).or_default() |= bit,
+                "removed" => {
+                    if let Entry::Occupied(mut held) = self.chunks.entry(chunk) {
+                        *held.get_mut() &= !bit;
+                        if *held.get() == 0 {
+                            held.remove();
+                        }
+                    }
+                }
+                _ => {
+                    ignored += 1;
+                    continue;
+                }
+            }
+            applied += 1;
+        }
+        (applied, ignored)
+    }
+}
+
+/// How a batch met the store's sequence.
+#[derive(Debug, PartialEq, Eq)]
+enum Applied {
+    Next,
+    Duplicate,
+    /// Some batches before it were lost.
+    Gap,
+}
+
+/// Event batches received while a snapshot loads, for replay on top of it.
+type PendingBatches = Vec<(u64, Vec<StoreEvent>)>;
+
+/// A store's state as its master's snapshot reports it, not yet caught up.
+struct Snapshot {
+    state: StoreState,
+    /// The first batch the snapshot does not reflect.
+    next_sequence: u64,
+    objects: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct SnapshotPage {
+    next_sequence: Option<u64>,
+    next_shard: Option<u64>,
+    /// Object key (nil: not asked for), group id, media.
+    objects: Vec<(Option<IgnoredAny>, Option<String>, Vec<String>)>,
+}
+
+#[derive(Debug)]
+enum SnapshotError {
+    /// The master serves no snapshot: an older master, or KV events off.
+    Unsupported(String),
+    Failed(anyhow::Error),
 }
 
 struct Inner {
     chain: Mutex<LruCache<Link, u64>>,
+    /// Computes vLLM chunk hashes when all announcing workers share one scheme.
+    hasher: ArcSwapOption<VllmBlockHasher>,
+    /// The scheme of workers that announce none.
+    default_scheme: Option<BlockHashScheme>,
     /// Chunks of all stores; sizes the chain bound.
     store_chunks: AtomicUsize,
     /// Each announcing worker's store, replaced whole when announcements change.
     workers: ArcSwap<HashMap<WorkerId, Arc<Store>>>,
+    http: reqwest::Client,
     metrics: Option<Arc<MooncakeStoreMetrics>>,
     cancellation_token: CancellationToken,
 }
@@ -143,11 +418,32 @@ impl MooncakeStoreSharedKvCache {
         metrics: Option<Arc<MooncakeStoreMetrics>>,
         cancellation_token: CancellationToken,
     ) -> Self {
+        let default_scheme = std::env::var(BLOCK_HASH_ENV).ok().and_then(|value| {
+            let scheme = BlockHashScheme::from_env(&value);
+            if scheme.is_none() {
+                tracing::warn!(env = BLOCK_HASH_ENV, %value, "Ignoring an unreadable block hash scheme");
+            }
+            scheme
+        });
+        Self::with_default_scheme(metrics, cancellation_token, default_scheme)
+    }
+
+    fn with_default_scheme(
+        metrics: Option<Arc<MooncakeStoreMetrics>>,
+        cancellation_token: CancellationToken,
+        default_scheme: Option<BlockHashScheme>,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 chain: Mutex::new(LruCache::unbounded()),
+                hasher: ArcSwapOption::empty(),
+                default_scheme,
                 store_chunks: AtomicUsize::new(0),
                 workers: ArcSwap::default(),
+                http: reqwest::Client::builder()
+                    .timeout(SNAPSHOT_PAGE_TIMEOUT)
+                    .build()
+                    .unwrap_or_default(),
                 metrics,
                 cancellation_token,
             }),
@@ -167,20 +463,24 @@ impl MooncakeStoreSharedKvCache {
         let cancellation_token = self.inner.cancellation_token.clone();
         let mut stores: HashMap<StoreAnnouncement, (Arc<Store>, CancellationToken)> =
             HashMap::new();
+        let mut warned_schemes = false;
         loop {
             let announced = announcements(&runtime_configs.borrow_and_update());
             let mut workers = HashMap::with_capacity(announced.len());
+            let mut schemes = HashSet::new();
             for (worker_id, announcement) in announced {
-                let (store, _) = stores.entry(announcement.clone()).or_insert_with(|| {
-                    let store = Arc::new(Store {
-                        announcement,
-                        state: RwLock::default(),
-                    });
+                let (store, _) = stores.entry(announcement.store.clone()).or_insert_with(|| {
+                    let store = Arc::new(Store::new(announcement.store));
                     let token = cancellation_token.child_token();
                     tokio::spawn(self.clone().follow(store.clone(), token.clone()));
                     (store, token)
                 });
                 workers.insert(worker_id, store.clone());
+                schemes.insert(
+                    announcement
+                        .block_hash
+                        .or_else(|| self.inner.default_scheme.clone()),
+                );
             }
             stores.retain(|_, (store, token)| {
                 let announced = workers.values().any(|other| Arc::ptr_eq(other, store));
@@ -190,6 +490,21 @@ impl MooncakeStoreSharedKvCache {
                 }
                 announced
             });
+            // Hashes are computed only for the one scheme every worker shares.
+            let hasher = match schemes.into_iter().collect::<Vec<_>>().as_slice() {
+                [Some(scheme)] => scheme.hasher(),
+                [] | [None] => None,
+                _ => {
+                    if !warned_schemes {
+                        warned_schemes = true;
+                        tracing::warn!(
+                            "Workers announce different block hash schemes; using learned links only"
+                        );
+                    }
+                    None
+                }
+            };
+            self.inner.hasher.store(hasher.map(Arc::new));
             self.inner.workers.store(Arc::new(workers));
             if let Some(metrics) = &self.inner.metrics {
                 metrics.stores.set(stores.len() as i64);
@@ -210,25 +525,61 @@ impl MooncakeStoreSharedKvCache {
     /// Track one store from its master's KV events until `cancellation_token` fires.
     async fn follow(self, store: Arc<Store>, cancellation_token: CancellationToken) {
         let endpoint = store.announcement.kv_events_endpoint.as_str();
-        loop {
-            // Whatever the store held before this connection is unknown again.
+        let snapshot_url = store.announcement.snapshot_url();
+        // Snapshot reads report here, tagged with the load they belong to.
+        let (loaded_tx, mut loaded) = mpsc::channel(1);
+        let mut generation = 0_u64;
+        let mut retry = SNAPSHOT_RETRY_MIN;
+        'connect: loop {
             self.reset(&store, "connect");
             match connect_sub_socket(endpoint, None).await {
                 Ok(mut socket) => {
                     tracing::info!(%endpoint, "Following Mooncake store KV events");
+                    // The load in flight and the batches received since it began.
+                    let mut load: Option<(tokio::task::JoinHandle<()>, PendingBatches)> = None;
+                    let mut pending_events = 0;
+                    // When to read the next snapshot. The first batch shows the
+                    // subscription is live, and moves it up.
+                    let mut next_load = snapshot_url
+                        .as_ref()
+                        .map(|_| tokio::time::Instant::now() + SUBSCRIBE_GRACE);
                     loop {
                         tokio::select! {
-                            _ = cancellation_token.cancelled() => break,
+                            _ = cancellation_token.cancelled() => {
+                                if let Some((task, _)) = load {
+                                    task.abort();
+                                }
+                                break 'connect;
+                            }
                             message = socket.next() => match message {
                                 Some(Ok(frames)) => {
-                                    match parse_mooncake_event_batch::<StoreEvent>(
+                                    let (sequence, events) = match parse_mooncake_event_batch::<StoreEvent>(
                                         &multipart_message(frames),
                                     ) {
-                                        Ok((sequence, events)) => self.apply(&store, sequence, events),
+                                        Ok(batch) => batch,
                                         Err(error) => {
                                             record_subscriber_error();
                                             tracing::warn!(%endpoint, %error, "Dropping invalid Mooncake KV event frame");
+                                            continue;
                                         }
+                                    };
+                                    if let Some((task, pending)) = &mut load {
+                                        pending_events += events.len();
+                                        pending.push((sequence, events.clone()));
+                                        if pending_events > MAX_PENDING_EVENTS {
+                                            task.abort();
+                                            load = None;
+                                            self.count_snapshot("overrun");
+                                            next_load = Some(tokio::time::Instant::now());
+                                        }
+                                    } else if next_load.is_some() && store.state.read().sequence.is_none() {
+                                        next_load = Some(tokio::time::Instant::now());
+                                    }
+                                    if self.apply(&store, sequence, events) == Applied::Gap
+                                        && load.is_none()
+                                        && snapshot_url.is_some()
+                                    {
+                                        next_load = Some(tokio::time::Instant::now());
                                     }
                                 }
                                 Some(Err(error)) => {
@@ -242,7 +593,67 @@ impl MooncakeStoreSharedKvCache {
                                     break;
                                 }
                             },
+                            _ = sleep_until(next_load), if load.is_none() && next_load.is_some() => {
+                                next_load = None;
+                                generation += 1;
+                                let (http, url, prefix, loaded_tx) = (
+                                    self.inner.http.clone(),
+                                    snapshot_url.clone().unwrap_or_default(),
+                                    store.announcement.group_prefix.clone(),
+                                    loaded_tx.clone(),
+                                );
+                                let task = tokio::spawn(async move {
+                                    let result = read_snapshot(&http, &url, &prefix).await;
+                                    let _ = loaded_tx.send((generation, result)).await;
+                                });
+                                load = Some((task, Vec::new()));
+                                pending_events = 0;
+                            }
+                            Some((loaded_generation, result)) = loaded.recv() => {
+                                if loaded_generation != generation {
+                                    continue;
+                                }
+                                let Some((_, pending)) = load.take() else {
+                                    continue;
+                                };
+                                let delay = match result {
+                                    Ok(snapshot) => {
+                                        if self.install(&store, snapshot, pending) {
+                                            retry = SNAPSHOT_RETRY_MIN;
+                                            SNAPSHOT_RESYNC
+                                        } else {
+                                            // A batch after the snapshot was lost: read it again.
+                                            SNAPSHOT_RETRY_MIN
+                                        }
+                                    }
+                                    Err(SnapshotError::Unsupported(reason)) => {
+                                        self.count_snapshot("unsupported");
+                                        tracing::info!(
+                                            url = snapshot_url.as_deref().unwrap_or_default(),
+                                            %reason,
+                                            "Mooncake master serves no KV snapshot; following its events only"
+                                        );
+                                        SNAPSHOT_UNSUPPORTED_RETRY
+                                    }
+                                    Err(SnapshotError::Failed(error)) => {
+                                        self.count_snapshot("failed");
+                                        tracing::warn!(
+                                            url = snapshot_url.as_deref().unwrap_or_default(),
+                                            %error,
+                                            retry_in = ?retry,
+                                            "Failed to read the Mooncake store snapshot"
+                                        );
+                                        let delay = retry;
+                                        retry = (retry * 2).min(SNAPSHOT_RETRY_MAX);
+                                        delay
+                                    }
+                                };
+                                next_load = Some(tokio::time::Instant::now() + delay);
+                            }
                         }
+                    }
+                    if let Some((task, _)) = load {
+                        task.abort();
                     }
                 }
                 Err(error) => {
@@ -258,64 +669,42 @@ impl MooncakeStoreSharedKvCache {
         self.forget(&store);
     }
 
-    fn apply(&self, store: &Store, sequence: u64, events: Vec<StoreEvent>) {
+    fn apply(&self, store: &Store, sequence: u64, events: Vec<StoreEvent>) -> Applied {
         let mut state = store.state.write();
+        let mut applied_as = Applied::Next;
         if let Some(previous) = state.sequence {
             if sequence == previous {
-                return;
+                return Applied::Duplicate;
             }
             // The master numbers batches consecutively: anything else lost some.
             if sequence != previous.wrapping_add(1) {
-                tracing::warn!(
-                    endpoint = %store.announcement.kv_events_endpoint,
-                    previous,
-                    sequence,
-                    "Mooncake store KV event sequence gap; forgetting the store's chunks"
-                );
-                self.clear(&mut state, "gap");
+                applied_as = Applied::Gap;
+                self.set_complete(store, false);
+                if store.snapshots.load(Ordering::Relaxed) {
+                    tracing::warn!(
+                        endpoint = %store.announcement.kv_events_endpoint,
+                        previous,
+                        sequence,
+                        "Mooncake store KV event sequence gap; reloading the store's snapshot"
+                    );
+                } else {
+                    tracing::warn!(
+                        endpoint = %store.announcement.kv_events_endpoint,
+                        previous,
+                        sequence,
+                        "Mooncake store KV event sequence gap; forgetting the store's chunks"
+                    );
+                    self.clear(&mut state, "gap");
+                }
             }
         }
         state.sequence = Some(sequence);
 
         let before = state.chunks.len();
-        let (mut applied, mut ignored) = (0, 0);
-        for event in events {
-            let Some(chunk) = event
-                .group_id
-                .as_deref()
-                .and_then(|group_id| chunk_hash(group_id, &store.announcement.group_prefix))
-            else {
-                ignored += 1;
-                continue;
-            };
-            let bit = state.medium_bit(event.medium.as_deref().unwrap_or_default());
-            match event.event_type.as_str() {
-                "stored" => *state.chunks.entry(chunk).or_default() |= bit,
-                "removed" => {
-                    if let Entry::Occupied(mut held) = state.chunks.entry(chunk) {
-                        *held.get_mut() &= !bit;
-                        if *held.get() == 0 {
-                            held.remove();
-                        }
-                    }
-                }
-                _ => {
-                    ignored += 1;
-                    continue;
-                }
-            }
-            applied += 1;
-        }
+        let (applied, ignored) = state.apply_events(&store.announcement.group_prefix, events);
         let after = state.chunks.len();
         self.add_chunks(after as isize - before as isize);
-        if after > MAX_STORE_CHUNKS {
-            tracing::warn!(
-                endpoint = %store.announcement.kv_events_endpoint,
-                chunks = after,
-                "Mooncake store index exceeded its size limit; forgetting the store's chunks"
-            );
-            self.clear(&mut state, "size");
-        }
+        self.check_size(store, &mut state);
         if let Some(metrics) = &self.inner.metrics {
             metrics
                 .events
@@ -326,18 +715,114 @@ impl MooncakeStoreSharedKvCache {
                 .with_label_values(&["ignored"])
                 .inc_by(ignored);
         }
+        applied_as
     }
 
+    /// Replaces the store's chunks with `snapshot` caught up on `pending`, the
+    /// batches received since it was requested. False if one it needs is missing.
+    fn install(&self, store: &Store, snapshot: Snapshot, pending: PendingBatches) -> bool {
+        let Snapshot {
+            state: mut fresh,
+            next_sequence,
+            objects,
+        } = snapshot;
+        let mut expected = next_sequence;
+        let mut replayed = 0;
+        for (sequence, events) in pending {
+            if sequence < expected {
+                continue;
+            }
+            if sequence != expected {
+                self.count_snapshot("stale");
+                tracing::warn!(
+                    endpoint = %store.announcement.kv_events_endpoint,
+                    expected,
+                    sequence,
+                    "Mooncake store snapshot misses a batch; reading it again"
+                );
+                return false;
+            }
+            fresh.apply_events(&store.announcement.group_prefix, events);
+            expected += 1;
+            replayed += 1;
+        }
+        fresh.sequence = expected.checked_sub(1);
+        // A complete index should equal the snapshot: count what differs.
+        let drift = store.complete.load(Ordering::Relaxed).then(|| {
+            let state = store.state.read();
+            let stale = state
+                .chunks
+                .keys()
+                .filter(|chunk| !fresh.chunks.contains_key(chunk))
+                .count();
+            let missing = fresh
+                .chunks
+                .keys()
+                .filter(|chunk| !state.chunks.contains_key(chunk))
+                .count();
+            (stale, missing)
+        });
+        let mut state = store.state.write();
+        let (before, after) = (state.chunks.len(), fresh.chunks.len());
+        *state = fresh;
+        self.add_chunks(after as isize - before as isize);
+        store.snapshots.store(true, Ordering::Relaxed);
+        self.set_complete(store, true);
+        self.check_size(store, &mut state);
+        self.count_snapshot("installed");
+        let (stale, missing) = drift.unwrap_or_default();
+        if let Some(metrics) = &self.inner.metrics {
+            metrics
+                .resync_drift
+                .with_label_values(&["stale"])
+                .inc_by(stale as u64);
+            metrics
+                .resync_drift
+                .with_label_values(&["missing"])
+                .inc_by(missing as u64);
+        }
+        tracing::info!(
+            endpoint = %store.announcement.kv_events_endpoint,
+            objects,
+            chunks = after,
+            replayed,
+            resync = drift.is_some(),
+            stale,
+            missing,
+            "Loaded the Mooncake store's snapshot"
+        );
+        true
+    }
+
+    fn check_size(&self, store: &Store, state: &mut StoreState) {
+        if state.chunks.len() > MAX_STORE_CHUNKS {
+            tracing::warn!(
+                endpoint = %store.announcement.kv_events_endpoint,
+                chunks = state.chunks.len(),
+                "Mooncake store index exceeded its size limit; forgetting the store's chunks"
+            );
+            self.clear(state, "size");
+            self.set_complete(store, false);
+        }
+    }
+
+    /// A new subscription: batches it missed may have changed the store. Chunks a
+    /// snapshot loaded stay until the next one replaces them.
     fn reset(&self, store: &Store, reason: &'static str) {
         let mut state = store.state.write();
-        self.clear(&mut state, reason);
+        if !store.snapshots.load(Ordering::Relaxed) {
+            self.clear(&mut state, reason);
+        }
         state.sequence = None;
+        self.set_complete(store, false);
     }
 
     fn forget(&self, store: &Store) {
         let mut state = store.state.write();
         self.add_chunks(-(state.chunks.len() as isize));
         *state = StoreState::default();
+        store.snapshots.store(false, Ordering::Relaxed);
+        self.set_complete(store, false);
     }
 
     fn clear(&self, state: &mut StoreState, reason: &'static str) {
@@ -345,6 +830,24 @@ impl MooncakeStoreSharedKvCache {
         state.chunks = HashMap::new();
         if let Some(metrics) = &self.inner.metrics {
             metrics.resets.with_label_values(&[reason]).inc();
+        }
+    }
+
+    fn set_complete(&self, store: &Store, complete: bool) {
+        if store.complete.swap(complete, Ordering::Relaxed) != complete
+            && let Some(metrics) = &self.inner.metrics
+        {
+            if complete {
+                metrics.loaded_stores.inc();
+            } else {
+                metrics.loaded_stores.dec();
+            }
+        }
+    }
+
+    fn count_snapshot(&self, result: &str) {
+        if let Some(metrics) = &self.inner.metrics {
+            metrics.snapshots.with_label_values(&[result]).inc();
         }
     }
 
@@ -374,6 +877,81 @@ impl MooncakeStoreSharedKvCache {
     }
 }
 
+async fn sleep_until(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Every page of a master's snapshot, from shard 0, into a store state.
+async fn read_snapshot(
+    http: &reqwest::Client,
+    url: &str,
+    group_prefix: &str,
+) -> Result<Snapshot, SnapshotError> {
+    let started = Instant::now();
+    let mut state = StoreState::default();
+    let (mut next_sequence, mut objects, mut pages) = (None, 0, 0);
+    let mut shard = Some(0);
+    while let Some(from) = shard {
+        let response = http
+            .get(url)
+            .query(&[
+                ("shard", from.to_string()),
+                ("max_objects", SNAPSHOT_PAGE_OBJECTS.to_string()),
+                ("object_keys", "0".to_string()),
+            ])
+            .send()
+            .await
+            .map_err(|error| SnapshotError::Failed(error.into()))?;
+        let status = response.status();
+        if status == reqwest::StatusCode::NOT_FOUND
+            || status == reqwest::StatusCode::NOT_IMPLEMENTED
+        {
+            return Err(SnapshotError::Unsupported(format!("HTTP {status}")));
+        }
+        let body = response
+            .error_for_status()
+            .map_err(|error| SnapshotError::Failed(error.into()))?
+            .bytes()
+            .await
+            .map_err(|error| SnapshotError::Failed(error.into()))?;
+        let page: SnapshotPage =
+            rmp_serde::from_slice(&body).map_err(|error| SnapshotError::Failed(error.into()))?;
+        if pages == 0 {
+            // Batches from this one on are not in the pages.
+            next_sequence = Some(page.next_sequence.ok_or_else(|| {
+                SnapshotError::Unsupported("the master publishes no KV events".to_string())
+            })?);
+        }
+        pages += 1;
+        objects += page.objects.len();
+        for (_, group_id, media) in page.objects {
+            let Some(chunk) = group_id
+                .as_deref()
+                .and_then(|group_id| chunk_hash(group_id, group_prefix))
+            else {
+                continue;
+            };
+            let mut bits = 0;
+            for medium in &media {
+                bits |= state.medium_bit(medium);
+            }
+            if bits != 0 {
+                *state.chunks.entry(chunk).or_default() |= bits;
+            }
+        }
+        shard = page.next_shard;
+    }
+    tracing::debug!(url, pages, objects, chunks = state.chunks.len(), elapsed = ?started.elapsed(), "Read a Mooncake store snapshot");
+    Ok(Snapshot {
+        state,
+        next_sequence: next_sequence.unwrap_or_default(),
+        objects,
+    })
+}
+
 #[async_trait]
 impl SharedKvCache for MooncakeStoreSharedKvCache {
     async fn check_blocks(
@@ -390,18 +968,56 @@ impl SharedKvCache for MooncakeStoreSharedKvCache {
                 stores.push(store);
             }
         }
+        // A cache namespace changes vLLM's hashes (extra keys): use learned links.
+        let computed = match (
+            &*self.inner.hasher.load(),
+            query
+                .cache_namespace
+                .filter(|namespace| !namespace.is_empty()),
+        ) {
+            (Some(hasher), None) => hasher.chunk_hashes(
+                query.tokens,
+                query.block_size as usize,
+                query.block_hashes.len(),
+            ),
+            _ => None,
+        };
 
         // Each store's run of leading chunks; the walk ends once none extends.
         let mut runs = vec![0_u32; stores.len()];
+        let mut verdicts = [0_u64; 3];
         let stop = {
             let states: Vec<_> = stores.iter().map(|store| store.state.read()).collect();
             let mut chain = self.inner.chain.lock();
+            let mut computed = computed.as_deref();
             let mut parent = None;
             let mut stop = "end";
             for (position, &block) in (0_u32..).zip(query.block_hashes) {
-                let Some(&hash) = chain.get(&Link { parent, block }) else {
-                    stop = "unlinked";
-                    break;
+                let learned = chain.get(&Link { parent, block }).copied();
+                let hash = match (
+                    computed.and_then(|hashes| hashes.get(position as usize)),
+                    learned,
+                ) {
+                    (Some(&computed_hash), Some(learned_hash)) if computed_hash != learned_hash => {
+                        // Not the workers' hash for this prompt: trust learned links from here.
+                        verdicts[Verdict::Differ as usize] += 1;
+                        computed = None;
+                        learned_hash
+                    }
+                    (Some(&computed_hash), learned_hash) => {
+                        let verdict = if learned_hash.is_some() {
+                            Verdict::Agree
+                        } else {
+                            Verdict::Unverified
+                        };
+                        verdicts[verdict as usize] += 1;
+                        computed_hash
+                    }
+                    (None, Some(learned_hash)) => learned_hash,
+                    (None, None) => {
+                        stop = "unlinked";
+                        break;
+                    }
                 };
                 let mut extended = false;
                 for (run, state) in runs.iter_mut().zip(&states) {
@@ -420,6 +1036,15 @@ impl SharedKvCache for MooncakeStoreSharedKvCache {
         };
         if let Some(metrics) = &self.inner.metrics {
             metrics.lookup_stops.with_label_values(&[stop]).inc();
+            for verdict in [Verdict::Agree, Verdict::Unverified, Verdict::Differ] {
+                let count = verdicts[verdict as usize];
+                if count > 0 {
+                    metrics
+                        .computed_hashes
+                        .with_label_values(&[verdict.label()])
+                        .inc_by(count);
+                }
+            }
         }
 
         Ok(SharedCacheHits::scoped(
@@ -460,18 +1085,36 @@ impl SharedKvCache for MooncakeStoreSharedKvCache {
     }
 }
 
+/// How a computed chunk hash compared with the learned link at its position.
+#[derive(Clone, Copy)]
+enum Verdict {
+    Agree,
+    Unverified,
+    Differ,
+}
+
+impl Verdict {
+    fn label(self) -> &'static str {
+        match self {
+            Verdict::Agree => "agree",
+            Verdict::Unverified => "unverified",
+            Verdict::Differ => "differ",
+        }
+    }
+}
+
 /// The store each worker announces. A worker without one, or with an
 /// unreadable one, gets no hits.
 fn announcements(
     runtime_configs: &HashMap<WorkerId, ModelRuntimeConfig>,
-) -> HashMap<WorkerId, StoreAnnouncement> {
+) -> HashMap<WorkerId, WorkerAnnouncement> {
     runtime_configs
         .iter()
         .filter_map(|(&worker_id, runtime_config)| {
             match runtime_config
-                .get_engine_specific::<StoreAnnouncement>(VLLM_MOONCAKE_STORE_RUNTIME_KEY)
+                .get_engine_specific::<WorkerAnnouncement>(VLLM_MOONCAKE_STORE_RUNTIME_KEY)
             {
-                Ok(Some(announcement)) if !announcement.kv_events_endpoint.is_empty() => {
+                Ok(Some(announcement)) if !announcement.store.kv_events_endpoint.is_empty() => {
                     Some((worker_id, announcement))
                 }
                 Ok(_) => None,
@@ -517,11 +1160,15 @@ fn record_subscriber_error() {
 /// Process-wide metrics of the Mooncake store shared cache.
 pub struct MooncakeStoreMetrics {
     stores: IntGauge,
+    loaded_stores: IntGauge,
     chunks: IntGauge,
     chain_links: IntGauge,
     events: IntCounterVec,
     resets: IntCounterVec,
+    snapshots: IntCounterVec,
+    resync_drift: IntCounterVec,
     lookup_stops: IntCounterVec,
+    computed_hashes: IntCounterVec,
 }
 
 static MOONCAKE_STORE_METRICS: OnceLock<Option<Arc<MooncakeStoreMetrics>>> = OnceLock::new();
@@ -548,6 +1195,11 @@ impl MooncakeStoreMetrics {
                 "Mooncake stores the router follows",
                 &[],
             )?,
+            loaded_stores: metrics.create_intgauge(
+                "router_mooncake_store_loaded_stores",
+                "Followed stores whose chunks are a snapshot plus every KV event since; a router is warm when this equals the stores",
+                &[],
+            )?,
             chunks: metrics.create_intgauge(
                 "router_mooncake_store_chunks",
                 "Chunks the followed Mooncake stores hold, as their KV events announced them",
@@ -566,14 +1218,32 @@ impl MooncakeStoreMetrics {
             )?,
             resets: metrics.create_intcountervec(
                 "router_mooncake_store_resets_total",
-                "Times a store's chunks were forgotten (connect, gap or size)",
+                "Times a store's chunks were forgotten (connect or gap without a snapshot, or size)",
                 &["reason"],
+                &[],
+            )?,
+            snapshots: metrics.create_intcountervec(
+                "router_mooncake_store_snapshots_total",
+                "Store snapshot loads: installed, stale (missed a batch, read again), overrun, failed or unsupported",
+                &["result"],
+                &[],
+            )?,
+            resync_drift: metrics.create_intcountervec(
+                "router_mooncake_store_resync_drift_total",
+                "Chunks a periodic snapshot found wrong in a complete index: stale (the master no longer holds it) or missing; the KV events missed these",
+                &["kind"],
                 &[],
             )?,
             lookup_stops: metrics.create_intcountervec(
                 "router_mooncake_store_lookup_stops_total",
-                "Where lookups stopped: end of prompt, a block no store holds (absent) or a block with no learned vLLM hash (unlinked)",
+                "Where lookups stopped: end of prompt, a block no store holds (absent) or a block with no vLLM hash (unlinked)",
                 &["reason"],
+                &[],
+            )?,
+            computed_hashes: metrics.create_intcountervec(
+                "router_mooncake_store_computed_hashes_total",
+                "Computed vLLM block hashes a lookup used, by how they compared with the learned link: agree, unverified (none learned) or differ",
+                &["result"],
                 &[],
             )?,
         })
@@ -600,6 +1270,7 @@ mod tests {
         StoreAnnouncement {
             kv_events_endpoint: endpoint.to_string(),
             group_prefix: PREFIX.to_string(),
+            admin_url: None,
         }
     }
 
@@ -633,13 +1304,9 @@ mod tests {
     /// A cache whose workers 1 and 2 share store `a` and worker 3 uses store `b`,
     /// without subscribers.
     fn cache_with_stores() -> (MooncakeStoreSharedKvCache, Arc<Store>, Arc<Store>) {
-        let cache = MooncakeStoreSharedKvCache::new(None, CancellationToken::new());
-        let store = |endpoint: &str| {
-            Arc::new(Store {
-                announcement: announcement(endpoint),
-                state: RwLock::default(),
-            })
-        };
+        let cache =
+            MooncakeStoreSharedKvCache::with_default_scheme(None, CancellationToken::new(), None);
+        let store = |endpoint: &str| Arc::new(Store::new(announcement(endpoint)));
         let (a, b) = (store("tcp://a:1"), store("tcp://b:1"));
         cache.inner.workers.store(Arc::new(HashMap::from([
             (1, a.clone()),
@@ -707,10 +1374,10 @@ mod tests {
             (3, unreadable),
             (4, ModelRuntimeConfig::new()),
         ]);
-        assert_eq!(
-            announcements(&configs),
-            HashMap::from([(1, announcement("tcp://a:1"))])
-        );
+        let announced = announcements(&configs);
+        assert_eq!(announced.len(), 1);
+        assert_eq!(announced[&1].store, announcement("tcp://a:1"));
+        assert_eq!(announced[&1].block_hash, None);
     }
 
     #[tokio::test]
@@ -876,7 +1543,8 @@ mod tests {
 
     #[test]
     fn nothing_is_learned_without_an_announced_store() {
-        let cache = MooncakeStoreSharedKvCache::new(None, CancellationToken::new());
+        let cache =
+            MooncakeStoreSharedKvCache::with_default_scheme(None, CancellationToken::new(), None);
         cache.observe_stored(WorkerWithDpRank::new(1, 0), &stored(4));
         assert_eq!(cache.inner.chain.lock().len(), 0);
     }
@@ -895,11 +1563,17 @@ mod tests {
             .unwrap()
             .unwrap();
         let mut runtime_config = ModelRuntimeConfig::new();
+        // A master without a snapshot: only events count.
+        let events_only = StoreAnnouncement {
+            admin_url: Some("http://127.0.0.1:1".to_string()),
+            ..announcement(&endpoint)
+        };
         runtime_config
-            .set_engine_specific(VLLM_MOONCAKE_STORE_RUNTIME_KEY, announcement(&endpoint))
+            .set_engine_specific(VLLM_MOONCAKE_STORE_RUNTIME_KEY, events_only)
             .unwrap();
         let (tx, runtime_configs) = watch::channel(HashMap::from([(1, runtime_config)]));
-        let cache = MooncakeStoreSharedKvCache::new(None, CancellationToken::new());
+        let cache =
+            MooncakeStoreSharedKvCache::with_default_scheme(None, CancellationToken::new(), None);
         cache.start(runtime_configs);
 
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -951,5 +1625,564 @@ mod tests {
         .await
         .unwrap();
         cache.shutdown();
+    }
+
+    // CPython 3.12: `NONE_HASH` under PYTHONHASHSEED=0, i.e. sha256(pickle.dumps("0", protocol=5)).
+    const NONE_HASH: &str = "1973e23848344dc43a988a9b478663803cfffe1243480253f9a3cf004b14aa7c";
+
+    fn none_hash() -> [u8; 32] {
+        BlockHashScheme::from_env(&format!("sha256:{NONE_HASH}"))
+            .unwrap()
+            .hasher()
+            .unwrap()
+            .none_hash
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    /// Token ids covering every int opcode width, as CPython's tests used them.
+    fn vector_tokens() -> Vec<u32> {
+        vec![
+            1, 1, 2147483647, 129279, 256, 2147483647, 129279, 0, 2147483647, 256, 1, 65536, 0,
+            3335, 129279, 256, 129279, 0, 256, 2147483647, 2147483647, 256, 256, 256, 2147483647,
+            65535, 0, 54549, 1, 65535, 65536, 117384, 129279, 256, 65535, 2147483647, 110912, 0,
+            256, 129279, 255, 48119, 65536, 2147483647, 87000, 255, 129279, 2147483647, 0, 0,
+            129279, 255, 22097, 0, 256, 70728, 129279, 65536, 65536, 65535, 86404, 0, 50290, 255,
+            67984, 129279, 0, 65536, 74710, 26193, 2147483647, 65536, 65536, 207, 65536, 0, 256,
+            255, 255, 1, 104652, 65535, 1, 0, 0, 65535, 65535, 255, 65535, 255, 65535, 255, 65535,
+            65535, 65536, 2147483647, 0, 129279, 129279, 256, 1, 33221, 256, 129279, 0, 0, 255,
+            255, 58414, 129279, 256, 128054, 256, 0, 65536, 129279, 65535, 256, 0, 1, 1, 65535,
+            255, 65535, 0, 0, 256, 2147483647, 22481, 129279, 65536, 256, 129279, 256, 1, 129279,
+            38806, 0, 129279, 65535, 255, 65536, 255, 129279, 65535, 1, 129279, 122183, 45069,
+            63504, 1, 0, 255, 255, 119404, 65535, 65536, 78670, 65535, 65536, 1, 256, 2147483647,
+            17740, 1, 0, 1, 255, 255, 1, 129279, 10046, 1, 65535, 65535, 73983, 1, 65535, 0, 65535,
+            0, 129279, 0, 256, 129279, 1, 255, 256, 1, 129279, 105707, 65535,
+        ]
+    }
+
+    #[test]
+    fn blocks_pickle_as_cpython_does() {
+        let mut out = Vec::new();
+        // Expected bytes from `pickle.dumps((NONE_HASH, tuple(tokens), None), protocol=5)`.
+        let parent = "43201973e23848344dc43a988a9b478663803cfffe1243480253f9a3cf004b14aa7c94";
+        for (tokens, expected) in [
+            (&[][..], format!("8005952800000000000000{parent}294e87942e")),
+            (
+                &[1][..],
+                format!("8005952b00000000000000{parent}4b0185944e87942e"),
+            ),
+            (
+                &[1, 1][..],
+                format!("8005952d00000000000000{parent}4b014b0186944e87942e"),
+            ),
+            (
+                &[1, 1, 2147483647][..],
+                format!("8005953200000000000000{parent}4b014b014affffff7f87944e87942e"),
+            ),
+        ] {
+            assert!(pickle_block(&none_hash(), tokens, &mut out));
+            assert_eq!(hex(&out), expected);
+        }
+        // Each int width: K (1 byte), M (2), J (4).
+        assert!(pickle_block(
+            &Sha256::digest(b"x").into(),
+            &[
+                [0, 1, 255, 256, 65535, 65536, 2147483647].as_slice(),
+                &[7; 57]
+            ]
+            .concat(),
+            &mut out
+        ));
+        assert_eq!(
+            hex(&out),
+            "800595b20000000000000043202d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a488194284b004b014bff4d00014dffff4a000001004affffff7f"
+                .to_string()
+                + &"4b07".repeat(57)
+                + "74944e87942e"
+        );
+        // A token CPython would write as a long.
+        assert!(!pickle_block(&none_hash(), &[1 << 31], &mut out));
+    }
+
+    #[test]
+    fn computed_chunk_hashes_match_vllm() {
+        let tokens = vector_tokens();
+        let scheme = |hash_block_size: Option<u32>| BlockHashScheme {
+            algo: "sha256".to_string(),
+            none_hash: NONE_HASH.to_string(),
+            hash_block_size,
+        };
+        // vLLM's `hash_block_tokens` chain, low 64 bits, from CPython.
+        assert_eq!(
+            scheme(None).hasher().unwrap().chunk_hashes(&tokens, 64, 3),
+            Some(vec![
+                0xed1a61cabd2a4392,
+                0xf351ca48d7e0860f,
+                0x3f98e2f0c81b2e6c
+            ])
+        );
+        // Hashes every 32 tokens: a chunk is named by its last one.
+        assert_eq!(
+            scheme(Some(32))
+                .hasher()
+                .unwrap()
+                .chunk_hashes(&tokens, 64, 3),
+            Some(vec![
+                0x6d12db8d48a39220,
+                0xfce9ac6a40838904,
+                0x5d458272d9d0fe84
+            ])
+        );
+        // A partial last block and a shorter block list.
+        assert_eq!(
+            scheme(None)
+                .hasher()
+                .unwrap()
+                .chunk_hashes(&tokens[..150], 64, 3),
+            Some(vec![0xed1a61cabd2a4392, 0xf351ca48d7e0860f])
+        );
+        assert_eq!(
+            scheme(Some(48))
+                .hasher()
+                .unwrap()
+                .chunk_hashes(&tokens, 64, 3),
+            None
+        );
+        assert_eq!(
+            BlockHashScheme {
+                algo: "xxhash".to_string(),
+                ..scheme(None)
+            }
+            .hasher(),
+            None
+        );
+    }
+
+    #[test]
+    fn schemes_and_snapshot_urls_parse() {
+        assert_eq!(
+            BlockHashScheme::from_env(&format!("sha256:{NONE_HASH}:32")),
+            Some(BlockHashScheme {
+                algo: "sha256".to_string(),
+                none_hash: NONE_HASH.to_string(),
+                hash_block_size: Some(32),
+            })
+        );
+        assert_eq!(BlockHashScheme::from_env("sha256"), None);
+        assert_eq!(BlockHashScheme::from_env("sha256:ab:x"), None);
+        assert_eq!(BlockHashScheme::from_env("sha256:ab:32:1"), None);
+        assert_eq!(
+            BlockHashScheme::from_env("sha256:ab").unwrap().hasher(),
+            None
+        );
+
+        let derived = announcement("tcp://mooncake-master.ns.svc:5558");
+        assert_eq!(
+            derived.snapshot_url().as_deref(),
+            Some("http://mooncake-master.ns.svc:9003/kv_events/snapshot")
+        );
+        let explicit = StoreAnnouncement {
+            admin_url: Some("http://10.0.0.1:9903/".to_string()),
+            ..derived
+        };
+        assert_eq!(
+            explicit.snapshot_url().as_deref(),
+            Some("http://10.0.0.1:9903/kv_events/snapshot")
+        );
+        assert_eq!(announcement("tcp://*:5558").snapshot_url(), None);
+        assert_eq!(announcement("ipc:///tmp/events").snapshot_url(), None);
+    }
+
+    #[test]
+    fn workers_announce_their_block_hash_scheme() {
+        let mut runtime_config = ModelRuntimeConfig::new();
+        runtime_config
+            .set_engine_specific(
+                VLLM_MOONCAKE_STORE_RUNTIME_KEY,
+                serde_json::json!({
+                    "kv_events_endpoint": "tcp://a:1",
+                    "group_prefix": PREFIX,
+                    "admin_url": "http://a:9003",
+                    "block_hash": {"algo": "sha256", "none_hash": NONE_HASH},
+                }),
+            )
+            .unwrap();
+        let announced = announcements(&HashMap::from([(1, runtime_config)]));
+        assert_eq!(
+            announced[&1].store.admin_url.as_deref(),
+            Some("http://a:9003")
+        );
+        assert_eq!(
+            announced[&1]
+                .block_hash
+                .as_ref()
+                .map(|scheme| scheme.algo.as_str()),
+            Some("sha256")
+        );
+    }
+
+    async fn token_hits(
+        cache: &MooncakeStoreSharedKvCache,
+        tokens: &[u32],
+        cache_namespace: Option<&str>,
+    ) -> HashMap<WorkerId, u32> {
+        let block_hashes = router_hashes((tokens.len() / 64) as u64);
+        let hits = cache
+            .check_blocks(SharedCacheQuery {
+                tokens,
+                block_hashes: &block_hashes,
+                block_size: 64,
+                cache_namespace,
+            })
+            .await
+            .unwrap();
+        [1, 2, 3]
+            .into_iter()
+            .map(|worker| (worker, hits.for_worker(worker).total_hits))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn computed_hashes_find_chunks_no_link_was_learned_for() {
+        let (cache, a, b) = cache_with_stores();
+        let tokens = vector_tokens();
+        let chunks = [
+            0xed1a61cabd2a4392_u64,
+            0xf351ca48d7e0860f,
+            0x3f98e2f0c81b2e6c,
+        ];
+        cache.apply(
+            &a,
+            1,
+            chunks.map(|hash| event("stored", hash, "cpu")).into(),
+        );
+        cache.apply(&b, 1, vec![event("stored", chunks[0], "disk")]);
+        // No scheme: nothing links the router's blocks to the store's chunks.
+        assert_eq!(token_hits(&cache, &tokens, None).await[&1], 0);
+
+        cache.inner.hasher.store(Some(Arc::new(VllmBlockHasher {
+            none_hash: none_hash(),
+            hash_block_size: None,
+        })));
+        assert_eq!(
+            token_hits(&cache, &tokens, None).await,
+            HashMap::from([(1, 3), (2, 3), (3, 1)])
+        );
+        // A cache namespace changes vLLM's hashes.
+        assert_eq!(token_hits(&cache, &tokens, Some("lora-a")).await[&1], 0);
+
+        // A learned link that disagrees wins, and the rest follows learned links.
+        cache.observe_stored(
+            WorkerWithDpRank::new(1, 0),
+            &KvCacheStoreData {
+                parent_hash: Some(ExternalSequenceBlockHash(chunks[0])),
+                start_position: None,
+                blocks: vec![KvCacheStoredBlockData {
+                    block_hash: ExternalSequenceBlockHash(77),
+                    tokens_hash: LocalBlockHash(2),
+                    mm_extra_info: None,
+                }],
+            },
+        );
+        assert_eq!(token_hits(&cache, &tokens, None).await[&1], 1);
+        cache.apply(&a, 2, vec![event("stored", 77, "cpu")]);
+        assert_eq!(token_hits(&cache, &tokens, None).await[&1], 2);
+    }
+
+    #[test]
+    fn a_snapshot_catches_up_from_its_sequence() {
+        let (cache, a, _) = cache_with_stores();
+        // Live events before the snapshot arrived.
+        cache.apply(&a, 4, vec![event("stored", 900, "cpu")]);
+        let snapshot = |chunks: &[u64]| {
+            let mut state = StoreState::default();
+            state.apply_events(
+                PREFIX,
+                chunks
+                    .iter()
+                    .map(|&hash| event("stored", hash, "cpu"))
+                    .collect(),
+            );
+            Snapshot {
+                state,
+                next_sequence: 6,
+                objects: chunks.len(),
+            }
+        };
+        let pending = vec![
+            // Already in the snapshot.
+            (5, vec![event("removed", 101, "cpu")]),
+            (
+                6,
+                vec![event("removed", 101, "cpu"), event("stored", 103, "disk")],
+            ),
+            (7, vec![event("stored", 104, "cpu")]),
+        ];
+        assert!(cache.install(&a, snapshot(&[101, 102]), pending));
+        let state = a.state.read();
+        assert_eq!(
+            state.chunks.keys().copied().collect::<HashSet<_>>(),
+            HashSet::from([102, 103, 104])
+        );
+        assert_eq!(state.sequence, Some(7));
+        drop(state);
+        assert!(a.complete.load(Ordering::Relaxed));
+        assert_eq!(cache.inner.store_chunks.load(Ordering::Relaxed), 3);
+
+        // The next batch continues the snapshot's sequence.
+        assert_eq!(
+            cache.apply(&a, 8, vec![event("stored", 105, "cpu")]),
+            Applied::Next
+        );
+        // A gap now keeps the chunks: the next snapshot replaces them.
+        assert_eq!(cache.apply(&a, 10, vec![]), Applied::Gap);
+        assert_eq!(a.state.read().chunks.len(), 4);
+        assert!(!a.complete.load(Ordering::Relaxed));
+
+        // A batch the snapshot needs is missing: it is not installed.
+        let gap = vec![(7, vec![event("stored", 104, "cpu")])];
+        assert!(!cache.install(&a, snapshot(&[101]), gap));
+        assert_eq!(a.state.read().chunks.len(), 4);
+    }
+
+    /// A master's admin server with a fixed snapshot, in pages of two objects.
+    async fn serve_snapshot(
+        next_sequence: Option<u64>,
+        chunks: Vec<u64>,
+    ) -> (String, Arc<AtomicUsize>) {
+        use axum::{Router, extract::Query, routing::get};
+
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = requests.clone();
+        let app = Router::new().route(
+            "/kv_events/snapshot",
+            get(move |Query(query): Query<HashMap<String, String>>| {
+                let chunks = chunks.clone();
+                counter.fetch_add(1, Ordering::Relaxed);
+                async move {
+                    assert_eq!(query.get("object_keys").map(String::as_str), Some("0"));
+                    let shard: usize = query["shard"].parse().unwrap();
+                    let page: Vec<_> = chunks
+                        .iter()
+                        .skip(shard * 2)
+                        .take(2)
+                        .map(|&hash| ((), Some(group_id(hash)), vec!["cpu"]))
+                        .collect();
+                    let next_shard = (shard * 2 + 2 < chunks.len()).then_some(shard + 1);
+                    rmp_serde::to_vec_named(&serde_json::json!({
+                        "next_sequence": next_sequence,
+                        "next_shard": next_shard,
+                        "objects": page,
+                    }))
+                    .unwrap()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (url, requests)
+    }
+
+    #[tokio::test]
+    async fn a_new_subscriber_loads_the_masters_snapshot() {
+        use crate::utils::zmq::{bind_pub_socket, send_multipart};
+        use tmq::AsZmqSocket;
+
+        let publisher = bind_pub_socket("tcp://127.0.0.1:*").await.unwrap();
+        let endpoint = publisher
+            .lock()
+            .await
+            .get_socket()
+            .get_last_endpoint()
+            .unwrap()
+            .unwrap();
+        // The store held chunks 101-105 before the router started; batch 1 is next.
+        let (admin_url, requests) = serve_snapshot(Some(1), (101..=105).collect()).await;
+        let mut runtime_config = ModelRuntimeConfig::new();
+        runtime_config
+            .set_engine_specific(
+                VLLM_MOONCAKE_STORE_RUNTIME_KEY,
+                StoreAnnouncement {
+                    admin_url: Some(admin_url),
+                    ..announcement(&endpoint)
+                },
+            )
+            .unwrap();
+        let (_tx, runtime_configs) = watch::channel(HashMap::from([(1, runtime_config)]));
+        let cache =
+            MooncakeStoreSharedKvCache::with_default_scheme(None, CancellationToken::new(), None);
+        cache.start(runtime_configs);
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                cache.observe_stored(WorkerWithDpRank::new(1, 0), &stored(6));
+                let store = cache.inner.workers.load().get(&1).cloned();
+                if store.is_some_and(|store| store.complete.load(Ordering::Relaxed)) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the snapshot loads");
+        // Three pages; a quiet master is read after the subscribe grace.
+        assert_eq!(requests.load(Ordering::Relaxed), 3);
+        assert_eq!(hits(&cache, 6).await[&1], 5);
+
+        // Batch 1 continues the snapshot.
+        let payload =
+            |events: serde_json::Value| rmp_serde::to_vec_named(&(0_i64, events, 0_u32)).unwrap();
+        send_multipart(
+            &publisher,
+            vec![
+                vec![],
+                1_u64.to_be_bytes().to_vec(),
+                payload(serde_json::json!([
+                    {"event_type": "stored", "group_id": group_id(106), "medium": "cpu"},
+                    {"event_type": "removed", "group_id": group_id(103), "medium": "cpu"},
+                ])),
+            ],
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while hits(&cache, 6).await[&1] != 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("events apply on top of the snapshot");
+        assert_eq!(cache.inner.store_chunks.load(Ordering::Relaxed), 5);
+
+        // A lost batch: the subscriber reads the snapshot again, keeping its
+        // chunks meanwhile.
+        send_multipart(
+            &publisher,
+            vec![
+                vec![],
+                3_u64.to_be_bytes().to_vec(),
+                payload(serde_json::json!([])),
+            ],
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while requests.load(Ordering::Relaxed) < 6 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a gap reads the snapshot again");
+        cache.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_master_without_snapshots_is_followed_by_events() {
+        let (cache, a, _) = cache_with_stores();
+        let (admin_url, _) = serve_snapshot(None, vec![101]).await;
+        let error = read_snapshot(
+            &cache.inner.http,
+            &format!("{admin_url}/kv_events/snapshot"),
+            PREFIX,
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(matches!(error, SnapshotError::Unsupported(_)));
+        let missing = read_snapshot(&cache.inner.http, &format!("{admin_url}/nothing"), PREFIX)
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(missing, SnapshotError::Unsupported(_)));
+        // Without a snapshot ever loaded, a gap forgets as before.
+        cache.apply(&a, 1, vec![event("stored", 101, "cpu")]);
+        assert_eq!(cache.apply(&a, 3, vec![]), Applied::Gap);
+        assert!(a.state.read().chunks.is_empty());
+    }
+
+    /// Against a live master, while writers change it:
+    /// `MOONCAKE_E2E_EVENTS=tcp://HOST:5558 MOONCAKE_E2E_ADMIN=http://HOST:9003
+    /// MOONCAKE_E2E_PREFIX=vllm-mooncake-store:MODEL@ MOONCAKE_E2E_SECONDS=N cargo test -p dynamo-llm
+    /// --lib follows_a_live_master -- --ignored --nocapture`. After N seconds, when the
+    /// writers have stopped, the index must equal a fresh snapshot.
+    #[tokio::test]
+    #[ignore]
+    async fn follows_a_live_master() {
+        let env = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("{name} is not set"));
+        let announcement = StoreAnnouncement {
+            kv_events_endpoint: env("MOONCAKE_E2E_EVENTS"),
+            group_prefix: env("MOONCAKE_E2E_PREFIX"),
+            admin_url: Some(env("MOONCAKE_E2E_ADMIN")),
+        };
+        let follow_for = Duration::from_secs(env("MOONCAKE_E2E_SECONDS").parse().unwrap());
+        let cache =
+            MooncakeStoreSharedKvCache::with_default_scheme(None, CancellationToken::new(), None);
+        let store = Arc::new(Store::new(announcement.clone()));
+        cache
+            .inner
+            .workers
+            .store(Arc::new(HashMap::from([(1, store.clone())])));
+        let token = CancellationToken::new();
+        tokio::spawn(cache.clone().follow(store.clone(), token.clone()));
+
+        let started = Instant::now();
+        tokio::time::timeout(Duration::from_secs(120), async {
+            while !store.complete.load(Ordering::Relaxed) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the snapshot loads");
+        println!(
+            "loaded in {:?}: {} chunks",
+            started.elapsed(),
+            store.state.read().chunks.len()
+        );
+        tokio::time::sleep(follow_for).await;
+
+        let named = |state: &StoreState| -> HashMap<u64, Vec<String>> {
+            state
+                .chunks
+                .iter()
+                .map(|(&chunk, &bits)| {
+                    let mut media: Vec<String> = (0..state.media.len())
+                        .filter(|index| bits & (1 << index) != 0)
+                        .map(|index| state.media[index].clone())
+                        .collect();
+                    media.sort();
+                    (chunk, media)
+                })
+                .collect()
+        };
+        let fresh = read_snapshot(
+            &cache.inner.http,
+            &announcement.snapshot_url().unwrap(),
+            &announcement.group_prefix,
+        )
+        .await
+        .ok()
+        .unwrap();
+        let (index, truth) = (named(&store.state.read()), named(&fresh.state));
+        let differ = index
+            .keys()
+            .chain(truth.keys())
+            .filter(|chunk| index.get(chunk) != truth.get(chunk))
+            .count();
+        println!(
+            "after {follow_for:?}: index {} chunks, snapshot {} chunks, {differ} differ, sequence {:?}, next batch {}",
+            index.len(),
+            truth.len(),
+            store.state.read().sequence,
+            fresh.next_sequence
+        );
+        assert!(
+            store.complete.load(Ordering::Relaxed),
+            "a gap left the index incomplete"
+        );
+        assert_eq!(differ, 0);
+        token.cancel();
     }
 }
