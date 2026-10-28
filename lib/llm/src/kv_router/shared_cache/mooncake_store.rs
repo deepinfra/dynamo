@@ -29,7 +29,9 @@
 //!   on, so a new router knows the whole store within seconds. Until a snapshot
 //!   loads, or from a master that serves none, only chunks stored since the
 //!   subscriber connected are known. A complete store is read again every 30
-//!   minutes; what differs is what the master changed without an event.
+//!   minutes; what differs is what the master changed without an event. The
+//!   frontend's admin API reports each store and reads its snapshot on request
+//!   ([`MooncakeStoreSharedKvCache::status`], [`MooncakeStoreSharedKvCache::resync`]).
 //!
 //! A worker's hits are the leading chunks of the prompt its store holds, as the
 //! connector loads one prefix. A chunk must be one router block (the connector's
@@ -56,7 +58,7 @@ use parking_lot::{Mutex, RwLock};
 use prometheus::{IntCounterVec, IntGauge};
 use serde::{Deserialize, Serialize, de::IgnoredAny};
 use sha2::{Digest, Sha256};
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use super::{MOONCAKE_EVENT_RECONNECT_DELAY, parse_mooncake_event_batch};
@@ -287,6 +289,12 @@ struct Store {
     snapshots: AtomicBool,
     /// The chunks are a snapshot plus every batch since.
     complete: AtomicBool,
+    /// Asks the subscriber to read the snapshot now.
+    resync: Notify,
+    /// A snapshot read is in flight.
+    loading: AtomicBool,
+    /// The last snapshot read that ended.
+    loads: watch::Sender<Option<LoadReport>>,
 }
 
 impl Store {
@@ -296,8 +304,177 @@ impl Store {
             state: RwLock::default(),
             snapshots: AtomicBool::new(false),
             complete: AtomicBool::new(false),
+            resync: Notify::new(),
+            loading: AtomicBool::new(false),
+            loads: watch::Sender::new(None),
         }
     }
+
+    fn status(&self, workers: Vec<WorkerId>) -> StoreStatus {
+        let (chunks, sequence) = {
+            let state = self.state.read();
+            (state.chunks.len(), state.sequence)
+        };
+        let last_load = self.loads.borrow().as_ref().map(|report| LoadStatus {
+            result: report.result,
+            error: report.error.clone(),
+            seconds_ago: report.ended.elapsed().as_secs_f64(),
+            seconds: report.took.as_secs_f64(),
+            installed: report.installed,
+        });
+        StoreStatus {
+            kv_events_endpoint: self.announcement.kv_events_endpoint.clone(),
+            snapshot_url: self.announcement.snapshot_url(),
+            group_prefix: self.announcement.group_prefix.clone(),
+            workers,
+            complete: self.complete.load(Ordering::Relaxed),
+            loading: self.loading.load(Ordering::Relaxed),
+            chunks,
+            sequence,
+            last_load,
+            resync: None,
+        }
+    }
+
+    /// Asks for a snapshot read now; a read in flight answers it too. With
+    /// `wait`, returns how the read ended, waiting through reads retried at once.
+    async fn resync(&self, wait: Option<Duration>) -> ResyncResult {
+        if self.announcement.snapshot_url().is_none() {
+            return ResyncResult::NoSnapshotUrl;
+        }
+        let mut loads = self.loads.subscribe();
+        let seen = loads
+            .borrow_and_update()
+            .as_ref()
+            .map_or(0, |report| report.attempt);
+        self.resync.notify_one();
+        let Some(wait) = wait else {
+            return ResyncResult::Requested;
+        };
+        let ended = async {
+            let report = loads
+                .wait_for(|report| {
+                    report
+                        .as_ref()
+                        .is_some_and(|report| report.attempt > seen && !report.result.retried())
+                })
+                .await
+                .ok()?;
+            report.as_ref().map(|report| report.result)
+        };
+        match tokio::time::timeout(wait, ended).await {
+            Ok(Some(LoadResult::Installed)) => ResyncResult::Installed,
+            Ok(Some(LoadResult::Unsupported)) => ResyncResult::Unsupported,
+            Ok(Some(_)) => ResyncResult::Failed,
+            Ok(None) => ResyncResult::Stopped,
+            Err(_) => ResyncResult::Timeout,
+        }
+    }
+}
+
+/// How a snapshot read ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoadResult {
+    Installed,
+    /// A batch after the snapshot was lost; read again after a second.
+    Stale,
+    /// More events arrived meanwhile than are kept for replay; read again at once.
+    Overrun,
+    /// The master serves no snapshot; read again after ten minutes.
+    Unsupported,
+    Failed,
+}
+
+impl LoadResult {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Installed => "installed",
+            Self::Stale => "stale",
+            Self::Overrun => "overrun",
+            Self::Unsupported => "unsupported",
+            Self::Failed => "failed",
+        }
+    }
+
+    /// The subscriber reads again right away.
+    fn retried(self) -> bool {
+        matches!(self, Self::Stale | Self::Overrun)
+    }
+}
+
+/// What an installed snapshot held.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Installed {
+    pub objects: usize,
+    pub chunks: usize,
+    /// Batches received during the read, applied on top.
+    pub replayed: usize,
+    /// When the index was complete before: chunks it held that the snapshot
+    /// lacks, and the reverse. What the events missed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stale: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub missing: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct LoadReport {
+    /// Reads ended since the store was announced.
+    attempt: u64,
+    result: LoadResult,
+    error: Option<String>,
+    ended: Instant,
+    took: Duration,
+    installed: Option<Installed>,
+}
+
+/// A store as the admin API reports it.
+#[derive(Debug, Clone, Serialize)]
+pub struct StoreStatus {
+    pub kv_events_endpoint: String,
+    pub snapshot_url: Option<String>,
+    pub group_prefix: String,
+    /// The workers that announce the store.
+    pub workers: Vec<WorkerId>,
+    /// The chunks are the master's snapshot plus every batch since.
+    pub complete: bool,
+    pub loading: bool,
+    pub chunks: usize,
+    /// The last batch applied.
+    pub sequence: Option<u64>,
+    pub last_load: Option<LoadStatus>,
+    /// How the requested resync ended; only in resync replies.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resync: Option<ResyncResult>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LoadStatus {
+    pub result: LoadResult,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub seconds_ago: f64,
+    pub seconds: f64,
+    #[serde(flatten)]
+    pub installed: Option<Installed>,
+}
+
+/// How a requested resync of a store ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResyncResult {
+    /// Asked for, not waited on.
+    Requested,
+    Installed,
+    Unsupported,
+    Failed,
+    /// No read ended within the wait.
+    Timeout,
+    /// The store has no admin server to read from.
+    NoSnapshotUrl,
+    /// The store is no longer followed.
+    Stopped,
 }
 
 #[derive(Default)]
@@ -450,6 +627,28 @@ impl MooncakeStoreSharedKvCache {
         }
     }
 
+    /// A cache whose workers announce these KV events endpoints, without subscribers.
+    #[cfg(test)]
+    pub(crate) fn with_unfollowed_stores(endpoints: &[(WorkerId, &str)]) -> Self {
+        let cache = Self::with_default_scheme(None, CancellationToken::new(), None);
+        let mut stores: HashMap<&str, Arc<Store>> = HashMap::new();
+        let workers = endpoints
+            .iter()
+            .map(|&(worker, endpoint)| {
+                let store = stores.entry(endpoint).or_insert_with(|| {
+                    Arc::new(Store::new(StoreAnnouncement {
+                        kv_events_endpoint: endpoint.to_string(),
+                        group_prefix: "vllm-mooncake-store:test@".to_string(),
+                        admin_url: None,
+                    }))
+                });
+                (worker, store.clone())
+            })
+            .collect();
+        cache.inner.workers.store(Arc::new(workers));
+        cache
+    }
+
     /// Follow the stores the workers in `runtime_configs` announce.
     pub fn start(&self, runtime_configs: RuntimeConfigWatch) {
         tokio::spawn(self.clone().supervise(runtime_configs));
@@ -457,6 +656,54 @@ impl MooncakeStoreSharedKvCache {
 
     pub fn shutdown(&self) {
         self.inner.cancellation_token.cancel();
+    }
+
+    /// The stores the workers announce, by KV events endpoint.
+    pub fn status(&self) -> Vec<StoreStatus> {
+        self.stores()
+            .into_iter()
+            .map(|(store, workers)| store.status(workers))
+            .collect()
+    }
+
+    /// Reads every store's snapshot now, as after a gap; a read in flight
+    /// counts. With `wait`, replies when each store's read ended or `wait` ran out.
+    pub async fn resync(&self, wait: Option<Duration>) -> Vec<StoreStatus> {
+        futures::future::join_all(
+            self.stores()
+                .into_iter()
+                .map(|(store, workers)| async move {
+                    let resync = store.resync(wait).await;
+                    StoreStatus {
+                        resync: Some(resync),
+                        ..store.status(workers)
+                    }
+                }),
+        )
+        .await
+    }
+
+    /// Each announced store with the workers announcing it.
+    fn stores(&self) -> Vec<(Arc<Store>, Vec<WorkerId>)> {
+        let mut stores: Vec<(Arc<Store>, Vec<WorkerId>)> = Vec::new();
+        for (&worker, store) in self.inner.workers.load().iter() {
+            match stores
+                .iter_mut()
+                .find(|(known, _)| Arc::ptr_eq(known, store))
+            {
+                Some((_, workers)) => workers.push(worker),
+                None => stores.push((store.clone(), vec![worker])),
+            }
+        }
+        for (_, workers) in &mut stores {
+            workers.sort_unstable();
+        }
+        stores.sort_by(|(a, _), (b, _)| {
+            a.announcement
+                .kv_events_endpoint
+                .cmp(&b.announcement.kv_events_endpoint)
+        });
+        stores
     }
 
     async fn supervise(self, mut runtime_configs: RuntimeConfigWatch) {
@@ -535,8 +782,9 @@ impl MooncakeStoreSharedKvCache {
             match connect_sub_socket(endpoint, None).await {
                 Ok(mut socket) => {
                     tracing::info!(%endpoint, "Following Mooncake store KV events");
-                    // The load in flight and the batches received since it began.
-                    let mut load: Option<(tokio::task::JoinHandle<()>, PendingBatches)> = None;
+                    // The load in flight, the batches received since it began, and when.
+                    let mut load: Option<(tokio::task::JoinHandle<()>, PendingBatches, Instant)> =
+                        None;
                     let mut pending_events = 0;
                     // When to read the next snapshot. The first batch shows the
                     // subscription is live, and moves it up.
@@ -546,7 +794,7 @@ impl MooncakeStoreSharedKvCache {
                     loop {
                         tokio::select! {
                             _ = cancellation_token.cancelled() => {
-                                if let Some((task, _)) = load {
+                                if let Some((task, _, _)) = load {
                                     task.abort();
                                 }
                                 break 'connect;
@@ -563,13 +811,14 @@ impl MooncakeStoreSharedKvCache {
                                             continue;
                                         }
                                     };
-                                    if let Some((task, pending)) = &mut load {
+                                    if let Some((task, pending, started)) = &mut load {
                                         pending_events += events.len();
                                         pending.push((sequence, events.clone()));
                                         if pending_events > MAX_PENDING_EVENTS {
                                             task.abort();
+                                            let started = *started;
                                             load = None;
-                                            self.count_snapshot("overrun");
+                                            self.finish_load(&store, LoadResult::Overrun, started, None, None);
                                             next_load = Some(tokio::time::Instant::now());
                                         }
                                     } else if next_load.is_some() && store.state.read().sequence.is_none() {
@@ -593,6 +842,12 @@ impl MooncakeStoreSharedKvCache {
                                     break;
                                 }
                             },
+                            _ = store.resync.notified(), if snapshot_url.is_some() => {
+                                // A read in flight answers the request too.
+                                if load.is_none() {
+                                    next_load = Some(tokio::time::Instant::now());
+                                }
+                            }
                             _ = sleep_until(next_load), if load.is_none() && next_load.is_some() => {
                                 next_load = None;
                                 generation += 1;
@@ -606,43 +861,47 @@ impl MooncakeStoreSharedKvCache {
                                     let result = read_snapshot(&http, &url, &prefix).await;
                                     let _ = loaded_tx.send((generation, result)).await;
                                 });
-                                load = Some((task, Vec::new()));
+                                load = Some((task, Vec::new(), Instant::now()));
+                                store.loading.store(true, Ordering::Relaxed);
                                 pending_events = 0;
                             }
                             Some((loaded_generation, result)) = loaded.recv() => {
                                 if loaded_generation != generation {
                                     continue;
                                 }
-                                let Some((_, pending)) = load.take() else {
+                                let Some((_, pending, started)) = load.take() else {
                                     continue;
                                 };
                                 let delay = match result {
-                                    Ok(snapshot) => {
-                                        if self.install(&store, snapshot, pending) {
+                                    Ok(snapshot) => match self.install(&store, snapshot, pending) {
+                                        Some(installed) => {
+                                            self.finish_load(&store, LoadResult::Installed, started, None, Some(installed));
                                             retry = SNAPSHOT_RETRY_MIN;
                                             SNAPSHOT_RESYNC
-                                        } else {
+                                        }
+                                        None => {
                                             // A batch after the snapshot was lost: read it again.
+                                            self.finish_load(&store, LoadResult::Stale, started, None, None);
                                             SNAPSHOT_RETRY_MIN
                                         }
-                                    }
+                                    },
                                     Err(SnapshotError::Unsupported(reason)) => {
-                                        self.count_snapshot("unsupported");
                                         tracing::info!(
                                             url = snapshot_url.as_deref().unwrap_or_default(),
                                             %reason,
                                             "Mooncake master serves no KV snapshot; following its events only"
                                         );
+                                        self.finish_load(&store, LoadResult::Unsupported, started, Some(reason), None);
                                         SNAPSHOT_UNSUPPORTED_RETRY
                                     }
                                     Err(SnapshotError::Failed(error)) => {
-                                        self.count_snapshot("failed");
                                         tracing::warn!(
                                             url = snapshot_url.as_deref().unwrap_or_default(),
                                             %error,
                                             retry_in = ?retry,
                                             "Failed to read the Mooncake store snapshot"
                                         );
+                                        self.finish_load(&store, LoadResult::Failed, started, Some(format!("{error:#}")), None);
                                         let delay = retry;
                                         retry = (retry * 2).min(SNAPSHOT_RETRY_MAX);
                                         delay
@@ -652,8 +911,9 @@ impl MooncakeStoreSharedKvCache {
                             }
                         }
                     }
-                    if let Some((task, _)) = load {
+                    if let Some((task, _, _)) = load {
                         task.abort();
+                        store.loading.store(false, Ordering::Relaxed);
                     }
                 }
                 Err(error) => {
@@ -719,8 +979,13 @@ impl MooncakeStoreSharedKvCache {
     }
 
     /// Replaces the store's chunks with `snapshot` caught up on `pending`, the
-    /// batches received since it was requested. False if one it needs is missing.
-    fn install(&self, store: &Store, snapshot: Snapshot, pending: PendingBatches) -> bool {
+    /// batches received since it was requested. None if one it needs is missing.
+    fn install(
+        &self,
+        store: &Store,
+        snapshot: Snapshot,
+        pending: PendingBatches,
+    ) -> Option<Installed> {
         let Snapshot {
             state: mut fresh,
             next_sequence,
@@ -733,14 +998,13 @@ impl MooncakeStoreSharedKvCache {
                 continue;
             }
             if sequence != expected {
-                self.count_snapshot("stale");
                 tracing::warn!(
                     endpoint = %store.announcement.kv_events_endpoint,
                     expected,
                     sequence,
                     "Mooncake store snapshot misses a batch; reading it again"
                 );
-                return false;
+                return None;
             }
             fresh.apply_events(&store.announcement.group_prefix, events);
             expected += 1;
@@ -769,7 +1033,6 @@ impl MooncakeStoreSharedKvCache {
         store.snapshots.store(true, Ordering::Relaxed);
         self.set_complete(store, true);
         self.check_size(store, &mut state);
-        self.count_snapshot("installed");
         let (stale, missing) = drift.unwrap_or_default();
         if let Some(metrics) = &self.inner.metrics {
             metrics
@@ -791,7 +1054,13 @@ impl MooncakeStoreSharedKvCache {
             missing,
             "Loaded the Mooncake store's snapshot"
         );
-        true
+        Some(Installed {
+            objects,
+            chunks: after,
+            replayed,
+            stale: drift.map(|(stale, _)| stale),
+            missing: drift.map(|(_, missing)| missing),
+        })
     }
 
     fn check_size(&self, store: &Store, state: &mut StoreState) {
@@ -845,10 +1114,29 @@ impl MooncakeStoreSharedKvCache {
         }
     }
 
-    fn count_snapshot(&self, result: &str) {
+    /// Counts a snapshot read that ended and reports it to the admin API.
+    fn finish_load(
+        &self,
+        store: &Store,
+        result: LoadResult,
+        started: Instant,
+        error: Option<String>,
+        installed: Option<Installed>,
+    ) {
+        store.loading.store(false, Ordering::Relaxed);
         if let Some(metrics) = &self.inner.metrics {
-            metrics.snapshots.with_label_values(&[result]).inc();
+            metrics.snapshots.with_label_values(&[result.label()]).inc();
         }
+        store.loads.send_modify(|last| {
+            *last = Some(LoadReport {
+                attempt: last.as_ref().map_or(0, |last| last.attempt) + 1,
+                result,
+                error,
+                ended: Instant::now(),
+                took: started.elapsed(),
+                installed,
+            })
+        });
     }
 
     fn add_chunks(&self, delta: isize) {
@@ -1920,7 +2208,7 @@ mod tests {
             ),
             (7, vec![event("stored", 104, "cpu")]),
         ];
-        assert!(cache.install(&a, snapshot(&[101, 102]), pending));
+        assert!(cache.install(&a, snapshot(&[101, 102]), pending).is_some());
         let state = a.state.read();
         assert_eq!(
             state.chunks.keys().copied().collect::<HashSet<_>>(),
@@ -1943,23 +2231,26 @@ mod tests {
 
         // A batch the snapshot needs is missing: it is not installed.
         let gap = vec![(7, vec![event("stored", 104, "cpu")])];
-        assert!(!cache.install(&a, snapshot(&[101]), gap));
+        assert!(cache.install(&a, snapshot(&[101]), gap).is_none());
         assert_eq!(a.state.read().chunks.len(), 4);
     }
 
-    /// A master's admin server with a fixed snapshot, in pages of two objects.
+    /// A master's admin server with the snapshot of `chunks`, in pages of two
+    /// objects. The chunks can change without events.
     async fn serve_snapshot(
         next_sequence: Option<u64>,
         chunks: Vec<u64>,
-    ) -> (String, Arc<AtomicUsize>) {
+    ) -> (String, Arc<AtomicUsize>, Arc<Mutex<Vec<u64>>>) {
         use axum::{Router, extract::Query, routing::get};
 
         let requests = Arc::new(AtomicUsize::new(0));
         let counter = requests.clone();
+        let chunks = Arc::new(Mutex::new(chunks));
+        let held = chunks.clone();
         let app = Router::new().route(
             "/kv_events/snapshot",
             get(move |Query(query): Query<HashMap<String, String>>| {
-                let chunks = chunks.clone();
+                let chunks = held.lock().clone();
                 counter.fetch_add(1, Ordering::Relaxed);
                 async move {
                     assert_eq!(query.get("object_keys").map(String::as_str), Some("0"));
@@ -1983,7 +2274,163 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        (url, requests)
+        (url, requests, chunks)
+    }
+
+    /// A cache following one store, worker 1's, whose master serves `admin_url`.
+    async fn follow_store(admin_url: String) -> MooncakeStoreSharedKvCache {
+        use crate::utils::zmq::bind_pub_socket;
+        use tmq::AsZmqSocket;
+
+        let publisher = bind_pub_socket("tcp://127.0.0.1:*").await.unwrap();
+        let endpoint = publisher
+            .lock()
+            .await
+            .get_socket()
+            .get_last_endpoint()
+            .unwrap()
+            .unwrap();
+        let mut runtime_config = ModelRuntimeConfig::new();
+        runtime_config
+            .set_engine_specific(
+                VLLM_MOONCAKE_STORE_RUNTIME_KEY,
+                StoreAnnouncement {
+                    admin_url: Some(admin_url),
+                    ..announcement(&endpoint)
+                },
+            )
+            .unwrap();
+        let (tx, runtime_configs) = watch::channel(HashMap::from([(1, runtime_config)]));
+        let cache =
+            MooncakeStoreSharedKvCache::with_default_scheme(None, CancellationToken::new(), None);
+        cache.start(runtime_configs);
+        // Keep the master's socket and the announcement until the test ends.
+        tokio::spawn(async move {
+            let _publisher = publisher;
+            tx.closed().await;
+        });
+        cache
+    }
+
+    async fn first_load(cache: &MooncakeStoreSharedKvCache) -> StoreStatus {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let [store] = cache.status().as_slice()
+                    && store.last_load.is_some()
+                {
+                    return store.clone();
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the subscriber reads the snapshot")
+    }
+
+    #[tokio::test]
+    async fn a_resync_reads_the_snapshot_at_once() {
+        let (admin_url, requests, chunks) = serve_snapshot(Some(1), vec![101, 102, 103]).await;
+        let cache = follow_store(admin_url).await;
+        let store = first_load(&cache).await;
+        assert!(store.complete);
+        assert_eq!(store.workers, vec![1]);
+        assert_eq!((store.chunks, store.sequence), (3, Some(0)));
+        let load = store.last_load.unwrap();
+        assert_eq!(load.result, LoadResult::Installed);
+        assert_eq!(
+            load.installed,
+            Some(Installed {
+                objects: 3,
+                chunks: 3,
+                replayed: 0,
+                stale: None,
+                missing: None,
+            })
+        );
+
+        // The master changed without events: a resync finds it now, not at the
+        // next periodic read.
+        *chunks.lock() = vec![101, 102, 104];
+        let started = Instant::now();
+        let replies = cache.resync(Some(Duration::from_secs(5))).await;
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let [store] = replies.as_slice() else {
+            panic!("one store: {replies:?}")
+        };
+        assert_eq!(store.resync, Some(ResyncResult::Installed));
+        let installed = store.last_load.as_ref().unwrap().installed.unwrap();
+        assert_eq!(
+            (installed.chunks, installed.stale, installed.missing),
+            (3, Some(1), Some(1))
+        );
+        let followed = cache.inner.workers.load()[&1].clone();
+        assert_eq!(
+            followed
+                .state
+                .read()
+                .chunks
+                .keys()
+                .copied()
+                .collect::<HashSet<_>>(),
+            HashSet::from([101, 102, 104])
+        );
+        let reply = serde_json::to_value(store).unwrap();
+        assert_eq!(reply["resync"], "installed");
+        assert_eq!(reply["last_load"]["result"], "installed");
+        assert_eq!(reply["last_load"]["stale"], 1);
+
+        // Without a wait it only asks; the read follows.
+        let before = requests.load(Ordering::Relaxed);
+        let replies = cache.resync(None).await;
+        assert_eq!(replies[0].resync, Some(ResyncResult::Requested));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while requests.load(Ordering::Relaxed) <= before {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the requested read happens");
+        cache.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_resync_reports_stores_it_cannot_read() {
+        // An older master: the next read would be ten minutes away.
+        let (admin_url, _, _) = serve_snapshot(None, vec![101]).await;
+        let cache = follow_store(admin_url).await;
+        let store = first_load(&cache).await;
+        assert!(!store.complete);
+        assert_eq!(store.last_load.unwrap().result, LoadResult::Unsupported);
+        let started = Instant::now();
+        let replies = cache.resync(Some(Duration::from_secs(5))).await;
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(replies[0].resync, Some(ResyncResult::Unsupported));
+        cache.shutdown();
+
+        // No admin server to read, and a store whose subscriber never reads.
+        let cache = MooncakeStoreSharedKvCache::with_unfollowed_stores(&[
+            (1, "tcp://a:1"),
+            (2, "tcp://*:1"),
+            (3, "tcp://a:1"),
+        ]);
+        let replies = cache.resync(Some(Duration::from_millis(50))).await;
+        let results: Vec<_> = replies
+            .iter()
+            .map(|store| {
+                (
+                    store.kv_events_endpoint.as_str(),
+                    store.workers.clone(),
+                    store.resync,
+                )
+            })
+            .collect();
+        assert_eq!(
+            results,
+            vec![
+                ("tcp://*:1", vec![2], Some(ResyncResult::NoSnapshotUrl)),
+                ("tcp://a:1", vec![1, 3], Some(ResyncResult::Timeout)),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -2000,7 +2447,7 @@ mod tests {
             .unwrap()
             .unwrap();
         // The store held chunks 101-105 before the router started; batch 1 is next.
-        let (admin_url, requests) = serve_snapshot(Some(1), (101..=105).collect()).await;
+        let (admin_url, requests, _) = serve_snapshot(Some(1), (101..=105).collect()).await;
         let mut runtime_config = ModelRuntimeConfig::new();
         runtime_config
             .set_engine_specific(
@@ -2082,7 +2529,7 @@ mod tests {
     #[tokio::test]
     async fn a_master_without_snapshots_is_followed_by_events() {
         let (cache, a, _) = cache_with_stores();
-        let (admin_url, _) = serve_snapshot(None, vec![101]).await;
+        let (admin_url, _, _) = serve_snapshot(None, vec![101]).await;
         let error = read_snapshot(
             &cache.inner.http,
             &format!("{admin_url}/kv_events/snapshot"),
@@ -2106,8 +2553,9 @@ mod tests {
     /// Against a live master, while writers change it:
     /// `MOONCAKE_E2E_EVENTS=tcp://HOST:5558 MOONCAKE_E2E_ADMIN=http://HOST:9003
     /// MOONCAKE_E2E_PREFIX=vllm-mooncake-store:MODEL@ MOONCAKE_E2E_SECONDS=N cargo test -p dynamo-llm
-    /// --lib follows_a_live_master -- --ignored --nocapture`. After N seconds, when the
-    /// writers have stopped, the index must equal a fresh snapshot.
+    /// --lib follows_a_live_master -- --ignored --nocapture`. A resync halfway finds
+    /// nothing the events missed. After N seconds, when the writers have stopped, the
+    /// index must equal a fresh snapshot, and a resync must undo damage to it.
     #[tokio::test]
     #[ignore]
     async fn follows_a_live_master() {
@@ -2141,7 +2589,25 @@ mod tests {
             started.elapsed(),
             store.state.read().chunks.len()
         );
-        tokio::time::sleep(follow_for).await;
+        tokio::time::sleep(follow_for / 2).await;
+        let resync = |what: &'static str| {
+            let cache = cache.clone();
+            async move {
+                let started = Instant::now();
+                let replies = cache.resync(Some(Duration::from_secs(120))).await;
+                let installed = replies[0].last_load.as_ref().unwrap().installed.unwrap();
+                println!(
+                    "{what}: {:?} in {:?}, {installed:?}",
+                    replies[0].resync,
+                    started.elapsed()
+                );
+                assert_eq!(replies[0].resync, Some(ResyncResult::Installed));
+                installed
+            }
+        };
+        let installed = resync("resync while writing").await;
+        assert_eq!((installed.stale, installed.missing), (Some(0), Some(0)));
+        tokio::time::sleep(follow_for - follow_for / 2).await;
 
         let named = |state: &StoreState| -> HashMap<u64, Vec<String>> {
             state
@@ -2183,6 +2649,26 @@ mod tests {
             "a gap left the index incomplete"
         );
         assert_eq!(differ, 0);
+
+        // Damage the index as lost events would: a resync restores it.
+        let removed = {
+            let mut state = store.state.write();
+            let real: Vec<u64> = state.chunks.keys().take(100).copied().collect();
+            for chunk in &real {
+                state.chunks.remove(chunk);
+            }
+            for fake in 0..1000 {
+                state.chunks.insert(0xdead_0000_0000_0000 | fake, 1);
+            }
+            real.len()
+        };
+        cache.add_chunks(1000 - removed as isize);
+        let installed = resync("resync after damage").await;
+        assert_eq!(
+            (installed.stale, installed.missing),
+            (Some(1000), Some(removed))
+        );
+        assert_eq!(named(&store.state.read()), truth);
         token.cancel();
     }
 }

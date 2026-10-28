@@ -39,7 +39,9 @@ use dynamo_kv_router::{
 
 mod mooncake_store;
 
-pub use mooncake_store::{MooncakeStoreMetrics, MooncakeStoreSharedKvCache};
+pub use mooncake_store::{
+    MooncakeStoreMetrics, MooncakeStoreSharedKvCache, ResyncResult, StoreStatus,
+};
 
 const SGLANG_HICACHE_MOONCAKE_RUNTIME_KEY: &str = "sglang_hicache_mooncake";
 pub(super) const MOONCAKE_EVENT_RECONNECT_DELAY: Duration = Duration::from_secs(1);

@@ -2125,6 +2125,47 @@ impl ModelManager {
             .clone()
     }
 
+    /// Each endpoint's Mooncake store index with the models routed to it; only
+    /// those that route `model`, when given.
+    pub(crate) fn mooncake_store_indexes(
+        &self,
+        model: Option<&str>,
+    ) -> Vec<(EndpointId, Vec<String>, MooncakeStoreSharedKvCache)> {
+        let mut models: HashMap<EndpointId, Vec<String>> = HashMap::new();
+        for (target, _) in self.router_policies.list(None) {
+            let routed = models
+                .entry(EndpointId {
+                    namespace: target.namespace,
+                    component: target.component,
+                    name: target.endpoint,
+                })
+                .or_default();
+            if !routed.contains(&target.model) {
+                routed.push(target.model);
+            }
+        }
+        let mut indexes: Vec<_> = self
+            .mooncake_store_caches
+            .iter()
+            .map(|entry| {
+                let routed = models.remove(entry.key()).unwrap_or_default();
+                (entry.key().clone(), routed, entry.value().clone())
+            })
+            .filter(|(_, routed, _)| model.is_none_or(|model| routed.iter().any(|m| m == model)))
+            .collect();
+        indexes.sort_by_key(|(endpoint, _, _)| endpoint.to_string());
+        indexes
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert_mooncake_store_cache(
+        &self,
+        endpoint: EndpointId,
+        cache: MooncakeStoreSharedKvCache,
+    ) {
+        self.mooncake_store_caches.insert(endpoint, cache);
+    }
+
     fn mooncake_store_cache_for(
         &self,
         endpoint: &Endpoint,
