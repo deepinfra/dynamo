@@ -58,6 +58,7 @@ pub use dynamo_kv_router::scheduling;
 
 pub(crate) mod embedded;
 pub mod encoder_router;
+pub mod ideal_cache;
 pub mod indexer;
 pub mod metrics;
 pub(crate) mod metrics_subscriber;
@@ -69,6 +70,7 @@ mod routing_host;
 pub(crate) mod routing_load;
 pub mod sequence;
 pub mod shared_cache;
+pub(crate) mod vllm_block_hash;
 
 pub use dynamo_kv_router::scheduling::OverlapScoresResponse;
 // TODO(v1.7): Remove these compatibility aliases; use kv_router::plugins instead.
@@ -655,6 +657,9 @@ pub struct KvRouter {
     teardown_task_guard: Option<dynamo_runtime::engine::EngineContextGuard>,
     /// Optional session-aware logical prefix index.
     session_prefix_index: Option<Arc<SessionPrefixIndexer>>,
+    /// The ideal KV cache tracker, when on. The KV event subscription feeds it the
+    /// workers' stored blocks; routed prompts count against it.
+    ideal_cache: Option<Arc<ideal_cache::IdealCache>>,
 }
 
 fn resolve_tracking_model_name(
@@ -806,6 +811,11 @@ impl KvRouter {
             .enable_session_prefix_index
             .then(|| Arc::new(SessionPrefixIndexer::new()));
 
+        // Only prefill and aggregated routers see prompts.
+        let ideal_cache = matches!(worker_type, WorkerType::Prefill | WorkerType::Aggregated)
+            .then(|| ideal_cache::IdealCache::from_env(component))
+            .flatten();
+
         let ingress = indexer::RuntimeIngress::start(indexer::RuntimeIngressArgs {
             endpoint: &endpoint,
             kv_router_config: &kv_router_config,
@@ -819,6 +829,7 @@ impl KvRouter {
             cancellation_token: cancellation_token.clone(),
             session_prefix_index: session_prefix_index.clone(),
             shared_cache: shared_cache.clone(),
+            ideal_cache: ideal_cache.clone(),
         })
         .await?;
         let indexer = ingress.indexer().clone();
@@ -961,6 +972,7 @@ impl KvRouter {
             shared_cache,
             teardown_task_guard: None,
             session_prefix_index,
+            ideal_cache,
         })
     }
 
@@ -1047,6 +1059,11 @@ impl KvRouter {
 
     pub fn is_eagle(&self) -> bool {
         self.is_eagle
+    }
+
+    /// The ideal KV cache tracker, when on.
+    pub(crate) fn ideal_cache(&self) -> Option<&ideal_cache::IdealCache> {
+        self.ideal_cache.as_deref()
     }
 
     fn approximate_lru_rank_registration(

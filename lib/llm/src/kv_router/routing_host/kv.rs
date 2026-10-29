@@ -440,6 +440,18 @@ impl RoutingHost {
         );
         guard.set_cache_prediction(selection.cache_prediction);
 
+        // A disaggregated request's prompt counts on its prefill hop. Prompts whose
+        // worker hashes carry extra keys cannot be matched against stored blocks.
+        let routing = request.routing.as_ref();
+        if !is_query_only
+            && phase != RequestPhase::Decode
+            && routing_parts.block_mm_infos.is_none()
+            && routing.is_none_or(|r| r.lora_name.is_none() && r.cache_namespace.is_none())
+            && let Some(ideal_cache) = chooser.ideal_cache()
+        {
+            ideal_cache.observe_prompt(chooser.block_size(), routing_parts.token_ids);
+        }
+
         let record_result: Result<(), Error> = async {
             if !is_query_only && chooser.indexer().records_routing_decisions() {
                 let worker = selected_worker;

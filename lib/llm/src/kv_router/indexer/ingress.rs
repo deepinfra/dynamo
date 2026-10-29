@@ -17,6 +17,8 @@ use dynamo_kv_router::{SessionPrefixIndexer, SharedKvCache, WorkerInputs, Worker
 use dynamo_runtime::component::Endpoint;
 use tokio_util::sync::CancellationToken;
 
+use crate::kv_router::ideal_cache::IdealCache;
+
 use super::{
     Indexer, KvEventSubscriptionHandle, ServedIndexerMode, ensure_served_indexer_service,
     start_subscriber,
@@ -39,6 +41,8 @@ pub(crate) struct RuntimeIngressArgs<'a> {
     pub session_prefix_index: Option<Arc<SessionPrefixIndexer>>,
     /// Sees every device-tier store the subscription admits.
     pub shared_cache: Option<Arc<dyn SharedKvCache>>,
+    /// Sees every store, of any tier, the subscription admits.
+    pub ideal_cache: Option<Arc<IdealCache>>,
 }
 
 pub(crate) struct RuntimeIngress {
@@ -62,6 +66,7 @@ impl RuntimeIngress {
             cancellation_token,
             session_prefix_index,
             shared_cache,
+            ideal_cache,
         } = args;
         let component = endpoint.component();
         let index_required = needs_kv_index(worker_inputs);
@@ -96,6 +101,7 @@ impl RuntimeIngress {
                     kv_event_source_requirement,
                     metric_worker_type,
                     shared_cache,
+                    ideal_cache,
                     cancellation_token.child_token(),
                 )
                 .await?,
