@@ -5,7 +5,8 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use futures::StreamExt;
-use tokio::sync::OwnedSemaphorePermit;
+use dynamo_protocols::types::PromptTokensDetails;
+use tokio::sync::{OwnedSemaphorePermit, oneshot};
 use tracing::Instrument;
 
 use dynamo_kv_router::selector::WorkerSelector;
@@ -152,6 +153,7 @@ where
         prefill_stream: ManyOut<Annotated<LLMEngineOutput>>,
         tracker: Option<Arc<RequestTracker>>,
         phase_transition_permit: OwnedSemaphorePermit,
+        prompt_details_tx: oneshot::Sender<Option<PromptTokensDetails>>,
     ) {
         let span = tracing::Span::current();
         let task_guard = self.task_guard.clone();
@@ -159,7 +161,19 @@ where
             async move {
                 drop(phase_transition_permit);
                 match Self::consume_prefill_stream(prefill_stream, tracker, task_guard).await {
-                    Ok(_) => tracing::debug!("Prefill background task completed"),
+                    Ok(completion) => {
+                        let details = match completion {
+                            PrefillCompletion::Handoff { result, .. } => {
+                                result.prompt_tokens_details
+                            }
+                            PrefillCompletion::Terminal { output } => output
+                                .data
+                                .and_then(|output| output.completion_usage)
+                                .and_then(|usage| usage.prompt_tokens_details),
+                        };
+                        let _ = prompt_details_tx.send(details);
+                        tracing::debug!("Prefill background task completed");
+                    }
                     Err(error) => tracing::warn!("Prefill background task error: {error:?}"),
                 }
             }

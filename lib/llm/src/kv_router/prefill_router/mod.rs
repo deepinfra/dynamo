@@ -27,6 +27,7 @@ use dynamo_runtime::{
     },
     protocols::{EndpointId, annotated::Annotated},
 };
+use dynamo_protocols::types::PromptTokensDetails;
 use futures::stream::{self, StreamExt};
 
 use crate::{
@@ -180,6 +181,37 @@ enum PrefillCompletion {
     Terminal {
         output: Box<Annotated<LLMEngineOutput>>,
     },
+}
+
+/// How long the decode's usage chunk waits for its prefill's prompt_tokens_details.
+const PREFILL_DETAILS_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// DI decode-first: the decode leg started before its prefill finished, so the decode counts the KV the
+/// prefill pushed as cached. Report the prefill's prompt_tokens_details on the usage chunk instead, as the
+/// prefill-first path does through `prefill_result`; none if the prefill never reported them.
+fn with_prefill_prompt_details(
+    mut decode_stream: ManyOut<Annotated<LLMEngineOutput>>,
+    details_rx: tokio::sync::oneshot::Receiver<Option<PromptTokensDetails>>,
+) -> ManyOut<Annotated<LLMEngineOutput>> {
+    let engine_ctx = decode_stream.context();
+    let stream = async_stream::stream! {
+        let mut details_rx = Some(details_rx);
+        let mut details = None;
+        while let Some(mut item) = decode_stream.next().await {
+            if let Some(usage) = item.data.as_mut().and_then(|output| output.completion_usage.as_mut()) {
+                if let Some(rx) = details_rx.take() {
+                    details = tokio::time::timeout(PREFILL_DETAILS_WAIT, rx)
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                        .flatten();
+                }
+                usage.prompt_tokens_details = details.clone();
+            }
+            yield item;
+        }
+    };
+    ResponseStream::new(Box::pin(stream), engine_ctx)
 }
 
 fn strip_terminal_disaggregated_params(
@@ -465,6 +497,7 @@ where
 
         let router = &binding.router;
         let endpoint_id = &binding.endpoint_id;
+        let mut prefill_details_rx = None;
         let prefill_result: Result<(PrefillOutcome, Option<RoutingConstraints>)> = async {
             let (prepared, prefill_stream) = router
                 .select_and_dispatch_prefill(prefill_context, |request, target| {
@@ -473,7 +506,9 @@ where
                 .await?;
             let topology_constraints = prepared.topology_constraints;
             let outcome = if let Some(bootstrap_info) = prepared.bootstrap_info {
-                self.spawn_prefill_task(prefill_stream, tracker, prefill_phase_barrier);
+                let (details_tx, details_rx) = tokio::sync::oneshot::channel();
+                prefill_details_rx = Some(details_rx);
+                self.spawn_prefill_task(prefill_stream, tracker, prefill_phase_barrier, details_tx);
                 PrefillOutcome::Bootstrap {
                     bootstrap_info,
                     worker_id: prepared.worker_id,
@@ -583,7 +618,11 @@ where
             self.conditional_disagg_policy.is_enabled(),
         ));
 
-        next.generate(context.map(|_| decode_req)).await
+        let decode_stream = next.generate(context.map(|_| decode_req)).await?;
+        Ok(match prefill_details_rx {
+            Some(details_rx) => with_prefill_prompt_details(decode_stream, details_rx),
+            None => decode_stream,
+        })
     }
 }
 
