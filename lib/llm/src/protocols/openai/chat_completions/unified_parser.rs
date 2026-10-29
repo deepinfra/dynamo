@@ -1209,6 +1209,11 @@ where
                     // carries still reach the client.
                     parsed.push(empty_choice(original.index));
                 }
+                // DI: keep the chunk's token logprobs, as vLLM does for every generated token whichever
+                // part of the message the parser routed its text to. They ride on this chunk's last child.
+                if let (Some(logprobs), Some(last)) = (original.logprobs.clone(), parsed.last_mut()) {
+                    last.logprobs = Some(logprobs);
+                }
                 emitted.extend(parsed);
             }
 
@@ -1555,6 +1560,32 @@ mod tests {
             collect_choices(&responses).last().unwrap().finish_reason,
             Some(FinishReason::ToolCalls)
         );
+    }
+
+    #[tokio::test]
+    async fn deepseek_v41_keeps_chunk_logprobs_through_reasoning_and_content() {
+        let logprobs: dynamo_protocols::types::ChatChoiceLogprobs = serde_json::from_value(serde_json::json!({
+            "content": [{"token": "Hi", "logprob": -0.25, "bytes": null, "top_logprobs": []}],
+            "refusal": null
+        }))
+        .unwrap();
+        let mut input = chunk("ponder</think>Hi", true);
+        input.data.as_mut().unwrap().inner.choices[0].logprobs = Some(logprobs.clone());
+        let responses = apply_stream(
+            stream::iter([input]),
+            None,
+            None,
+            false,
+            UnifiedParserStartingState::Reasoning,
+            DEEPSEEK_V41_UNIFIED_FAMILY,
+        )
+        .collect::<Vec<_>>()
+        .await;
+        let carried: Vec<_> = collect_choices(&responses)
+            .into_iter()
+            .filter_map(|choice| choice.logprobs.clone())
+            .collect();
+        assert_eq!(carried, vec![logprobs]);
     }
 
     #[tokio::test]
