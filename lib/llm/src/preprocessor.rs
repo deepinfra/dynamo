@@ -18,6 +18,7 @@ pub mod media;
 mod mm_routing;
 pub mod prompt;
 pub mod speculative_prefill;
+mod deepseek_v41_tool_tag;
 pub(crate) mod structural_tag;
 pub(crate) mod tool_choice;
 pub mod tools;

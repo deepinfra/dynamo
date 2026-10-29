@@ -98,6 +98,24 @@ impl OpenAIPreprocessor {
             gd.json = None;
         }
 
+        // DI: DeepSeek V4.1 gets vLLM's --tool-strict-level=function structural tag (see deepseek_v41_tool_tag). The
+        // unified parser still reads native DSML, so the reported constraint stays None.
+        if self.tool_call_parser.as_deref() == Some("deepseek_v41")
+            && std::env::var("DI_V41_TOOL_STRUCTURAL_TAG").as_deref() != Ok("0")
+            && let Some(tag) = super::deepseek_v41_tool_tag::structural_tag(
+                &convert_tool_choice(tool_choice),
+                &convert_tools(tools),
+                request.inner.parallel_tool_calls,
+            )
+        {
+            common_request
+                .sampling_options
+                .guided_decoding
+                .get_or_insert_default()
+                .structural_tag = Some(tag);
+            return Ok(GuidedToolConstraint::None);
+        }
+
         if self.apply_tool_choice_structural_tag(
             &convert_tool_choice(tool_choice),
             &convert_tools(tools),

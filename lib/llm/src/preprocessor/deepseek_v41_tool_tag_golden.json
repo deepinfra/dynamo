@@ -1,0 +1,210 @@
+{
+ "tools": [
+  {
+   "type": "function",
+   "function": {
+    "name": "get_current_weather",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "location": {
+       "type": "string"
+      }
+     },
+     "required": [
+      "location"
+     ]
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "calculate",
+    "strict": true,
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "expression": {
+       "type": "string"
+      }
+     },
+     "required": [
+      "expression"
+     ],
+     "additionalProperties": false
+    }
+   }
+  }
+ ],
+ "cases": {
+  "auto": {
+   "type": "structural_tag",
+   "format": {
+    "type": "triggered_tags",
+    "triggers": [
+     "<｜DSML｜ calls>"
+    ],
+    "tags": [
+     {
+      "type": "tag",
+      "begin": "<｜DSML｜ calls>\n",
+      "content": {
+       "type": "tags_with_separator",
+       "tags": [
+        {
+         "type": "tag",
+         "begin": "<｜DSML｜ invoke name=\"get_current_weather\">\n",
+         "content": {
+          "type": "json_schema",
+          "json_schema": true,
+          "style": "deepseek_v4_1_xml",
+          "any_order": false,
+          "max_whitespace_cnt": null,
+          "excludes": []
+         },
+         "end": "</｜DSML｜ invoke>\n"
+        },
+        {
+         "type": "tag",
+         "begin": "<｜DSML｜ invoke name=\"calculate\">\n",
+         "content": {
+          "type": "json_schema",
+          "json_schema": {
+           "type": "object",
+           "properties": {
+            "expression": {
+             "type": "string"
+            }
+           },
+           "required": [
+            "expression"
+           ],
+           "additionalProperties": false
+          },
+          "style": "deepseek_v4_1_xml",
+          "any_order": false,
+          "max_whitespace_cnt": null,
+          "excludes": []
+         },
+         "end": "</｜DSML｜ invoke>\n"
+        }
+       ],
+       "separator": "",
+       "at_least_one": true,
+       "stop_after_first": false
+      },
+      "end": "</｜DSML｜ calls>"
+     }
+    ],
+    "at_least_one": false,
+    "stop_after_first": false,
+    "excludes": [
+     "<think>",
+     "</think>"
+    ]
+   }
+  },
+  "required": {
+   "type": "structural_tag",
+   "format": {
+    "type": "sequence",
+    "elements": [
+     {
+      "type": "const_string",
+      "value": "\n\n<｜DSML｜ calls>\n"
+     },
+     {
+      "type": "tags_with_separator",
+      "tags": [
+       {
+        "type": "tag",
+        "begin": "<｜DSML｜ invoke name=\"get_current_weather\">\n",
+        "content": {
+         "type": "json_schema",
+         "json_schema": true,
+         "style": "deepseek_v4_1_xml",
+         "any_order": false,
+         "max_whitespace_cnt": null,
+         "excludes": []
+        },
+        "end": "</｜DSML｜ invoke>\n"
+       },
+       {
+        "type": "tag",
+        "begin": "<｜DSML｜ invoke name=\"calculate\">\n",
+        "content": {
+         "type": "json_schema",
+         "json_schema": {
+          "type": "object",
+          "properties": {
+           "expression": {
+            "type": "string"
+           }
+          },
+          "required": [
+           "expression"
+          ],
+          "additionalProperties": false
+         },
+         "style": "deepseek_v4_1_xml",
+         "any_order": false,
+         "max_whitespace_cnt": null,
+         "excludes": []
+        },
+        "end": "</｜DSML｜ invoke>\n"
+       }
+      ],
+      "separator": "",
+      "at_least_one": true,
+      "stop_after_first": false
+     },
+     {
+      "type": "const_string",
+      "value": "</｜DSML｜ calls>"
+     }
+    ]
+   }
+  },
+  "named": {
+   "type": "structural_tag",
+   "format": {
+    "type": "sequence",
+    "elements": [
+     {
+      "type": "const_string",
+      "value": "\n\n<｜DSML｜ calls>\n"
+     },
+     {
+      "type": "tag",
+      "begin": "<｜DSML｜ invoke name=\"calculate\">\n",
+      "content": {
+       "type": "json_schema",
+       "json_schema": {
+        "type": "object",
+        "properties": {
+         "expression": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "expression"
+        ],
+        "additionalProperties": false
+       },
+       "style": "deepseek_v4_1_xml",
+       "any_order": false,
+       "max_whitespace_cnt": null,
+       "excludes": []
+      },
+      "end": "</｜DSML｜ invoke>\n"
+     },
+     {
+      "type": "const_string",
+      "value": "</｜DSML｜ calls>"
+     }
+    ]
+   }
+  }
+ }
+}
