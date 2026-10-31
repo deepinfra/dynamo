@@ -56,7 +56,7 @@ use futures::StreamExt;
 use lru::LruCache;
 use parking_lot::{Mutex, RwLock};
 use prometheus::{IntCounterVec, IntGauge};
-use serde::{Deserialize, Serialize, de::IgnoredAny};
+use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
@@ -79,6 +79,8 @@ const MAX_STORE_CHUNKS: usize = 1 << 25;
 /// `mooncake_master --metrics_port` default, where it serves its admin API.
 const MOONCAKE_ADMIN_PORT: u16 = 9003;
 const SNAPSHOT_PAGE_OBJECTS: usize = 65536;
+/// Start of every worker's group prefix: `vllm-mooncake-store:[{cache_prefix}@]{model}@`.
+const GROUP_ID_PREFIX: &str = "vllm-mooncake-store:";
 const SNAPSHOT_PAGE_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long a new subscription may stay silent before the snapshot is read anyway.
 const SUBSCRIBE_GRACE: Duration = Duration::from_secs(1);
@@ -138,6 +140,9 @@ struct StoreEvent {
     event_type: String,
     #[serde(default)]
     group_id: Option<String>,
+    /// Used when the object has no group id (see [`object_chunk`]).
+    #[serde(default)]
+    object_key: Option<String>,
     #[serde(default)]
     medium: Option<String>,
 }
@@ -371,11 +376,11 @@ impl StoreState {
     fn apply_events(&mut self, group_prefix: &str, events: Vec<StoreEvent>) -> (u64, u64) {
         let (mut applied, mut ignored) = (0, 0);
         for event in events {
-            let Some(chunk) = event
-                .group_id
-                .as_deref()
-                .and_then(|group_id| chunk_hash(group_id, group_prefix))
-            else {
+            let Some(chunk) = object_chunk(
+                event.group_id.as_deref(),
+                event.object_key.as_deref(),
+                group_prefix,
+            ) else {
                 ignored += 1;
                 continue;
             };
@@ -426,7 +431,7 @@ struct SnapshotPage {
     next_sequence: Option<u64>,
     next_shard: Option<u64>,
     /// Object key (nil: not asked for), group id, media.
-    objects: Vec<(Option<IgnoredAny>, Option<String>, Vec<String>)>,
+    objects: Vec<(Option<String>, Option<String>, Vec<String>)>,
 }
 
 #[derive(Debug)]
@@ -1055,7 +1060,8 @@ async fn read_snapshot(
             .query(&[
                 ("shard", from.to_string()),
                 ("max_objects", SNAPSHOT_PAGE_OBJECTS.to_string()),
-                ("object_keys", "0".to_string()),
+                // Keys stand in for a missing group id (see [`object_chunk`]).
+                ("object_keys", "1".to_string()),
             ])
             .send()
             .await
@@ -1082,10 +1088,9 @@ async fn read_snapshot(
         }
         pages += 1;
         objects += page.objects.len();
-        for (_, group_id, media) in page.objects {
-            let Some(chunk) = group_id
-                .as_deref()
-                .and_then(|group_id| chunk_hash(group_id, group_prefix))
+        for (object_key, group_id, media) in page.objects {
+            let Some(chunk) =
+                object_chunk(group_id.as_deref(), object_key.as_deref(), group_prefix)
             else {
                 continue;
             };
@@ -1297,6 +1302,31 @@ fn chunk_hash(group_id: &str, group_prefix: &str) -> Option<u64> {
     u64::from_str_radix(&hex[hex.len() - 16..], 16).ok()
 }
 
+/// The chunk an object belongs to: from its group id, or else from its key.
+///
+/// The connector derives an object's group id from the chunk hash that ends its key, so both name the same chunk.
+/// An object re-registered from the SSD tier after a master restart (`ReRegisterOffloadedObjects`) has no group id,
+/// only its key: without the key fallback a backfilled index misses every such chunk.
+fn object_chunk(group_id: Option<&str>, object_key: Option<&str>, group_prefix: &str) -> Option<u64> {
+    group_id
+        .and_then(|group_id| chunk_hash(group_id, group_prefix))
+        .or_else(|| object_key.and_then(|key| key_chunk_hash(key, group_prefix)))
+}
+
+/// The chunk hash of an object key `[{cache_prefix}@]{model}@tp_rank:…@{chunk hash hex}`, for the worker whose
+/// group prefix is `vllm-mooncake-store:[{cache_prefix}@]{model}@`.
+fn key_chunk_hash(object_key: &str, group_prefix: &str) -> Option<u64> {
+    let scope = group_prefix.strip_prefix(GROUP_ID_PREFIX)?;
+    if scope.is_empty() || !object_key.starts_with(scope) {
+        return None;
+    }
+    let (_, hex) = object_key.rsplit_once('@')?;
+    if hex.len() < 16 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    u64::from_str_radix(&hex[hex.len() - 16..], 16).ok()
+}
+
 #[allow(clippy::single_range_in_vec_init)]
 fn leading_blocks(blocks: u32) -> SharedCacheHits {
     if blocks == 0 {
@@ -1433,7 +1463,21 @@ mod tests {
         StoreEvent {
             event_type: event_type.to_string(),
             group_id: Some(group_id(hash)),
+            object_key: Some(object_key(hash)),
             medium: Some(medium.to_string()),
+        }
+    }
+
+    /// The key the connector writes for `hash` under [`PREFIX`]'s model.
+    fn object_key(hash: u64) -> String {
+        format!("DeepSeek-V3.2@tp_rank:0@pcp0@dcp0@pp_rank:0@group:0@{:048x}{hash:016x}", 0xabcdef_u64)
+    }
+
+    /// An event for an object the master knows only by key, as after an SSD re-registration.
+    fn keyed_event(event_type: &str, hash: u64, medium: &str) -> StoreEvent {
+        StoreEvent {
+            group_id: None,
+            ..event(event_type, hash, medium)
         }
     }
 
@@ -1649,6 +1693,32 @@ mod tests {
     }
 
     #[test]
+    fn key_chunk_hash_reads_the_chunk_that_ends_the_key() {
+        assert_eq!(key_chunk_hash(&object_key(0x1234), PREFIX), Some(0x1234));
+        assert_eq!(object_chunk(None, Some(&object_key(7)), PREFIX), Some(7));
+        // The group id wins when both are there.
+        assert_eq!(object_chunk(Some(&group_id(5)), Some(&object_key(7)), PREFIX), Some(5));
+        // Another model's key, a key without a hex hash, and no key at all.
+        assert_eq!(key_chunk_hash(&object_key(1).replace("V3.2", "V3.1"), PREFIX), None);
+        assert_eq!(key_chunk_hash("DeepSeek-V3.2@tp_rank:0@group:0@not-hex", PREFIX), None);
+        assert_eq!(key_chunk_hash(&object_key(1), "no-group-prefix@"), None);
+        assert_eq!(object_chunk(None, None, PREFIX), None);
+    }
+
+    #[test]
+    fn objects_known_only_by_key_count() {
+        let (cache, a, _) = cache_with_stores();
+        cache.apply(
+            &a,
+            1,
+            vec![keyed_event("stored", 101, "disk"), keyed_event("stored", 102, "disk")],
+        );
+        assert_eq!(a.state.read().chunks.len(), 2);
+        cache.apply(&a, 2, vec![keyed_event("removed", 101, "disk")]);
+        assert_eq!(a.state.read().chunks.len(), 1);
+    }
+
+    #[test]
     fn foreign_and_unknown_events_are_ignored() {
         let (cache, a, _) = cache_with_stores();
         cache.apply(
@@ -1658,11 +1728,13 @@ mod tests {
                 StoreEvent {
                     event_type: "stored".to_string(),
                     group_id: None,
+                    object_key: None,
                     medium: Some("cpu".to_string()),
                 },
                 StoreEvent {
                     event_type: "stored".to_string(),
                     group_id: Some(group_id(101).replace("V3.2", "V3.1")),
+                    object_key: Some(object_key(101).replace("V3.2", "V3.1")),
                     medium: Some("cpu".to_string()),
                 },
                 event("updated", 101, "cpu"),
@@ -1973,13 +2045,18 @@ mod tests {
                 let chunks = held.lock().clone();
                 counter.fetch_add(1, Ordering::Relaxed);
                 async move {
-                    assert_eq!(query.get("object_keys").map(String::as_str), Some("0"));
+                    assert_eq!(query.get("object_keys").map(String::as_str), Some("1"));
                     let shard: usize = query["shard"].parse().unwrap();
                     let page: Vec<_> = chunks
                         .iter()
                         .skip(shard * 2)
                         .take(2)
-                        .map(|&hash| ((), Some(group_id(hash)), vec!["cpu"]))
+                        // Odd hashes come without a group id, as SSD objects re-registered after a master
+                        // restart do; their keys still place them.
+                        .map(|&hash| {
+                            let group = (hash % 2 == 0).then(|| group_id(hash));
+                            (Some(object_key(hash)), group, vec!["cpu"])
+                        })
                         .collect();
                     let next_shard = (shard * 2 + 2 < chunks.len()).then_some(shard + 1);
                     rmp_serde::to_vec_named(&serde_json::json!({
