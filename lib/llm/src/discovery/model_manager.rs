@@ -2455,6 +2455,7 @@ impl ModelManager {
         // A policy that does not consume cache input must not create a shared-cache client or
         // subscribe to its updates.
         let wants_cache = policy.inputs().contains(WorkerInputs::CACHE);
+        let mut mooncake_store = None;
         let shared_cache: Option<Arc<dyn dynamo_kv_router::SharedKvCache>> = if wants_cache {
             match kv_router_config
                 .as_ref()
@@ -2477,10 +2478,10 @@ impl ModelManager {
                         worker_component = %endpoint.id().component,
                         "Using vLLM Mooncake store shared KV cache"
                     );
-                    Some(Arc::new(self.mooncake_store_cache_for(
-                        &endpoint,
-                        workers_with_configs.clone(),
-                    )))
+                    let cache =
+                        self.mooncake_store_cache_for(&endpoint, workers_with_configs.clone());
+                    mooncake_store = Some(cache.clone());
+                    Some(Arc::new(cache))
                 }
             }
         } else {
@@ -2521,6 +2522,10 @@ impl ModelManager {
             cancellation_token,
         )
         .await?;
+        // The ideal KV cache holds what the store tiers stored too.
+        if let (Some(store), Some(ideal_cache)) = (&mooncake_store, chooser.ideal_cache()) {
+            store.feed_ideal_cache(ideal_cache);
+        }
 
         // F2: feed the LoRA LoadEstimator in KV mode. Start exactly one active-sequence
         // subscription per decode endpoint. WORKER_TYPE_DECODE is the routing path for BOTH

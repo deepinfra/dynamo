@@ -1062,8 +1062,8 @@ impl KvRouter {
     }
 
     /// The ideal KV cache tracker, when on.
-    pub(crate) fn ideal_cache(&self) -> Option<&ideal_cache::IdealCache> {
-        self.ideal_cache.as_deref()
+    pub(crate) fn ideal_cache(&self) -> Option<&Arc<ideal_cache::IdealCache>> {
+        self.ideal_cache.as_ref()
     }
 
     fn approximate_lru_rank_registration(

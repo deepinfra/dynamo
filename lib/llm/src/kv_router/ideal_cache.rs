@@ -488,8 +488,14 @@ impl IdealCache {
 
     /// Stamps the blocks a worker stored.
     pub fn observe_stored(&self, data: &KvCacheStoreData) {
-        let hashes = data.blocks.iter().map(|block| block.block_hash.0).collect();
-        self.send(Input::Stored(hashes));
+        self.observe_stored_hashes(data.blocks.iter().map(|block| block.block_hash.0).collect());
+    }
+
+    /// Stamps blocks a lower tier stored, named by the workers' block hashes.
+    pub fn observe_stored_hashes(&self, hashes: Vec<u64>) {
+        if !hashes.is_empty() {
+            self.send(Input::Stored(hashes));
+        }
     }
 
     /// Counts a routed prompt. Its full blocks are hashed as the workers hash
@@ -621,6 +627,46 @@ fn run(inputs: mpsc::Receiver<Input>, mut state: State, metrics: &'static Metric
         metrics
             .tracked_seconds
             .set(started.elapsed().as_secs() as i64);
+    }
+}
+
+#[cfg(test)]
+impl IdealCache {
+    /// A tracker without its thread, for other modules' tests, and a reader of the
+    /// block hashes stamped since the last read.
+    pub(crate) fn unstarted() -> (Arc<Self>, impl Fn() -> Vec<u64>) {
+        static METRICS: OnceLock<Metrics> = OnceLock::new();
+        let metrics = METRICS.get_or_init(|| {
+            let opts = |name: &str| prometheus::Opts::new(name, name);
+            Metrics {
+                hit_tokens: IntCounterVec::new(opts("hit_tokens"), &["window"]).unwrap(),
+                prompt_tokens: IntCounter::with_opts(opts("prompt_tokens")).unwrap(),
+                live_blocks: IntGaugeVec::new(opts("live_blocks"), &["window"]).unwrap(),
+                entries: IntGauge::with_opts(opts("entries")).unwrap(),
+                table_bytes: IntGauge::with_opts(opts("table_bytes")).unwrap(),
+                tracked_seconds: IntGauge::with_opts(opts("tracked_seconds")).unwrap(),
+                dropped: IntCounterVec::new(opts("dropped"), &["input"]).unwrap(),
+            }
+        });
+        let hasher = BlockHashScheme::from_env(&format!("sha256:{}", "0".repeat(64)))
+            .and_then(|scheme| scheme.hasher())
+            .unwrap();
+        let (inputs, received) = mpsc::sync_channel(QUEUE_INPUTS);
+        let stamped = move || {
+            received
+                .try_iter()
+                .flat_map(|input| match input {
+                    Input::Stored(hashes) => hashes,
+                    Input::Prompt(_) => Vec::new(),
+                })
+                .collect()
+        };
+        let cache = Self {
+            inputs,
+            hasher,
+            metrics,
+        };
+        (Arc::new(cache), stamped)
     }
 }
 

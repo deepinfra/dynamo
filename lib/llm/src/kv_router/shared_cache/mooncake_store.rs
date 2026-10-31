@@ -33,13 +33,17 @@
 //!   frontend's admin API reports each store and reads its snapshot on request
 //!   ([`MooncakeStoreSharedKvCache::status`], [`MooncakeStoreSharedKvCache::resync`]).
 //!
+//! The routers' ideal KV caches ([`MooncakeStoreSharedKvCache::feed_ideal_cache`])
+//! are stamped with every chunk a store holds when they start, and with every
+//! chunk stored after; removals never reach them.
+//!
 //! A worker's hits are the leading chunks of the prompt its store holds, as the
 //! connector loads one prefix. A chunk must be one router block (the connector's
 //! default chunk size); other chunk sizes find no hits.
 
 use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::sync::{
-    Arc, OnceLock,
+    Arc, OnceLock, Weak,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
@@ -61,6 +65,7 @@ use tokio::sync::{Notify, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use super::{MOONCAKE_EVENT_RECONNECT_DELAY, parse_mooncake_event_batch};
+use crate::kv_router::ideal_cache::IdealCache;
 use crate::kv_router::vllm_block_hash::{BLOCK_HASH_ENV, BlockHashScheme, VllmBlockHasher};
 use crate::{
     discovery::RuntimeConfigWatch,
@@ -372,9 +377,14 @@ impl StoreState {
         1 << index
     }
 
-    /// Applies object events; returns how many changed a chunk and how many were ignored.
-    fn apply_events(&mut self, group_prefix: &str, events: Vec<StoreEvent>) -> (u64, u64) {
-        let (mut applied, mut ignored) = (0, 0);
+    /// Applies object events; returns how many changed a chunk, how many were
+    /// ignored, and the chunks stored.
+    fn apply_events(
+        &mut self,
+        group_prefix: &str,
+        events: Vec<StoreEvent>,
+    ) -> (u64, u64, Vec<u64>) {
+        let (mut applied, mut ignored, mut stored) = (0, 0, Vec::new());
         for event in events {
             let Some(chunk) = object_chunk(
                 event.group_id.as_deref(),
@@ -386,7 +396,10 @@ impl StoreState {
             };
             let bit = self.medium_bit(event.medium.as_deref().unwrap_or_default());
             match event.event_type.as_str() {
-                "stored" => *self.chunks.entry(chunk).or_default() |= bit,
+                "stored" => {
+                    *self.chunks.entry(chunk).or_default() |= bit;
+                    stored.push(chunk);
+                }
                 "removed" => {
                     if let Entry::Occupied(mut held) = self.chunks.entry(chunk) {
                         *held.get_mut() &= !bit;
@@ -402,7 +415,7 @@ impl StoreState {
             }
             applied += 1;
         }
-        (applied, ignored)
+        (applied, ignored, stored)
     }
 }
 
@@ -453,6 +466,8 @@ struct Inner {
     workers: ArcSwap<HashMap<WorkerId, Arc<Store>>>,
     http: reqwest::Client,
     metrics: Option<Arc<MooncakeStoreMetrics>>,
+    /// The routers' trackers stamped with stored chunks; see [`Self::feed_ideal_cache`].
+    ideal_caches: Mutex<Vec<Weak<IdealCache>>>,
     cancellation_token: CancellationToken,
 }
 
@@ -494,6 +509,7 @@ impl MooncakeStoreSharedKvCache {
                     .build()
                     .unwrap_or_default(),
                 metrics,
+                ideal_caches: Mutex::new(Vec::new()),
                 cancellation_token,
             }),
         }
@@ -524,6 +540,28 @@ impl MooncakeStoreSharedKvCache {
     /// Follow the stores the workers in `runtime_configs` announce.
     pub fn start(&self, runtime_configs: RuntimeConfigWatch) {
         tokio::spawn(self.clone().supervise(runtime_configs));
+    }
+
+    /// Stamps a router's ideal KV cache with every chunk the stores hold, then
+    /// with every chunk they store, live or from a snapshot. Removals skip it.
+    pub fn feed_ideal_cache(&self, ideal_cache: &Arc<IdealCache>) {
+        // Registered first, so a chunk stored meanwhile is stamped at least once.
+        self.inner
+            .ideal_caches
+            .lock()
+            .push(Arc::downgrade(ideal_cache));
+        for (store, _) in self.stores() {
+            let chunks = store.state.read().chunks.keys().copied().collect();
+            ideal_cache.observe_stored_hashes(chunks);
+        }
+    }
+
+    fn stamp_ideal_caches(&self, chunks: Vec<u64>) {
+        let mut ideal_caches = self.inner.ideal_caches.lock();
+        ideal_caches.retain(|ideal_cache| ideal_cache.strong_count() > 0);
+        for ideal_cache in ideal_caches.iter().filter_map(Weak::upgrade) {
+            ideal_cache.observe_stored_hashes(chunks.clone());
+        }
     }
 
     pub fn shutdown(&self) {
@@ -833,7 +871,9 @@ impl MooncakeStoreSharedKvCache {
         state.sequence = Some(sequence);
 
         let before = state.chunks.len();
-        let (applied, ignored) = state.apply_events(&store.announcement.group_prefix, events);
+        let (applied, ignored, stored) =
+            state.apply_events(&store.announcement.group_prefix, events);
+        self.stamp_ideal_caches(stored);
         let after = state.chunks.len();
         self.add_chunks(after as isize - before as isize);
         self.check_size(store, &mut state);
@@ -899,6 +939,16 @@ impl MooncakeStoreSharedKvCache {
             (stale, missing)
         });
         let mut state = store.state.write();
+        // Chunks the index lacked are stores it missed: all of them at the first
+        // load. The others were stamped when their events came; stamping them again
+        // on every 30-minute read would keep them past their window.
+        let unknown = fresh
+            .chunks
+            .keys()
+            .filter(|chunk| !state.chunks.contains_key(chunk))
+            .copied()
+            .collect();
+        self.stamp_ideal_caches(unknown);
         let (before, after) = (state.chunks.len(), fresh.chunks.len());
         *state = fresh;
         self.add_chunks(after as isize - before as isize);
@@ -1307,7 +1357,11 @@ fn chunk_hash(group_id: &str, group_prefix: &str) -> Option<u64> {
 /// The connector derives an object's group id from the chunk hash that ends its key, so both name the same chunk.
 /// An object re-registered from the SSD tier after a master restart (`ReRegisterOffloadedObjects`) has no group id,
 /// only its key: without the key fallback a backfilled index misses every such chunk.
-fn object_chunk(group_id: Option<&str>, object_key: Option<&str>, group_prefix: &str) -> Option<u64> {
+fn object_chunk(
+    group_id: Option<&str>,
+    object_key: Option<&str>,
+    group_prefix: &str,
+) -> Option<u64> {
     group_id
         .and_then(|group_id| chunk_hash(group_id, group_prefix))
         .or_else(|| object_key.and_then(|key| key_chunk_hash(key, group_prefix)))
@@ -1470,7 +1524,10 @@ mod tests {
 
     /// The key the connector writes for `hash` under [`PREFIX`]'s model.
     fn object_key(hash: u64) -> String {
-        format!("DeepSeek-V3.2@tp_rank:0@pcp0@dcp0@pp_rank:0@group:0@{:048x}{hash:016x}", 0xabcdef_u64)
+        format!(
+            "DeepSeek-V3.2@tp_rank:0@pcp0@dcp0@pp_rank:0@group:0@{:048x}{hash:016x}",
+            0xabcdef_u64
+        )
     }
 
     /// An event for an object the master knows only by key, as after an SSD re-registration.
@@ -1697,10 +1754,19 @@ mod tests {
         assert_eq!(key_chunk_hash(&object_key(0x1234), PREFIX), Some(0x1234));
         assert_eq!(object_chunk(None, Some(&object_key(7)), PREFIX), Some(7));
         // The group id wins when both are there.
-        assert_eq!(object_chunk(Some(&group_id(5)), Some(&object_key(7)), PREFIX), Some(5));
+        assert_eq!(
+            object_chunk(Some(&group_id(5)), Some(&object_key(7)), PREFIX),
+            Some(5)
+        );
         // Another model's key, a key without a hex hash, and no key at all.
-        assert_eq!(key_chunk_hash(&object_key(1).replace("V3.2", "V3.1"), PREFIX), None);
-        assert_eq!(key_chunk_hash("DeepSeek-V3.2@tp_rank:0@group:0@not-hex", PREFIX), None);
+        assert_eq!(
+            key_chunk_hash(&object_key(1).replace("V3.2", "V3.1"), PREFIX),
+            None
+        );
+        assert_eq!(
+            key_chunk_hash("DeepSeek-V3.2@tp_rank:0@group:0@not-hex", PREFIX),
+            None
+        );
         assert_eq!(key_chunk_hash(&object_key(1), "no-group-prefix@"), None);
         assert_eq!(object_chunk(None, None, PREFIX), None);
     }
@@ -1711,7 +1777,10 @@ mod tests {
         cache.apply(
             &a,
             1,
-            vec![keyed_event("stored", 101, "disk"), keyed_event("stored", 102, "disk")],
+            vec![
+                keyed_event("stored", 101, "disk"),
+                keyed_event("stored", 102, "disk"),
+            ],
         );
         assert_eq!(a.state.read().chunks.len(), 2);
         cache.apply(&a, 2, vec![keyed_event("removed", 101, "disk")]);
@@ -2025,6 +2094,56 @@ mod tests {
         let gap = vec![(7, vec![event("stored", 104, "cpu")])];
         assert!(cache.install(&a, snapshot(&[101]), gap).is_none());
         assert_eq!(a.state.read().chunks.len(), 4);
+    }
+
+    #[test]
+    fn ideal_caches_get_every_stored_chunk_and_no_removal() {
+        let (cache, a, b) = cache_with_stores();
+        cache.apply(
+            &a,
+            1,
+            vec![event("stored", 1, "cpu"), event("stored", 2, "cpu")],
+        );
+        cache.apply(&b, 1, vec![event("stored", 3, "disk")]);
+        let (ideal_cache, stamped) = IdealCache::unstarted();
+        let stamped = || {
+            let mut hashes = stamped();
+            hashes.sort_unstable();
+            hashes
+        };
+
+        // Registering replays what the stores hold.
+        cache.feed_ideal_cache(&ideal_cache);
+        assert_eq!(stamped(), vec![1, 2, 3]);
+        // Then every store, of any medium; removals stamp nothing.
+        cache.apply(
+            &a,
+            2,
+            vec![
+                event("removed", 1, "cpu"),
+                event("stored", 1, "disk"),
+                event("removed", 2, "cpu"),
+            ],
+        );
+        assert_eq!(stamped(), vec![1]);
+        // A snapshot stamps the chunks the index lacked, not those it knew.
+        let mut state = StoreState::default();
+        state.apply_events(
+            PREFIX,
+            Vec::from([1, 4, 5].map(|hash| event("stored", hash, "disk"))),
+        );
+        let snapshot = Snapshot {
+            state,
+            next_sequence: 3,
+            objects: 3,
+        };
+        assert!(cache.install(&a, snapshot, vec![]).is_some());
+        assert_eq!(stamped(), vec![4, 5]);
+
+        // A router gone leaves the list.
+        drop(ideal_cache);
+        cache.apply(&a, 3, vec![event("stored", 6, "cpu")]);
+        assert!(cache.inner.ideal_caches.lock().is_empty());
     }
 
     /// A master's admin server with the snapshot of `chunks`, in pages of two
