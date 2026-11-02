@@ -25,6 +25,7 @@ pub(crate) use dynamo_kv_router::indexer::TieredMatchDetails;
 #[allow(unused_imports)]
 pub(crate) use dynamo_kv_router::indexer::WireTieredMatchDetails;
 use dynamo_runtime::component::Component;
+use dynamo_runtime::metrics::MetricsHierarchy;
 use tokio_util::sync::CancellationToken;
 
 mod embedding_cache;
@@ -116,6 +117,37 @@ fn resolve_approximate_primary_policy(
     Ok(ResolvedApproximatePrimaryPolicy::Lru)
 }
 
+const TRACKED_BLOCKS_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Publish the radix tree's (worker, block) entry count as `kv_indexer_tracked_blocks`.
+fn spawn_tracked_blocks_gauge(
+    component: &Component,
+    indexer: Arc<ThreadPoolIndexer<ConcurrentRadixTreeCompressed>>,
+    cancellation_token: CancellationToken,
+) {
+    let gauge = match component.metrics().create_intgauge(
+        "kv_indexer_tracked_blocks",
+        "Number of (worker, block) entries currently tracked in the KV router radix tree",
+        &[],
+    ) {
+        Ok(gauge) => gauge,
+        Err(e) => {
+            tracing::warn!("kv-indexer: failed to create tracked-blocks gauge: {e}");
+            return;
+        }
+    };
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(TRACKED_BLOCKS_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = cancellation_token.cancelled() => break,
+                _ = ticker.tick() => gauge.set(indexer.total_blocks().await as i64),
+            }
+        }
+    });
+}
+
 async fn dump_local_events(
     mut events: Vec<RouterEvent>,
     lower_tiers: &LowerTierIndexers,
@@ -172,6 +204,27 @@ impl Indexer {
     }
 
     pub async fn new(
+        component: &Component,
+        kv_router_config: &KvRouterConfig,
+        block_size: u32,
+        model_name: Option<&str>,
+        cancellation_token: CancellationToken,
+    ) -> Result<Self> {
+        let indexer = Self::new_inner(
+            component,
+            kv_router_config,
+            block_size,
+            model_name,
+            cancellation_token.clone(),
+        )
+        .await?;
+        if let Self::Concurrent { primary, .. } = &indexer {
+            spawn_tracked_blocks_gauge(component, primary.clone(), cancellation_token);
+        }
+        Ok(indexer)
+    }
+
+    async fn new_inner(
         component: &Component,
         kv_router_config: &KvRouterConfig,
         block_size: u32,

@@ -598,6 +598,11 @@ impl<T: SyncIndexer> ThreadPoolIndexer<T> {
         WorkerLookupStats::from_worker_block_counts(worker_blocks)
     }
 
+    /// Number of (worker, block) entries currently tracked across all shards.
+    pub async fn total_blocks(&self) -> usize {
+        self.worker_lookup_stats().await.block_count()
+    }
+
     pub async fn get_workers(&self) -> Vec<WorkerId> {
         self.worker_lookup_stats()
             .await
