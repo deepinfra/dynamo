@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::http::service::metrics::{
     WORKER_LAST_INPUT_SEQUENCE_TOKENS_GAUGE, WORKER_LAST_INTER_TOKEN_LATENCY_GAUGE,
-    WORKER_LAST_TIME_TO_FIRST_TOKEN_GAUGE,
+    WORKER_LAST_TIME_TO_FIRST_TOKEN_GAUGE, prune_worker_timing_gauges,
 };
 use crate::kv_router::metrics::WORKER_LOAD_METRICS;
 use crate::kv_router::routing_load::SchedulerLoadReceiver;
@@ -50,6 +50,22 @@ fn cleanup_worker_metrics(worker_id: u64, dp_ranks: &[u32], worker_type: &str) {
     let _ = WORKER_LAST_TIME_TO_FIRST_TOKEN_GAUGE.remove_label_values(unset_labels);
     let _ = WORKER_LAST_INPUT_SEQUENCE_TOKENS_GAUGE.remove_label_values(unset_labels);
     let _ = WORKER_LAST_INTER_TOKEN_LATENCY_GAUGE.remove_label_values(unset_labels);
+}
+
+/// How often the worker monitor sweeps per-worker timing gauges for departed workers.
+const STALE_WORKER_GAUGE_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Drop TTFT/ISL/ITL "last" gauge series of `worker_type` for workers this monitor
+/// has seen (`owned`) that are no longer live.
+fn sweep_stale_worker_gauges(worker_type: &str, owned: &HashSet<u64>, live: &HashSet<u64>) {
+    let removed = prune_worker_timing_gauges(worker_type, owned, live);
+    if removed > 0 {
+        tracing::debug!(
+            removed,
+            worker_type,
+            "pruned stale per-worker timing gauge series"
+        );
+    }
 }
 
 /// Default value for `max_num_batched_tokens` when the runtime config does not
@@ -726,6 +742,16 @@ impl WorkerLoadMonitor for KvWorkerMonitor {
             let mut overloaded_tracker = OverloadedWorkerTracker::default();
             let mut last_thresholds = thresholds.get();
 
+            // Every worker id this monitor has seen. The stale-gauge sweep only
+            // touches these ids, so monitors for other models/roles in the same
+            // frontend keep their own series (the gauges are process-global).
+            let mut owned_workers: HashSet<u64> = known_workers.clone();
+            // Periodic sweep: catches series that the exact-label cleanup missed
+            // (unknown dp_ranks) or that in-flight requests re-created after
+            // their worker was removed.
+            let mut stale_gauge_sweep = tokio::time::interval(STALE_WORKER_GAUGE_SWEEP_INTERVAL);
+            stale_gauge_sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
             loop {
                 let kv_event_future = async {
                     if let Some(kv_metrics_rx) = &mut kv_metrics_rx {
@@ -753,6 +779,10 @@ impl WorkerLoadMonitor for KvWorkerMonitor {
                             cleanup_worker_metrics(*worker_id, &dp_ranks, source.metric_label());
                         }
                         break;
+                    }
+
+                    _ = stale_gauge_sweep.tick() => {
+                        sweep_stale_worker_gauges(source.metric_label(), &owned_workers, &known_workers);
                     }
 
                     // Handle runtime config updates
@@ -1014,7 +1044,9 @@ impl WorkerLoadMonitor for KvWorkerMonitor {
                             client.clear_overloaded_instances_for_removed(&removed_workers);
                         }
 
+                        owned_workers.extend(current_instances.iter().copied());
                         known_workers = current_instances;
+                        sweep_stale_worker_gauges(source.metric_label(), &owned_workers, &known_workers);
                     }
 
                 }
