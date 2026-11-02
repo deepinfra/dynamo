@@ -428,7 +428,12 @@ where
                 );
                 tracker.record_router_queue_depth(chooser.pending_count());
                 if let Some(hit_rate) = tracker.kv_hit_rate() {
-                    guard.request_metrics().kv_hit_rate.observe(hit_rate);
+                    let metrics = guard.request_metrics();
+                    metrics.kv_hit_rate.observe(hit_rate);
+                    metrics
+                        .kv_hit_blocks_total
+                        .inc_by(selection.effective_overlap_blocks.max(0.0));
+                    metrics.kv_input_blocks_total.inc_by(isl_blocks as u64);
                 }
             }
             guard

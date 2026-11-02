@@ -849,6 +849,8 @@ pub struct RouterRequestMetrics {
     pub input_sequence_tokens: prometheus::Histogram,
     pub output_sequence_tokens: prometheus::Histogram,
     pub kv_hit_rate: prometheus::Histogram,
+    pub kv_hit_blocks_total: prometheus::Counter,
+    pub kv_input_blocks_total: prometheus::IntCounter,
     pub kv_transfer_estimated_latency_seconds: prometheus::Histogram,
     pub shared_cache_hit_rate: prometheus::Histogram,
     pub shared_cache_beyond_blocks: prometheus::Histogram,
@@ -946,6 +948,20 @@ impl RouterRequestMetrics {
                         Some(prometheus::linear_buckets(0.0, 0.05, 21).unwrap()),
                     )
                     .expect("failed to create router_kv_hit_rate");
+                let kv_hit_blocks_total = metrics
+                    .create_counter(
+                        &router_metric(frontend_service::KV_HIT_BLOCKS_TOTAL),
+                        "Predicted-cached input blocks summed over routed requests",
+                        extra_labels,
+                    )
+                    .expect("failed to create router_kv_hit_blocks_total");
+                let kv_input_blocks_total = metrics
+                    .create_intcounter(
+                        &router_metric(frontend_service::KV_INPUT_BLOCKS_TOTAL),
+                        "Input blocks summed over routed requests",
+                        extra_labels,
+                    )
+                    .expect("failed to create router_kv_input_blocks_total");
                 let kv_transfer_estimated_latency_seconds = metrics
                     .create_histogram(
                         &router_metric(frontend_service::KV_TRANSFER_ESTIMATED_LATENCY_SECONDS),
@@ -996,6 +1012,8 @@ impl RouterRequestMetrics {
                     input_sequence_tokens,
                     output_sequence_tokens,
                     kv_hit_rate,
+                    kv_hit_blocks_total,
+                    kv_input_blocks_total,
                     kv_transfer_estimated_latency_seconds,
                     shared_cache_hit_rate,
                     shared_cache_beyond_blocks,
