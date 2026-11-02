@@ -114,6 +114,77 @@ pub static WORKER_LAST_INTER_TOKEN_LATENCY_GAUGE: LazyLock<GaugeVec> = LazyLock:
     .expect("Failed to create worker_last_inter_token_latency gauge")
 });
 
+/// Remove per-worker "last" timing gauge series (TTFT / ISL / ITL) for workers that
+/// are gone.
+///
+/// A series with the given `worker_type` is removed when its `worker_id` is in
+/// `owned` (ids the caller is responsible for) but not in `live`. Restricting to
+/// `owned` keeps one model's monitor from deleting another model's series in the
+/// same frontend process (these gauges are process-global).
+///
+/// Complements the exact-label cleanup in `worker_monitor`, which misses series
+/// whose dp_rank it never learned (e.g. per-DP-rank workers whose runtime config was
+/// dropped first, leaving only the `[0]` fallback) and series re-created by in-flight
+/// requests that finish after the worker was removed.
+pub(crate) fn prune_worker_timing_gauges(
+    worker_type: &str,
+    owned: &std::collections::HashSet<u64>,
+    live: &std::collections::HashSet<u64>,
+) -> usize {
+    use prometheus::core::Collector;
+
+    let stale = |families: Vec<prometheus::proto::MetricFamily>| -> Vec<[String; 3]> {
+        let mut out = Vec::new();
+        for mf in families {
+            for m in mf.get_metric() {
+                let (mut id, mut rank, mut ty) = (None, None, None);
+                for lp in m.get_label() {
+                    match lp.name() {
+                        "worker_id" => id = Some(lp.value()),
+                        "dp_rank" => rank = Some(lp.value()),
+                        "worker_type" => ty = Some(lp.value()),
+                        _ => {}
+                    }
+                }
+                let (Some(id), Some(rank), Some(ty)) = (id, rank, ty) else {
+                    continue;
+                };
+                if ty != worker_type {
+                    continue;
+                }
+                let Ok(wid) = id.parse::<u64>() else {
+                    continue;
+                };
+                if owned.contains(&wid) && !live.contains(&wid) {
+                    out.push([id.to_string(), rank.to_string(), ty.to_string()]);
+                }
+            }
+        }
+        out
+    };
+
+    let mut removed = 0;
+    for l in stale(WORKER_LAST_TIME_TO_FIRST_TOKEN_GAUGE.collect()) {
+        let l = [l[0].as_str(), l[1].as_str(), l[2].as_str()];
+        removed += WORKER_LAST_TIME_TO_FIRST_TOKEN_GAUGE
+            .remove_label_values(&l)
+            .is_ok() as usize;
+    }
+    for l in stale(WORKER_LAST_INPUT_SEQUENCE_TOKENS_GAUGE.collect()) {
+        let l = [l[0].as_str(), l[1].as_str(), l[2].as_str()];
+        removed += WORKER_LAST_INPUT_SEQUENCE_TOKENS_GAUGE
+            .remove_label_values(&l)
+            .is_ok() as usize;
+    }
+    for l in stale(WORKER_LAST_INTER_TOKEN_LATENCY_GAUGE.collect()) {
+        let l = [l[0].as_str(), l[1].as_str(), l[2].as_str()];
+        removed += WORKER_LAST_INTER_TOKEN_LATENCY_GAUGE
+            .remove_label_values(&l)
+            .is_ok() as usize;
+    }
+    removed
+}
+
 /// Global Prometheus histogram for output sequence length per decode worker (in tokens)
 /// Labels: worker_id, dp_rank, worker_type
 /// Observed once per completed request (in `ResponseMetricCollector::drop`),
@@ -2199,6 +2270,52 @@ async fn handler_metrics(State(state): State<Arc<MetricsHandlerState>>) -> impl 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_prune_worker_timing_gauges_drops_only_owned_dead_workers() {
+        use std::collections::HashSet;
+        // Unique ids so parallel tests sharing the global gauges don't interfere.
+        let (dead, live, foreign) = (9_100_000_001u64, 9_100_000_002u64, 9_100_000_003u64);
+        for (id, rank) in [(dead, "0"), (dead, "5"), (live, "3"), (foreign, "1")] {
+            let l = [id.to_string(), rank.to_string()];
+            WORKER_LAST_INTER_TOKEN_LATENCY_GAUGE
+                .with_label_values(&[l[0].as_str(), l[1].as_str(), WORKER_TYPE_DECODE])
+                .set(0.01);
+            WORKER_LAST_TIME_TO_FIRST_TOKEN_GAUGE
+                .with_label_values(&[l[0].as_str(), l[1].as_str(), WORKER_TYPE_DECODE])
+                .set(0.5);
+        }
+        // Prefill series for the dead id must survive a decode-type prune.
+        WORKER_LAST_TIME_TO_FIRST_TOKEN_GAUGE
+            .with_label_values(&[dead.to_string().as_str(), "0", WORKER_TYPE_PREFILL])
+            .set(1.0);
+
+        let owned: HashSet<u64> = [dead, live].into();
+        let live_set: HashSet<u64> = [live].into();
+        let removed = prune_worker_timing_gauges(WORKER_TYPE_DECODE, &owned, &live_set);
+        assert_eq!(removed, 4, "two dp_ranks x (ITL, TTFT) for the dead worker");
+
+        let ids = |g: &GaugeVec, ty: &str| -> HashSet<String> {
+            use prometheus::core::Collector;
+            g.collect()
+                .iter()
+                .flat_map(|mf| mf.get_metric().iter())
+                .filter(|m| m.get_label().iter().any(|l| l.name() == "worker_type" && l.value() == ty))
+                .filter_map(|m| {
+                    m.get_label()
+                        .iter()
+                        .find(|l| l.name() == "worker_id")
+                        .map(|l| l.value().to_string())
+                })
+                .collect()
+        };
+        let itl = ids(&WORKER_LAST_INTER_TOKEN_LATENCY_GAUGE, WORKER_TYPE_DECODE);
+        assert!(!itl.contains(&dead.to_string()));
+        assert!(itl.contains(&live.to_string()));
+        assert!(itl.contains(&foreign.to_string()), "unowned ids are left alone");
+        let prefill_ttft = ids(&WORKER_LAST_TIME_TO_FIRST_TOKEN_GAUGE, WORKER_TYPE_PREFILL);
+        assert!(prefill_ttft.contains(&dead.to_string()));
+    }
 
     #[test]
     fn test_worker_osl_histogram_observed_on_drop() {

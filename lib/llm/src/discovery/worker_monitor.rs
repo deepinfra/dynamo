@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::http::service::metrics::{
     WORKER_LAST_INPUT_SEQUENCE_TOKENS_GAUGE, WORKER_LAST_INTER_TOKEN_LATENCY_GAUGE,
-    WORKER_LAST_TIME_TO_FIRST_TOKEN_GAUGE,
+    WORKER_LAST_TIME_TO_FIRST_TOKEN_GAUGE, prune_worker_timing_gauges,
 };
 use crate::kv_router::KV_METRICS_SUBJECT;
 use crate::kv_router::metrics::{WORKER_KV_METRICS, WORKER_LOAD_METRICS};
@@ -54,6 +54,26 @@ fn cleanup_worker_metrics(worker_id: u64, dp_ranks: &[u32], worker_type: &str) {
     let _ = WORKER_LAST_TIME_TO_FIRST_TOKEN_GAUGE.remove_label_values(unset_labels);
     let _ = WORKER_LAST_INPUT_SEQUENCE_TOKENS_GAUGE.remove_label_values(unset_labels);
     let _ = WORKER_LAST_INTER_TOKEN_LATENCY_GAUGE.remove_label_values(unset_labels);
+}
+
+/// How often the worker monitor sweeps per-worker timing gauges for departed workers.
+const STALE_WORKER_GAUGE_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Drop TTFT/ISL/ITL "last" gauge series for owned workers that are no longer live.
+/// `prefill` is `None` when the prefill watcher is not active (live set unknown).
+fn sweep_stale_worker_gauges(
+    owned_decode: &HashSet<u64>,
+    live_decode: &HashSet<u64>,
+    prefill: Option<(&HashSet<u64>, &HashSet<u64>)>,
+) {
+    let mut removed =
+        prune_worker_timing_gauges(WORKER_TYPE_DECODE, owned_decode, live_decode);
+    if let Some((owned, live)) = prefill {
+        removed += prune_worker_timing_gauges(WORKER_TYPE_PREFILL, owned, live);
+    }
+    if removed > 0 {
+        tracing::debug!(removed, "Pruned stale per-worker timing gauge series");
+    }
 }
 
 /// Default value for `max_num_batched_tokens` when the runtime config does not
@@ -689,6 +709,16 @@ impl WorkerLoadMonitor for KvWorkerMonitor {
             let mut overloaded_tracker = OverloadedWorkerTracker::default();
             let mut last_thresholds = thresholds.read().unwrap().clone();
 
+            // Every worker id this monitor has ever seen, per role. The stale-gauge
+            // sweep only touches ids in these sets, so monitors for other models in
+            // the same frontend keep their own series.
+            let mut owned_decode_workers: HashSet<u64> = known_decode_workers.clone();
+            let mut owned_prefill_workers: HashSet<u64> = HashSet::new();
+            // Periodic sweep: catches series re-created by in-flight requests that
+            // complete after their worker was removed.
+            let mut stale_gauge_sweep = tokio::time::interval(STALE_WORKER_GAUGE_SWEEP_INTERVAL);
+            stale_gauge_sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
             loop {
                 // Create a future that either reads from kv_metrics or pends forever if unavailable
                 let kv_event_future = async {
@@ -704,6 +734,16 @@ impl WorkerLoadMonitor for KvWorkerMonitor {
                     _ = cancellation_token.cancelled() => {
                         tracing::debug!("Worker monitoring cancelled");
                         break;
+                    }
+
+                    _ = stale_gauge_sweep.tick() => {
+                        sweep_stale_worker_gauges(
+                            &owned_decode_workers,
+                            &known_decode_workers,
+                            prefill_instances_rx
+                                .is_some()
+                                .then_some((&owned_prefill_workers, &known_prefill_workers)),
+                        );
                     }
 
                     // Handle runtime config updates
@@ -730,6 +770,11 @@ impl WorkerLoadMonitor for KvWorkerMonitor {
                                 );
                             }
                         }
+
+                        // Workers published via MDC may carry either role; record them as
+                        // owned for both (the sweep filters by worker_type + live set).
+                        owned_decode_workers.extend(runtime_configs.keys().copied());
+                        owned_prefill_workers.extend(runtime_configs.keys().copied());
 
                         worker_load_states.retain(|lease_id, _| runtime_configs.contains_key(lease_id));
                         overloaded_tracker.remove_workers(&removed_workers);
@@ -904,7 +949,13 @@ impl WorkerLoadMonitor for KvWorkerMonitor {
                             client.clear_overloaded_instances_for_removed(&removed_workers);
                         }
 
+                        owned_decode_workers.extend(current_instances.iter().copied());
                         known_decode_workers = current_instances;
+                        sweep_stale_worker_gauges(
+                            &owned_decode_workers,
+                            &known_decode_workers,
+                            None,
+                        );
                     }
 
                     // Handle prefill endpoint instance changes (for TTFT and prefill metrics cleanup in disaggregated mode)
@@ -955,7 +1006,13 @@ impl WorkerLoadMonitor for KvWorkerMonitor {
                             client.clear_overloaded_instances_for_removed(&removed_workers);
                         }
 
+                        owned_prefill_workers.extend(current_instances.iter().copied());
                         known_prefill_workers = current_instances;
+                        sweep_stale_worker_gauges(
+                            &HashSet::new(),
+                            &HashSet::new(),
+                            Some((&owned_prefill_workers, &known_prefill_workers)),
+                        );
                     }
 
                     // Wait for prefill client to be registered (push-based notification)
@@ -964,6 +1021,7 @@ impl WorkerLoadMonitor for KvWorkerMonitor {
                         if let Some(ref prefill_client) = *guard {
                             let rx = prefill_client.instance_avail_watcher();
                             known_prefill_workers = rx.borrow().iter().copied().collect();
+                            owned_prefill_workers.extend(known_prefill_workers.iter().copied());
                             prefill_instances_rx = Some(rx);
                             tracing::info!(
                                 "KvWorkerMonitor: prefill endpoint watcher activated, tracking {} workers",
