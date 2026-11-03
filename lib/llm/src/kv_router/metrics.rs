@@ -849,8 +849,8 @@ pub struct RouterRequestMetrics {
     pub input_sequence_tokens: prometheus::Histogram,
     pub output_sequence_tokens: prometheus::Histogram,
     pub kv_hit_rate: prometheus::Histogram,
-    pub kv_hit_blocks_total: prometheus::Counter,
-    pub kv_input_blocks_total: prometheus::IntCounter,
+    pub kv_hit_blocks_total: prometheus::CounterVec,
+    pub kv_input_blocks_total: IntCounterVec,
     pub kv_transfer_estimated_latency_seconds: prometheus::Histogram,
     pub shared_cache_hit_rate: prometheus::Histogram,
     pub shared_cache_beyond_blocks: prometheus::Histogram,
@@ -949,16 +949,18 @@ impl RouterRequestMetrics {
                     )
                     .expect("failed to create router_kv_hit_rate");
                 let kv_hit_blocks_total = metrics
-                    .create_counter(
+                    .create_countervec(
                         &router_metric(frontend_service::KV_HIT_BLOCKS_TOTAL),
-                        "Predicted-cached input blocks summed over routed requests",
+                        "Predicted-cached input blocks summed over router selections",
+                        &[labels::WORKER_TYPE],
                         extra_labels,
                     )
                     .expect("failed to create router_kv_hit_blocks_total");
                 let kv_input_blocks_total = metrics
-                    .create_intcounter(
+                    .create_intcountervec(
                         &router_metric(frontend_service::KV_INPUT_BLOCKS_TOTAL),
-                        "Input blocks summed over routed requests",
+                        "Input blocks summed over router selections",
+                        &[labels::WORKER_TYPE],
                         extra_labels,
                     )
                     .expect("failed to create router_kv_input_blocks_total");
