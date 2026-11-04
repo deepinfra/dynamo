@@ -35,7 +35,7 @@ use dynamo_kv_router::{
     config::{KvRouterConfig, RouterConfigOverride},
     multi_worker_sequence::ReplicaRequestLeaseObserver,
     protocols::{RoutingConstraints, WorkerId, WorkerWithDpRank},
-    scheduling::QueueRejection,
+    scheduling::{DecodeAdmission, QueueRejection},
 };
 use dynamo_runtime::component::Endpoint;
 use dynamo_runtime::traits::DistributedRuntimeProvider;
@@ -278,24 +278,24 @@ where
         })
     }
 
-    /// Decode admission for a request of `policy_class`: rejects (and counts) when every
-    /// registered rank already holds the class's `max_active_decode_requests_per_rank`.
-    pub fn active_decode_rejection(
+    /// Decode admission for a request of `policy_class`; see
+    /// [`LocalScheduler::admit_active_decode`]. Rejections are counted.
+    pub fn admit_active_decode(
         &self,
         policy_class: Option<&str>,
         isl_tokens: usize,
-    ) -> Option<QueueRejection> {
-        let rejection = self
-            .inner
-            .active_decode_rejection(policy_class, isl_tokens)?;
-        DECODE_ADMISSION_REJECTIONS
-            .with_label_values(&[
-                self.metric_model.as_str(),
-                rejection.policy_class.as_str(),
-                "active_decode_requests",
-            ])
-            .inc();
-        Some(rejection)
+    ) -> Result<DecodeAdmission, QueueRejection> {
+        self.inner
+            .admit_active_decode(policy_class, isl_tokens)
+            .inspect_err(|rejection| {
+                DECODE_ADMISSION_REJECTIONS
+                    .with_label_values(&[
+                        self.metric_model.as_str(),
+                        rejection.policy_class.as_str(),
+                        "active_decode_requests",
+                    ])
+                    .inc();
+            })
     }
 
     pub async fn schedule_request(

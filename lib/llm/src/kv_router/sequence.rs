@@ -9,6 +9,7 @@
 
 mod direct_zmq;
 
+use dynamo_kv_router::multi_worker_sequence::replica_refresh_interval;
 pub use dynamo_kv_router::multi_worker_sequence::{
     ActiveSequencesMultiWorker, ReplicaRequestLeaseObserver, SchedulerLoadSnapshot, SequenceError,
     SequencePublishQueueError, SequencePublisher, SequenceRequest, SequenceSubscriber,
@@ -648,6 +649,7 @@ pub(crate) async fn create_multi_worker_sequences_with_observer(
     if !uses_shared_lease_manager {
         arc.start_periodic_force_expiry_across_all_workers(cancellation_token.child_token());
     }
+    arc.start_replica_refresh(replica_refresh_interval(), cancellation_token.child_token());
 
     // Worker-origin completion marks are consumed even when router-to-router replica sync is
     // disabled. The tracker filters all other remote lifecycle events in that mode.

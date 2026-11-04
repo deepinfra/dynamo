@@ -63,18 +63,28 @@ impl PolicyClassConfig {
         absolute_busy || fractional_busy
     }
 
-    /// Rejects when every rank in `active_per_rank` already holds the class limit.
+    /// Rejects when the ranks' bookings (each capped at the class limit) plus the
+    /// admissions still on their way to a booking fill every rank's limit.
     /// No limit or no ranks admits, so routing reports a missing decode set as before.
     pub fn active_decode_rejection(
         &self,
         active_per_rank: impl IntoIterator<Item = usize>,
+        admissions_in_flight: usize,
     ) -> Option<QueueRejection> {
         let limit = self.max_active_decode_requests_per_rank?;
-        let least_loaded = active_per_rank.into_iter().min()?;
-        (least_loaded >= limit).then(|| QueueRejection {
+        let (ranks, booked) = active_per_rank
+            .into_iter()
+            .fold((0usize, 0usize), |(ranks, booked), active| {
+                (ranks + 1, booked + active.min(limit))
+            });
+        if ranks == 0 {
+            return None;
+        }
+        let occupied = booked.saturating_add(admissions_in_flight);
+        (occupied >= ranks * limit).then(|| QueueRejection {
             policy_class: self.name.clone(),
             limit_kind: QueueLimitKind::ActiveDecodeRequests,
-            current: least_loaded,
+            current: occupied.div_ceil(ranks),
             limit,
         })
     }
@@ -1079,7 +1089,7 @@ policy_classes:
         for class in profile.classes() {
             assert_eq!(class.max_active_decode_requests_per_rank, None);
             assert_eq!(
-                class.active_decode_rejection([usize::MAX, usize::MAX]),
+                class.active_decode_rejection([usize::MAX, usize::MAX], 0),
                 None
             );
         }
@@ -1087,7 +1097,7 @@ policy_classes:
         assert_eq!(
             synthetic
                 .default_class()
-                .active_decode_rejection([usize::MAX]),
+                .active_decode_rejection([usize::MAX], 0),
             None
         );
     }
@@ -1100,30 +1110,55 @@ policy_classes:
         let no_queue = profile.class(profile.resolve_class_index(Some("no-queue"), 0));
 
         let one_rank_with_room = [384, 255, 384];
-        assert_eq!(no_queue.active_decode_rejection(one_rank_with_room), None);
-        assert_eq!(standard.active_decode_rejection(one_rank_with_room), None);
+        assert_eq!(
+            no_queue.active_decode_rejection(one_rank_with_room, 0),
+            None
+        );
+        assert_eq!(
+            standard.active_decode_rejection(one_rank_with_room, 0),
+            None
+        );
 
         let between_limits = [256, 300, 383];
-        let rejection = no_queue.active_decode_rejection(between_limits).unwrap();
+        let rejection = no_queue.active_decode_rejection(between_limits, 0).unwrap();
         assert_eq!(rejection.policy_class, "no-queue");
         assert_eq!(rejection.limit_kind, QueueLimitKind::ActiveDecodeRequests);
         assert_eq!((rejection.current, rejection.limit), (256, 256));
         assert_eq!(
-            standard.active_decode_rejection(between_limits),
+            standard.active_decode_rejection(between_limits, 0),
             None,
             "standard is still admitted while no-queue is refused"
         );
 
         let full = [384, 400, 384];
-        let rejection = standard.active_decode_rejection(full).unwrap();
+        let rejection = standard.active_decode_rejection(full, 0).unwrap();
         assert_eq!(rejection.policy_class, "standard");
         assert_eq!((rejection.current, rejection.limit), (384, 384));
-        assert!(no_queue.active_decode_rejection(full).is_some());
+        assert!(no_queue.active_decode_rejection(full, 0).is_some());
 
         assert_eq!(
-            standard.active_decode_rejection(std::iter::empty()),
+            standard.active_decode_rejection(std::iter::empty(), 0),
             None,
             "no decode ranks is left to routing, which reports it"
+        );
+    }
+
+    #[test]
+    fn decode_limit_counts_admissions_still_on_their_way_to_a_booking() {
+        let config = RouterPolicyConfig::from_yaml(V41_MERGED_POLICY).unwrap();
+        let profile = config.resolve_profile(None, None, RouterQueuePolicy::Fcfs);
+        let standard = profile.class(profile.resolve_class_index(None, 0));
+
+        let ranks = [380; 16];
+        assert_eq!(standard.active_decode_rejection(ranks, 63), None);
+        let rejection = standard.active_decode_rejection(ranks, 64).unwrap();
+        assert_eq!((rejection.current, rejection.limit), (384, 384));
+
+        let uneven = [0, 384, 384, 400];
+        assert_eq!(standard.active_decode_rejection(uneven, 383), None);
+        assert!(
+            standard.active_decode_rejection(uneven, 384).is_some(),
+            "a rank above the limit does not lend its overshoot to the others"
         );
     }
 

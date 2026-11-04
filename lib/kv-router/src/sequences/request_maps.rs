@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use dashmap::{DashMap, mapref::entry::Entry};
+use rustc_hash::FxHashSet;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -19,7 +20,17 @@ pub(super) struct RequestBooking {
 pub(super) struct RequestIndex {
     request_to_booking: DashMap<RequestId, RequestBooking>,
     request_to_lora: DashMap<RequestId, String>,
+    /// Peer router that owns a mirrored booking. Bookings absent here are this router's own.
+    request_to_origin: DashMap<RequestId, u64>,
     next_attempt_id: AtomicU64,
+}
+
+/// One of this router's own bookings, as replica sync re-announces it to peers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct LocalBooking {
+    pub(super) request_id: RequestId,
+    pub(super) booking: RequestBooking,
+    pub(super) lora_name: Option<String>,
 }
 
 impl RequestIndex {
@@ -29,11 +40,25 @@ impl RequestIndex {
         worker: WorkerWithDpRank,
         lora_name: Option<String>,
     ) -> Result<AttemptId, WorkerWithDpRank> {
+        self.try_insert_request_from(request_id, worker, lora_name, None)
+    }
+
+    /// Insert a booking; `origin` names the peer router that owns a mirrored one.
+    pub(super) fn try_insert_request_from(
+        &self,
+        request_id: RequestId,
+        worker: WorkerWithDpRank,
+        lora_name: Option<String>,
+        origin: Option<u64>,
+    ) -> Result<AttemptId, WorkerWithDpRank> {
         match self.request_to_booking.entry(request_id.clone()) {
             Entry::Occupied(entry) => Err(entry.get().worker),
             Entry::Vacant(entry) => {
                 let attempt_id =
                     AttemptId::new(self.next_attempt_id.fetch_add(1, Ordering::Relaxed) + 1);
+                if let Some(origin) = origin {
+                    self.request_to_origin.insert(request_id.clone(), origin);
+                }
                 entry.insert(RequestBooking { worker, attempt_id });
                 if let Some(lora_name) = lora_name {
                     self.request_to_lora.insert(request_id, lora_name);
@@ -68,6 +93,42 @@ impl RequestIndex {
         self.request_to_booking.get(request_id).map(|entry| *entry)
     }
 
+    pub(super) fn origin_for(&self, request_id: &RequestId) -> Option<u64> {
+        self.request_to_origin.get(request_id).map(|entry| *entry)
+    }
+
+    /// This router's own bookings (those without a peer origin).
+    pub(super) fn local_bookings(&self) -> Vec<LocalBooking> {
+        self.request_to_booking
+            .iter()
+            .filter(|entry| !self.request_to_origin.contains_key(entry.key()))
+            .map(|entry| LocalBooking {
+                request_id: entry.key().clone(),
+                booking: *entry.value(),
+                lora_name: self.lora_for(entry.key()),
+            })
+            .collect()
+    }
+
+    pub(super) fn remote_origins(&self) -> FxHashSet<u64> {
+        self.request_to_origin
+            .iter()
+            .map(|entry| *entry.value())
+            .collect()
+    }
+
+    pub(super) fn remote_requests_from(&self, origin: u64) -> Vec<(RequestId, RequestBooking)> {
+        self.request_to_origin
+            .iter()
+            .filter(|entry| *entry.value() == origin)
+            .filter_map(|entry| {
+                let request_id = entry.key().clone();
+                let booking = self.booking_for(&request_id)?;
+                Some((request_id, booking))
+            })
+            .collect()
+    }
+
     pub(super) fn lora_for(&self, request_id: &RequestId) -> Option<String> {
         self.request_to_lora
             .get(request_id)
@@ -80,6 +141,7 @@ impl RequestIndex {
             .remove(request_id)
             .map(|(_request_id, booking)| booking.worker);
         self.request_to_lora.remove(request_id);
+        self.request_to_origin.remove(request_id);
         worker
     }
 
@@ -96,6 +158,7 @@ impl RequestIndex {
             .is_some();
         if removed {
             self.request_to_lora.remove(request_id);
+            self.request_to_origin.remove(request_id);
         }
         removed
     }
@@ -115,6 +178,7 @@ impl RequestIndex {
             .is_some();
         if removed {
             self.request_to_lora.remove(request_id);
+            self.request_to_origin.remove(request_id);
         }
         removed
     }
@@ -147,7 +211,9 @@ impl RequestIndex {
 
     #[cfg(any(test, feature = "bench"))]
     pub(super) fn is_empty(&self) -> bool {
-        self.request_to_booking.is_empty() && self.request_to_lora.is_empty()
+        self.request_to_booking.is_empty()
+            && self.request_to_lora.is_empty()
+            && self.request_to_origin.is_empty()
     }
 
     #[cfg(any(test, feature = "bench"))]

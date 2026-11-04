@@ -6,11 +6,12 @@ use std::sync::Arc;
 use std::task::Poll;
 
 use rustc_hash::FxHashMap;
-use tokio::time::Instant;
+use tokio::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
 use super::multi_worker::{
-    ActiveSequencesMultiWorker, ReplicaWorkerPolicy, SequencePublisher, SequenceSubscriber,
+    ActiveSequencesMultiWorker, REPLICA_PEER_SILENT_REFRESHES, ReplicaWorkerPolicy,
+    SequencePublisher, SequenceSubscriber,
 };
 use super::prompt_registry::WorkerLoadSnapshot;
 use crate::protocols::{
@@ -155,7 +156,153 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
         Ok(())
     }
 
+    /// Re-announce this router's live bookings to its peers and drop the mirrored bookings
+    /// of peers that have been silent for [`REPLICA_PEER_SILENT_REFRESHES`] intervals.
+    ///
+    /// A re-announcement is an `AddRequest` without blocks: a peer that already mirrors the
+    /// booking refreshes its lease, and one that missed it books it again. Routers without
+    /// this refresh ignore it as a duplicate.
+    pub fn start_replica_refresh(
+        self: &Arc<Self>,
+        interval: Duration,
+        cancel_token: CancellationToken,
+    ) {
+        if !self.replica_sync {
+            return;
+        }
+        let this = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = cancel_token.cancelled() => break,
+                    _ = ticker.tick() => {
+                        this.refresh_replicas(Instant::now(), interval * REPLICA_PEER_SILENT_REFRESHES);
+                    }
+                }
+            }
+        });
+    }
+
+    /// One refresh round; see [`Self::start_replica_refresh`].
+    pub fn refresh_replicas(&self, now: Instant, peer_silence: Duration) {
+        if !self.replica_sync {
+            return;
+        }
+        self.republish_local_bookings();
+        self.purge_silent_peers(now, peer_silence);
+    }
+
+    fn republish_local_bookings(&self) {
+        for local in self.request_index.local_bookings() {
+            if self.request_index.booking_for(&local.request_id) != Some(local.booking) {
+                continue;
+            }
+            self.enqueue_publish_event(ActiveSequenceEvent {
+                request_id: local.request_id,
+                worker: local.booking.worker,
+                data: ActiveSequenceEventData::AddRequest {
+                    token_sequence: None,
+                    track_prefill_tokens: false,
+                    expected_output_tokens: None,
+                    prefill_load_hint: None,
+                },
+                router_id: self.router_id,
+                lora_name: local.lora_name,
+            });
+        }
+    }
+
+    fn purge_silent_peers(&self, now: Instant, peer_silence: Duration) {
+        let origins = self.request_index.remote_origins();
+        let silent: Vec<(u64, Option<Duration>)> = {
+            let mut last_seen = self.peer_last_seen.lock();
+            last_seen.retain(|origin, seen| {
+                origins.contains(origin) || now.saturating_duration_since(*seen) <= peer_silence
+            });
+            origins
+                .into_iter()
+                .filter_map(|origin| {
+                    let silence = last_seen
+                        .get(&origin)
+                        .map(|seen| now.saturating_duration_since(*seen));
+                    silence
+                        .is_none_or(|silence| silence > peer_silence)
+                        .then_some((origin, silence))
+                })
+                .collect()
+        };
+        if silent.is_empty() {
+            return;
+        }
+
+        let mut effects = ReplicaBatchEffects::default();
+        for (origin, silence) in silent {
+            let bookings = self.request_index.remote_requests_from(origin);
+            tracing::warn!(
+                router_id = origin,
+                worker_type = self.worker_type(),
+                bookings = bookings.len(),
+                silent_secs = silence.map(|silence| silence.as_secs()),
+                "Peer router stopped refreshing its bookings; dropping its mirrored bookings"
+            );
+            for (request_id, booking) in bookings {
+                self.apply_replica_lifecycle(
+                    ActiveSequenceEvent {
+                        request_id,
+                        worker: booking.worker,
+                        data: ActiveSequenceEventData::Free,
+                        router_id: origin,
+                        lora_name: None,
+                    },
+                    &mut effects,
+                );
+            }
+            self.peer_last_seen.lock().remove(&origin);
+        }
+        self.flush_replica_batch_effects(&mut effects);
+    }
+
+    /// A refresh from the peer that owns this mirrored booking keeps its lease alive.
+    fn touch_mirrored_booking(&self, request_id: &str, worker: WorkerWithDpRank, origin: u64) {
+        let request_id = request_id.to_string();
+        let Some(current) = self.request_index.booking_for(&request_id) else {
+            return;
+        };
+        if current.worker != worker || self.request_index.origin_for(&request_id) != Some(origin) {
+            return;
+        }
+        if let Some(observer) = self.replica_request_lease_observer() {
+            observer.progressed(&SchedulerBookingDescriptor {
+                request_id,
+                worker,
+                attempt_id: current.attempt_id,
+            });
+        }
+    }
+
     fn apply_replica_event(&self, event: ActiveSequenceEvent, effects: &mut ReplicaBatchEffects) {
+        if event.router_id == self.router_id {
+            return;
+        }
+        let worker_origin = matches!(event.data, ActiveSequenceEventData::MarkPrefillCompleted);
+        if !self.replica_sync && !worker_origin {
+            return;
+        }
+        if !worker_origin {
+            self.peer_last_seen
+                .lock()
+                .insert(event.router_id, Instant::now());
+        }
+        self.apply_replica_lifecycle(event, effects);
+    }
+
+    fn apply_replica_lifecycle(
+        &self,
+        event: ActiveSequenceEvent,
+        effects: &mut ReplicaBatchEffects,
+    ) {
         let ActiveSequenceEvent {
             request_id,
             worker: event_worker,
@@ -163,13 +310,6 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
             router_id,
             lora_name,
         } = event;
-
-        if router_id == self.router_id {
-            return;
-        }
-        if !self.replica_sync && !matches!(data, ActiveSequenceEventData::MarkPrefillCompleted) {
-            return;
-        }
 
         // ActiveSequenceEvent does not carry prompt-load decay timestamps yet.
         // Peer routers still approximate decay anchoring with local receive time.
@@ -182,11 +322,13 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
                 expected_output_tokens,
                 prefill_load_hint,
             } => {
-                let Ok(attempt_id) = self.request_index.try_insert_request(
+                let Ok(attempt_id) = self.request_index.try_insert_request_from(
                     request_id.clone(),
                     event_worker,
                     lora_name,
+                    Some(router_id),
                 ) else {
+                    self.touch_mirrored_booking(&request_id, event_worker, router_id);
                     return;
                 };
                 let booking = SchedulerBookingDescriptor {

@@ -18,7 +18,7 @@ mod worker_selection_config;
 
 mod types;
 pub use filter::*;
-pub use local::LocalScheduler;
+pub use local::{DecodeAdmission, LocalScheduler};
 pub use overlap::{
     CacheHitEstimates, OverlapAnalysis, OverlapScoresResponse, OverlapSignals,
     SelectedWorkerTierSnapshot, SharedCacheOverlapScore, WorkerOverlapScore,

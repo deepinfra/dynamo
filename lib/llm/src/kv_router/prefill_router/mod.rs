@@ -16,7 +16,7 @@ use dynamo_kv_router::{
     conditional_disagg::ConditionalDisaggPolicy,
     config::RouterConfigOverride,
     protocols::RoutingConstraints,
-    scheduling::QueueRejection,
+    scheduling::{DecodeAdmission, QueueRejection},
     selector::{DefaultWorkerSelector, WorkerSelector},
 };
 use dynamo_runtime::{
@@ -370,20 +370,22 @@ where
         // Save original max_tokens for decode
         let original_max_tokens = req.stop_conditions.max_tokens;
 
-        // Decode-first books the decode hop on arrival, so the decode-slot limit is
-        // enforced here, before any prefill is dispatched and on every downstream path.
-        if req.get_annotation_value("query_instance_id").is_none()
-            && let Some(rejection) = self.active_decode_rejection(&context, &req)
-        {
-            tracing::debug!(
-                request_id = %request_id,
-                policy_class = %rejection.policy_class,
-                active = rejection.current,
-                limit = rejection.limit,
-                "Every decode rank is at the class active-request limit; rejecting"
-            );
-            return Err(anyhow::Error::new(rejection));
-        }
+        // The decode-slot limit is enforced here, before any prefill is dispatched and on
+        // every downstream path. The admission is held until this function returns, by
+        // which point the decode leg has booked its worker (or failed).
+        let _decode_admission = match self.admit_active_decode(&context, &req) {
+            Ok(admission) => admission,
+            Err(rejection) => {
+                tracing::debug!(
+                    request_id = %request_id,
+                    policy_class = %rejection.policy_class,
+                    active = rejection.current,
+                    limit = rejection.limit,
+                    "Every decode rank is at the class active-request limit; rejecting"
+                );
+                return Err(anyhow::Error::new(rejection));
+            }
+        };
 
         // If the prefill router is not activated (no prefill workers discovered) or has been
         // deactivated (all prefill workers died), route directly to the backend. Model admission
@@ -651,18 +653,29 @@ where
         self.conditional_disagg_policy.is_enabled()
     }
 
-    /// Migration retries pass: the request already held a decode slot.
-    fn active_decode_rejection(
+    /// Query-only lookups and migration retries (which already held a decode slot) pass
+    /// without a reservation, as does a decode set without a KV router.
+    fn admit_active_decode(
         &self,
         context: &Context<()>,
         req: &PreprocessedRequest,
-    ) -> Option<QueueRejection> {
-        if get_route_trace_context(context).is_some_and(|trace| trace.is_retry()) {
-            return None;
+    ) -> Result<Option<DecodeAdmission>, QueueRejection> {
+        if req.get_annotation_value("query_instance_id").is_some()
+            || get_route_trace_context(context).is_some_and(|trace| trace.is_retry())
+        {
+            return Ok(None);
         }
-        let decode = self.decode_routing_host.get()?.kv_router_if_enabled()?;
+        let Some(decode) = self
+            .decode_routing_host
+            .get()
+            .and_then(|host| host.kv_router_if_enabled())
+        else {
+            return Ok(None);
+        };
         let policy_class = context.metadata().get("policy-class").map(String::as_str);
-        decode.active_decode_rejection(policy_class, req.token_ids.len())
+        decode
+            .admit_active_decode(policy_class, req.token_ids.len())
+            .map(Some)
     }
 
     pub(crate) fn set_decode_routing_host(
@@ -950,17 +963,22 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn decode_slot_limit_rejects_per_class_before_any_dispatch() {
+    struct DecodeSlotFixture {
+        runtime: dynamo_runtime::Runtime,
+        decode: Arc<crate::kv_router::KvRouter>,
+        router: Arc<PrefillRouter>,
+        worker: dynamo_kv_router::protocols::WorkerWithDpRank,
+        _workers_tx: watch::Sender<HashMap<u64, ModelRuntimeConfig>>,
+        _policy: tempfile::NamedTempFile,
+    }
+
+    /// One decode rank behind a KV decode router with standard=2 and no-queue=1 slots,
+    /// installed on a Pending PrefillRouter.
+    async fn decode_slot_fixture(model: &str) -> DecodeSlotFixture {
         use crate::kv_router::KvRouter;
-        use dynamo_kv_router::{protocols::WorkerWithDpRank, scheduling::QueueLimitKind};
+        use dynamo_kv_router::protocols::WorkerWithDpRank;
         use dynamo_runtime::{
-            DistributedRuntime, Runtime,
-            distributed::DistributedConfig,
-            pipeline::PushRouter,
-            pipeline::network::egress::route_span::{
-                RouteTraceContext, attach_route_trace_context,
-            },
+            DistributedRuntime, Runtime, distributed::DistributedConfig, pipeline::PushRouter,
         };
 
         let policy = tempfile::NamedTempFile::new().unwrap();
@@ -991,14 +1009,14 @@ policy_classes:
                 .await
                 .unwrap();
         let endpoint = distributed
-            .namespace("decode-slot-limit")
+            .namespace(format!("decode-slot-limit-{model}"))
             .unwrap()
             .component("decode")
             .unwrap()
             .endpoint("generate");
         let client = endpoint.client().await.unwrap();
         let worker = WorkerWithDpRank::new(7, 0);
-        let (_workers_tx, workers) = watch::channel(HashMap::from([(
+        let (workers_tx, workers) = watch::channel(HashMap::from([(
             worker.worker_id,
             ModelRuntimeConfig::default(),
         )]));
@@ -1019,7 +1037,7 @@ policy_classes:
                 Some(config),
                 None,
                 "decode",
-                Some("model".to_string()),
+                Some(model.to_string()),
                 false,
                 None,
                 None,
@@ -1032,7 +1050,6 @@ policy_classes:
             .unwrap();
         let host = Arc::new(RoutingHost::new(inner, decode.clone(), None).unwrap());
 
-        // No prefill worker registered: the router stays Pending and passes requests to decode.
         let (_activation_tx, activation_rx) = oneshot::channel();
         let router = PrefillRouter::new(
             activation_rx,
@@ -1043,23 +1060,57 @@ policy_classes:
             None,
             None,
             SessionAffinityMode::Hard,
-            "model".to_string(),
+            model.to_string(),
             "namespace".to_string(),
             crate::discovery::LoadThresholdHandle::new(Default::default()),
             CancellationToken::new(),
         );
         router.set_decode_routing_host(host).unwrap();
+        DecodeSlotFixture {
+            runtime,
+            decode,
+            router,
+            worker,
+            _workers_tx: workers_tx,
+            _policy: policy,
+        }
+    }
+
+    fn slot_request(policy_class: Option<&str>) -> SingleIn<PreprocessedRequest> {
+        let mut req = query_only_request();
+        req.annotations.clear();
+        let metadata = policy_class
+            .map(|class| ("policy-class".to_string(), class.to_string()))
+            .into_iter()
+            .collect();
+        Context::with_id_and_metadata(req, Uuid::new_v4().to_string(), metadata)
+    }
+
+    fn rejection_of(error: anyhow::Error) -> QueueRejection {
+        error
+            .downcast_ref::<QueueRejection>()
+            .cloned()
+            .expect("decode-slot rejection must surface as the policy queue's QueueRejection")
+    }
+
+    #[tokio::test]
+    async fn decode_slot_limit_rejects_per_class_before_any_dispatch() {
+        use dynamo_kv_router::scheduling::QueueLimitKind;
+        use dynamo_runtime::pipeline::network::egress::route_span::{
+            RouteTraceContext, attach_route_trace_context,
+        };
+
+        // No prefill worker registered: the router stays Pending and passes requests to decode.
+        let DecodeSlotFixture {
+            runtime,
+            decode,
+            router,
+            worker,
+            ..
+        } = decode_slot_fixture("model").await;
         let downstream = Arc::new(CountingDecodeHost::default());
 
-        let request = |policy_class: Option<&str>| {
-            let mut req = query_only_request();
-            req.annotations.clear();
-            let metadata = policy_class
-                .map(|class| ("policy-class".to_string(), class.to_string()))
-                .into_iter()
-                .collect();
-            Context::with_id_and_metadata(req, Uuid::new_v4().to_string(), metadata)
-        };
+        let request = slot_request;
         let book = |id: &'static str| {
             let decode = decode.clone();
             async move {
@@ -1078,13 +1129,6 @@ policy_classes:
                     .await
             }
         };
-        let rejection_of = |error: anyhow::Error| {
-            error
-                .downcast_ref::<QueueRejection>()
-                .cloned()
-                .expect("decode-slot rejection must surface as the policy queue's QueueRejection")
-        };
-
         router
             .generate(request(Some("no-queue")), downstream.clone())
             .await
@@ -1138,6 +1182,126 @@ policy_classes:
             1
         );
 
+        drop(router);
+        runtime.shutdown();
+    }
+
+    /// Holds each request where the prefill would run, then books decode when released.
+    struct GatedDecodeHost {
+        decode: Arc<crate::kv_router::KvRouter>,
+        worker: dynamo_kv_router::protocols::WorkerWithDpRank,
+        entered: tokio::sync::mpsc::UnboundedSender<()>,
+        release: tokio::sync::Semaphore,
+    }
+
+    #[async_trait]
+    impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutput>>, Error>
+        for GatedDecodeHost
+    {
+        async fn generate(
+            &self,
+            request: SingleIn<PreprocessedRequest>,
+        ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
+            let _ = self.entered.send(());
+            self.release.acquire().await?.forget();
+            self.decode
+                .add_request(
+                    request.id().to_string(),
+                    &[1, 2, 3],
+                    None,
+                    0,
+                    None,
+                    self.worker,
+                    None,
+                    None,
+                    None,
+                )
+                .await;
+            Ok(ResponseStream::new(
+                Box::pin(stream::empty()),
+                request.context(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn decode_slot_limit_counts_requests_admitted_but_not_yet_booked() {
+        use futures::future::{Either, select};
+
+        let fixture = decode_slot_fixture("model-in-flight").await;
+        fixture.router.lifecycle.store(
+            PrefillLifecycleState::Active as u8,
+            std::sync::atomic::Ordering::Release,
+        );
+        let (entered_tx, mut entered) = tokio::sync::mpsc::unbounded_channel();
+        let downstream = Arc::new(GatedDecodeHost {
+            decode: fixture.decode.clone(),
+            worker: fixture.worker,
+            entered: entered_tx,
+            release: tokio::sync::Semaphore::new(0),
+        });
+        let spawn_standard = || {
+            let router = fixture.router.clone();
+            let downstream = downstream.clone();
+            tokio::spawn(async move {
+                router
+                    .generate(slot_request(None), downstream)
+                    .await
+                    .map(|_| ())
+            })
+        };
+
+        let first = spawn_standard();
+        let second = spawn_standard();
+        entered.recv().await.unwrap();
+        entered.recv().await.unwrap();
+
+        let rejection = rejection_of(
+            fixture
+                .router
+                .generate(slot_request(None), downstream.clone())
+                .await
+                .unwrap_err(),
+        );
+        assert_eq!(
+            (rejection.current, rejection.limit),
+            (2, 2),
+            "two admitted requests still before their decode booking fill the rank"
+        );
+        assert!(
+            fixture
+                .router
+                .generate(slot_request(Some("no-queue")), downstream.clone())
+                .await
+                .is_err()
+        );
+
+        downstream.release.add_permits(1);
+        let still_queued = match select(first, second).await {
+            Either::Left((finished, other)) | Either::Right((finished, other)) => {
+                finished.unwrap().unwrap();
+                other
+            }
+        };
+        assert!(
+            fixture
+                .router
+                .generate(slot_request(None), downstream.clone())
+                .await
+                .is_err(),
+            "one booked plus one still queued keeps the rank full"
+        );
+
+        still_queued.abort();
+        assert!(still_queued.await.unwrap_err().is_cancelled());
+        assert!(
+            fixture.decode.admit_active_decode(None, 3).is_ok(),
+            "a cancelled admission returns its slot"
+        );
+
+        let DecodeSlotFixture {
+            runtime, router, ..
+        } = fixture;
         drop(router);
         runtime.shutdown();
     }

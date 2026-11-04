@@ -3,6 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use rustc_hash::FxHashMap;
@@ -55,6 +56,21 @@ where
     track_prefill_tokens_default: bool,
     worker_type: &'static str,
     profile: PolicyProfile,
+    decode_admissions_in_flight: Arc<AtomicUsize>,
+}
+
+/// A request that passed the decode-slot gate and has not booked its decode worker yet.
+/// Dropping it (booking landed, error, or cancel) releases the reservation.
+#[must_use = "the decode-slot reservation is released when this is dropped"]
+#[derive(Debug)]
+pub struct DecodeAdmission {
+    in_flight: Arc<AtomicUsize>,
+}
+
+impl Drop for DecodeAdmission {
+    fn drop(&mut self) {
+        self.in_flight.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl<P, C, Sel, RF> LocalScheduler<P, C, Sel, RF>
@@ -313,21 +329,40 @@ where
             track_prefill_tokens_default,
             worker_type,
             profile,
+            decode_admissions_in_flight: Arc::new(AtomicUsize::new(0)),
         })
     }
 
-    /// Per-class decode-slot gate: rejects when every registered rank already holds
-    /// the request class's `max_active_decode_requests_per_rank` active bookings.
-    pub fn active_decode_rejection(
+    /// Per-class decode-slot gate. An admitted request holds the returned reservation
+    /// until its decode booking lands, so requests still waiting on prefill count
+    /// against `max_active_decode_requests_per_rank` alongside the booked ones.
+    pub fn admit_active_decode(
         &self,
         policy_class: Option<&str>,
         isl_tokens: usize,
-    ) -> Option<QueueRejection> {
+    ) -> Result<DecodeAdmission, QueueRejection> {
+        let in_flight = self
+            .decode_admissions_in_flight
+            .fetch_add(1, Ordering::AcqRel);
+        let admission = DecodeAdmission {
+            in_flight: Arc::clone(&self.decode_admissions_in_flight),
+        };
         let class = self
             .profile
             .class(self.profile.resolve_class_index(policy_class, isl_tokens));
-        class.max_active_decode_requests_per_rank?;
-        class.active_decode_rejection(self.slots.active_request_counts().into_values())
+        if class.max_active_decode_requests_per_rank.is_none() {
+            return Ok(admission);
+        }
+        match class
+            .active_decode_rejection(self.slots.active_request_counts().into_values(), in_flight)
+        {
+            Some(rejection) => Err(rejection),
+            None => Ok(admission),
+        }
+    }
+
+    pub fn decode_admissions_in_flight(&self) -> usize {
+        self.decode_admissions_in_flight.load(Ordering::Acquire)
     }
 
     pub fn active_request_counts(&self) -> HashMap<WorkerWithDpRank, usize> {
@@ -1141,7 +1176,7 @@ policy_classes:
             false,
         )
         .unwrap();
-        let rejected = |class: Option<&str>| scheduler.active_decode_rejection(class, 64);
+        let rejected = |class: Option<&str>| scheduler.admit_active_decode(class, 64).err();
 
         assert!(rejected(Some("no-queue")).is_none());
         scheduler.add_request(book(0, "a")).await.unwrap();
@@ -1171,6 +1206,27 @@ policy_classes:
                 (WorkerWithDpRank::new(1, 0), 2)
             ])
         );
+
+        let first = scheduler.admit_active_decode(None, 64).unwrap();
+        let second = scheduler.admit_active_decode(None, 64).unwrap();
+        assert_eq!(scheduler.decode_admissions_in_flight(), 2);
+        let rejection = rejected(None).expect("two unbooked admissions fill rank 0's two slots");
+        assert_eq!((rejection.current, rejection.limit), (2, 2));
+        assert!(
+            rejected(Some("no-queue")).is_some(),
+            "admissions of any class hold slots"
+        );
+        drop(first);
+        assert!(
+            rejected(None).is_none(),
+            "a dropped admission frees its slot"
+        );
+        scheduler.add_request(book(0, "e")).await.unwrap();
+        drop(second);
+        assert_eq!(scheduler.decode_admissions_in_flight(), 0);
+        assert!(rejected(None).is_none(), "booking replaced the admission");
+        scheduler.add_request(book(0, "f")).await.unwrap();
+        assert!(rejected(None).is_some());
         cancel_token.cancel();
     }
 

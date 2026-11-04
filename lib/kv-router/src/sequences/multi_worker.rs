@@ -47,6 +47,14 @@ const SEQUENCE_PUBLISH_FAILURE_LOG_INTERVAL: Duration = Duration::from_secs(30);
 /// Environment override for the stale active-request cleanup guard.
 const DYN_ROUTER_ACTIVE_REQUEST_EXPIRY_SECS: &str = "DYN_ROUTER_ACTIVE_REQUEST_EXPIRY_SECS";
 
+/// Environment override for how often replica sync re-announces this router's live bookings.
+const DYN_ROUTER_REPLICA_REFRESH_SECS: &str = "DYN_ROUTER_REPLICA_REFRESH_SECS";
+
+const DEFAULT_REPLICA_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
+
+/// A peer whose bookings went unannounced for this many refresh intervals is treated as gone.
+pub const REPLICA_PEER_SILENT_REFRESHES: u32 = 3;
+
 /// Returns the configured active-request expiry duration.
 ///
 /// Legacy standalone slot trackers use this as an absolute-age threshold. The
@@ -83,6 +91,32 @@ fn active_request_expiry_duration_from_lookup(
     }
 
     Duration::from_secs(seconds)
+}
+
+/// How often replica sync re-announces this router's live bookings to its peers. Kept
+/// under half the active-request expiry so every mirrored lease is touched between two
+/// reaper scans.
+pub fn replica_refresh_interval() -> Duration {
+    replica_refresh_interval_from_lookup(|key| env::var(key).ok())
+}
+
+fn replica_refresh_interval_from_lookup(get_env: impl Fn(&str) -> Option<String>) -> Duration {
+    let configured = match get_env(DYN_ROUTER_REPLICA_REFRESH_SECS) {
+        Some(raw) => match raw.parse::<u64>() {
+            Ok(seconds) if seconds > 0 => Duration::from_secs(seconds),
+            _ => {
+                tracing::warn!(
+                    env = DYN_ROUTER_REPLICA_REFRESH_SECS,
+                    value = %raw,
+                    default_secs = DEFAULT_REPLICA_REFRESH_INTERVAL.as_secs(),
+                    "invalid replica refresh interval, falling back to default"
+                );
+                DEFAULT_REPLICA_REFRESH_INTERVAL
+            }
+        },
+        None => DEFAULT_REPLICA_REFRESH_INTERVAL,
+    };
+    configured.min(active_request_expiry_duration_from_lookup(get_env) / 2)
 }
 
 // ---------------------------------------------------------------------------
@@ -376,6 +410,8 @@ pub struct ActiveSequencesMultiWorker<P: SequencePublisher> {
     pub(super) replica_worker_policy: ReplicaWorkerPolicy,
     replica_request_lease_observer: OnceLock<Arc<dyn ReplicaRequestLeaseObserver>>,
     worker_type: &'static str,
+    /// When each peer router last published a lifecycle event or refresh.
+    pub(super) peer_last_seen: Mutex<FxHashMap<u64, Instant>>,
 }
 
 impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
@@ -520,6 +556,7 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
             replica_worker_policy: options.replica_worker_policy,
             replica_request_lease_observer: OnceLock::new(),
             worker_type,
+            peer_last_seen: Mutex::new(FxHashMap::default()),
         }
     }
 
@@ -590,7 +627,7 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
         }
     }
 
-    fn enqueue_publish_event(&self, event: ActiveSequenceEvent) {
+    pub(super) fn enqueue_publish_event(&self, event: ActiveSequenceEvent) {
         if !self.replica_sync {
             return;
         }
@@ -1619,6 +1656,23 @@ mod tests {
 
     /// Verifies that absent and invalid expiry overrides use the shared default.
     #[test]
+    fn replica_refresh_interval_stays_under_half_the_expiry() {
+        let lookup = |refresh: Option<&'static str>, expiry: Option<&'static str>| {
+            replica_refresh_interval_from_lookup(move |key| match key {
+                DYN_ROUTER_REPLICA_REFRESH_SECS => refresh.map(str::to_string),
+                DYN_ROUTER_ACTIVE_REQUEST_EXPIRY_SECS => expiry.map(str::to_string),
+                _ => None,
+            })
+        };
+        assert_eq!(lookup(None, None), Duration::from_secs(10));
+        assert_eq!(lookup(Some("30"), None), Duration::from_secs(30));
+        assert_eq!(lookup(Some("0"), None), Duration::from_secs(10));
+        assert_eq!(lookup(Some("junk"), None), Duration::from_secs(10));
+        assert_eq!(lookup(None, Some("8")), Duration::from_secs(4));
+        assert_eq!(lookup(Some("600"), None), Duration::from_secs(150));
+    }
+
+    #[test]
     fn active_request_expiry_duration_override_falls_back_to_default() {
         assert_eq!(
             active_request_expiry_duration_from_lookup(|_| None),
@@ -1760,8 +1814,8 @@ mod tests {
             .collect()
     }
 
-    fn active_request_count(
-        sequences: &ActiveSequencesMultiWorker<NoopSequencePublisher>,
+    fn active_request_count<P: SequencePublisher + 'static>(
+        sequences: &ActiveSequencesMultiWorker<P>,
         worker: WorkerWithDpRank,
     ) -> usize {
         sequences
@@ -2006,6 +2060,140 @@ mod tests {
                 .unwrap()
                 .push(ObservedReplicaLeaseEvent::Completed(booking.clone()));
         }
+    }
+
+    fn replica_refresh(
+        request_id: impl Into<String>,
+        worker: WorkerWithDpRank,
+        router_id: u64,
+    ) -> ActiveSequenceEvent {
+        ActiveSequenceEvent {
+            request_id: request_id.into(),
+            worker,
+            data: ActiveSequenceEventData::AddRequest {
+                token_sequence: None,
+                track_prefill_tokens: false,
+                expected_output_tokens: None,
+                prefill_load_hint: None,
+            },
+            router_id,
+            lora_name: None,
+        }
+    }
+
+    #[test]
+    fn replica_refresh_reannounces_only_this_routers_live_bookings() {
+        let worker = WorkerWithDpRank::new(1, 0);
+        let (sequences, publisher) = make_recording_sequences(HashMap::from([(1, (0, 1))]));
+        sequences
+            .add_request(local_sequence_request("local", worker), Instant::now())
+            .unwrap();
+        sequences
+            .add_request(local_sequence_request("finished", worker), Instant::now())
+            .unwrap();
+        sequences
+            .free(&"finished".to_string(), Instant::now())
+            .unwrap();
+        sequences.apply_replica_batch(vec![replica_add("mirrored", worker, vec![1, 2, 3])]);
+        publisher.clear();
+
+        sequences.refresh_replicas(Instant::now(), Duration::from_secs(30));
+
+        let events = publisher.events.lock().unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "only the live local booking is re-announced"
+        );
+        assert!(matches!(
+            events[0],
+            ActiveSequenceEventData::AddRequest {
+                token_sequence: None,
+                track_prefill_tokens: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn replica_refresh_keeps_the_owners_mirrored_lease_alive_and_restores_a_lost_booking() {
+        let worker = WorkerWithDpRank::new(1, 0);
+        let (sequences, publisher) = make_recording_sequences(HashMap::from([(1, (0, 1))]));
+        let observer = Arc::new(RecordingReplicaLeaseObserver::default());
+        assert!(sequences.set_replica_request_lease_observer(observer.clone()));
+        sequences.apply_replica_batch(vec![replica_add("req-1", worker, vec![1, 2, 3])]);
+        let ObservedReplicaLeaseEvent::Admitted(admitted) =
+            observer.events.lock().unwrap()[0].clone()
+        else {
+            panic!("the first replica event admits the booking");
+        };
+        publisher.clear();
+
+        sequences.apply_replica_batch(vec![
+            replica_refresh("req-1", worker, 99),
+            replica_refresh("req-1", worker, 98),
+            replica_refresh("req-1", WorkerWithDpRank::new(2, 0), 99),
+        ]);
+        assert_eq!(
+            observer.events.lock().unwrap()[1..],
+            [ObservedReplicaLeaseEvent::Progressed(admitted)],
+            "only the owner's refresh for the booked worker touches the lease"
+        );
+        assert_eq!(
+            sequences.active_blocks()[&worker],
+            3,
+            "a refresh adds no blocks"
+        );
+        assert!(publisher.load_batches().is_empty());
+
+        sequences.apply_replica_batch(vec![replica_refresh("missed", worker, 99)]);
+        assert_eq!(active_request_count(&sequences, worker), 2);
+        assert!(matches!(
+            observer.events.lock().unwrap().last(),
+            Some(ObservedReplicaLeaseEvent::Admitted(booking)) if booking.request_id == "missed"
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn silent_peer_routers_lose_their_mirrored_bookings() {
+        let worker = WorkerWithDpRank::new(1, 0);
+        let (sequences, _) = make_recording_sequences(HashMap::from([(1, (0, 1))]));
+        let observer = Arc::new(RecordingReplicaLeaseObserver::default());
+        assert!(sequences.set_replica_request_lease_observer(observer.clone()));
+        sequences
+            .add_request(local_sequence_request("local", worker), Instant::now())
+            .unwrap();
+        let silence = Duration::from_secs(30);
+
+        sequences.apply_replica_batch(vec![replica_add("crashed-peer", worker, vec![1, 2, 3])]);
+        tokio::time::advance(Duration::from_secs(20)).await;
+        let mut live_peer = replica_add("live-peer", worker, vec![4, 5, 6]);
+        live_peer.router_id = 98;
+        sequences.apply_replica_batch(vec![live_peer]);
+        tokio::time::advance(Duration::from_secs(15)).await;
+
+        sequences.refresh_replicas(Instant::now(), silence);
+
+        assert_eq!(active_request_count(&sequences, worker), 2);
+        assert!(
+            sequences
+                .request_index
+                .booking_for(&"crashed-peer".to_string())
+                .is_none()
+        );
+        assert!(matches!(
+            observer.events.lock().unwrap().last(),
+            Some(ObservedReplicaLeaseEvent::Completed(booking)) if booking.request_id == "crashed-peer"
+        ));
+
+        sequences.apply_replica_batch(vec![replica_refresh("live-peer", worker, 98)]);
+        tokio::time::advance(Duration::from_secs(25)).await;
+        sequences.refresh_replicas(Instant::now(), silence);
+        assert_eq!(
+            active_request_count(&sequences, worker),
+            2,
+            "a refreshing peer keeps its bookings past the silence window"
+        );
     }
 
     #[test]
