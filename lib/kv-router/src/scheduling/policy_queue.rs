@@ -41,6 +41,7 @@ pub enum QueueLimitKind {
     Requests,
     RawIslTokens,
     CachedTokens,
+    ActiveDecodeRequests,
 }
 
 impl std::fmt::Display for QueueLimitKind {
@@ -49,6 +50,7 @@ impl std::fmt::Display for QueueLimitKind {
             Self::Requests => formatter.write_str("requests"),
             Self::RawIslTokens => formatter.write_str("raw_isl_tokens"),
             Self::CachedTokens => formatter.write_str("cached_tokens"),
+            Self::ActiveDecodeRequests => formatter.write_str("active_decode_requests"),
         }
     }
 }

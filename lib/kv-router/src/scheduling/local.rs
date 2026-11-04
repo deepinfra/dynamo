@@ -14,6 +14,7 @@ use super::config::RouterQueuePolicy;
 use super::overlap::OverlapSignals;
 use super::overlap_refresh::{NoopOverlapScoresRefresh, OverlapScoresRefresh};
 use super::policy_config::PolicyProfile;
+use super::policy_queue::QueueRejection;
 use super::prefill_load::PrefillLoadEstimator;
 use super::queue::{
     ClassQueueStats, SchedulerBookingCleanup, SchedulerBookingDescriptor, SchedulerQueue,
@@ -53,6 +54,7 @@ where
     queue_updates: watch::Sender<()>,
     track_prefill_tokens_default: bool,
     worker_type: &'static str,
+    profile: PolicyProfile,
 }
 
 impl<P, C, Sel, RF> LocalScheduler<P, C, Sel, RF>
@@ -206,7 +208,7 @@ where
         let queue = Arc::new(SchedulerQueue::new_with_policy_profile(
             Arc::clone(&slots),
             workers_with_configs.clone(),
-            profile,
+            profile.clone(),
             block_size,
             selector,
             prefill_load_estimator,
@@ -310,7 +312,26 @@ where
             queue_updates,
             track_prefill_tokens_default,
             worker_type,
+            profile,
         })
+    }
+
+    /// Per-class decode-slot gate: rejects when every registered rank already holds
+    /// the request class's `max_active_decode_requests_per_rank` active bookings.
+    pub fn active_decode_rejection(
+        &self,
+        policy_class: Option<&str>,
+        isl_tokens: usize,
+    ) -> Option<QueueRejection> {
+        let class = self
+            .profile
+            .class(self.profile.resolve_class_index(policy_class, isl_tokens));
+        class.max_active_decode_requests_per_rank?;
+        class.active_decode_rejection(self.slots.active_request_counts().into_values())
+    }
+
+    pub fn active_request_counts(&self) -> HashMap<WorkerWithDpRank, usize> {
+        self.slots.active_request_counts()
     }
 
     pub async fn schedule_request(
@@ -1052,6 +1073,104 @@ mod tests {
             .expect("scheduled worker should appear in potential loads");
         assert_eq!(worker_load.active_requests, 1);
 
+        cancel_token.cancel();
+    }
+
+    fn book(worker_id: WorkerId, request_id: &str) -> SequenceRequest {
+        SequenceRequest {
+            request_id: request_id.to_string(),
+            token_sequence: Some(vec![1]),
+            track_prefill_tokens: false,
+            expected_output_tokens: None,
+            prefill_load_hint: None,
+            worker: WorkerWithDpRank::new(worker_id, 0),
+            lora_name: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn decode_limit_follows_bookings_per_class() {
+        let profile = super::super::policy_config::RouterPolicyConfig::from_yaml(
+            "\
+default_policy_family: standard
+uncached_isl_buckets:
+  - min_tokens: 0
+    bucket: all
+policy_classes:
+  - name: standard
+    policy_family: standard
+    cache_bucket: all
+    quantum: 1
+    max_active_decode_requests_per_rank: 2
+  - name: no-queue
+    quantum: 1
+    max_active_decode_requests_per_rank: 1
+",
+        )
+        .unwrap()
+        .resolve_profile(None, None, RouterQueuePolicy::Fcfs);
+        let workers = HashMap::from([
+            (0, SimpleWorkerConfig::default()),
+            (1, SimpleWorkerConfig::default()),
+        ]);
+        let dp_range = workers.keys().map(|&id| (id, (0, 1))).collect();
+        let slots = Arc::new(ActiveSequencesMultiWorker::new(
+            NoopSequencePublisher,
+            64,
+            dp_range,
+            false,
+            0,
+            "decode",
+        ));
+        let (_cfg_tx, cfg_rx) = watch::channel(workers);
+        let cancel_token = CancellationToken::new();
+        let scheduler = LocalScheduler::new_with_policy_profile(
+            Arc::clone(&slots),
+            cfg_rx,
+            profile,
+            64,
+            DefaultWorkerSelector::new(None, "test"),
+            None,
+            None::<Arc<NoopOverlapScoresRefresh>>,
+            None,
+            None,
+            Duration::from_secs(60),
+            false,
+            cancel_token.clone(),
+            "decode",
+            false,
+        )
+        .unwrap();
+        let rejected = |class: Option<&str>| scheduler.active_decode_rejection(class, 64);
+
+        assert!(rejected(Some("no-queue")).is_none());
+        scheduler.add_request(book(0, "a")).await.unwrap();
+        assert!(
+            rejected(Some("no-queue")).is_none(),
+            "rank 1 still has room"
+        );
+        scheduler.add_request(book(1, "b")).await.unwrap();
+        let rejection = rejected(Some("no-queue")).unwrap();
+        assert_eq!(rejection.policy_class, "no-queue");
+        assert_eq!((rejection.current, rejection.limit), (1, 1));
+        assert!(rejected(None).is_none(), "standard admitted below 2");
+
+        scheduler.add_request(book(0, "c")).await.unwrap();
+        scheduler.add_request(book(1, "d")).await.unwrap();
+        assert_eq!(rejected(None).unwrap().policy_class, "standard");
+
+        scheduler.free("c").await.unwrap();
+        assert!(rejected(None).is_none(), "a freed booking reopens the rank");
+        assert!(rejected(Some("no-queue")).is_some());
+        scheduler.free("a").await.unwrap();
+        assert!(rejected(Some("no-queue")).is_none());
+        assert_eq!(
+            scheduler.active_request_counts(),
+            HashMap::from([
+                (WorkerWithDpRank::new(0, 0), 0),
+                (WorkerWithDpRank::new(1, 0), 2)
+            ])
+        );
         cancel_token.cancel();
     }
 

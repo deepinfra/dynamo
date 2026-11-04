@@ -133,6 +133,15 @@ pub trait SequencePublisher: Send + Sync {
         tokens: usize,
     );
 
+    /// Record the router's active request count for one worker/dp_rank.
+    fn observe_active_requests(
+        &self,
+        _worker: &WorkerWithDpRank,
+        _worker_type: &str,
+        _requests: usize,
+    ) {
+    }
+
     /// Observe that a worker/dp_rank is currently registered in the router.
     fn observe_worker_registered(&self, _worker: &WorkerWithDpRank, _worker_type: &str) {}
 
@@ -571,6 +580,8 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
 
         self.publisher
             .observe_load(&worker, self.worker_type, active_blocks, active_tokens);
+        self.publisher
+            .observe_active_requests(&worker, self.worker_type, load.active_requests);
 
         SchedulerLoadSnapshot {
             worker,

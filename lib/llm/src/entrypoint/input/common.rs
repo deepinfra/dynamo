@@ -320,11 +320,11 @@ where
         session_affinity_mode,
         load_context,
     )?;
-    if router_mode.is_kv_routing() && prefill_router.conditional_disagg_enabled() {
-        prefill_router
-            .set_decode_routing_host(routing_host.clone())
-            .context("install conditional-disagg decode RoutingHost")?;
-    }
+    // Always installed: the policy-class decode-slot gate reads the decode load from it
+    // even when conditional disagg is off.
+    prefill_router
+        .set_decode_routing_host(routing_host.clone())
+        .context("install decode RoutingHost")?;
     let backend_engine: ServiceEngine<_, _> = routing_host;
     Ok(PreprocessedRouting {
         backend_engine,

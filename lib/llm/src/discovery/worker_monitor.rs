@@ -16,7 +16,7 @@ use crate::http::service::metrics::{
     WORKER_LAST_INPUT_SEQUENCE_TOKENS_GAUGE, WORKER_LAST_INTER_TOKEN_LATENCY_GAUGE,
     WORKER_LAST_TIME_TO_FIRST_TOKEN_GAUGE, prune_worker_timing_gauges,
 };
-use crate::kv_router::metrics::WORKER_LOAD_METRICS;
+use crate::kv_router::metrics::{WORKER_LOAD_METRICS, remove_worker_active_requests};
 use crate::kv_router::routing_load::SchedulerLoadReceiver;
 use crate::kv_router::{KV_METRICS_SUBJECT, RouterLoadSource};
 use dynamo_runtime::component::Client;
@@ -41,6 +41,7 @@ fn cleanup_worker_metrics(worker_id: u64, dp_ranks: &[u32], worker_type: &str) {
         let labels = &[worker_id_str.as_str(), dp_rank_str.as_str(), worker_type];
         let _ = m.active_decode_blocks.remove_label_values(labels);
         let _ = m.active_prefill_tokens.remove_label_values(labels);
+        remove_worker_active_requests(worker_id, *dp_rank, worker_type);
         let _ = WORKER_LAST_TIME_TO_FIRST_TOKEN_GAUGE.remove_label_values(labels);
         let _ = WORKER_LAST_INPUT_SEQUENCE_TOKENS_GAUGE.remove_label_values(labels);
         let _ = WORKER_LAST_INTER_TOKEN_LATENCY_GAUGE.remove_label_values(labels);

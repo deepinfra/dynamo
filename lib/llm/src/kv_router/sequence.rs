@@ -35,7 +35,10 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use super::metrics::{RouterWorkerStatusMetrics, WORKER_LOAD_METRICS};
+use super::metrics::{
+    RouterWorkerStatusMetrics, WORKER_LOAD_METRICS, observe_worker_active_requests,
+    remove_worker_active_requests,
+};
 use crate::kv_router::{ACTIVE_SEQUENCES_SUBJECT, SchedulerLoadSender};
 use crate::local_model::runtime_config::ModelRuntimeConfig;
 #[cfg(test)]
@@ -304,6 +307,15 @@ impl SequencePublisher for RuntimeSequencePublisher {
         );
     }
 
+    fn observe_active_requests(
+        &self,
+        worker: &WorkerWithDpRank,
+        worker_type: &str,
+        requests: usize,
+    ) {
+        observe_worker_active_requests(worker.worker_id, worker.dp_rank, worker_type, requests);
+    }
+
     fn observe_worker_registered(&self, worker: &WorkerWithDpRank, worker_type: &str) {
         self.worker_status_metrics
             .set_registered(worker.worker_id, worker.dp_rank, worker_type);
@@ -312,6 +324,7 @@ impl SequencePublisher for RuntimeSequencePublisher {
     fn observe_worker_removed(&self, worker: &WorkerWithDpRank, worker_type: &str) {
         self.worker_status_metrics
             .remove_worker(worker.worker_id, worker.dp_rank, worker_type);
+        remove_worker_active_requests(worker.worker_id, worker.dp_rank, worker_type);
     }
 }
 

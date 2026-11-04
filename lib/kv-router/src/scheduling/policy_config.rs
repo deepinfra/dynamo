@@ -9,6 +9,7 @@ use serde::Deserialize;
 use thiserror::Error;
 
 use super::config::RouterQueuePolicy;
+use super::policy_queue::{QueueLimitKind, QueueRejection};
 use super::worker_selection_config::RawWorkerSelectionConfig;
 pub use super::worker_selection_config::{WorkerSelectionConfig, WorkerSelectionInstance};
 
@@ -42,6 +43,9 @@ pub struct PolicyClassConfig {
     pub request_queue_limit_per_worker: Option<usize>,
     pub raw_isl_token_queue_limit_per_worker: Option<usize>,
     pub cached_token_queue_limit_per_worker: Option<usize>,
+    /// Admit a request only while some decode rank has fewer active requests
+    /// than this (the router's own per-(worker, dp_rank) bookings).
+    pub max_active_decode_requests_per_rank: Option<usize>,
 }
 
 impl PolicyClassConfig {
@@ -57,6 +61,22 @@ impl PolicyClassConfig {
             (active_tokens as f64) > threshold * (max_batched_tokens as f64)
         });
         absolute_busy || fractional_busy
+    }
+
+    /// Rejects when every rank in `active_per_rank` already holds the class limit.
+    /// No limit or no ranks admits, so routing reports a missing decode set as before.
+    pub fn active_decode_rejection(
+        &self,
+        active_per_rank: impl IntoIterator<Item = usize>,
+    ) -> Option<QueueRejection> {
+        let limit = self.max_active_decode_requests_per_rank?;
+        let least_loaded = active_per_rank.into_iter().min()?;
+        (least_loaded >= limit).then(|| QueueRejection {
+            policy_class: self.name.clone(),
+            limit_kind: QueueLimitKind::ActiveDecodeRequests,
+            current: least_loaded,
+            limit,
+        })
     }
 }
 
@@ -123,6 +143,7 @@ impl PolicyProfile {
             request_queue_limit_per_worker: None,
             raw_isl_token_queue_limit_per_worker: None,
             cached_token_queue_limit_per_worker: None,
+            max_active_decode_requests_per_rank: None,
         };
         Self {
             classes: vec![class],
@@ -327,6 +348,8 @@ struct RawPolicyClassConfig {
     raw_isl_token_queue_limit_per_worker: Option<usize>,
     #[serde(default)]
     cached_token_queue_limit_per_worker: Option<usize>,
+    #[serde(default)]
+    max_active_decode_requests_per_rank: Option<usize>,
 }
 
 fn resolve_profile(
@@ -481,6 +504,12 @@ fn resolve_policy_class(
             raw.name
         )));
     }
+    if raw.max_active_decode_requests_per_rank == Some(0) {
+        return Err(RouterPolicyConfigError::Validation(format!(
+            "{location} policy class {:?} max_active_decode_requests_per_rank must be greater than zero",
+            raw.name
+        )));
+    }
 
     let binding = match (raw.policy_family.as_deref(), raw.cache_bucket.as_deref()) {
         (None, None) => ClassBinding::Explicit,
@@ -515,6 +544,7 @@ fn resolve_policy_class(
             request_queue_limit_per_worker: raw.request_queue_limit_per_worker,
             raw_isl_token_queue_limit_per_worker: raw.raw_isl_token_queue_limit_per_worker,
             cached_token_queue_limit_per_worker: raw.cached_token_queue_limit_per_worker,
+            max_active_decode_requests_per_rank: raw.max_active_decode_requests_per_rank,
         },
         binding,
     })
@@ -967,6 +997,143 @@ policy_classes:
                 "unexpectedly accepted {yaml}"
             );
         }
+    }
+
+    /// `deepinfra/dynamo_router_policy.yaml` merged with the V4.1 frontend row's partial, as
+    /// model-manager writes it to `DYN_ROUTER_POLICY_CONFIG` (byte for byte).
+    const V41_MERGED_POLICY: &str = "\
+default_policy_family: standard
+uncached_isl_buckets:
+- min_tokens: 0
+  bucket: all
+policy_classes:
+- name: standard
+  policy_family: standard
+  cache_bucket: all
+  queue_policy: fcfs
+  quantum: 1
+  prefill_busy_threshold_frac: 12
+  request_queue_limit_per_worker: 16
+  max_active_decode_requests_per_rank: 384
+- name: no-queue
+  queue_policy: fcfs
+  quantum: 1
+  prefill_busy_threshold_frac: 11
+  request_queue_limit_per_worker: 3
+  max_active_decode_requests_per_rank: 256
+";
+
+    /// The repo profile as shipped, with no decode limits.
+    const REPO_POLICY: &str = "\
+default_policy_family: standard
+uncached_isl_buckets:
+  - min_tokens: 0
+    bucket: all
+policy_classes:
+  - name: standard
+    policy_family: standard
+    cache_bucket: all
+    queue_policy: fcfs
+    quantum: 1
+    prefill_busy_threshold_frac: 3
+  - name: no-queue
+    queue_policy: fcfs
+    quantum: 1
+    prefill_busy_threshold_frac: 3
+    request_queue_limit_per_worker: 0
+";
+
+    #[test]
+    fn v41_merged_policy_parses_with_per_class_decode_limits() {
+        let config = RouterPolicyConfig::from_yaml(V41_MERGED_POLICY).unwrap();
+        let profile = config.resolve_profile(
+            Some("deepseek-ai/DeepSeek-V4.1-Flash"),
+            Some(3.0),
+            RouterQueuePolicy::Fcfs,
+        );
+
+        let standard = profile.class(profile.resolve_class_index(None, 100_000));
+        assert_eq!(standard.name, "standard");
+        assert_eq!(standard.prefill_busy_threshold_frac, Some(12.0));
+        assert_eq!(standard.request_queue_limit_per_worker, Some(16));
+        assert_eq!(standard.max_active_decode_requests_per_rank, Some(384));
+
+        let no_queue = profile.class(profile.resolve_class_index(Some("no-queue"), 0));
+        assert_eq!(no_queue.name, "no-queue");
+        assert_eq!(no_queue.prefill_busy_threshold_frac, Some(11.0));
+        assert_eq!(no_queue.request_queue_limit_per_worker, Some(3));
+        assert_eq!(no_queue.max_active_decode_requests_per_rank, Some(256));
+
+        assert_eq!(
+            profile
+                .class(profile.resolve_class_index(Some("unknown"), 0))
+                .name,
+            "standard"
+        );
+    }
+
+    #[test]
+    fn absent_decode_limit_keeps_existing_profiles_unlimited() {
+        let config = RouterPolicyConfig::from_yaml(REPO_POLICY).unwrap();
+        let profile = config.resolve_profile(None, None, RouterQueuePolicy::Fcfs);
+        for class in profile.classes() {
+            assert_eq!(class.max_active_decode_requests_per_rank, None);
+            assert_eq!(
+                class.active_decode_rejection([usize::MAX, usize::MAX]),
+                None
+            );
+        }
+        let synthetic = PolicyProfile::synthetic(Some(3.0), RouterQueuePolicy::Fcfs);
+        assert_eq!(
+            synthetic
+                .default_class()
+                .active_decode_rejection([usize::MAX]),
+            None
+        );
+    }
+
+    #[test]
+    fn decode_limit_rejects_per_class_only_when_every_rank_is_full() {
+        let config = RouterPolicyConfig::from_yaml(V41_MERGED_POLICY).unwrap();
+        let profile = config.resolve_profile(None, None, RouterQueuePolicy::Fcfs);
+        let standard = profile.class(profile.resolve_class_index(None, 0));
+        let no_queue = profile.class(profile.resolve_class_index(Some("no-queue"), 0));
+
+        let one_rank_with_room = [384, 255, 384];
+        assert_eq!(no_queue.active_decode_rejection(one_rank_with_room), None);
+        assert_eq!(standard.active_decode_rejection(one_rank_with_room), None);
+
+        let between_limits = [256, 300, 383];
+        let rejection = no_queue.active_decode_rejection(between_limits).unwrap();
+        assert_eq!(rejection.policy_class, "no-queue");
+        assert_eq!(rejection.limit_kind, QueueLimitKind::ActiveDecodeRequests);
+        assert_eq!((rejection.current, rejection.limit), (256, 256));
+        assert_eq!(
+            standard.active_decode_rejection(between_limits),
+            None,
+            "standard is still admitted while no-queue is refused"
+        );
+
+        let full = [384, 400, 384];
+        let rejection = standard.active_decode_rejection(full).unwrap();
+        assert_eq!(rejection.policy_class, "standard");
+        assert_eq!((rejection.current, rejection.limit), (384, 384));
+        assert!(no_queue.active_decode_rejection(full).is_some());
+
+        assert_eq!(
+            standard.active_decode_rejection(std::iter::empty()),
+            None,
+            "no decode ranks is left to routing, which reports it"
+        );
+    }
+
+    #[test]
+    fn rejects_zero_decode_limit() {
+        let yaml = REPO_POLICY.replace(
+            "    request_queue_limit_per_worker: 0\n",
+            "    request_queue_limit_per_worker: 0\n    max_active_decode_requests_per_rank: 0\n",
+        );
+        assert!(RouterPolicyConfig::from_yaml(&yaml).is_err());
     }
 
     #[test]

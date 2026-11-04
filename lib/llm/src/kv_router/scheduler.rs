@@ -18,7 +18,10 @@ pub use dynamo_kv_router::selector::DefaultWorkerSelector;
 use dynamo_kv_router::selector::WorkerSelector as WorkerSelectorTrait;
 
 use super::SchedulerLoadSender;
-use super::metrics::{ROUTER_QUEUE_METRICS, RouterQueueMetricHandles, RouterRequestMetrics};
+use super::metrics::{
+    DECODE_ADMISSION_REJECTIONS, ROUTER_QUEUE_METRICS, RouterQueueMetricHandles,
+    RouterRequestMetrics,
+};
 use super::sequence::{
     DeferredReplicaRequestLeaseObserver, RuntimeSequencePublisher, SequenceError, SequenceRequest,
     create_multi_worker_sequences_with_observer,
@@ -32,6 +35,7 @@ use dynamo_kv_router::{
     config::{KvRouterConfig, RouterConfigOverride},
     multi_worker_sequence::ReplicaRequestLeaseObserver,
     protocols::{RoutingConstraints, WorkerId, WorkerWithDpRank},
+    scheduling::QueueRejection,
 };
 use dynamo_runtime::component::Endpoint;
 use dynamo_runtime::traits::DistributedRuntimeProvider;
@@ -50,6 +54,7 @@ where
     replica_request_lease_observer: Option<Arc<DeferredReplicaRequestLeaseObserver>>,
     queue_metrics: Vec<RouterQueueMetricHandles>,
     queue_metric_indices: HashMap<String, usize>,
+    metric_model: String,
 }
 
 impl<Sel, RF> KvScheduler<Sel, RF>
@@ -269,7 +274,28 @@ where
             replica_request_lease_observer,
             queue_metrics,
             queue_metric_indices,
+            metric_model: metric_model.to_string(),
         })
+    }
+
+    /// Decode admission for a request of `policy_class`: rejects (and counts) when every
+    /// registered rank already holds the class's `max_active_decode_requests_per_rank`.
+    pub fn active_decode_rejection(
+        &self,
+        policy_class: Option<&str>,
+        isl_tokens: usize,
+    ) -> Option<QueueRejection> {
+        let rejection = self
+            .inner
+            .active_decode_rejection(policy_class, isl_tokens)?;
+        DECODE_ADMISSION_REJECTIONS
+            .with_label_values(&[
+                self.metric_model.as_str(),
+                rejection.policy_class.as_str(),
+                "active_decode_requests",
+            ])
+            .inc();
+        Some(rejection)
     }
 
     pub async fn schedule_request(
@@ -445,6 +471,7 @@ where
                 dynamo_kv_router::scheduling::QueueLimitKind::CachedTokens => {
                     metrics.cached_token_limit_rejections.inc();
                 }
+                dynamo_kv_router::scheduling::QueueLimitKind::ActiveDecodeRequests => {}
             }
         }
         self.update_queue_metrics();

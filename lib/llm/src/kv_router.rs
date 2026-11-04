@@ -1971,6 +1971,16 @@ where
         self.block_size
     }
 
+    /// See [`KvScheduler::active_decode_rejection`].
+    pub fn active_decode_rejection(
+        &self,
+        policy_class: Option<&str>,
+        isl_tokens: usize,
+    ) -> Option<scheduling::QueueRejection> {
+        self.scheduler
+            .active_decode_rejection(policy_class, isl_tokens)
+    }
+
     /// Compute the overlap blocks for a given token sequence and worker.
     /// This queries the indexer to find the effective weighted cache hit.
     pub async fn get_overlap_blocks(

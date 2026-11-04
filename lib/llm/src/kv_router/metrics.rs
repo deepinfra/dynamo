@@ -544,6 +544,41 @@ pub static WORKER_LOAD_METRICS: LazyLock<WorkerLoadMetrics> = LazyLock::new(|| W
     .expect("Failed to create worker_active_prefill_tokens gauge"),
 });
 
+/// Router-booked active requests per worker/dp_rank, published with the load gauges.
+pub static WORKER_ACTIVE_REQUESTS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    IntGaugeVec::new(
+        Opts::new(
+            format!("{}_worker_active_requests", name_prefix::FRONTEND),
+            "Active requests the router has booked per worker",
+        ),
+        &[labels::WORKER_ID, labels::DP_RANK, labels::WORKER_TYPE],
+    )
+    .expect("Failed to create worker_active_requests gauge")
+});
+
+pub fn observe_worker_active_requests(
+    worker_id: u64,
+    dp_rank: u32,
+    worker_type: &str,
+    requests: usize,
+) {
+    let worker_id = worker_id.to_string();
+    let dp_rank = dp_rank.to_string();
+    WORKER_ACTIVE_REQUESTS
+        .with_label_values(&[worker_id.as_str(), dp_rank.as_str(), worker_type])
+        .set(requests as i64);
+}
+
+pub fn remove_worker_active_requests(worker_id: u64, dp_rank: u32, worker_type: &str) {
+    let worker_id = worker_id.to_string();
+    let dp_rank = dp_rank.to_string();
+    let _ = WORKER_ACTIVE_REQUESTS.remove_label_values(&[
+        worker_id.as_str(),
+        dp_rank.as_str(),
+        worker_type,
+    ]);
+}
+
 /// Register the worker load gauges with the given Prometheus registry.
 /// Called during frontend HTTP service setup (`service_v2.rs`), served on port 8000.
 pub fn register_worker_load_metrics(
@@ -552,6 +587,7 @@ pub fn register_worker_load_metrics(
     let m = &*WORKER_LOAD_METRICS;
     registry.register(Box::new(m.active_decode_blocks.clone()))?;
     registry.register(Box::new(m.active_prefill_tokens.clone()))?;
+    registry.register(Box::new(WORKER_ACTIVE_REQUESTS.clone()))?;
     Ok(())
 }
 
@@ -645,6 +681,21 @@ impl RouterQueueMetrics {
     }
 }
 
+/// Requests refused before dispatch by a policy class's decode admission limit.
+pub static DECODE_ADMISSION_REJECTIONS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            format!(
+                "{}_router_decode_admission_rejections_total",
+                name_prefix::FRONTEND
+            ),
+            "Requests rejected because every decode rank was at the class's active-request limit",
+        ),
+        &[labels::MODEL, "policy_class", "reason"],
+    )
+    .expect("Failed to create router_decode_admission_rejections_total counter")
+});
+
 /// Register the router queue gauge with the given Prometheus registry.
 /// Called during frontend HTTP service setup (`service_v2.rs`), served on port 8000.
 pub fn register_router_queue_metrics(
@@ -655,6 +706,7 @@ pub fn register_router_queue_metrics(
     registry.register(Box::new(m.pending_isl_tokens.clone()))?;
     registry.register(Box::new(m.pending_cached_tokens.clone()))?;
     registry.register(Box::new(m.backpressure_total.clone()))?;
+    registry.register(Box::new(DECODE_ADMISSION_REJECTIONS.clone()))?;
     Ok(())
 }
 
