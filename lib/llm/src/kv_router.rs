@@ -58,6 +58,7 @@ pub use dynamo_kv_router::scheduling;
 
 pub(crate) mod embedded;
 pub mod encoder_router;
+pub mod ideal_cache;
 pub mod indexer;
 pub mod metrics;
 pub(crate) mod metrics_subscriber;
@@ -656,6 +657,9 @@ pub struct KvRouter {
     teardown_task_guard: Option<dynamo_runtime::engine::EngineContextGuard>,
     /// Optional session-aware logical prefix index.
     session_prefix_index: Option<Arc<SessionPrefixIndexer>>,
+    /// The ideal KV cache tracker, when on. The KV event subscription feeds it the
+    /// workers' stored blocks; routed prompts count against it.
+    ideal_cache: Option<Arc<ideal_cache::IdealCache>>,
 }
 
 fn resolve_tracking_model_name(
@@ -807,6 +811,11 @@ impl KvRouter {
             .enable_session_prefix_index
             .then(|| Arc::new(SessionPrefixIndexer::new()));
 
+        // Only prefill and aggregated routers see prompts.
+        let ideal_cache = matches!(worker_type, WorkerType::Prefill | WorkerType::Aggregated)
+            .then(|| ideal_cache::IdealCache::from_env(component))
+            .flatten();
+
         let ingress = indexer::RuntimeIngress::start(indexer::RuntimeIngressArgs {
             endpoint: &endpoint,
             kv_router_config: &kv_router_config,
@@ -820,6 +829,7 @@ impl KvRouter {
             cancellation_token: cancellation_token.clone(),
             session_prefix_index: session_prefix_index.clone(),
             shared_cache: shared_cache.clone(),
+            ideal_cache: ideal_cache.clone(),
         })
         .await?;
         let indexer = ingress.indexer().clone();
@@ -931,6 +941,12 @@ impl KvRouter {
                 endpoint: endpoint.clone(),
                 router_id: endpoint.drt().discovery().instance_id(),
                 policy_factory,
+                peer_prompts: ideal_cache
+                    .clone()
+                    .filter(|cache| cache.shares_prompts())
+                    .map(|cache| {
+                        cache as Arc<dyn dynamo_kv_router::sequences::ReplicaPromptObserver>
+                    }),
             },
             workers_with_configs.clone(),
             Some(request_leases.replica_observer()),
@@ -962,6 +978,7 @@ impl KvRouter {
             shared_cache,
             teardown_task_guard: None,
             session_prefix_index,
+            ideal_cache,
         })
     }
 
@@ -1048,6 +1065,11 @@ impl KvRouter {
 
     pub fn is_eagle(&self) -> bool {
         self.is_eagle
+    }
+
+    /// The ideal KV cache tracker, when on.
+    pub(crate) fn ideal_cache(&self) -> Option<&Arc<ideal_cache::IdealCache>> {
+        self.ideal_cache.as_ref()
     }
 
     fn approximate_lru_rank_registration(
@@ -1343,6 +1365,7 @@ impl KvRouter {
             allowed_worker_ids,
             routing_constraints,
             FindBestMatchAdmission::WithAdmission,
+            None,
         )
         .await
     }
@@ -1368,6 +1391,7 @@ impl KvRouter {
         allowed_worker_ids: Option<HashSet<WorkerId>>,
         routing_constraints: RoutingConstraints,
         admission: FindBestMatchAdmission,
+        engine_block_hashes: Option<&[u64]>,
     ) -> anyhow::Result<AdmittedFindBestMatchOutcome> {
         let start = Instant::now();
         if update_states && context_id.is_none() {
@@ -1426,6 +1450,15 @@ impl KvRouter {
                 track_active_blocks: self.kv_router_config.router_track_active_blocks,
                 return_routing_hashes: return_routing_hashes || session_index_context.is_some(),
                 replay_id: None,
+                // Peers stamp the prompt with their ideal caches' prompt stamp.
+                engine_block_hashes: engine_block_hashes.filter(|hashes| {
+                    !hashes.is_empty()
+                        && self.kv_router_config.router_replica_sync
+                        && self
+                            .ideal_cache
+                            .as_ref()
+                            .is_some_and(|cache| cache.shares_prompts())
+                }),
             })
             .await;
         if lookup.is_some_and(|lookup| lookup.shared_cache_error)
@@ -1645,6 +1678,7 @@ impl KvRouter {
                 prefill_load_hint,
                 worker,
                 lora_name,
+                engine_block_hashes: None,
             })
             .await;
         let attempt_id = match admission {
@@ -2822,6 +2856,7 @@ mod tests {
                     None,
                     RoutingConstraints::default(),
                     admission,
+                    None,
                 )
                 .await
                 .unwrap();
@@ -3007,6 +3042,7 @@ mod tests {
                     None,
                     RoutingConstraints::default(),
                     FindBestMatchAdmission::WithAdmission,
+                    None,
                 )
                 .await
                 .unwrap();
@@ -3058,6 +3094,7 @@ mod tests {
                     prefill_load_hint: None,
                     worker,
                     lora_name: None,
+                    engine_block_hashes: None,
                 })
                 .await
                 .expect("booking");
@@ -3155,6 +3192,7 @@ mod tests {
                 None,
                 RoutingConstraints::default(),
                 FindBestMatchAdmission::WithAdmission,
+                None,
             )
             .await
             .unwrap();

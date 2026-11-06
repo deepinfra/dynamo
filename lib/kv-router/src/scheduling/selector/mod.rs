@@ -787,6 +787,7 @@ mod test_support {
             routing_constraints: crate::protocols::RoutingConstraints::default(),
             shared_cache_hits: None,
             resp_tx: None,
+            engine_block_hashes: None,
         }
     }
 

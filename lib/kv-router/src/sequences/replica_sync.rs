@@ -183,7 +183,13 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
                 track_prefill_tokens,
                 expected_output_tokens,
                 prefill_load_hint,
+                engine_block_hashes,
             } => {
+                if let Some(hashes) = engine_block_hashes
+                    && let Some(observer) = self.replica_prompt_observer()
+                {
+                    observer.peer_prompt(hashes);
+                }
                 let Ok(attempt_id) = self.request_index.try_insert_request(
                     request_id.clone(),
                     event_worker,

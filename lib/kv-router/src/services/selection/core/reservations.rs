@@ -405,6 +405,7 @@ impl SelectionCore {
                 prefill_load_hint,
                 worker,
                 lora_name,
+                engine_block_hashes: None,
             })?;
         let affinity_lease = match session {
             Some((table, session_id, hold)) => {

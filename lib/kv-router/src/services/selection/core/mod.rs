@@ -39,8 +39,9 @@ use crate::scheduling::{
     narrow_allowed_worker_ids_by_lora, prefill_load_hint_from_effective_tokens,
 };
 use crate::sequences::{
-    ActiveSequencesMultiWorker, LifecycleMutationOutcome, ReplicaRequestLeaseObserver,
-    ReplicaWorkerPolicy, SequenceRequest, SequenceTrackerOptions, active_request_expiry_duration,
+    ActiveSequencesMultiWorker, LifecycleMutationOutcome, ReplicaPromptObserver,
+    ReplicaRequestLeaseObserver, ReplicaWorkerPolicy, SequenceRequest, SequenceTrackerOptions,
+    active_request_expiry_duration,
 };
 use crate::services::common::replica_sync::{
     AFFINITY_EVENT_CHANNEL_CAPACITY, AffinityMeshSink, HostReplicaSyncFactory, ReplicaInbox,
@@ -239,6 +240,8 @@ pub struct HostReplication {
     pub channels: Option<HostReplicaSyncFactory>,
     /// Owns request expiry when supplied; the partition then expires only through lifecycle events.
     pub request_leases: Option<Arc<dyn ReplicaRequestLeaseObserver>>,
+    /// Receives the engine block hashes of prompts peer routers booked.
+    pub peer_prompts: Option<Arc<dyn ReplicaPromptObserver>>,
     /// Whether peer events may create accounting before catalog discovery.
     /// This does not make an undiscovered worker eligible for selection.
     pub replica_worker_policy: ReplicaWorkerPolicy,
@@ -249,6 +252,7 @@ impl Default for HostReplication {
         Self {
             channels: None,
             request_leases: None,
+            peer_prompts: None,
             replica_worker_policy: ReplicaWorkerPolicy::RequireRegistered,
         }
     }

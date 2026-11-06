@@ -219,6 +219,7 @@ fn fixture_with_preferred_taints(
         shared_cache_hits: None,
         worker_loads,
         resp_tx: None,
+        engine_block_hashes: None,
     };
 
     (workers, request)

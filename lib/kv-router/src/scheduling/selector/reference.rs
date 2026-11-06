@@ -841,6 +841,7 @@ mod tests {
             routing_constraints: crate::protocols::RoutingConstraints::default(),
             shared_cache_hits: None,
             resp_tx: None,
+            engine_block_hashes: None,
         };
         let mut selected = [false; 3];
 
@@ -1248,6 +1249,7 @@ mod tests {
             },
             shared_cache_hits: None,
             resp_tx: None,
+            engine_block_hashes: None,
         };
 
         let result = selector.select_worker(WorkerSelectionInput::configured(
@@ -1307,6 +1309,7 @@ mod tests {
             },
             shared_cache_hits: None,
             resp_tx: None,
+            engine_block_hashes: None,
         };
 
         let result = selector
@@ -1384,6 +1387,7 @@ mod tests {
                 },
                 shared_cache_hits: None,
                 resp_tx: None,
+                engine_block_hashes: None,
             };
 
             let result = selector
@@ -1459,6 +1463,7 @@ mod tests {
             },
             shared_cache_hits: None,
             resp_tx: None,
+            engine_block_hashes: None,
         };
 
         let result = selector
@@ -1530,6 +1535,7 @@ mod tests {
             },
             shared_cache_hits: None,
             resp_tx: None,
+            engine_block_hashes: None,
         };
 
         let result = selector
@@ -1614,6 +1620,7 @@ mod tests {
             routing_constraints: crate::protocols::RoutingConstraints::default(),
             shared_cache_hits: Some(shared_hits),
             resp_tx: Some(tx),
+            engine_block_hashes: None,
         };
 
         let result = selector
@@ -1692,6 +1699,7 @@ mod tests {
             routing_constraints: crate::protocols::RoutingConstraints::default(),
             shared_cache_hits: None,
             resp_tx: Some(tx),
+            engine_block_hashes: None,
         };
 
         let result = selector
@@ -1994,6 +2002,7 @@ mod tests {
             routing_constraints: crate::protocols::RoutingConstraints::default(),
             shared_cache_hits: None,
             resp_tx: Some(tx),
+            engine_block_hashes: None,
         };
 
         let result = selector
@@ -2099,6 +2108,7 @@ mod tests {
             routing_constraints: crate::protocols::RoutingConstraints::default(),
             shared_cache_hits: None,
             resp_tx: Some(tx),
+            engine_block_hashes: None,
         };
 
         let result = selector

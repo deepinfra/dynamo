@@ -301,6 +301,7 @@ impl SlotTrackerRegistry {
                 prefill_load_hint,
                 worker,
                 lora_name: None,
+                engine_block_hashes: None,
             },
             Instant::now(),
         )?;
@@ -523,6 +524,7 @@ mod tests {
                     track_prefill_tokens: false,
                     expected_output_tokens: None,
                     prefill_load_hint: None,
+                    engine_block_hashes: None,
                 },
                 router_id,
                 lora_name: None,

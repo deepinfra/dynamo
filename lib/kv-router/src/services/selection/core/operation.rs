@@ -48,6 +48,9 @@ pub struct SelectionOperation<'a> {
     /// Cache the inputs under this id for a later `create_reservation` replay
     /// (unbooked admissions only).
     pub replay_id: Option<String>,
+    /// The prompt's full blocks hashed as the workers hash them, sent to peer
+    /// routers with the booking for their ideal KV cache trackers.
+    pub engine_block_hashes: Option<&'a [u64]>,
 }
 
 pub enum SelectionAdmission {
