@@ -2952,7 +2952,8 @@ async fn chat_completions(
             request.chat_template_args.as_ref(),
         );
     let parsing_options = parsing_options
-        .with_move_reasoning_to_content_when_empty(move_reasoning_to_content_when_empty);
+        .with_move_reasoning_to_content_when_empty(move_reasoning_to_content_when_empty)
+        .with_unified_prompt_state(&mut request);
 
     // Computed before `request` moves into `generate`. Only a stream that can
     // withhold every data frame needs forced keep-alive frames.
@@ -3598,7 +3599,8 @@ async fn responses(
             request.chat_template_args.as_ref(),
         );
     let parsing_options = parsing_options
-        .with_move_reasoning_to_content_when_empty(move_reasoning_to_content_when_empty);
+        .with_move_reasoning_to_content_when_empty(move_reasoning_to_content_when_empty)
+        .with_unified_prompt_state(&mut request);
 
     // Computed before `request` moves into `generate`. Responses streams use
     // the same force-nonempty deferral as chat completions and therefore need

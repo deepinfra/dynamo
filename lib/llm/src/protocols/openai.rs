@@ -451,6 +451,13 @@ pub struct ParsingOptions {
     /// round-tripped, so it is skipped rather than wired into the wire format.
     #[serde(skip)]
     pub tools: Vec<ToolDefinition>,
+
+    /// Filled by the in-process preprocessor with the request's rendered-prompt
+    /// channel state, read by the batch aggregator after the stream ends. Unset when
+    /// preprocessing ran elsewhere.
+    #[serde(skip)]
+    pub(crate) unified_prompt_state:
+        Option<chat_completions::unified_parser::UnifiedPromptStateCell>,
 }
 
 impl Default for ParsingOptions {
@@ -473,6 +480,7 @@ impl ParsingOptions {
             exclude_tools_when_tool_choice_none:
                 crate::local_model::runtime_config::default_exclude_tools_when_tool_choice_none(),
             tools: Vec::new(),
+            unified_prompt_state: None,
         }
     }
 
@@ -533,6 +541,26 @@ impl ParsingOptions {
     pub fn with_move_reasoning_to_content_when_empty(mut self, enabled: bool) -> Self {
         self.move_reasoning_to_content_when_empty = enabled;
         self
+    }
+
+    /// Share a fresh prompt-state cell with the preprocessor through `context`.
+    pub(crate) fn with_unified_prompt_state<T: Send + Sync + 'static>(
+        mut self,
+        context: &mut dynamo_runtime::pipeline::Context<T>,
+    ) -> Self {
+        let cell = chat_completions::unified_parser::UnifiedPromptStateCell::default();
+        context.insert(
+            chat_completions::unified_parser::UNIFIED_PROMPT_STATE_CONTEXT_KEY,
+            cell.clone(),
+        );
+        self.unified_prompt_state = Some(cell);
+        self
+    }
+
+    pub(crate) fn recorded_unified_prompt_state(
+        &self,
+    ) -> Option<chat_completions::unified_parser::UnifiedPromptState> {
+        self.unified_prompt_state.as_ref()?.get().copied()
     }
 }
 

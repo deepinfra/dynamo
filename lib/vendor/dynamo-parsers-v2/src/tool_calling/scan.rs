@@ -412,6 +412,10 @@ pub(crate) struct ReasoningSpec {
     /// thought rather than emitted as reasoning text. `None` for families whose
     /// opener carries no label.
     pub start_label: Option<&'static str>,
+    /// Strip a bare `end` outside reasoning even when the request disabled the
+    /// reasoning channel (`Response` starting state), the way vLLM's DeepSeek V4
+    /// parser absorbs THINK_END in CONTENT state. Matched as a token, not quote-aware.
+    pub absorb_end_without_reasoning: bool,
 }
 
 /// Per-family hook: parse one complete invoke (opener..closer inclusive) into
@@ -889,7 +893,7 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
         let reasoning_close = self
             .reasoning
             .as_ref()
-            .filter(|_| self.reasoning_enabled)
+            .filter(|reasoning| self.reasoning_enabled || reasoning.absorb_end_without_reasoning)
             .and_then(|reasoning| {
                 self.buffer
                     .find(reasoning.end)
@@ -913,6 +917,12 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
             .filter(|_| self.reasoning_enabled)
             .map(|reasoning| {
                 marker_prefix_suffix_len(&self.buffer, [reasoning.start, reasoning.end])
+            })
+            .or_else(|| {
+                self.reasoning
+                    .as_ref()
+                    .filter(|reasoning| reasoning.absorb_end_without_reasoning)
+                    .map(|reasoning| marker_prefix_suffix_len(&self.buffer, [reasoning.end]))
             })
             .unwrap_or_default();
         let invoke = self
@@ -1615,6 +1625,7 @@ mod tests {
             forced_start: true,
             start_label: None,
             preserve_special_tokens: false,
+            absorb_end_without_reasoning: false,
         });
 
         scanner.set_reasoning_mode(true, Some(false));

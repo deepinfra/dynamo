@@ -522,7 +522,7 @@ async fn anthropic_messages(
             .or_insert(serde_json::Value::Bool(false));
     }
 
-    let request = context.map(|_req| chat_request);
+    let mut request = context.map(|_req| chat_request);
 
     // Anthropic requests are converted to the same chat request contract. Keep
     // parser activation identical to the OpenAI Chat Completions and Responses
@@ -544,7 +544,8 @@ async fn anthropic_messages(
             request.chat_template_args.as_ref(),
         );
     let parsing_options = parsing_options
-        .with_move_reasoning_to_content_when_empty(move_reasoning_to_content_when_empty);
+        .with_move_reasoning_to_content_when_empty(move_reasoning_to_content_when_empty)
+        .with_unified_prompt_state(&mut request);
 
     // Computed before `request` moves into `generate`. Only a stream that can
     // withhold every data frame needs forced keep-alive frames.

@@ -38,6 +38,7 @@ pub(crate) fn deepseek_v41_unified(_tools: &[Tool]) -> Box<dyn UnifiedParser> {
         start: "<think>",
         end: "</think>",
         preserve_special_tokens: true,
+        absorb_end_without_reasoning: true,
         ..Default::default()
     });
     Box::new(VllmWhitespace::new(Box::new(GuidedRouted::new(
@@ -568,6 +569,38 @@ mod tests {
         ] {
             assert_every_split(&input, UnifiedParserStartingState::Reasoning, expected);
         }
+    }
+
+    #[test]
+    fn bare_think_end_is_absorbed_in_response_state_like_vllm() {
+        let text = |text: &str| vec![UnifiedEvent::Text { text: text.into() }];
+        for (input, expected) in [
+            ("A.</think>B", text("A.B")),
+            ("Answer: I.</think>To determine", text("Answer: I.To determine")),
+            ("say \"x</think>y\" ok", text("say \"xy\" ok")),
+            ("it's `a</think>b` and 'c'", text("it's `ab` and 'c'")),
+            ("</think>lead", text("lead")),
+            ("tail</think>", text("tail")),
+            ("Use <think> literally", text("Use <think> literally")),
+        ] {
+            assert_every_split(input, UnifiedParserStartingState::Response, expected);
+        }
+    }
+
+    #[test]
+    fn think_end_inside_tool_arguments_stays_data_in_response_state() {
+        let input = "x</think><｜DSML｜ calls><｜DSML｜ invoke name=\"run\"><｜DSML｜ parameter name=\"text\" string=\"true\">a</think>b</｜DSML｜ parameter></｜DSML｜ invoke></｜DSML｜ calls>";
+        assert_every_split(
+            input,
+            UnifiedParserStartingState::Response,
+            vec![
+                UnifiedEvent::Text { text: "x".into() },
+                UnifiedEvent::ToolCall {
+                    name: "run".into(),
+                    arguments: serde_json::json!({"text": "a</think>b"}),
+                },
+            ],
+        );
     }
 
     #[test]

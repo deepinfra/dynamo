@@ -4721,6 +4721,7 @@ mod tests {
             forced_start: false,
             start_label: None,
             preserve_special_tokens: false,
+            absorb_end_without_reasoning: false,
         });
 
         assert_eq!(
@@ -4752,6 +4753,7 @@ mod tests {
                 forced_start: false,
                 start_label: None,
                 preserve_special_tokens: false,
+                absorb_end_without_reasoning: false,
             }),
             GuidedGrammar {
                 control_markers: vec!["<tool_call>".into(), "</tool_call>".into()],

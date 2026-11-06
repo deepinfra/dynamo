@@ -7033,6 +7033,18 @@ impl
         )?;
         let tool_processing_route =
             self.tool_processing_route(&request, &guided_tool_constraint)?;
+        if let Ok(Some(cell)) = context
+            .get_optional::<crate::protocols::openai::chat_completions::unified_parser::UnifiedPromptStateCell>(
+                crate::protocols::openai::chat_completions::unified_parser::UNIFIED_PROMPT_STATE_CONTEXT_KEY,
+            )
+        {
+            let _ = cell.set(
+                crate::protocols::openai::chat_completions::unified_parser::UnifiedPromptState {
+                    prompt_injected_reasoning,
+                    stream_parsed: matches!(tool_processing_route, ToolProcessingRoute::Unified(_)),
+                },
+            );
+        }
         validate_legacy_jail_nvext_choice_count(
             request.inner.n.unwrap_or(1),
             request

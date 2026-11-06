@@ -492,6 +492,7 @@ impl DeltaAggregator {
             parsing_options.reasoning_parser.as_deref(),
         );
         if let Some(family) = qwen3_unified_family {
+            let prompt_state = parsing_options.recorded_unified_prompt_state();
             for choice in aggregator.choices.values_mut() {
                 if choice.text.is_empty()
                     || choice
@@ -501,11 +502,12 @@ impl DeltaAggregator {
                 {
                     continue;
                 }
-                match super::unified_parser::parse_complete(
+                match super::unified_parser::parse_complete_with_prompt_state(
                     family,
                     &choice.text,
                     &parsing_options.guided_tool_constraint,
                     &parsing_options.tools,
+                    prompt_state,
                 ) {
                     Ok(parsed) => {
                         choice.text = parsed.text;

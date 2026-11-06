@@ -107,6 +107,7 @@ pub(crate) fn gemma4_unified(tools: &[Tool]) -> Box<dyn UnifiedParser> {
             // one, so the stream starts in visible content (policy P5).
             forced_start: false,
             preserve_special_tokens: true,
+            absorb_end_without_reasoning: false,
         }))
         .with_guided_prefix_policy(guided_call_prefix),
     ))

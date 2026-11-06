@@ -185,6 +185,46 @@ pub(crate) fn stream_prefill(
     }
 }
 
+/// Request-context key under which the HTTP handler shares a [`UnifiedPromptStateCell`]
+/// with the in-process preprocessor, so the batch aggregator learns the request's
+/// rendered-prompt channel instead of guessing it from the output text.
+pub(crate) const UNIFIED_PROMPT_STATE_CONTEXT_KEY: &str = "llm.unified_prompt_state";
+
+/// One request's channel facts, recorded by the preprocessor for the batch aggregator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnifiedPromptState {
+    /// The rendered prompt ended inside the family's reasoning opener.
+    pub prompt_injected_reasoning: bool,
+    /// The unified stream adapter already split this request's output starting from
+    /// `stream_prefill(family, prompt_injected_reasoning)`, so the aggregated text is
+    /// the content channel.
+    pub stream_parsed: bool,
+}
+
+/// Write-once slot the preprocessor fills and the aggregator reads after the stream.
+pub type UnifiedPromptStateCell = std::sync::Arc<std::sync::OnceLock<UnifiedPromptState>>;
+
+/// The batch path's starting state. DeepSeek V4.1 takes it from the request, as the
+/// streaming path does, when the preprocessor recorded it; reading it back off the
+/// output (`detect_prefill`) moves the text before a bare mid-answer `</think>` into
+/// reasoning, and its quote heuristic can leave the closer as literal text, where
+/// vLLM's deepseek_v41 parser absorbs it. Other families, and requests whose state was
+/// not recorded, keep `detect_prefill`.
+fn batch_prefill(
+    family: &str,
+    content: &str,
+    prompt_state: Option<UnifiedPromptState>,
+) -> anyhow::Result<UnifiedParserStartingState> {
+    match prompt_state {
+        Some(state) if family == DEEPSEEK_V41_UNIFIED_FAMILY => Ok(if state.stream_parsed {
+            UnifiedParserStartingState::Response
+        } else {
+            stream_prefill(family, state.prompt_injected_reasoning)
+        }),
+        _ => detect_prefill(family, content),
+    }
+}
+
 /// Resolve a `Reasoning`-prefill choice's ACTUAL starting state when guided JSON is
 /// installed, from the shape of that choice's first content-bearing chunk.
 ///
@@ -783,6 +823,23 @@ pub(crate) fn parse_complete(
     guided_tool_constraint: &GuidedToolConstraint,
     tool_definitions: &[ToolDefinition],
 ) -> anyhow::Result<CompleteOutput> {
+    parse_complete_with_prompt_state(
+        family,
+        content,
+        guided_tool_constraint,
+        tool_definitions,
+        None,
+    )
+}
+
+/// [`parse_complete`] with the request's recorded channel state (see [`batch_prefill`]).
+pub(crate) fn parse_complete_with_prompt_state(
+    family: &str,
+    content: &str,
+    guided_tool_constraint: &GuidedToolConstraint,
+    tool_definitions: &[ToolDefinition],
+    prompt_state: Option<UnifiedPromptState>,
+) -> anyhow::Result<CompleteOutput> {
     let tools = to_v2_tools(Some(tool_definitions));
     let mut parser = create_unified_parser_for_family(family, &tools)?;
     // Batch replays already-generated output. Prefer its observable native marker when
@@ -802,7 +859,7 @@ pub(crate) fn parse_complete(
         _ => None,
     };
     parser.initialize_request(UnifiedParserInit {
-        starting_state: detect_prefill(family, content)?,
+        starting_state: batch_prefill(family, content, prompt_state)?,
         tool_output_mode: effective_mode,
         ..UnifiedParserInit::default()
     })?;
@@ -1441,6 +1498,168 @@ mod tests {
         assert_eq!(configured_family(Some("deepseek_v41"), Some("qwen3")), None);
         assert_eq!(configured_family(Some("deepseek_v41"), None), None);
         assert_eq!(configured_family(None, Some("deepseek_v41")), None);
+    }
+
+    const V41_BARE_CLOSER: &str = "Answer: I.</think>To determine";
+    const V41_QUOTED_CLOSER: &str = "He said \"x</think>y\" and 'it's' fine.";
+
+    fn v41_prompt_state(thinking: bool, stream_parsed: bool) -> Option<UnifiedPromptState> {
+        Some(UnifiedPromptState {
+            prompt_injected_reasoning: thinking,
+            stream_parsed,
+        })
+    }
+
+    async fn v41_stream_split(
+        input: &str,
+        split: usize,
+        prefill: UnifiedParserStartingState,
+    ) -> Vec<Annotated<NvCreateChatCompletionStreamResponse>> {
+        let (first, second) = input.split_at(split);
+        apply_stream(
+            stream::iter([chunk(first, false), chunk(second, true)]),
+            None,
+            None,
+            false,
+            prefill,
+            DEEPSEEK_V41_UNIFIED_FAMILY,
+        )
+        .collect::<Vec<_>>()
+        .await
+    }
+
+    async fn v41_aggregate(
+        responses: Vec<Annotated<NvCreateChatCompletionStreamResponse>>,
+        prompt_state: Option<UnifiedPromptState>,
+    ) -> (String, String) {
+        use super::super::aggregator::ChatCompletionAggregator;
+        let mut options = crate::protocols::openai::ParsingOptions::new(
+            Some(DEEPSEEK_V41_UNIFIED_FAMILY.to_string()),
+            Some(DEEPSEEK_V41_UNIFIED_FAMILY.to_string()),
+        );
+        if let Some(state) = prompt_state {
+            let cell = UnifiedPromptStateCell::default();
+            cell.set(state).unwrap();
+            options.unified_prompt_state = Some(cell);
+        }
+        let response = super::super::NvCreateChatCompletionResponse::from_annotated_stream(
+            stream::iter(responses),
+            options,
+        )
+        .await
+        .unwrap();
+        let message = &response.inner.choices[0].message;
+        let content = match message.content.as_ref() {
+            Some(ChatCompletionMessageContent::Text(text)) => text.clone(),
+            None => String::new(),
+            other => panic!("unexpected content {other:?}"),
+        };
+        (
+            content,
+            message.reasoning_content.clone().unwrap_or_default(),
+        )
+    }
+
+    #[test]
+    fn deepseek_v41_non_thinking_batch_absorbs_a_bare_closer() {
+        for (input, expected) in [
+            ("A.</think>B", "A.B"),
+            (V41_BARE_CLOSER, "Answer: I.To determine"),
+            (V41_QUOTED_CLOSER, "He said \"xy\" and 'it's' fine."),
+        ] {
+            for stream_parsed in [false, true] {
+                let parsed = parse_complete_with_prompt_state(
+                    DEEPSEEK_V41_UNIFIED_FAMILY,
+                    input,
+                    &GuidedToolConstraint::None,
+                    &[],
+                    v41_prompt_state(false, stream_parsed),
+                )
+                .unwrap();
+                assert_eq!(parsed.text, expected, "input={input:?}");
+                assert_eq!(parsed.reasoning, "", "input={input:?}");
+                assert!(parsed.tool_calls.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn deepseek_v41_batch_without_a_recorded_state_keeps_detect_prefill() {
+        let parsed = parse_complete(
+            DEEPSEEK_V41_UNIFIED_FAMILY,
+            "A.</think>B",
+            &GuidedToolConstraint::None,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            (parsed.reasoning.as_str(), parsed.text.as_str()),
+            ("A.", "B")
+        );
+    }
+
+    #[test]
+    fn deepseek_v41_thinking_batch_from_raw_text_splits_at_the_closer() {
+        let parsed = parse_complete_with_prompt_state(
+            DEEPSEEK_V41_UNIFIED_FAMILY,
+            "plan \"q</think>\" more</think>A.</think>B",
+            &GuidedToolConstraint::None,
+            &[],
+            v41_prompt_state(true, false),
+        )
+        .unwrap();
+        assert_eq!(parsed.reasoning, "plan \"q");
+        assert_eq!(parsed.text, "\" moreA.B");
+    }
+
+    #[tokio::test]
+    async fn deepseek_v41_non_thinking_stream_absorbs_a_bare_closer() {
+        for (input, expected) in [
+            ("A.</think>B", "A.B"),
+            (V41_BARE_CLOSER, "Answer: I.To determine"),
+            (V41_QUOTED_CLOSER, "He said \"xy\" and 'it's' fine."),
+        ] {
+            let prefill = stream_prefill(DEEPSEEK_V41_UNIFIED_FAMILY, false);
+            for split in input.char_indices().map(|(index, _)| index) {
+                let responses = v41_stream_split(input, split, prefill).await;
+                assert_eq!(
+                    logical_events(&responses),
+                    vec![LogicalEvent::Text(expected.to_string())],
+                    "input={input:?} split={split}"
+                );
+                for prompt_state in [v41_prompt_state(false, true), None] {
+                    assert_eq!(
+                        v41_aggregate(responses.clone(), prompt_state).await,
+                        (expected.to_string(), String::new()),
+                        "aggregated input={input:?} split={split} state={prompt_state:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn deepseek_v41_thinking_stream_and_aggregate_are_unchanged() {
+        let input = "plan</think>A.</think>B";
+        let prefill = stream_prefill(DEEPSEEK_V41_UNIFIED_FAMILY, true);
+        for split in input.char_indices().map(|(index, _)| index) {
+            let responses = v41_stream_split(input, split, prefill).await;
+            assert_eq!(
+                logical_events(&responses),
+                vec![
+                    LogicalEvent::Reasoning("plan".to_string()),
+                    LogicalEvent::Text("A.B".to_string()),
+                ],
+                "split={split}"
+            );
+            for prompt_state in [v41_prompt_state(true, true), None] {
+                assert_eq!(
+                    v41_aggregate(responses.clone(), prompt_state).await,
+                    ("A.B".to_string(), "plan".to_string()),
+                    "split={split} state={prompt_state:?}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
