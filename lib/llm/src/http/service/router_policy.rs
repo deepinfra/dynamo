@@ -78,6 +78,8 @@ fn policy_error(error_value: RuntimePolicyError) -> Response {
 pub(crate) fn router_policy_router(manager: Arc<ModelManager>) -> (Vec<RouteDoc>, Router) {
     let (mut docs, thresholds) =
         super::busy_threshold::router(manager.clone(), "/router_policy/busy_threshold");
+    let (store_docs, stores) = super::mooncake_store::router(manager.clone());
+    docs.extend(store_docs);
     docs.extend([
         RouteDoc::new(Method::GET, "/router_policy"),
         RouteDoc::new(Method::PATCH, "/router_policy"),
@@ -88,7 +90,8 @@ pub(crate) fn router_policy_router(manager: Arc<ModelManager>) -> (Vec<RouteDoc>
             .route("/router_policy", get(list).patch(update))
             .layer(DefaultBodyLimit::max(16 * 1024))
             .with_state(manager)
-            .merge(thresholds),
+            .merge(thresholds)
+            .merge(stores),
     )
 }
 
@@ -239,6 +242,101 @@ mod tests {
         let status = response.status();
         let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
         (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    #[tokio::test]
+    async fn mooncake_store_routes_report_and_resync_a_models_stores() {
+        use crate::kv_router::shared_cache::MooncakeStoreSharedKvCache;
+
+        let manager = Arc::new(ModelManager::new());
+        let (app, _core, _, _) = fixture(manager.clone()).await;
+        manager.insert_mooncake_store_cache(
+            EndpointId {
+                namespace: "test".into(),
+                component: "first".into(),
+                name: "generate".into(),
+            },
+            MooncakeStoreSharedKvCache::with_unfollowed_stores(&[
+                (1, "tcp://a:5558"),
+                (2, "tcp://*:5558"),
+            ]),
+        );
+
+        let (status, listing) = call(
+            &app,
+            Method::GET,
+            "/router_policy/mooncake_store?model=first",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{listing}");
+        assert_eq!(listing["complete"], false);
+        let endpoint = &listing["endpoints"][0];
+        assert_eq!(endpoint["component"], "first");
+        assert_eq!(endpoint["models"], serde_json::json!(["first"]));
+        let stores = endpoint["stores"].as_array().unwrap();
+        assert_eq!(stores.len(), 2);
+        assert_eq!(stores[0]["snapshot_url"], Value::Null);
+        assert_eq!(
+            stores[1]["snapshot_url"],
+            "http://a:9003/kv_events/snapshot"
+        );
+        assert_eq!(stores[1]["workers"], serde_json::json!([1]));
+        assert_eq!(stores[1]["last_load"], Value::Null);
+        assert!(stores[1].get("resync").is_none());
+        let (status, all) = call(
+            &app,
+            Method::GET,
+            "/router_policy/mooncake_store",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(all["endpoints"].as_array().unwrap().len(), 1);
+
+        let resync = "/router_policy/mooncake_store/resync?model=first";
+        let (status, asked) = call(&app, Method::POST, resync, Value::Null).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{asked}");
+        let results = |reply: &Value| -> Vec<Value> {
+            reply["endpoints"][0]["stores"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|store| store["resync"].clone())
+                .collect()
+        };
+        assert_eq!(results(&asked), ["no_snapshot_url", "requested"]);
+        let (status, waited) =
+            call(&app, Method::POST, &format!("{resync}&wait=0"), Value::Null).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{waited}");
+        assert_eq!(results(&waited), ["no_snapshot_url", "timeout"]);
+
+        // A model whose router follows no store, and unknown parameters.
+        for (method, uri, expected) in [
+            (
+                Method::GET,
+                "/router_policy/mooncake_store?model=second",
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                Method::POST,
+                "/router_policy/mooncake_store/resync?model=second",
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                Method::GET,
+                "/router_policy/mooncake_store?modle=first",
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                Method::POST,
+                "/router_policy/mooncake_store/resync?wait=soon",
+                StatusCode::BAD_REQUEST,
+            ),
+        ] {
+            let (status, reply) = call(&app, method, uri, Value::Null).await;
+            assert_eq!(status, expected, "{uri}: {reply}");
+        }
     }
 
     #[tokio::test]

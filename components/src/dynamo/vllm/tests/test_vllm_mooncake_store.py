@@ -8,6 +8,7 @@ from unittest.mock import Mock
 import pytest
 
 from dynamo.vllm.mooncake_store import (
+    MOONCAKE_ADMIN_URL_ENV,
     MOONCAKE_KV_EVENTS_ENDPOINT_ENV,
     VLLM_MOONCAKE_STORE_RUNTIME_KEY,
     publish_vllm_mooncake_store,
@@ -23,7 +24,12 @@ pytestmark = [
 ENDPOINT = "tcp://mooncake-master:5558"
 
 
-def vllm_config(kv_connector, extra=None, model="/models/deepseek-ai/DeepSeek-V3.2/"):
+def vllm_config(
+    kv_connector,
+    extra=None,
+    model="/models/deepseek-ai/DeepSeek-V3.2/",
+    cache_config=None,
+):
     kv_transfer_config = (
         None
         if kv_connector is None
@@ -34,6 +40,7 @@ def vllm_config(kv_connector, extra=None, model="/models/deepseek-ai/DeepSeek-V3
     return SimpleNamespace(
         kv_transfer_config=kv_transfer_config,
         model_config=SimpleNamespace(model=model),
+        cache_config=cache_config,
     )
 
 
@@ -103,3 +110,39 @@ def test_announces_nothing_without_endpoint_and_connector(
     runtime_config = Mock()
     assert not publish_vllm_mooncake_store(runtime_config, config)
     runtime_config.set_engine_specific.assert_not_called()
+
+
+def test_announces_the_admin_url_and_block_hash_scheme(monkeypatch):
+    pytest.importorskip("vllm.utils.hashing")
+    monkeypatch.setenv(MOONCAKE_KV_EVENTS_ENDPOINT_ENV, ENDPOINT)
+    monkeypatch.setenv(MOONCAKE_ADMIN_URL_ENV, "http://mooncake-master:9003")
+    monkeypatch.setenv("PYTHONHASHSEED", "0")
+    config = vllm_config(
+        "MooncakeStoreConnector",
+        cache_config=SimpleNamespace(prefix_caching_hash_algo="sha256"),
+    )
+    runtime_config = Mock()
+    assert publish_vllm_mooncake_store(runtime_config, config)
+    assert announced(runtime_config) == {
+        "kv_events_endpoint": ENDPOINT,
+        "group_prefix": "vllm-mooncake-store:DeepSeek-V3.2@",
+        "admin_url": "http://mooncake-master:9003",
+        # sha256(pickle.dumps("0", protocol=5)): vLLM's NONE_HASH under PYTHONHASHSEED=0.
+        "block_hash": {
+            "algo": "sha256",
+            "none_hash": "1973e23848344dc43a988a9b478663803cfffe1243480253f9a3cf004b14aa7c",
+        },
+    }
+
+
+def test_announces_no_scheme_for_a_random_none_hash(monkeypatch):
+    pytest.importorskip("vllm.utils.hashing")
+    monkeypatch.setenv(MOONCAKE_KV_EVENTS_ENDPOINT_ENV, ENDPOINT)
+    monkeypatch.delenv("PYTHONHASHSEED", raising=False)
+    config = vllm_config(
+        "MooncakeStoreConnector",
+        cache_config=SimpleNamespace(prefix_caching_hash_algo="xxhash"),
+    )
+    runtime_config = Mock()
+    assert publish_vllm_mooncake_store(runtime_config, config)
+    assert "block_hash" not in announced(runtime_config)
