@@ -180,7 +180,10 @@ pub(crate) fn stream_prefill(
         // Qwen3's generation prompt ends at the assistant header with no channel open,
         // so the model emits `<think>` itself when it thinks.
         QWEN3_UNIFIED_FAMILY => UnifiedParserStartingState::None,
-        DEEPSEEK_V41_UNIFIED_FAMILY => UnifiedParserStartingState::Response,
+        // The non-thinking prompt closes reasoning, but vLLM's deepseek_v41 parser still
+        // opens it on a later `<think>` (CONTENT + THINK_START -> REASONING) and absorbs
+        // a bare `</think>`.
+        DEEPSEEK_V41_UNIFIED_FAMILY => UnifiedParserStartingState::None,
         _ => UnifiedParserStartingState::None,
     }
 }
@@ -533,9 +536,25 @@ pub(crate) fn empty_choice(index: u32) -> ChatChoiceStream {
 /// Per-choice streaming state: one parser instance plus the bookkeeping the OpenAI
 /// streaming tool-call contract needs. One instance parses exactly one choice of one
 /// request, which is what gives per-stream isolation by construction.
+/// How a DeepSeek V4.1 choice reads its reasoning markers, matching the vLLM path
+/// the request would take.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum MarkerMode {
+    /// Marker text is the marker (the shared family parser).
+    #[default]
+    Text,
+    /// Streaming: only the special tokens, carried as stand-ins, are markers.
+    TokenIds,
+    /// Non-streaming: a text reasoning pass, then tool parsing of the content.
+    TwoPass,
+}
+
 pub(crate) struct ChoiceState {
     family: String,
     parser: Box<dyn UnifiedParser>,
+    /// DeepSeek V4.1 text carries the special reasoning-marker tokens as stand-ins
+    /// (see `deepseek_v41_tokens`), mapped back to marker text on the way out.
+    token_markers: bool,
     /// Tool indices whose opening chunk (id + type + name) has already gone out.
     opened_calls: HashSet<usize>,
     /// Whether any tool-call chunk was emitted; flips a terminal `Stop` to `ToolCalls`.
@@ -553,7 +572,36 @@ impl ChoiceState {
         tool_output_mode: UnifiedToolOutputMode,
         guided_streaming: bool,
     ) -> anyhow::Result<Self> {
-        let mut parser = create_unified_parser_for_family(family, tools)?;
+        Self::new_with_markers(
+            family,
+            tools,
+            prefill,
+            tool_output_mode,
+            guided_streaming,
+            MarkerMode::Text,
+        )
+    }
+
+    pub(crate) fn new_with_markers(
+        family: &str,
+        tools: &[Tool],
+        prefill: UnifiedParserStartingState,
+        tool_output_mode: UnifiedToolOutputMode,
+        guided_streaming: bool,
+        marker_mode: MarkerMode,
+    ) -> anyhow::Result<Self> {
+        use dynamo_parsers_v2::unified::deepseek_v41;
+        let marker_mode = if family == DEEPSEEK_V41_UNIFIED_FAMILY {
+            marker_mode
+        } else {
+            MarkerMode::Text
+        };
+        let token_markers = marker_mode == MarkerMode::TokenIds;
+        let mut parser = match marker_mode {
+            MarkerMode::Text => create_unified_parser_for_family(family, tools)?,
+            MarkerMode::TokenIds => deepseek_v41::deepseek_v41_unified_token_markers(tools),
+            MarkerMode::TwoPass => deepseek_v41::deepseek_v41_unified_two_pass(tools),
+        };
         // `prompt_token_ids` stays empty: this path establishes the starting state from
         // the rendered prompt text (see `stream_prefill` / `detect_prefill`), not from
         // token IDs, which the preprocessor has already consumed by this point.
@@ -575,6 +623,7 @@ impl ChoiceState {
         Ok(Self {
             family: family.to_string(),
             parser,
+            token_markers,
             opened_calls: HashSet::new(),
             tool_emitted: false,
             failed: false,
@@ -585,6 +634,7 @@ impl ChoiceState {
         Ok(Self {
             family: family.to_string(),
             parser: create_unified_parser_for_family(family, tools)?,
+            token_markers: false,
             opened_calls: HashSet::new(),
             tool_emitted: false,
             failed: false,
@@ -593,6 +643,39 @@ impl ChoiceState {
 
     /// Feed one decoded text delta through the parser.
     pub(crate) fn push(&mut self, text: &str) -> Vec<UnifiedParserEvent> {
+        let events = self.push_raw(text);
+        self.restore_markers(events)
+    }
+
+    /// Flush buffered partial state at end of stream.
+    pub(crate) fn finish(&mut self) -> Vec<UnifiedParserEvent> {
+        let events = self.finish_raw();
+        self.restore_markers(events)
+    }
+
+    fn restore_markers(&self, events: Vec<UnifiedParserEvent>) -> Vec<UnifiedParserEvent> {
+        if !self.token_markers {
+            return events;
+        }
+        use dynamo_parsers_v2::unified::deepseek_v41::restore_token_markers;
+        events
+            .into_iter()
+            .map(|event| match event {
+                UnifiedParserEvent::Text(text) => {
+                    UnifiedParserEvent::Text(restore_token_markers(&text).into_owned())
+                }
+                UnifiedParserEvent::Reasoning(text) => {
+                    UnifiedParserEvent::Reasoning(restore_token_markers(&text).into_owned())
+                }
+                UnifiedParserEvent::ToolCall(mut call) => {
+                    call.arguments = restore_token_markers(&call.arguments).into_owned();
+                    UnifiedParserEvent::ToolCall(call)
+                }
+            })
+            .collect()
+    }
+
+    fn push_raw(&mut self, text: &str) -> Vec<UnifiedParserEvent> {
         if self.failed {
             return text_delta(text.to_string());
         }
@@ -611,8 +694,7 @@ impl ChoiceState {
         }
     }
 
-    /// Flush buffered partial state at end of stream.
-    pub(crate) fn finish(&mut self) -> Vec<UnifiedParserEvent> {
+    fn finish_raw(&mut self) -> Vec<UnifiedParserEvent> {
         if self.failed {
             return Vec::new();
         }
@@ -1078,6 +1160,31 @@ pub(crate) fn apply_stream_with_constraint<S>(
 where
     S: Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send + 'static,
 {
+    apply_stream_with_markers(
+        stream_in,
+        tool_definitions,
+        guided_tool_constraint,
+        prefill,
+        family,
+        guided_streaming,
+        MarkerMode::Text,
+    )
+}
+
+/// [`apply_stream_with_constraint`] with DeepSeek V4.1's reasoning markers read the
+/// way `marker_mode` says.
+pub(crate) fn apply_stream_with_markers<S>(
+    stream_in: S,
+    tool_definitions: Option<Vec<ToolDefinition>>,
+    guided_tool_constraint: GuidedToolConstraint,
+    prefill: UnifiedParserStartingState,
+    family: &'static str,
+    guided_streaming: bool,
+    marker_mode: MarkerMode,
+) -> impl Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send
+where
+    S: Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send + 'static,
+{
     let tools = to_v2_tools(tool_definitions.as_deref());
     stream! {
         let mut states: HashMap<u32, ChoiceState> = HashMap::new();
@@ -1217,7 +1324,14 @@ where
                         } else {
                             prefill
                         };
-                        match ChoiceState::new(family, &tools, choice_prefill, mode, guided_streaming) {
+                        match ChoiceState::new_with_markers(
+                            family,
+                            &tools,
+                            choice_prefill,
+                            mode,
+                            guided_streaming,
+                            marker_mode,
+                        ) {
                             Ok(mut state) => {
                                 // A raw run resuming after an already-parsed detour
                                 // gets a brand-new parser instance; seed it with any
@@ -1660,6 +1774,119 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// One stream, one chunk per element, through the DeepSeek V4.1 adapter.
+    async fn v41_marker_stream(
+        chunks: &[&str],
+        thinking: bool,
+        mode: MarkerMode,
+    ) -> Vec<LogicalEvent> {
+        let count = chunks.len();
+        let input: Vec<_> = chunks
+            .iter()
+            .enumerate()
+            .map(|(index, text)| chunk(text, index + 1 == count))
+            .collect();
+        let responses = apply_stream_with_markers(
+            stream::iter(input),
+            None,
+            GuidedToolConstraint::None,
+            stream_prefill(DEEPSEEK_V41_UNIFIED_FAMILY, thinking),
+            DEEPSEEK_V41_UNIFIED_FAMILY,
+            true,
+            mode,
+        )
+        .collect::<Vec<_>>()
+        .await;
+        logical_events(&responses)
+    }
+
+    const S: &str = dynamo_parsers_v2::unified::deepseek_v41::THINK_START_TOKEN_MARKER;
+    const E: &str = dynamo_parsers_v2::unified::deepseek_v41::THINK_END_TOKEN_MARKER;
+
+    #[tokio::test]
+    async fn deepseek_v41_think_opener_in_content_opens_reasoning() {
+        // think_opener_in_content_not_honored: a non-thinking turn's `<think>...</think>`
+        // span is reasoning (vLLM: CONTENT + THINK_START -> REASONING), streaming on
+        // token ids and non-streaming on text.
+        let expected = vec![
+            LogicalEvent::Text("The answer is 42.".to_string()),
+            LogicalEvent::Reasoning("Let me think.".to_string()),
+            LogicalEvent::Text("Second take.".to_string()),
+        ];
+        let streamed = format!("The answer is 42.{S}Let me think.{E}Second take.");
+        let split = streamed.find(S).unwrap() + S.len() + 1;
+        assert_eq!(
+            v41_marker_stream(&[&streamed[..split], &streamed[split..]], false, MarkerMode::TokenIds).await,
+            expected
+        );
+        let text = "The answer is 42.<think>Let me think.</think>Second take.";
+        assert_eq!(
+            v41_marker_stream(&[text], false, MarkerMode::TwoPass).await,
+            expected
+        );
+    }
+
+    #[tokio::test]
+    async fn deepseek_v41_plain_text_markers_stay_text_while_streaming() {
+        // plaintext_marker_vs_special_token: marker text spelled with ordinary tokens is
+        // not a marker while streaming, and comes back out verbatim.
+        assert_eq!(
+            v41_marker_stream(&["The answer is 42.</th", "ink>Second take"], true, MarkerMode::TokenIds).await,
+            vec![LogicalEvent::Reasoning("The answer is 42.</think>Second take".to_string())]
+        );
+        assert_eq!(
+            v41_marker_stream(&["A</think>B", "<think>C"], false, MarkerMode::TokenIds).await,
+            vec![LogicalEvent::Text("A</think>B<think>C".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn deepseek_v41_reopened_reasoning_matches_one_token_chunks() {
+        // prod_quirk_stream_reasoning_reopen: vLLM's own non-streaming result and its
+        // one-token-per-chunk stream both keep the second span in reasoning.
+        let input = format!("Reason one.{E}{S}Reason two.{E}Answer.");
+        let expected = vec![
+            LogicalEvent::Reasoning("Reason one.Reason two.".to_string()),
+            LogicalEvent::Text("Answer.".to_string()),
+        ];
+        let chars: Vec<String> = input.chars().map(String::from).collect();
+        let chars: Vec<&str> = chars.iter().map(String::as_str).collect();
+        assert_eq!(v41_marker_stream(&chars, true, MarkerMode::TokenIds).await, expected);
+        assert_eq!(v41_marker_stream(&[&input], true, MarkerMode::TokenIds).await, expected);
+    }
+
+    #[tokio::test]
+    async fn deepseek_v41_think_token_inside_dsml_argument() {
+        // prod_quirk_think_token_inside_dsml_arg: streaming keeps the markers as argument
+        // data; non-streaming runs vLLM's reasoning pass first, which absorbs `</think>`
+        // and lets `<think>` open reasoning over the rest of the block.
+        let block = |end: &str, start: &str| {
+            format!(
+                "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"search\">\n<｜DSML｜ parameter name=\"query\" string=\"true\">x {end} y {start} z</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>"
+            )
+        };
+        let streamed = v41_marker_stream(&[&block(E, S)], false, MarkerMode::TokenIds).await;
+        assert_eq!(
+            streamed,
+            vec![LogicalEvent::Tool {
+                index: 0,
+                name: Some("search".to_string()),
+                arguments: "{\"query\": \"x </think> y <think> z\"}".to_string(),
+            }]
+        );
+        let batch = v41_marker_stream(&[&block("</think>", "<think>")], false, MarkerMode::TwoPass).await;
+        let reasoning: Vec<_> = batch
+            .into_iter()
+            .filter(|event| matches!(event, LogicalEvent::Reasoning(_)))
+            .collect();
+        assert_eq!(
+            reasoning,
+            vec![LogicalEvent::Reasoning(
+                " z</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>".to_string()
+            )]
+        );
     }
 
     #[tokio::test]
@@ -3757,6 +3984,7 @@ mod tests {
             parser: Box::new(PartialCommitParser {
                 recovered: "<broken>".to_string(),
             }),
+            token_markers: false,
             opened_calls: HashSet::new(),
             tool_emitted: false,
             failed: false,

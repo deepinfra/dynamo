@@ -20,7 +20,179 @@ const INVOKE_END: &str = "</｜DSML｜ invoke>";
 const PARAMETER_START: &str = "<｜DSML｜ parameter name=\"";
 const PARAMETER_END: &str = "</｜DSML｜ parameter>";
 
+/// Stand-ins for the `<think>` / `</think>` SPECIAL tokens (ids 128821/128822) in text
+/// fed to [`deepseek_v41_unified_token_markers`]. vLLM matches the reasoning markers by
+/// token id, so a marker spelled with ordinary tokens is plain text; the frontend
+/// rewrites only the special tokens' text to these noncharacters before parsing and
+/// [`restore_token_markers`] maps them back in the parsed output.
+pub const THINK_START_TOKEN_MARKER: &str = "\u{FDD0}";
+pub const THINK_END_TOKEN_MARKER: &str = "\u{FDD1}";
+pub const THINK_START: &str = "<think>";
+pub const THINK_END: &str = "</think>";
+
 pub(crate) fn deepseek_v41_unified(_tools: &[Tool]) -> Box<dyn UnifiedParser> {
+    build(THINK_START, THINK_END)
+}
+
+/// DeepSeek V4.1 with the reasoning markers matched only as the special-token stand-ins.
+pub fn deepseek_v41_unified_token_markers(_tools: &[Tool]) -> Box<dyn UnifiedParser> {
+    build(THINK_START_TOKEN_MARKER, THINK_END_TOKEN_MARKER)
+}
+
+/// DeepSeek V4.1 as vLLM parses a complete (non-streaming) output: first a reasoning
+/// pass over the text, which ends reasoning at `</think>` or a DSML calls block and
+/// treats every `<think>`/`</think>` as a marker, even inside a calls block; then the
+/// tool parser over the content that pass left.
+pub fn deepseek_v41_unified_two_pass(_tools: &[Tool]) -> Box<dyn UnifiedParser> {
+    Box::new(TwoPass {
+        split: ReasoningSplit::default(),
+        content: build(THINK_START, THINK_END),
+        held_reasoning_ws: String::new(),
+    })
+}
+
+#[derive(Default)]
+struct ReasoningSplit {
+    in_reasoning: bool,
+    buffer: String,
+}
+
+impl ReasoningSplit {
+    /// Split buffered text into `(is_reasoning, text)` runs, holding back a suffix that
+    /// may still grow into a marker unless `flush`.
+    fn drain(&mut self, flush: bool, out: &mut Vec<(bool, String)>) {
+        loop {
+            let mut next: Option<(usize, usize, Option<bool>)> = None;
+            for (marker, to) in [(THINK_START, Some(true)), (THINK_END, Some(false))] {
+                if let Some(at) = self.buffer.find(marker)
+                    && next.is_none_or(|(best, _, _)| at < best)
+                {
+                    next = Some((at, marker.len(), to));
+                }
+            }
+            if self.in_reasoning
+                && let Some(at) = self.buffer.find(BLOCK_START)
+                && next.is_none_or(|(best, _, _)| at < best)
+            {
+                // The block opener ends reasoning and stays in the content.
+                next = Some((at, 0, Some(false)));
+            }
+            let Some((at, len, to)) = next else { break };
+            self.emit(at, out);
+            self.buffer.drain(..len);
+            if let Some(to) = to {
+                self.in_reasoning = to;
+            }
+        }
+        let keep = if flush {
+            0
+        } else {
+            let mut markers = vec![THINK_START, THINK_END];
+            if self.in_reasoning {
+                markers.push(BLOCK_START);
+            }
+            crate::tool_calling::scan::marker_prefix_suffix_len(&self.buffer, markers)
+        };
+        self.emit(self.buffer.len() - keep, out);
+    }
+
+    fn emit(&mut self, len: usize, out: &mut Vec<(bool, String)>) {
+        if len == 0 {
+            return;
+        }
+        let text: String = self.buffer.drain(..len).collect();
+        match out.last_mut() {
+            Some((reasoning, last)) if *reasoning == self.in_reasoning => last.push_str(&text),
+            _ => out.push((self.in_reasoning, text)),
+        }
+    }
+}
+
+struct TwoPass {
+    split: ReasoningSplit,
+    content: Box<dyn UnifiedParser>,
+    /// vLLM strips trailing whitespace off the joined reasoning only.
+    held_reasoning_ws: String,
+}
+
+impl TwoPass {
+    fn route(
+        &mut self,
+        runs: Vec<(bool, String)>,
+        output: &mut UnifiedParserOutput,
+    ) -> anyhow::Result<()> {
+        for (reasoning, text) in runs {
+            if reasoning {
+                let combined = std::mem::take(&mut self.held_reasoning_ws) + &text;
+                let trimmed = combined.trim_end();
+                self.held_reasoning_ws = combined[trimmed.len()..].to_string();
+                output.push_reasoning(trimmed);
+            } else {
+                self.content.parse_into(&text, output)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl UnifiedParser for TwoPass {
+    fn initialize_request(&mut self, init: crate::unified::UnifiedParserInit) -> anyhow::Result<()> {
+        self.split = ReasoningSplit {
+            in_reasoning: init.starting_state == crate::unified::UnifiedParserStartingState::Reasoning,
+            buffer: String::new(),
+        };
+        self.held_reasoning_ws.clear();
+        self.content.initialize_request(crate::unified::UnifiedParserInit {
+            starting_state: crate::unified::UnifiedParserStartingState::Response,
+            ..init
+        })
+    }
+
+    fn parse_into(&mut self, delta: &str, output: &mut UnifiedParserOutput) -> anyhow::Result<()> {
+        self.split.buffer.push_str(delta);
+        let mut runs = Vec::new();
+        self.split.drain(false, &mut runs);
+        self.route(runs, output)
+    }
+
+    fn finish(&mut self) -> anyhow::Result<UnifiedParserOutput> {
+        let mut output = UnifiedParserOutput::default();
+        let mut runs = Vec::new();
+        self.split.drain(true, &mut runs);
+        self.route(runs, &mut output)?;
+        let mut tail = self.content.finish()?;
+        output.append(&mut tail);
+        Ok(output)
+    }
+
+    fn reset(&mut self) -> String {
+        self.held_reasoning_ws.clear();
+        let mut recovered = std::mem::take(&mut self.split.buffer);
+        recovered.insert_str(0, &self.content.reset());
+        recovered
+    }
+
+    fn preserve_special_tokens(&self) -> bool {
+        true
+    }
+
+    fn tool_call_id(&self, tool_index: usize) -> Option<&str> {
+        self.content.tool_call_id(tool_index)
+    }
+}
+
+/// Map the special-token stand-ins back to the marker text.
+pub fn restore_token_markers(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains(['\u{FDD0}', '\u{FDD1}']) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    std::borrow::Cow::Owned(
+        text.replace(THINK_START_TOKEN_MARKER, THINK_START)
+            .replace(THINK_END_TOKEN_MARKER, THINK_END),
+    )
+}
+
+fn build(think_start: &'static str, think_end: &'static str) -> Box<dyn UnifiedParser> {
     let spec = WrappedBlockSpec {
         family: "deepseek_v41",
         block_starts: vec![BLOCK_START.into()],
@@ -35,8 +207,8 @@ pub(crate) fn deepseek_v41_unified(_tools: &[Tool]) -> Box<dyn UnifiedParser> {
         ..Default::default()
     };
     let scanner = WrappedBlockScanner::new(spec, DeepSeekV41).with_reasoning(ReasoningSpec {
-        start: "<think>",
-        end: "</think>",
+        start: think_start,
+        end: think_end,
         preserve_special_tokens: true,
         absorb_end_without_reasoning: true,
         ..Default::default()
@@ -568,6 +740,141 @@ mod tests {
             ("r</think>Use <think> tags </think> ok".to_string(), vec![reasoning("r"), text("Use "), reasoning(" tags"), text(" ok")]),
         ] {
             assert_every_split(&input, UnifiedParserStartingState::Reasoning, expected);
+        }
+    }
+
+    fn assert_every_split_with(
+        make: fn(&[Tool]) -> Box<dyn UnifiedParser>,
+        input: &str,
+        state: UnifiedParserStartingState,
+        expected: Vec<UnifiedEvent>,
+    ) {
+        assert_every_split_filtered(make, input, state, expected, false);
+    }
+
+    fn assert_every_split_filtered(
+        make: fn(&[Tool]) -> Box<dyn UnifiedParser>,
+        input: &str,
+        state: UnifiedParserStartingState,
+        expected: Vec<UnifiedEvent>,
+        reasoning_only: bool,
+    ) {
+        for split in (0..=input.len()).filter(|&i| input.is_char_boundary(i)) {
+            let mut parser = make(&[]);
+            parser
+                .initialize_request(UnifiedParserInit {
+                    starting_state: state,
+                    ..Default::default()
+                })
+                .unwrap();
+            let mut output = UnifiedParserOutput::default();
+            parser.parse_into(&input[..split], &mut output).unwrap();
+            parser.parse_into(&input[split..], &mut output).unwrap();
+            output.append(&mut parser.finish().unwrap());
+            let restored: Vec<UnifiedEvent> = output
+                .assembled()
+                .into_iter()
+                .map(|event| match event {
+                    UnifiedEvent::Text { text } => UnifiedEvent::Text {
+                        text: restore_token_markers(&text).into_owned(),
+                    },
+                    UnifiedEvent::Reasoning { text } => UnifiedEvent::Reasoning {
+                        text: restore_token_markers(&text).into_owned(),
+                    },
+                    call => call,
+                })
+                .collect();
+            let restored: Vec<UnifiedEvent> = if reasoning_only {
+                restored
+                    .into_iter()
+                    .filter(|event| matches!(event, UnifiedEvent::Reasoning { .. }))
+                    .collect()
+            } else {
+                restored
+            };
+            assert_eq!(restored, expected, "split {split} of {input:?}");
+        }
+    }
+
+    #[test]
+    fn token_markers_open_reasoning_from_content_like_vllm() {
+        // think_opener_in_content_not_honored: CONTENT + THINK_START -> REASONING, and a
+        // bare THINK_END is absorbed, in a turn whose prompt closed reasoning.
+        let (s, e) = (THINK_START_TOKEN_MARKER, THINK_END_TOKEN_MARKER);
+        let reasoning = |t: &str| UnifiedEvent::Reasoning { text: t.into() };
+        let text = |t: &str| UnifiedEvent::Text { text: t.into() };
+        for (input, expected) in [
+            (format!("A.{s}R{e}B"), vec![text("A."), reasoning("R"), text("B")]),
+            (format!("{s}R{e}B"), vec![reasoning("R"), text("B")]),
+            (format!("A{e}B"), vec![text("AB")]),
+            (format!("A{s}R"), vec![text("A"), reasoning("R")]),
+        ] {
+            assert_every_split_with(
+                deepseek_v41_unified_token_markers,
+                &input,
+                UnifiedParserStartingState::None,
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    fn plain_text_markers_are_text_when_markers_are_token_ids() {
+        // plaintext_marker_vs_special_token: marker text spelled with ordinary tokens
+        // stays where it was written; only the special tokens switch channels.
+        let (s, e) = (THINK_START_TOKEN_MARKER, THINK_END_TOKEN_MARKER);
+        let reasoning = |t: &str| UnifiedEvent::Reasoning { text: t.into() };
+        let text = |t: &str| UnifiedEvent::Text { text: t.into() };
+        assert_every_split_with(
+            deepseek_v41_unified_token_markers,
+            "R</think>still R",
+            UnifiedParserStartingState::Reasoning,
+            vec![reasoning("R</think>still R")],
+        );
+        assert_every_split_with(
+            deepseek_v41_unified_token_markers,
+            &format!("<think>R{e}A</think>B"),
+            UnifiedParserStartingState::Reasoning,
+            vec![reasoning("<think>R"), text("A</think>B")],
+        );
+        assert_every_split_with(
+            deepseek_v41_unified_token_markers,
+            &format!("A<think>B{s}R"),
+            UnifiedParserStartingState::None,
+            vec![text("A<think>B"), reasoning("R")],
+        );
+    }
+
+    #[test]
+    fn two_pass_reads_markers_inside_a_calls_block_like_vllm_batch() {
+        // prod_quirk_think_token_inside_dsml_arg (non-streaming): vLLM's reasoning pass
+        // runs before tool parsing, so `</think>` inside an argument is absorbed and
+        // `<think>` opens reasoning that takes the rest of the block.
+        let input = "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"search\">\n<｜DSML｜ parameter name=\"query\" string=\"true\">x </think> y <think> z</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>";
+        for state in [UnifiedParserStartingState::None, UnifiedParserStartingState::Reasoning] {
+            assert_every_split_filtered(
+                deepseek_v41_unified_two_pass,
+                input,
+                state,
+                vec![UnifiedEvent::Reasoning {
+                    text: " z</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>".into(),
+                }],
+                true,
+            );
+        }
+    }
+
+    #[test]
+    fn two_pass_splits_reasoning_like_the_single_pass_for_plain_turns() {
+        let reasoning = |t: &str| UnifiedEvent::Reasoning { text: t.into() };
+        let text = |t: &str| UnifiedEvent::Text { text: t.into() };
+        for (input, state, expected) in [
+            ("R </think>A", UnifiedParserStartingState::Reasoning, vec![reasoning("R"), text("A")]),
+            ("A<think>R</think>B", UnifiedParserStartingState::None, vec![text("A"), reasoning("R"), text("B")]),
+            ("A</think>B", UnifiedParserStartingState::None, vec![text("AB")]),
+            ("R<think>S", UnifiedParserStartingState::Reasoning, vec![reasoning("RS")]),
+        ] {
+            assert_every_split_with(deepseek_v41_unified_two_pass, input, state, expected);
         }
     }
 

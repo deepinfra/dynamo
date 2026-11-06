@@ -99,6 +99,9 @@ use crate::protocols::{
         embeddings::{NvCreateEmbeddingRequest, NvCreateEmbeddingResponse},
     },
 };
+use crate::protocols::openai::chat_completions::deepseek_v41_tokens::{
+    DeepSeekV41TokenView, ReasoningCount,
+};
 use crate::tokenizers::traits::Tokenizer;
 
 use crate::preprocessor::prompt::{
@@ -4519,20 +4522,52 @@ impl OpenAIPreprocessor {
     where
         S: Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send + 'static,
     {
+        Self::apply_unified_response_policies_with_tokens(
+            stream,
+            emit_tool_calls,
+            defer_reasoning_for_nonempty_content,
+            None,
+        )
+    }
+
+    fn apply_unified_response_policies_with_tokens<S>(
+        stream: S,
+        emit_tool_calls: bool,
+        defer_reasoning_for_nonempty_content: bool,
+        token_view: Option<Arc<DeepSeekV41TokenView>>,
+    ) -> Pin<Box<dyn Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send>>
+    where
+        S: Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send + 'static,
+    {
         let stream: Pin<Box<dyn Stream<Item = _> + Send>> = Box::pin(
             Self::apply_tool_call_response_policy(stream, emit_tool_calls),
         );
         // Observe parser classification before force_nonempty deferral removes the
         // reasoning delta. The annotated usage trailer can still be held below until
-        // every deferred recovery chunk has been emitted.
-        let stream: Pin<Box<dyn Stream<Item = _> + Send>> =
-            Box::pin(annotate_reasoning_usage_with(
+        // every deferred recovery chunk has been emitted. DeepSeek V4.1 counts its
+        // reasoning tokens exactly from the output token ids instead.
+        let stream: Pin<Box<dyn Stream<Item = _> + Send>> = match token_view {
+            Some(view) => Box::pin(stream.map(move |mut response| {
+                if let Some(usage) = response
+                    .data
+                    .as_mut()
+                    .and_then(|chunk| chunk.inner.usage.as_mut())
+                {
+                    usage
+                        .completion_tokens_details
+                        .get_or_insert_default()
+                        .reasoning_tokens = Some(view.reasoning_tokens());
+                }
+                response
+            })),
+            None => Box::pin(annotate_reasoning_usage_with(
                 stream,
                 ReasoningUsageEstimator {
                     reasoning_chunks_only: true,
                     ..Default::default()
                 },
-            ));
+            )),
+        };
         let stream: Pin<Box<dyn Stream<Item = _> + Send>> = if defer_reasoning_for_nonempty_content
         {
             Box::pin(Self::defer_unified_reasoning_for_nonempty_content(stream))
@@ -4646,6 +4681,7 @@ impl OpenAIPreprocessor {
             prompt_injected_reasoning,
             guided_tool_constraint,
             tool_processing_route,
+            None,
         )
     }
 
@@ -4656,6 +4692,7 @@ impl OpenAIPreprocessor {
         prompt_injected_reasoning: bool,
         guided_tool_constraint: crate::protocols::openai::GuidedToolConstraint,
         tool_processing_route: ToolProcessingRoute,
+        token_view: Option<Arc<DeepSeekV41TokenView>>,
     ) -> anyhow::Result<
         impl Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send + 'static,
     >
@@ -4734,18 +4771,24 @@ impl OpenAIPreprocessor {
                     .collect()
             });
             let unified: Pin<Box<dyn Stream<Item = _> + Send>> =
-                Box::pin(unified_parser::apply_stream_with_constraint(
+                Box::pin(unified_parser::apply_stream_with_markers(
                     stream,
                     tool_definitions,
                     guided_tool_constraint,
                     unified_parser::stream_prefill(family, prompt_injected_reasoning),
                     family,
                     guided_tool_streaming,
+                    match &token_view {
+                        Some(view) if view.rewrites_markers() => unified_parser::MarkerMode::TokenIds,
+                        Some(_) => unified_parser::MarkerMode::TwoPass,
+                        None => unified_parser::MarkerMode::Text,
+                    },
                 ));
-            return Ok(Self::apply_unified_response_policies(
+            return Ok(Self::apply_unified_response_policies_with_tokens(
                 unified,
                 Self::tool_call_parsing_enabled(request),
                 defer_reasoning_for_nonempty_content,
+                token_view,
             ));
         }
 
@@ -7089,10 +7132,39 @@ impl
             .collect();
         let annotations_stream = stream::iter(annotations);
 
+        let token_view = match &tool_processing_route {
+            ToolProcessingRoute::Unified(family)
+                if *family
+                    == crate::protocols::openai::chat_completions::unified_parser::DEEPSEEK_V41_UNIFIED_FAMILY =>
+            {
+                DeepSeekV41TokenView::new(
+                    self.tokenizer.clone(),
+                    original_stream_flag,
+                    if original_stream_flag {
+                        ReasoningCount::Stream
+                    } else {
+                        ReasoningCount::Full
+                    },
+                    prompt_injected_reasoning,
+                )
+            }
+            _ => None,
+        };
+
         // forward the common completion request to the next operator
         let response_stream = next.generate(common_request).await?;
         // Extract context once
         let context = response_stream.context();
+        let response_stream: Pin<Box<dyn Stream<Item = Annotated<BackendOutput>> + Send>> =
+            match token_view.clone() {
+                Some(view) => Box::pin(response_stream.map(move |mut response| {
+                    if let Some(output) = response.data.as_mut() {
+                        view.observe(output);
+                    }
+                    response
+                })),
+                None => Box::pin(response_stream),
+            };
 
         // transform the postprocessor stream (no boxing yet) - detokenize
         let stream = Self::transform_postprocessor_stream_with_image_tokens(
@@ -7112,6 +7184,7 @@ impl
             prompt_injected_reasoning,
             guided_tool_constraint,
             tool_processing_route,
+            token_view,
         )?;
         let transformed_stream = Self::normalize_chat_stream_roles(transformed_stream);
 

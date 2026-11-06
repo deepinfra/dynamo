@@ -23,6 +23,7 @@ pub mod aggregator;
 mod delta;
 pub mod tool_parser_v2;
 pub(crate) mod unified_parser;
+pub(crate) mod deepseek_v41_tokens;
 
 pub use aggregator::DeltaAggregator;
 pub use delta::DeltaGenerator;
