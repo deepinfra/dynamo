@@ -2627,6 +2627,8 @@ mod tests {
             (reqwest::Method::POST, "/router_policy/busy_threshold"),
             (reqwest::Method::GET, "/router_policy"),
             (reqwest::Method::PATCH, "/router_policy"),
+            (reqwest::Method::GET, "/router_policy/mooncake_store"),
+            (reqwest::Method::POST, "/router_policy/mooncake_store/resync"),
         ] {
             let response = client
                 .request(method, format!("http://localhost:{port}{path}"))

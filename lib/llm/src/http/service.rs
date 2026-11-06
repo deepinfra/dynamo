@@ -33,6 +33,7 @@ pub mod frontend_extension;
 pub mod generate;
 pub mod health;
 pub mod metrics;
+pub mod mooncake_store;
 pub mod openapi_docs;
 pub mod realtime;
 pub mod router_policy;
