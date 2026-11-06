@@ -330,6 +330,8 @@ pub struct SequenceRequest {
     pub prefill_load_hint: Option<PrefillLoadHint>,
     pub worker: WorkerWithDpRank,
     pub lora_name: Option<String>,
+    /// Sent to peer routers with the booking; see [`ActiveSequenceEventData::AddRequest`].
+    pub engine_block_hashes: Option<Vec<u64>>,
 }
 
 /// Whether a lifecycle operation changed the tracked request state.
@@ -351,6 +353,11 @@ pub trait ReplicaRequestLeaseObserver: Send + Sync {
     fn admitted(&self, booking: SchedulerBookingDescriptor);
     fn progressed(&self, booking: &SchedulerBookingDescriptor);
     fn completed(&self, booking: &SchedulerBookingDescriptor);
+}
+
+/// Receives the engine block hashes of prompts peer routers booked.
+pub trait ReplicaPromptObserver: Send + Sync {
+    fn peer_prompt(&self, engine_block_hashes: Vec<u64>);
 }
 
 impl LifecycleMutationOutcome {
@@ -382,6 +389,7 @@ pub struct ActiveSequencesMultiWorker<P: SequencePublisher> {
     pub(super) replica_sync: bool,
     pub(super) replica_worker_policy: ReplicaWorkerPolicy,
     replica_request_lease_observer: OnceLock<Arc<dyn ReplicaRequestLeaseObserver>>,
+    replica_prompt_observer: OnceLock<Arc<dyn ReplicaPromptObserver>>,
     worker_type: &'static str,
 }
 
@@ -492,6 +500,7 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
             replica_sync,
             replica_worker_policy: options.replica_worker_policy,
             replica_request_lease_observer: OnceLock::new(),
+            replica_prompt_observer: OnceLock::new(),
             worker_type,
         }
     }
@@ -666,6 +675,15 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
         self.replica_request_lease_observer.get()
     }
 
+    /// Install the one observer for the prompts peer routers book.
+    pub fn set_replica_prompt_observer(&self, observer: Arc<dyn ReplicaPromptObserver>) -> bool {
+        self.replica_prompt_observer.set(observer).is_ok()
+    }
+
+    pub(super) fn replica_prompt_observer(&self) -> Option<&Arc<dyn ReplicaPromptObserver>> {
+        self.replica_prompt_observer.get()
+    }
+
     pub(super) fn notify_remote_state_update(&self) {
         #[cfg(test)]
         self.remote_state_update_count
@@ -826,10 +844,11 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
 
     fn add_request_impl(
         &self,
-        req: SequenceRequest,
+        mut req: SequenceRequest,
         decay_now: Instant,
         lazily_register_worker: bool,
     ) -> Result<AttemptId, SequenceError> {
+        let engine_block_hashes = req.engine_block_hashes.take();
         let event = self.replica_sync.then(|| ActiveSequenceEvent {
             request_id: req.request_id.clone(),
             worker: req.worker,
@@ -838,6 +857,7 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
                 track_prefill_tokens: req.track_prefill_tokens,
                 expected_output_tokens: req.expected_output_tokens,
                 prefill_load_hint: req.prefill_load_hint,
+                engine_block_hashes,
             },
             router_id: self.router_id,
             lora_name: req.lora_name.clone(),
@@ -1495,6 +1515,7 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
             prefill_load_hint,
             worker,
             lora_name,
+            engine_block_hashes: _,
         } = req;
 
         let mut attempted_lazy_registration = false;
@@ -2035,6 +2056,67 @@ mod tests {
         );
     }
 
+    #[derive(Default)]
+    struct RecordingPromptObserver {
+        prompts: Mutex<Vec<Vec<u64>>>,
+    }
+
+    impl ReplicaPromptObserver for RecordingPromptObserver {
+        fn peer_prompt(&self, engine_block_hashes: Vec<u64>) {
+            self.prompts.lock().unwrap().push(engine_block_hashes);
+        }
+    }
+
+    #[test]
+    fn bookings_carry_engine_block_hashes_to_peer_prompt_observers() {
+        let worker = WorkerWithDpRank::new(1, 0);
+        let (origin, origin_state) = make_recording_sequences(HashMap::from([(1, (0, 1))]));
+        origin
+            .add_request(
+                SequenceRequest {
+                    request_id: "req-1".to_string(),
+                    token_sequence: Some(vec![1, 2]),
+                    track_prefill_tokens: true,
+                    expected_output_tokens: None,
+                    prefill_load_hint: None,
+                    worker,
+                    lora_name: None,
+                    engine_block_hashes: Some(vec![7, 8]),
+                },
+                Instant::now(),
+            )
+            .unwrap();
+        let mut events = std::mem::take(&mut *origin_state.published.lock().unwrap());
+        assert_eq!(events.len(), 1);
+
+        let peer = ActiveSequencesMultiWorker::new(
+            RecordingPublisher {
+                state: Arc::new(RecordingPublisherState::default()),
+            },
+            4,
+            HashMap::from([(1, (0, 1))]),
+            true,
+            1,
+            "test",
+        );
+        let observer = Arc::new(RecordingPromptObserver::default());
+        assert!(peer.set_replica_prompt_observer(observer.clone()));
+        // A booking without hashes, and the peer's own echo, reach no observer.
+        events.push(replica_add("req-2", worker, vec![3]));
+        let mut echo = replica_add("req-3", worker, vec![4]);
+        echo.router_id = peer.router_id;
+        if let ActiveSequenceEventData::AddRequest {
+            engine_block_hashes,
+            ..
+        } = &mut echo.data
+        {
+            *engine_block_hashes = Some(vec![9]);
+        }
+        events.push(echo);
+        peer.apply_replica_batch(events);
+        assert_eq!(*observer.prompts.lock().unwrap(), vec![vec![7, 8]]);
+    }
+
     #[test]
     fn worker_topology_observes_registered_and_removed_workers() {
         let (sequences, state) = make_recording_sequences(HashMap::from([(1, (0, 2))]));
@@ -2073,6 +2155,7 @@ mod tests {
                 track_prefill_tokens: true,
                 expected_output_tokens: None,
                 prefill_load_hint: tracking_hint(12),
+                engine_block_hashes: None,
             },
             router_id: 99,
             lora_name: None,
@@ -2114,6 +2197,7 @@ mod tests {
             prefill_load_hint: tracking_hint(12),
             worker,
             lora_name: None,
+            engine_block_hashes: None,
         }
     }
 
@@ -2496,6 +2580,7 @@ mod tests {
                     prefill_load_hint: None,
                     worker,
                     lora_name: None,
+                    engine_block_hashes: None,
                 },
                 decay_now,
             )
@@ -2523,6 +2608,7 @@ mod tests {
             prefill_load_hint: None,
             worker,
             lora_name: None,
+            engine_block_hashes: None,
         };
 
         sequences.add_request(req(worker_a), decay_now).unwrap();
@@ -2554,6 +2640,7 @@ mod tests {
                     prefill_load_hint: None,
                     worker: booked_worker,
                     lora_name: None,
+                    engine_block_hashes: None,
                 },
                 decay_now,
             )
@@ -2585,6 +2672,7 @@ mod tests {
                     prefill_load_hint: modeled_hint(100, 10),
                     worker: worker_a,
                     lora_name: None,
+                    engine_block_hashes: None,
                 },
                 start,
             )
@@ -2599,6 +2687,7 @@ mod tests {
                     prefill_load_hint: modeled_hint(60, 4),
                     worker: worker_a,
                     lora_name: None,
+                    engine_block_hashes: None,
                 },
                 start + Duration::from_secs(1),
             )
@@ -2613,6 +2702,7 @@ mod tests {
                     prefill_load_hint: tracking_hint(12),
                     worker: worker_b,
                     lora_name: None,
+                    engine_block_hashes: None,
                 },
                 start,
             )
@@ -2654,6 +2744,7 @@ mod tests {
                     prefill_load_hint: modeled_hint(100, 10),
                     worker,
                     lora_name: None,
+                    engine_block_hashes: None,
                 },
                 start,
             )
@@ -2668,6 +2759,7 @@ mod tests {
                     prefill_load_hint: modeled_hint(40, 4),
                     worker,
                     lora_name: None,
+                    engine_block_hashes: None,
                 },
                 start,
             )
@@ -2723,6 +2815,7 @@ mod tests {
                     prefill_load_hint: tracking_hint(12),
                     worker: worker_a,
                     lora_name: None,
+                    engine_block_hashes: None,
                 },
                 decay_now,
             )
@@ -2744,6 +2837,7 @@ mod tests {
                     prefill_load_hint: tracking_hint(12),
                     worker: worker_b,
                     lora_name: None,
+                    engine_block_hashes: None,
                 },
                 decay_now,
             )
@@ -2802,6 +2896,7 @@ mod tests {
                     prefill_load_hint: None,
                     worker,
                     lora_name: None,
+                    engine_block_hashes: None,
                 },
                 decay_now,
             )
@@ -2838,6 +2933,7 @@ mod tests {
                     prefill_load_hint: None,
                     worker: worker_a,
                     lora_name: None,
+                    engine_block_hashes: None,
                 },
                 decay_now,
             )
@@ -2852,6 +2948,7 @@ mod tests {
                     prefill_load_hint: None,
                     worker: worker_b,
                     lora_name: Some("adapter-a".to_string()),
+                    engine_block_hashes: None,
                 },
                 decay_now,
             )
@@ -2898,6 +2995,7 @@ mod tests {
                     prefill_load_hint: None,
                     worker: worker_a,
                     lora_name: None,
+                    engine_block_hashes: None,
                 },
                 decay_now,
             )
@@ -2912,6 +3010,7 @@ mod tests {
                     prefill_load_hint: None,
                     worker: worker_b,
                     lora_name: None,
+                    engine_block_hashes: None,
                 },
                 decay_now,
             )
@@ -2970,6 +3069,7 @@ mod tests {
                     prefill_load_hint: tracking_hint(12),
                     worker,
                     lora_name: None,
+                    engine_block_hashes: None,
                 },
                 Instant::now(),
             )
@@ -3014,6 +3114,7 @@ mod tests {
                         prefill_load_hint: tracking_hint(4),
                         worker,
                         lora_name: None,
+                        engine_block_hashes: None,
                     },
                     Instant::now(),
                 )
@@ -3049,6 +3150,7 @@ mod tests {
                     prefill_load_hint: tracking_hint(12),
                     worker,
                     lora_name: None,
+                    engine_block_hashes: None,
                 },
                 Instant::now(),
             )
@@ -3066,6 +3168,7 @@ mod tests {
                     prefill_load_hint: tracking_hint(12),
                     worker,
                     lora_name: None,
+                    engine_block_hashes: None,
                 },
                 Instant::now(),
             )
@@ -3396,6 +3499,7 @@ mod tests {
             track_prefill_tokens: false,
             expected_output_tokens: None,
             prefill_load_hint: None,
+            engine_block_hashes: None,
         };
         sequences.apply_replica_batch(vec![add]);
         state.clear();
@@ -3634,6 +3738,7 @@ mod tests {
                         track_prefill_tokens: true,
                         expected_output_tokens: None,
                         prefill_load_hint: tracking_hint(12),
+                        engine_block_hashes: None,
                     },
                     router_id: 99,
                     lora_name: None,
@@ -3682,6 +3787,7 @@ mod tests {
                             track_prefill_tokens: true,
                             expected_output_tokens: None,
                             prefill_load_hint: modeled_hint(12, 10),
+                            engine_block_hashes: None,
                         },
                         router_id: 99,
                         lora_name: None,
@@ -3725,6 +3831,7 @@ mod tests {
                             track_prefill_tokens: true,
                             expected_output_tokens: None,
                             prefill_load_hint: modeled_hint(12, 6),
+                            engine_block_hashes: None,
                         },
                         router_id: 99,
                         lora_name: None,
@@ -3783,6 +3890,7 @@ mod tests {
                                 track_prefill_tokens: true,
                                 expected_output_tokens: None,
                                 prefill_load_hint: modeled_hint(100, 10),
+                                engine_block_hashes: None,
                             },
                             router_id: 99,
                             lora_name: None,
@@ -3795,6 +3903,7 @@ mod tests {
                                 track_prefill_tokens: true,
                                 expected_output_tokens: None,
                                 prefill_load_hint: modeled_hint(40, 4),
+                                engine_block_hashes: None,
                             },
                             router_id: 99,
                             lora_name: None,
@@ -3859,6 +3968,7 @@ mod tests {
                     track_prefill_tokens: true,
                     expected_output_tokens: None,
                     prefill_load_hint: tracking_hint(12),
+                    engine_block_hashes: None,
                 },
                 router_id: 99,
                 lora_name: None,
@@ -3948,6 +4058,7 @@ mod tests {
                     prefill_load_hint: None,
                     worker,
                     lora_name: None,
+                    engine_block_hashes: None,
                 },
                 decay_now,
             )
@@ -3990,6 +4101,7 @@ mod tests {
                     prefill_load_hint: None,
                     worker,
                     lora_name: None,
+                    engine_block_hashes: None,
                 },
                 Instant::now(),
             )
@@ -4025,6 +4137,7 @@ mod tests {
                     prefill_load_hint: None,
                     worker,
                     lora_name: None,
+                    engine_block_hashes: None,
                 },
                 decay_now,
             )
@@ -4076,6 +4189,7 @@ mod tests {
                     }),
                     worker,
                     lora_name: None,
+                    engine_block_hashes: None,
                 },
                 start,
             )

@@ -513,6 +513,7 @@ pub(crate) fn prepare_active_sequences_trial(
                     }),
                     worker: WorkerWithDpRank::from_worker_id(operation.worker_id),
                     lora_name: None,
+                    engine_block_hashes: None,
                 })
             }
             ActiveOperationKind::PrefillComplete => {
@@ -1789,6 +1790,7 @@ mod tests {
             }),
             worker: WorkerWithDpRank::from_worker_id(0),
             lora_name: None,
+            engine_block_hashes: None,
         }
     }
 

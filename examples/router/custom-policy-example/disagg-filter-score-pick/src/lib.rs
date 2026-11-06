@@ -169,6 +169,7 @@ mod tests {
             shared_cache_hits: None,
             worker_loads: Default::default(),
             resp_tx: None,
+            engine_block_hashes: None,
         }
     }
 

@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use crate::discovery::PublisherId;
 use crate::kv_router::Indexer;
+use crate::kv_router::ideal_cache::IdealCache;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RecoveryResetReason {
@@ -61,6 +62,7 @@ pub(crate) trait RecoveryTarget: Send + Sync + 'static {
 pub(crate) struct IndexerRecoveryTarget {
     indexer: Indexer,
     shared_cache: Option<Arc<dyn SharedKvCache>>,
+    ideal_cache: Option<Arc<IdealCache>>,
 }
 
 impl IndexerRecoveryTarget {
@@ -68,7 +70,14 @@ impl IndexerRecoveryTarget {
         Self {
             indexer,
             shared_cache: None,
+            ideal_cache: None,
         }
+    }
+
+    /// Stamp every stored block, of any tier, in the ideal KV cache tracker.
+    pub(crate) fn with_ideal_cache(mut self, ideal_cache: Option<Arc<IdealCache>>) -> Self {
+        self.ideal_cache = ideal_cache;
+        self
     }
 
     /// Show `shared_cache` every device-tier store, live or replayed, before
@@ -88,6 +97,11 @@ impl RecoveryTarget for IndexerRecoveryTarget {
         _publisher_id: PublisherId,
         event: RouterEvent,
     ) -> anyhow::Result<()> {
+        if let Some(ideal_cache) = &self.ideal_cache
+            && let KvCacheEventData::Stored(data) = &event.event.data
+        {
+            ideal_cache.observe_stored(data);
+        }
         if let Some(shared_cache) = &self.shared_cache
             && let KvCacheEventData::Stored(data) = &event.event.data
             && event.targets_primary().unwrap_or(false)

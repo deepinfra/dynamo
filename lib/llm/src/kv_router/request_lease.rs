@@ -516,6 +516,7 @@ mod tests {
                 prefill_load_hint: None,
                 worker,
                 lora_name: None,
+                engine_block_hashes: None,
             })
             .await
             .unwrap();

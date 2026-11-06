@@ -45,6 +45,9 @@ pub(super) struct WorkerSelection {
     pub(super) kv_hint: Option<KvHint>,
     pub(super) request_lifecycle: Option<Box<RequestLifecycle>>,
     pub(super) cache_prediction: Option<CachePrediction>,
+    /// The prompt's blocks hashed as the workers hash them, when the ideal KV
+    /// cache counts it.
+    pub(super) engine_block_hashes: Option<Vec<u64>>,
 }
 
 // Transient return value; `Routed` is moved into `WorkerSelection` right away.
@@ -106,6 +109,7 @@ struct BestMatchArgs<'a> {
     allowed_worker_ids: Option<HashSet<WorkerId>>,
     routing_constraints: RoutingConstraints,
     admission: FindBestMatchAdmission,
+    engine_block_hashes: Option<Vec<u64>>,
 }
 
 impl RoutingHost {
@@ -131,6 +135,7 @@ impl RoutingHost {
                 args.allowed_worker_ids,
                 args.routing_constraints,
                 args.admission,
+                args.engine_block_hashes.as_deref(),
             )
             .await?;
         match admitted.outcome {
@@ -159,6 +164,7 @@ impl RoutingHost {
                 kv_hint,
                 request_lifecycle: None,
                 cache_prediction,
+                engine_block_hashes: args.engine_block_hashes,
             })),
             FindBestMatchOutcome::QueueRejected { rejection } => {
                 Ok(SelectionOutcome::QueueRejected(rejection))
@@ -217,6 +223,22 @@ impl RoutingHost {
         }
         let return_routing_hashes =
             !is_query_only && self.kv_router().indexer().records_routing_decisions();
+        // The ideal KV cache counts a disaggregated request's prompt on its prefill
+        // hop. Prompts whose worker hashes carry extra keys cannot be matched
+        // against stored blocks.
+        let engine_block_hashes = self
+            .kv_router()
+            .ideal_cache()
+            .filter(|_| {
+                !is_query_only
+                    && phase != RequestPhase::Decode
+                    && routing_parts.block_mm_infos.is_none()
+                    && lora_name.is_none()
+                    && cache_namespace.is_none()
+            })
+            .and_then(|cache| {
+                cache.prompt_hashes(self.kv_router().block_size(), routing_parts.token_ids)
+            });
         let SelectionOptions {
             pinned_target,
             affinity_target,
@@ -300,6 +322,7 @@ impl RoutingHost {
                     allowed_worker_ids,
                     routing_constraints: routing_constraints.clone(),
                     admission,
+                    engine_block_hashes,
                 })
                 .await?;
 
@@ -367,6 +390,7 @@ impl RoutingHost {
             allowed_worker_ids,
             routing_constraints,
             admission,
+            engine_block_hashes,
         })
         .await
     }

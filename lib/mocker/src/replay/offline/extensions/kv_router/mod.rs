@@ -451,6 +451,7 @@ impl PendingRequest {
             routing_constraints: RoutingConstraints::default(),
             shared_cache_hits: None,
             resp_tx: None,
+            engine_block_hashes: None,
         }
     }
 }
@@ -1198,6 +1199,7 @@ impl OfflineReplayRouter {
                     prefill_load_hint,
                     worker: selection.worker,
                     lora_name: None,
+                    engine_block_hashes: None,
                 },
                 decay_now,
             )

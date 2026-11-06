@@ -440,6 +440,12 @@ impl RoutingHost {
         );
         guard.set_cache_prediction(selection.cache_prediction);
 
+        if let Some(hashes) = selection.engine_block_hashes.take()
+            && let Some(ideal_cache) = chooser.ideal_cache()
+        {
+            ideal_cache.observe_prompt(chooser.block_size(), routing_parts.token_ids.len(), hashes);
+        }
+
         let record_result: Result<(), Error> = async {
             if !is_query_only && chooser.indexer().records_routing_decisions() {
                 let worker = selected_worker;

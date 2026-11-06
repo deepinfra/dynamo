@@ -319,6 +319,9 @@ impl SelectionCore {
                     partition: key.clone(),
                     host: self.host.replication.request_leases.clone(),
                 }));
+                if let Some(observer) = &self.host.replication.peer_prompts {
+                    slots.set_replica_prompt_observer(Arc::clone(observer));
+                }
                 let replica_inbox = scoped_replica_sync.channel.map(|(replica_tx, subscriber)| {
                     slots.start_replica_sync(subscriber, self.cancel_token.child_token());
                     ReplicaInbox::new(replica_tx)

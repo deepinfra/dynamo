@@ -48,6 +48,7 @@ pub fn fixture(
         shared_cache_hits: None,
         worker_loads: Default::default(),
         resp_tx: None,
+        engine_block_hashes: None,
     };
     let workers = (0..count as u64).map(|id| (id, TestWorker)).collect();
     for id in 0..count as u64 {

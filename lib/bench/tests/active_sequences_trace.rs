@@ -169,6 +169,7 @@ async fn active_sequences_replay_matches_sequential_direct_oracle() -> anyhow::R
             }),
             worker: WorkerWithDpRank::from_worker_id(0),
             lora_name: None,
+            engine_block_hashes: None,
         },
         now,
     )?;

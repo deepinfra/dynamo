@@ -1885,6 +1885,7 @@ impl<
             prefill_load_hint,
             worker: selected.selection.worker,
             lora_name: request.lora_name.take(),
+            engine_block_hashes: request.engine_block_hashes.take(),
         };
         self.book_and_respond(
             request,
@@ -2142,6 +2143,7 @@ mod tests {
                     prefill_load_hint: None,
                     worker,
                     lora_name: None,
+                    engine_block_hashes: None,
                 },
                 Instant::now(),
             )
@@ -2762,6 +2764,7 @@ mod tests {
             routing_constraints: crate::protocols::RoutingConstraints::default(),
             shared_cache_hits: None,
             resp_tx: Some(tx),
+            engine_block_hashes: None,
         };
         (req, rx)
     }
@@ -5306,6 +5309,7 @@ policy_classes:
                     }),
                     worker,
                     lora_name: None,
+                    engine_block_hashes: None,
                 },
                 decay_now(),
             )

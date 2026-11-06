@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::kv_router::ideal_cache::IdealCache;
 use std::{sync::Arc, time::Duration};
 
 use anyhow::Result;
@@ -416,6 +417,7 @@ pub async fn start_subscriber(
     source_requirement: KvEventSourceRequirement,
     worker_type: &'static str,
     shared_cache: Option<Arc<dyn SharedKvCache>>,
+    ideal_cache: Option<Arc<IdealCache>>,
     cancellation_token: CancellationToken,
 ) -> Result<KvEventSubscriptionHandle> {
     let runtime = endpoint.component().drt().runtime().secondary();
@@ -449,7 +451,9 @@ pub async fn start_subscriber(
     };
     let client = WorkerQueryClient::spawn(
         endpoint.component().clone(),
-        IndexerRecoveryTarget::new(indexer).with_shared_cache(shared_cache),
+        IndexerRecoveryTarget::new(indexer)
+            .with_shared_cache(shared_cache)
+            .with_ideal_cache(ideal_cache),
         membership_watch.fork_receiver(),
         cancel.child_token(),
     )

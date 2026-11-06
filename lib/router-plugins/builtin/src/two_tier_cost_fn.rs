@@ -250,6 +250,7 @@ mod tests {
             shared_cache_hits: None,
             worker_loads: Default::default(),
             resp_tx: None,
+            engine_block_hashes: None,
         };
         for (id, overlap_blocks, active_requests) in workers {
             request

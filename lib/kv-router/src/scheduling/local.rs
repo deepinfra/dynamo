@@ -107,6 +107,7 @@ where
             kv_transfer_candidates,
             retain_kv_transfer_chain,
             shared_cache_hits,
+            engine_block_hashes,
         } = request;
         let request = SchedulingRequest {
             mode,
@@ -128,6 +129,7 @@ where
             kv_transfer_candidates,
             retain_kv_transfer_chain,
             shared_cache_hits,
+            engine_block_hashes,
             worker_loads: FxHashMap::default(),
             resp_tx,
         };
@@ -625,6 +627,7 @@ where
             pinned_worker,
             allowed_worker_ids,
             shared_cache_hits,
+            engine_block_hashes: None,
         })
         .await
     }
@@ -985,6 +988,7 @@ mod tests {
                     }),
                     worker,
                     lora_name: None,
+                    engine_block_hashes: None,
                 })
                 .unwrap()
                 .commit();
@@ -1041,6 +1045,7 @@ mod tests {
                 prefill_load_hint: None,
                 worker,
                 lora_name: None,
+                engine_block_hashes: None,
             })
             .unwrap()
             .commit();
@@ -1190,6 +1195,7 @@ mod tests {
             kv_transfer_candidates: None,
             retain_kv_transfer_chain: false,
             shared_cache_hits: None,
+            engine_block_hashes: None,
         }
     }
 

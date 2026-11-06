@@ -263,6 +263,7 @@ fn lease_operation<'a>(
         track_active_blocks,
         return_routing_hashes: false,
         replay_id: None,
+        engine_block_hashes: None,
     }
 }
 
@@ -2126,6 +2127,7 @@ async fn replaced_claim_cannot_remove_or_overwrite_a_new_reservation(
         expected_output_tokens: None,
         prefill_load_hint: None,
         lora_name: None,
+        engine_block_hashes: None,
     };
     let old_entry = core.entry(&key).unwrap();
     let new_entry = core.entry(&other_key).unwrap();
@@ -2330,6 +2332,7 @@ async fn early_peer_accounting_follows_host_policy_without_granting_eligibility(
                         track_prefill_tokens: false,
                         expected_output_tokens: None,
                         prefill_load_hint: None,
+                        engine_block_hashes: None,
                     },
                     router_id: 99,
                     lora_name: None,
@@ -2408,6 +2411,7 @@ async fn mirrored_replica_bookings_are_indexed_until_freed() {
                 track_prefill_tokens: false,
                 expected_output_tokens: None,
                 prefill_load_hint: None,
+                engine_block_hashes: None,
             },
         )
     };

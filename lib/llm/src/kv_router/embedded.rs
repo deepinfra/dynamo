@@ -68,6 +68,8 @@ pub(crate) struct EmbeddedSelectionArgs {
     /// Builds the partition's worker-selection policy (see
     /// `SelectionPolicySource::resolve`).
     pub policy_factory: WorkerSelectionPolicyFactory,
+    /// Receives the engine block hashes of prompts peer routers booked.
+    pub peer_prompts: Option<Arc<dyn dynamo_kv_router::sequences::ReplicaPromptObserver>>,
 }
 
 fn record_queue_rejection(
@@ -284,6 +286,7 @@ impl EmbeddedSelection {
             replication: HostReplication {
                 channels: replica_sync,
                 request_leases,
+                peer_prompts: args.peer_prompts,
                 replica_worker_policy: ReplicaWorkerPolicy::LazyRegister,
             },
         })

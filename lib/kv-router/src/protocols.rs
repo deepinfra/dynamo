@@ -1282,6 +1282,10 @@ pub enum ActiveSequenceEventData {
         track_prefill_tokens: bool,
         expected_output_tokens: Option<u32>,
         prefill_load_hint: Option<PrefillLoadHint>,
+        /// The prompt's full blocks hashed as the workers hash them, for the peers'
+        /// ideal KV cache trackers. Not used for routing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        engine_block_hashes: Option<Vec<u64>>,
     },
     // NOTE: Output-block growth is intentionally not a replica-sync event. It can occur
     // at high frequency, and broadcasting it would consume disproportionate network bandwidth.
@@ -2012,6 +2016,56 @@ mod tests {
     use super::*;
     use rstest::rstest;
     use serde_json;
+
+    // N/N-1 fixture: routers with and without `engine_block_hashes` share replica sync.
+    mod engine_block_hashes_compat {
+        use super::*;
+
+        #[derive(Serialize, Deserialize)]
+        enum LegacyActiveSequenceEventData {
+            AddRequest {
+                token_sequence: Option<Vec<SequenceHash>>,
+                track_prefill_tokens: bool,
+                expected_output_tokens: Option<u32>,
+                prefill_load_hint: Option<PrefillLoadHint>,
+            },
+            Free,
+            MarkPrefillCompleted,
+        }
+
+        #[test]
+        fn add_requests_decode_across_versions() {
+            let current = ActiveSequenceEventData::AddRequest {
+                token_sequence: Some(vec![1, 2]),
+                track_prefill_tokens: true,
+                expected_output_tokens: Some(5),
+                prefill_load_hint: None,
+                engine_block_hashes: Some(vec![7, 8]),
+            };
+            let legacy: LegacyActiveSequenceEventData =
+                rmp_serde::from_slice(&rmp_serde::to_vec_named(&current).unwrap()).unwrap();
+            let LegacyActiveSequenceEventData::AddRequest {
+                token_sequence,
+                expected_output_tokens,
+                ..
+            } = &legacy
+            else {
+                panic!("an AddRequest stays an AddRequest");
+            };
+            assert_eq!(token_sequence, &Some(vec![1, 2]));
+            assert_eq!(expected_output_tokens, &Some(5));
+
+            let current: ActiveSequenceEventData =
+                rmp_serde::from_slice(&rmp_serde::to_vec_named(&legacy).unwrap()).unwrap();
+            assert!(matches!(
+                current,
+                ActiveSequenceEventData::AddRequest {
+                    engine_block_hashes: None,
+                    ..
+                }
+            ));
+        }
+    }
 
     // Temporary N/N-1 fixtures. Remove this module when domainless RouterEvent
     // is outside the supported mixed-version window.

@@ -422,6 +422,8 @@ pub struct ScheduleRequest {
     pub kv_transfer_candidates: Option<KvTransferCandidates>,
     pub retain_kv_transfer_chain: bool,
     pub shared_cache_hits: Option<SharedCacheHits>,
+    /// Sent to peer routers with the booking; see [`crate::sequences::SequenceRequest`].
+    pub engine_block_hashes: Option<Vec<u64>>,
 }
 
 /// Actor-owned admission request.
@@ -436,6 +438,8 @@ pub struct SchedulingRequest {
     pub isl_tokens: usize,
     pub lora_name: Option<String>,
     pub expected_output_tokens: Option<u32>,
+    /// Sent to peer routers with the booking; see [`crate::sequences::SequenceRequest`].
+    pub engine_block_hashes: Option<Vec<u64>>,
 
     // Routing constraints and request-level config.
     /// Affinity target with the same default-versus-custom policy semantics as
@@ -674,6 +678,7 @@ mod tests {
             shared_cache_hits: None,
             worker_loads,
             resp_tx: None,
+            engine_block_hashes: None,
         }
     }
 

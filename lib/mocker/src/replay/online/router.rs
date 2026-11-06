@@ -380,6 +380,7 @@ impl KvReplayRouter {
                 pinned_worker: None,
                 allowed_worker_ids: None,
                 shared_cache_hits: None,
+                engine_block_hashes: None,
             })
             .await?;
         Ok(ReplayPlacement {
