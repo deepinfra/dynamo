@@ -387,6 +387,14 @@ pub(crate) struct WrappedBlockSpec {
     /// differently for identical markup — the tool-only parser said `true` while the
     /// unified one inherited the trait default `false`.
     pub preserve_special_tokens: bool,
+    /// DI: vLLM's DeepSeek V4/V4.1 `TOOL_BETWEEN` rule. A tool block (or a bare invoke)
+    /// ends the visible turn: once one opens, later text is dropped and a thought it
+    /// interrupted does not resume; only further blocks, invokes and explicitly opened
+    /// reasoning spans still parse (vLLM's non-streaming reasoning pass keeps those).
+    pub block_ends_turn: bool,
+    /// DI: a bare invoke opener inside reasoning stays reasoning text, as in vLLM's
+    /// DeepSeek V4/V4.1 parser (no REASONING + INVOKE_PREFIX transition).
+    pub bare_invoke_in_reasoning_is_text: bool,
 }
 
 /// The reasoning channel a unified scanner also owns.
@@ -443,6 +451,17 @@ pub(crate) trait InvokeEmitter {
         invoke: &str,
         tool_index: usize,
     ) -> anyhow::Result<Option<ToolCallDelta>>;
+
+    /// DI: the call an invoke still open at end of output stands for (`invoke` runs
+    /// from its opener to the end of output), as vLLM's parser engine closes an open
+    /// tool call at finish. The default drops it.
+    fn parse_truncated_invoke(
+        &mut self,
+        _invoke: &str,
+        _tool_index: usize,
+    ) -> anyhow::Result<Option<ToolCallDelta>> {
+        Ok(None)
+    }
 
     /// The model-emitted id for a call already parsed at `tool_index`, when
     /// this family's grammar carries one. Mirrors
@@ -630,6 +649,8 @@ pub(crate) struct WrappedBlockScanner<E: InvokeEmitter> {
     /// visible text instead of reasoning.
     resume_reasoning: bool,
     suppress_normal_text: bool,
+    /// A tool block or bare invoke opened under `block_ends_turn`.
+    turn_ended: bool,
     next_index: usize,
     invoke_boundary: Option<Box<dyn InvokeBoundary>>,
     invoke_boundary_len: usize,
@@ -653,6 +674,7 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
             accept_redundant_reasoning_start: false,
             resume_reasoning: false,
             suppress_normal_text: false,
+            turn_ended: false,
             next_index: 0,
             invoke_boundary,
             invoke_boundary_len: 0,
@@ -807,10 +829,27 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
         // armed, and the NEXT stream's first post-call answer is emitted as reasoning.
         self.resume_reasoning = false;
         self.suppress_normal_text = false;
+        self.turn_ended = false;
         self.next_index = 0;
         self.emitter.reset();
         self.reset_invoke_boundary();
         pending
+    }
+
+    fn text_suppressed(&self) -> bool {
+        self.suppress_normal_text || self.turn_ended
+    }
+
+    /// Emit the call for an invoke left open at end of output, if the family recovers one.
+    fn emit_truncated_invoke<S: EventSink + ?Sized>(&mut self, out: &mut S) -> anyhow::Result<()> {
+        if let Some(delta) = self
+            .emitter
+            .parse_truncated_invoke(&self.buffer, self.next_index)?
+        {
+            out.push_call(delta);
+            self.next_index += 1;
+        }
+        Ok(())
     }
 
     /// Whether one invoke closer also closes the surrounding block.
@@ -989,7 +1028,11 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
         let tool_open = find_first(&self.buffer, &self.spec.block_starts)
             .map(|(pos, _)| pos)
             .into_iter()
-            .chain(self.find_invoke_start(&self.buffer))
+            .chain(
+                (!self.spec.bare_invoke_in_reasoning_is_text)
+                    .then(|| self.find_invoke_start(&self.buffer))
+                    .flatten(),
+            )
             .min();
         let duplicate_start = self
             .buffer
@@ -1078,7 +1121,8 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
                         self.uncommitted_block.clear();
                         self.in_block = false;
                         self.suppress_normal_text = false;
-                        self.in_reasoning = std::mem::take(&mut self.resume_reasoning);
+                        self.in_reasoning =
+                            std::mem::take(&mut self.resume_reasoning) && !self.turn_ended;
                         continue;
                     }
                 }
@@ -1120,7 +1164,8 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
                         self.uncommitted_block.clear();
                         self.in_block = false;
                         self.suppress_normal_text = false;
-                        self.in_reasoning = std::mem::take(&mut self.resume_reasoning);
+                        self.in_reasoning =
+                            std::mem::take(&mut self.resume_reasoning) && !self.turn_ended;
                         continue;
                     }
                     if flush {
@@ -1158,9 +1203,11 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
                             self.uncommitted_block.clear();
                             self.in_block = false;
                             self.suppress_normal_text = false;
-                            self.in_reasoning = std::mem::take(&mut self.resume_reasoning);
+                            self.in_reasoning =
+                                std::mem::take(&mut self.resume_reasoning) && !self.turn_ended;
                             continue;
                         }
+                        self.emit_truncated_invoke(out)?;
                         tracing::warn!(
                             why = %format!("{}_incomplete_invoke", self.spec.family),
                             "stream dropped incomplete invoke at EOF"
@@ -1232,7 +1279,8 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
                     self.uncommitted_block.clear();
                     self.in_block = false;
                     self.suppress_normal_text = false;
-                    self.in_reasoning = std::mem::take(&mut self.resume_reasoning);
+                    self.in_reasoning =
+                        std::mem::take(&mut self.resume_reasoning) && !self.turn_ended;
                 }
                 continue;
             }
@@ -1253,7 +1301,7 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
                     .chain(self.find_reasoning_start(flush).map(|(p, _)| p))
                     .min();
                 if next_open.is_none_or(|open| pos < open) {
-                    if !self.suppress_normal_text && pos > 0 {
+                    if !self.text_suppressed() && pos > 0 {
                         push_run(out, Kind::Text, &self.buffer[..pos]);
                     }
                     self.buffer.drain(..pos + len);
@@ -1279,7 +1327,7 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
                 let keep = if flush { 0 } else { self.holdback_len() };
                 let emit_len = self.buffer.len().saturating_sub(keep);
                 if emit_len > 0 {
-                    if !self.suppress_normal_text {
+                    if !self.text_suppressed() {
                         push_run(out, Kind::Text, &self.buffer[..emit_len]);
                     }
                     self.buffer.drain(..emit_len);
@@ -1288,7 +1336,7 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
             };
 
             if start > 0 {
-                if !self.suppress_normal_text {
+                if !self.text_suppressed() {
                     push_run(out, Kind::Text, &self.buffer[..start]);
                 }
                 self.buffer.drain(..start);
@@ -1301,6 +1349,7 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
                     self.reset_invoke_boundary();
                     self.in_block = true;
                     self.suppress_normal_text = true;
+                    self.turn_ended |= self.spec.block_ends_turn;
                 }
                 Marker::ReasoningStart(rlen) => {
                     self.buffer.drain(..rlen);
@@ -1328,6 +1377,10 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
                             continue;
                         }
                         if flush {
+                            if self.spec.block_ends_turn {
+                                self.turn_ended = true;
+                                self.emit_truncated_invoke(out)?;
+                            }
                             tracing::warn!(
                                 why = %format!("{}_incomplete_bare_invoke", self.spec.family),
                                 "stream dropped incomplete bare invoke at EOF"
@@ -1351,13 +1404,15 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
                         self.next_index += 1;
                         self.suppress_normal_text =
                             self.spec.bare_recovery_latch == BareRecoveryLatch::Set;
+                        self.turn_ended |= self.spec.block_ends_turn;
                     }
                     // A bare invoke nested in a thought has no block close to
                     // resume on, so resume here.
                     if self.resume_reasoning {
                         self.suppress_normal_text = false;
                     }
-                    self.in_reasoning = std::mem::take(&mut self.resume_reasoning);
+                    self.in_reasoning =
+                        std::mem::take(&mut self.resume_reasoning) && !self.turn_ended;
                 }
             }
         }
@@ -1409,6 +1464,8 @@ pub(crate) mod test_support {
                 drop_invoke_crossing_block_end: false,
                 invoke_boundary_factory: None,
                 preserve_special_tokens: true,
+                block_ends_turn: false,
+                bare_invoke_in_reasoning_is_text: false,
             },
             FailOnBoom,
         )

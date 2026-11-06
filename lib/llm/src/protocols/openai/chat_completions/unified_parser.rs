@@ -533,6 +533,35 @@ pub(crate) fn empty_choice(index: u32) -> ChatChoiceStream {
     }
 }
 
+/// DI: request `tool_choice` facts vLLM's chat serving applies per choice (DeepSeek V4.1).
+///
+/// `suppress_tool_calls` is `tool_choice: "none"` with tools: vLLM's parser engine drops the
+/// call events, which also changes its whitespace handling. `forced_named_tool` is a named
+/// choice, for which `resolve_finish_reason` reports `stop` rather than `tool_calls`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ToolChoicePolicy {
+    pub suppress_tool_calls: bool,
+    pub forced_named_tool: bool,
+}
+
+/// The [`ToolChoicePolicy`] for one request: DeepSeek V4.1 only, whose frontend must
+/// match vLLM's chat serving; every other family keeps the default.
+pub(crate) fn tool_choice_policy(
+    family: &str,
+    request: &super::NvCreateChatCompletionRequest,
+) -> ToolChoicePolicy {
+    use dynamo_protocols::types::ChatCompletionToolChoiceOption as Choice;
+    if family != DEEPSEEK_V41_UNIFIED_FAMILY {
+        return ToolChoicePolicy::default();
+    }
+    let has_tools = request.inner.tools.as_ref().is_some_and(|tools| !tools.is_empty());
+    ToolChoicePolicy {
+        suppress_tool_calls: has_tools
+            && matches!(request.inner.tool_choice, Some(Choice::None)),
+        forced_named_tool: matches!(request.inner.tool_choice, Some(Choice::Named(_))),
+    }
+}
+
 /// Per-choice streaming state: one parser instance plus the bookkeeping the OpenAI
 /// streaming tool-call contract needs. One instance parses exactly one choice of one
 /// request, which is what gives per-stream isolation by construction.
@@ -562,6 +591,8 @@ pub(crate) struct ChoiceState {
     /// The parser errored. Later chunks pass through as plain text instead of failing
     /// the request — a parser bug must not turn a served answer into a 500.
     failed: bool,
+    /// A named `tool_choice` finishes with `Stop` even after a call (vLLM).
+    forced_named_tool: bool,
 }
 
 impl ChoiceState {
@@ -627,6 +658,7 @@ impl ChoiceState {
             opened_calls: HashSet::new(),
             tool_emitted: false,
             failed: false,
+            forced_named_tool: false,
         })
     }
 
@@ -638,7 +670,16 @@ impl ChoiceState {
             opened_calls: HashSet::new(),
             tool_emitted: false,
             failed: false,
+            forced_named_tool: false,
         })
+    }
+
+    /// Apply the request's [`ToolChoicePolicy`] before the first delta.
+    pub(crate) fn apply_tool_choice_policy(&mut self, policy: ToolChoicePolicy) {
+        if policy.suppress_tool_calls {
+            self.parser.suppress_tool_calls();
+        }
+        self.forced_named_tool = policy.forced_named_tool;
     }
 
     /// Feed one decoded text delta through the parser.
@@ -847,7 +888,7 @@ impl ChoiceState {
     }
 
     pub(crate) fn unterminated_finish_reason(&self) -> Option<FinishReason> {
-        self.tool_emitted.then_some(FinishReason::ToolCalls)
+        self.normalize_finish_reason(self.tool_emitted.then_some(FinishReason::ToolCalls))
     }
 
     /// Whether this choice has emitted a tool call so far.
@@ -863,12 +904,15 @@ impl ChoiceState {
 
     /// OpenAI streaming contract: once a choice has emitted tool calls, a `Stop`
     /// terminating reason must be reported as `ToolCalls`. `Length` / `ContentFilter`
-    /// describe why generation stopped and are preserved as-is.
+    /// describe why generation stopped and are preserved as-is. A forced named tool
+    /// reports `Stop` (vLLM `resolve_finish_reason`, as OpenAI does).
     fn normalize_finish_reason(&self, finish_reason: Option<FinishReason>) -> Option<FinishReason> {
-        if finish_reason == Some(FinishReason::Stop) && self.tool_emitted {
-            Some(FinishReason::ToolCalls)
-        } else {
-            finish_reason
+        match finish_reason {
+            Some(FinishReason::ToolCalls) if self.forced_named_tool => Some(FinishReason::Stop),
+            Some(FinishReason::Stop) if self.tool_emitted && !self.forced_named_tool => {
+                Some(FinishReason::ToolCalls)
+            }
+            other => other,
         }
     }
 }
@@ -1045,7 +1089,7 @@ fn finish_unterminated_choices(
                 // even when the backend never sent a finish_reason: a strict client
                 // waits for a non-null one before considering the call complete, and
                 // would otherwise hang.
-                let finish_reason = state.tool_emitted().then_some(FinishReason::ToolCalls);
+                let finish_reason = state.unterminated_finish_reason();
                 choices.extend(state.choices_for(&base, deltas, true, finish_reason));
             }
             None => {
@@ -1160,7 +1204,7 @@ pub(crate) fn apply_stream_with_constraint<S>(
 where
     S: Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send + 'static,
 {
-    apply_stream_with_markers(
+    apply_stream_with_options(
         stream_in,
         tool_definitions,
         guided_tool_constraint,
@@ -1168,11 +1212,13 @@ where
         family,
         guided_streaming,
         MarkerMode::Text,
+        ToolChoicePolicy::default(),
     )
 }
 
 /// [`apply_stream_with_constraint`] with DeepSeek V4.1's reasoning markers read the
 /// way `marker_mode` says.
+#[allow(dead_code)]
 pub(crate) fn apply_stream_with_markers<S>(
     stream_in: S,
     tool_definitions: Option<Vec<ToolDefinition>>,
@@ -1181,6 +1227,61 @@ pub(crate) fn apply_stream_with_markers<S>(
     family: &'static str,
     guided_streaming: bool,
     marker_mode: MarkerMode,
+) -> impl Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send
+where
+    S: Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send + 'static,
+{
+    apply_stream_with_options(
+        stream_in,
+        tool_definitions,
+        guided_tool_constraint,
+        prefill,
+        family,
+        guided_streaming,
+        marker_mode,
+        ToolChoicePolicy::default(),
+    )
+}
+
+/// [`apply_stream_with_constraint`] with the request's [`ToolChoicePolicy`] applied to
+/// every choice.
+#[allow(dead_code)]
+pub(crate) fn apply_stream_with_policy<S>(
+    stream_in: S,
+    tool_definitions: Option<Vec<ToolDefinition>>,
+    guided_tool_constraint: GuidedToolConstraint,
+    prefill: UnifiedParserStartingState,
+    family: &'static str,
+    guided_streaming: bool,
+    tool_choice_policy: ToolChoicePolicy,
+) -> impl Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send
+where
+    S: Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send + 'static,
+{
+    apply_stream_with_options(
+        stream_in,
+        tool_definitions,
+        guided_tool_constraint,
+        prefill,
+        family,
+        guided_streaming,
+        MarkerMode::Text,
+        tool_choice_policy,
+    )
+}
+
+/// [`apply_stream_with_constraint`] with DeepSeek V4.1's marker mode and the request's
+/// [`ToolChoicePolicy`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_stream_with_options<S>(
+    stream_in: S,
+    tool_definitions: Option<Vec<ToolDefinition>>,
+    guided_tool_constraint: GuidedToolConstraint,
+    prefill: UnifiedParserStartingState,
+    family: &'static str,
+    guided_streaming: bool,
+    marker_mode: MarkerMode,
+    tool_choice_policy: ToolChoicePolicy,
 ) -> impl Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send
 where
     S: Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send + 'static,
@@ -1333,6 +1434,7 @@ where
                             marker_mode,
                         ) {
                             Ok(mut state) => {
+                                state.apply_tool_choice_policy(tool_choice_policy);
                                 // A raw run resuming after an already-parsed detour
                                 // gets a brand-new parser instance; seed it with any
                                 // tool-call history from before the gap so a Stop at
@@ -1889,6 +1991,80 @@ mod tests {
         );
     }
 
+    async fn v41_policy_stream(
+        input: &str,
+        finish_reason: FinishReason,
+        policy: ToolChoicePolicy,
+    ) -> Vec<Annotated<NvCreateChatCompletionStreamResponse>> {
+        let mut last = chunk(input, true);
+        last.data.as_mut().unwrap().inner.choices[0].finish_reason = Some(finish_reason);
+        apply_stream_with_policy(
+            stream::iter([last]),
+            Some(weather_tools()),
+            GuidedToolConstraint::None,
+            UnifiedParserStartingState::Response,
+            DEEPSEEK_V41_UNIFIED_FAMILY,
+            true,
+            policy,
+        )
+        .collect::<Vec<_>>()
+        .await
+    }
+
+    /// vLLM `resolve_finish_reason`: `tool_calls` only for a call that finished on its
+    /// own (`stop`) without a named tool_choice; a `length` cut stays `length`.
+    #[tokio::test]
+    async fn deepseek_v41_finish_reason_follows_vllm() {
+        let call = "<｜DSML｜ calls><｜DSML｜ invoke name=\"get_weather\"><｜DSML｜ parameter name=\"city\" string=\"true\">Paris</｜DSML｜ parameter></｜DSML｜ invoke></｜DSML｜ calls>";
+        let named = ToolChoicePolicy {
+            forced_named_tool: true,
+            ..Default::default()
+        };
+        for (finish, policy, expected) in [
+            (FinishReason::Stop, ToolChoicePolicy::default(), FinishReason::ToolCalls),
+            (FinishReason::Stop, named, FinishReason::Stop),
+            (FinishReason::Length, ToolChoicePolicy::default(), FinishReason::Length),
+            (FinishReason::Length, named, FinishReason::Length),
+        ] {
+            let responses = v41_policy_stream(call, finish, policy).await;
+            assert!(
+                logical_events(&responses)
+                    .iter()
+                    .any(|event| matches!(event, LogicalEvent::Tool { .. })),
+                "{finish:?} {policy:?}"
+            );
+            assert_eq!(
+                collect_choices(&responses).last().unwrap().finish_reason,
+                Some(expected),
+                "{finish:?} {policy:?}"
+            );
+        }
+    }
+
+    /// `tool_choice: "none"` with tools: vLLM's engine suppresses the call, keeps the
+    /// whitespace before it and drops the text after the block; the stream ends `stop`.
+    #[tokio::test]
+    async fn deepseek_v41_suppressed_tool_choice_keeps_leading_whitespace() {
+        let input = "\n\n<｜DSML｜ calls><｜DSML｜ invoke name=\"get_weather\"><｜DSML｜ parameter name=\"city\" string=\"true\">Paris</｜DSML｜ parameter></｜DSML｜ invoke></｜DSML｜ calls>tail";
+        let responses = v41_policy_stream(
+            input,
+            FinishReason::Stop,
+            ToolChoicePolicy {
+                suppress_tool_calls: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(
+            logical_events(&responses),
+            vec![LogicalEvent::Text("\n\n".to_string())]
+        );
+        assert_eq!(
+            collect_choices(&responses).last().unwrap().finish_reason,
+            Some(FinishReason::Stop)
+        );
+    }
+
     #[tokio::test]
     async fn deepseek_v41_preserves_calls_across_utf8_chunk_boundaries() {
         let call = concat!(
@@ -2062,7 +2238,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deepseek_v41_recovers_malformed_closed_arguments_as_text() {
+    async fn deepseek_v41_drops_an_unclosed_parameter_like_vllm() {
         let text = concat!(
             "<｜DSML｜ calls><｜DSML｜ invoke name=\"get_weather\">",
             "<｜DSML｜ parameter name=\"count\" string=\"false\">1",
@@ -2081,11 +2257,15 @@ mod tests {
         assert!(responses.iter().all(|response| !response.is_error()));
         assert_eq!(
             logical_events(&responses),
-            vec![LogicalEvent::Text(text.to_string())]
+            vec![LogicalEvent::Tool {
+                index: 0,
+                name: Some("get_weather".to_string()),
+                arguments: "{}".to_string(),
+            }]
         );
         assert_eq!(
             collect_choices(&responses).last().unwrap().finish_reason,
-            Some(FinishReason::Stop)
+            Some(FinishReason::ToolCalls)
         );
     }
 
@@ -3988,6 +4168,7 @@ mod tests {
             opened_calls: HashSet::new(),
             tool_emitted: false,
             failed: false,
+            forced_named_tool: false,
         };
 
         assert_eq!(

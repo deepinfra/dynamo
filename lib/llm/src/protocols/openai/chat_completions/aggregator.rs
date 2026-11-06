@@ -820,12 +820,48 @@ impl DeltaAggregator {
             }
         }
 
+        // DI: DeepSeek V4.1 builds its message as vLLM's chat serving does. The streamed
+        // finish_reason is already `resolve_finish_reason`'s (a `length` cut stays `length`
+        // and a named tool_choice stays `stop` even with calls). Under a forced tool_choice
+        // vLLM's parser drops whitespace-only content and `assemble_chat_message_fields`
+        // then serves `""`, never null.
+        let vllm_message_fields =
+            qwen3_unified_family == Some(super::unified_parser::DEEPSEEK_V41_UNIFIED_FAMILY);
+        let streamed_finish_reasons: HashMap<u32, _> = if vllm_message_fields {
+            aggregator
+                .choices
+                .iter()
+                .map(|(index, choice)| (*index, choice.finish_reason))
+                .collect()
+        } else {
+            HashMap::new()
+        };
+
         // Extract aggregated choices and sort them by index.
         let mut choices: Vec<_> = aggregator
             .choices
             .into_values()
             .map(dynamo_protocols::types::ChatChoice::from)
             .collect();
+
+        if vllm_message_fields {
+            let forces_tool_calls = parsing_options.forced_tool_choice
+                != crate::protocols::openai::ForcedToolChoice::None;
+            for choice in &mut choices {
+                if let Some(finish_reason) = streamed_finish_reasons.get(&choice.index) {
+                    choice.finish_reason = *finish_reason;
+                }
+                let blank = match &choice.message.content {
+                    None => true,
+                    Some(ChatCompletionMessageContent::Text(text)) => text.trim().is_empty(),
+                    Some(ChatCompletionMessageContent::Parts(_)) => false,
+                };
+                if forces_tool_calls && blank {
+                    choice.message.content =
+                        Some(ChatCompletionMessageContent::Text(String::new()));
+                }
+            }
+        }
 
         choices.sort_by_key(|a| a.index);
 
@@ -2296,8 +2332,92 @@ mod tests {
         assert_eq!(tool_calls[0].function.arguments, "{\"location\":\"SF\"}");
     }
 
+    fn deepseek_v41_options(forced: crate::protocols::openai::ForcedToolChoice) -> ParsingOptions {
+        let mut options = ParsingOptions::new(
+            Some("deepseek_v41".to_string()),
+            Some("deepseek_v41".to_string()),
+        );
+        options.forced_tool_choice = forced;
+        options
+    }
+
+    /// vLLM's message for DeepSeek V4.1: the streamed finish_reason is kept (a named
+    /// tool_choice reports `stop`, a `length` cut `length`, even with calls), and a forced
+    /// tool_choice serves `""` for null or whitespace-only content.
     #[tokio::test]
-    async fn deepseek_v41_batch_recovers_malformed_closed_arguments_as_text() {
+    async fn deepseek_v41_message_fields_follow_vllm() {
+        use crate::protocols::openai::ForcedToolChoice;
+        use dynamo_protocols::types::FinishReason;
+        let call = || dynamo_protocols::types::ChatCompletionMessageToolCallChunk {
+            index: 0,
+            id: Some("call-1".to_string()),
+            r#type: Some(dynamo_protocols::types::FunctionType::Function),
+            function: Some(dynamo_protocols::types::FunctionCallStream {
+                name: Some("get_weather".to_string()),
+                arguments: Some(r#"{"city": "Paris"}"#.to_string()),
+            }),
+        };
+        for (forced, finish, expected_finish) in [
+            (
+                ForcedToolChoice::Named,
+                FinishReason::Stop,
+                FinishReason::Stop,
+            ),
+            (
+                ForcedToolChoice::None,
+                FinishReason::Length,
+                FinishReason::Length,
+            ),
+            (
+                ForcedToolChoice::Required,
+                FinishReason::ToolCalls,
+                FinishReason::ToolCalls,
+            ),
+        ] {
+            let stream = Box::pin(stream::iter(vec![create_test_delta_with_tool_chunks(
+                0,
+                vec![call()],
+                Some(finish),
+                Some(dynamo_protocols::types::Role::Assistant),
+            )]));
+            let response = DeltaAggregator::apply(stream, deepseek_v41_options(forced))
+                .await
+                .unwrap();
+            let choice = &response.inner.choices[0];
+            assert_eq!(choice.finish_reason, Some(expected_finish), "{forced:?}");
+            assert_eq!(choice.message.tool_calls.as_ref().map(Vec::len), Some(1));
+            let expected_content = (forced != ForcedToolChoice::None)
+                .then(|| ChatCompletionMessageContent::Text(String::new()));
+            assert_eq!(choice.message.content, expected_content, "{forced:?}");
+        }
+        for (forced, text, expected) in [
+            (ForcedToolChoice::Required, "\n\n", Some("")),
+            (ForcedToolChoice::Named, "Sure.\n\n", Some("Sure.\n\n")),
+            (ForcedToolChoice::None, "\n\n", Some("\n\n")),
+        ] {
+            let stream = Box::pin(stream::iter(vec![create_test_delta(
+                0,
+                text,
+                Some(dynamo_protocols::types::Role::Assistant),
+                Some(FinishReason::Stop),
+                None,
+                None,
+            )]));
+            let response = DeltaAggregator::apply(stream, deepseek_v41_options(forced))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.inner.choices[0].message.content,
+                expected.map(|text| ChatCompletionMessageContent::Text(text.to_string())),
+                "{forced:?} {text:?}"
+            );
+        }
+    }
+
+    /// vLLM's parameter regex drops a parameter that never closes, so the call
+    /// survives with the parameters that did (none here).
+    #[tokio::test]
+    async fn deepseek_v41_batch_drops_an_unclosed_parameter_like_vllm() {
         let text = concat!(
             "<｜DSML｜ calls><｜DSML｜ invoke name=\"get_weather\">",
             "<｜DSML｜ parameter name=\"count\" string=\"false\">1",
@@ -2322,13 +2442,21 @@ mod tests {
         )
         .await;
 
-        let response = result.expect("malformed parser output should fall back to text");
+        let response = result.expect("aggregation succeeds");
         let choice = &response.inner.choices[0];
+        assert_eq!(choice.message.content, None);
+        let calls = choice
+            .message
+            .tool_calls
+            .as_ref()
+            .expect("the call is kept");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "get_weather");
+        assert_eq!(calls[0].function.arguments, "{}");
         assert_eq!(
-            choice.message.content,
-            Some(ChatCompletionMessageContent::Text(text.to_string()))
+            choice.finish_reason,
+            Some(dynamo_protocols::types::FinishReason::ToolCalls)
         );
-        assert!(choice.message.tool_calls.is_none());
     }
 
     #[tokio::test]

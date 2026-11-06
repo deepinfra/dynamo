@@ -390,6 +390,29 @@ impl GuidedToolConstraint {
     }
 }
 
+/// DI: a request `tool_choice` that forces a call (vLLM `_forces_tool_calls`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ForcedToolChoice {
+    #[default]
+    None,
+    Required,
+    Named,
+}
+
+impl ForcedToolChoice {
+    pub(crate) fn of(
+        tool_choice: Option<&dynamo_protocols::types::ChatCompletionToolChoiceOption>,
+    ) -> Self {
+        use dynamo_protocols::types::ChatCompletionToolChoiceOption as Choice;
+        match tool_choice {
+            Some(Choice::Required) => Self::Required,
+            Some(Choice::Named(_)) => Self::Named,
+            _ => Self::None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ParsingOptions {
     pub tool_call_parser: Option<String>,
@@ -452,6 +475,11 @@ pub struct ParsingOptions {
     #[serde(skip)]
     pub tools: Vec<ToolDefinition>,
 
+    /// The request's forced `tool_choice`, for the DeepSeek V4.1 non-streaming message
+    /// (vLLM: `content` is `""` rather than null when a call is forced).
+    #[serde(default)]
+    pub forced_tool_choice: ForcedToolChoice,
+
     /// Filled by the in-process preprocessor with the request's rendered-prompt
     /// channel state, read by the batch aggregator after the stream ends. Unset when
     /// preprocessing ran elsewhere.
@@ -480,6 +508,7 @@ impl ParsingOptions {
             exclude_tools_when_tool_choice_none:
                 crate::local_model::runtime_config::default_exclude_tools_when_tool_choice_none(),
             tools: Vec::new(),
+            forced_tool_choice: ForcedToolChoice::None,
             unified_prompt_state: None,
         }
     }

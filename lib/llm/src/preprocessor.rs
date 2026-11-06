@@ -4771,7 +4771,7 @@ impl OpenAIPreprocessor {
                     .collect()
             });
             let unified: Pin<Box<dyn Stream<Item = _> + Send>> =
-                Box::pin(unified_parser::apply_stream_with_markers(
+                Box::pin(unified_parser::apply_stream_with_options(
                     stream,
                     tool_definitions,
                     guided_tool_constraint,
@@ -4783,6 +4783,7 @@ impl OpenAIPreprocessor {
                         Some(_) => unified_parser::MarkerMode::TwoPass,
                         None => unified_parser::MarkerMode::Text,
                     },
+                    unified_parser::tool_choice_policy(family, request),
                 ));
             return Ok(Self::apply_unified_response_policies_with_tokens(
                 unified,

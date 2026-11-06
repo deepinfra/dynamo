@@ -79,10 +79,13 @@ fn apply_request_tool_call_parsing_options(
         parsing_options.reasoning_parser.as_deref(),
         uses_structural_tag,
     )?;
-    Ok(parsing_options
+    let mut parsing_options = parsing_options
         .with_guided_tool_constraint(guided_tool_constraint)
         .with_tool_call_parsing_enabled(tool_call_parsing_enabled)
-        .with_tools(converted_tools))
+        .with_tools(converted_tools);
+    parsing_options.forced_tool_choice =
+        crate::protocols::openai::ForcedToolChoice::of(request.inner.tool_choice.as_ref());
+    Ok(parsing_options)
 }
 
 #[cfg(test)]

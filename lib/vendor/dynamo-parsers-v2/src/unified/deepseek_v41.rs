@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::Context;
-use serde_json::{Map, Value};
+use serde_json::Value;
 
 use crate::tool_calling::scan::{
     BareRecoveryLatch, InvokeBoundary, InvokeBoundaryFactory, InvokeEmitter, ReasoningSpec,
@@ -20,6 +20,8 @@ const INVOKE_END: &str = "</｜DSML｜ invoke>";
 const PARAMETER_START: &str = "<｜DSML｜ parameter name=\"";
 const PARAMETER_END: &str = "</｜DSML｜ parameter>";
 
+mod args;
+
 /// Stand-ins for the `<think>` / `</think>` SPECIAL tokens (ids 128821/128822) in text
 /// fed to [`deepseek_v41_unified_token_markers`]. vLLM matches the reasoning markers by
 /// token id, so a marker spelled with ordinary tokens is plain text; the frontend
@@ -30,23 +32,23 @@ pub const THINK_END_TOKEN_MARKER: &str = "\u{FDD1}";
 pub const THINK_START: &str = "<think>";
 pub const THINK_END: &str = "</think>";
 
-pub(crate) fn deepseek_v41_unified(_tools: &[Tool]) -> Box<dyn UnifiedParser> {
-    build(THINK_START, THINK_END)
+pub(crate) fn deepseek_v41_unified(tools: &[Tool]) -> Box<dyn UnifiedParser> {
+    build(tools, THINK_START, THINK_END)
 }
 
 /// DeepSeek V4.1 with the reasoning markers matched only as the special-token stand-ins.
-pub fn deepseek_v41_unified_token_markers(_tools: &[Tool]) -> Box<dyn UnifiedParser> {
-    build(THINK_START_TOKEN_MARKER, THINK_END_TOKEN_MARKER)
+pub fn deepseek_v41_unified_token_markers(tools: &[Tool]) -> Box<dyn UnifiedParser> {
+    build(tools, THINK_START_TOKEN_MARKER, THINK_END_TOKEN_MARKER)
 }
 
 /// DeepSeek V4.1 as vLLM parses a complete (non-streaming) output: first a reasoning
 /// pass over the text, which ends reasoning at `</think>` or a DSML calls block and
 /// treats every `<think>`/`</think>` as a marker, even inside a calls block; then the
 /// tool parser over the content that pass left.
-pub fn deepseek_v41_unified_two_pass(_tools: &[Tool]) -> Box<dyn UnifiedParser> {
+pub fn deepseek_v41_unified_two_pass(tools: &[Tool]) -> Box<dyn UnifiedParser> {
     Box::new(TwoPass {
         split: ReasoningSplit::default(),
-        content: build(THINK_START, THINK_END),
+        content: build(tools, THINK_START, THINK_END),
         held_reasoning_ws: String::new(),
     })
 }
@@ -179,6 +181,10 @@ impl UnifiedParser for TwoPass {
     fn tool_call_id(&self, tool_index: usize) -> Option<&str> {
         self.content.tool_call_id(tool_index)
     }
+
+    fn suppress_tool_calls(&mut self) {
+        self.content.suppress_tool_calls()
+    }
 }
 
 /// Map the special-token stand-ins back to the marker text.
@@ -192,7 +198,11 @@ pub fn restore_token_markers(text: &str) -> std::borrow::Cow<'_, str> {
     )
 }
 
-fn build(think_start: &'static str, think_end: &'static str) -> Box<dyn UnifiedParser> {
+fn build(
+    tools: &[Tool],
+    think_start: &'static str,
+    think_end: &'static str,
+) -> Box<dyn UnifiedParser> {
     let spec = WrappedBlockSpec {
         family: "deepseek_v41",
         block_starts: vec![BLOCK_START.into()],
@@ -204,9 +214,14 @@ fn build(think_start: &'static str, think_end: &'static str) -> Box<dyn UnifiedP
         bare_recovery_latch: BareRecoveryLatch::Set,
         invoke_boundary_factory: Some(InvokeBoundaryFactory::custom(invocation_boundary)),
         preserve_special_tokens: true,
+        block_ends_turn: true,
+        bare_invoke_in_reasoning_is_text: true,
         ..Default::default()
     };
-    let scanner = WrappedBlockScanner::new(spec, DeepSeekV41).with_reasoning(ReasoningSpec {
+    let emitter = DeepSeekV41 {
+        tools: tools.to_vec(),
+    };
+    let scanner = WrappedBlockScanner::new(spec, emitter).with_reasoning(ReasoningSpec {
         start: think_start,
         end: think_end,
         preserve_special_tokens: true,
@@ -221,16 +236,16 @@ fn build(think_start: &'static str, think_end: &'static str) -> Box<dyn UnifiedP
 /// vLLM's DeepSeek V4/V4.1 parser-engine whitespace rules
 /// (`strip_trailing_reasoning_whitespace`, `drop_whitespace_only_content_before_tools`):
 /// reasoning never ends in whitespace, and content that is only whitespace before
-/// any visible text is held back, then dropped if a tool-call block follows, even
-/// one truncated before its first call completes (kept at EOF otherwise).
+/// any visible text is held back, then dropped if a tool call follows, even one
+/// truncated at EOF (kept at EOF otherwise). Under `tool_choice: "none"` vLLM's
+/// engine suppresses call events, so calls are dropped here and keep that whitespace.
 struct VllmWhitespace {
     inner: Box<dyn UnifiedParser>,
     deferred_reasoning: String,
     deferred_text: String,
     content_has_text: bool,
     tool_seen: bool,
-    block_started: bool,
-    raw_tail: String,
+    suppress_tool_calls: bool,
 }
 
 impl VllmWhitespace {
@@ -241,26 +256,8 @@ impl VllmWhitespace {
             deferred_text: String::new(),
             content_has_text: false,
             tool_seen: false,
-            block_started: false,
-            raw_tail: String::new(),
+            suppress_tool_calls: false,
         }
-    }
-
-    fn watch_block_start(&mut self, delta: &str) {
-        if self.block_started {
-            return;
-        }
-        self.raw_tail.push_str(delta);
-        if self.raw_tail.contains(BLOCK_START) {
-            self.block_started = true;
-            self.raw_tail.clear();
-            return;
-        }
-        let mut keep = self.raw_tail.len().saturating_sub(BLOCK_START.len() - 1);
-        while !self.raw_tail.is_char_boundary(keep) {
-            keep -= 1;
-        }
-        self.raw_tail.drain(..keep);
     }
 
     fn clear(&mut self) {
@@ -268,8 +265,6 @@ impl VllmWhitespace {
         self.deferred_text.clear();
         self.content_has_text = false;
         self.tool_seen = false;
-        self.block_started = false;
-        self.raw_tail.clear();
     }
 
     fn shape(&mut self, events: Vec<UnifiedParserEvent>, out: &mut UnifiedParserOutput) {
@@ -297,6 +292,7 @@ impl VllmWhitespace {
                         self.deferred_text = combined;
                     }
                 }
+                UnifiedParserEvent::ToolCall(_) if self.suppress_tool_calls => {}
                 UnifiedParserEvent::ToolCall(call) => {
                     self.deferred_reasoning.clear();
                     self.deferred_text.clear();
@@ -315,7 +311,6 @@ impl UnifiedParser for VllmWhitespace {
     }
 
     fn parse_into(&mut self, delta: &str, output: &mut UnifiedParserOutput) -> anyhow::Result<()> {
-        self.watch_block_start(delta);
         let mut raw = UnifiedParserOutput::default();
         let result = self.inner.parse_into(delta, &mut raw);
         self.shape(raw.events, output);
@@ -326,10 +321,14 @@ impl UnifiedParser for VllmWhitespace {
         let raw = self.inner.finish()?;
         let mut out = UnifiedParserOutput::default();
         self.shape(raw.events, &mut out);
-        if !self.deferred_text.is_empty() && !self.tool_seen && !self.block_started {
+        if !self.deferred_text.is_empty() && !self.tool_seen {
             out.push_text(std::mem::take(&mut self.deferred_text));
         }
         Ok(out)
+    }
+
+    fn suppress_tool_calls(&mut self) {
+        self.suppress_tool_calls = true;
     }
 
     fn reset(&mut self) -> String {
@@ -578,7 +577,24 @@ fn invocation_boundary() -> Box<dyn InvokeBoundary> {
     Box::new(DeepSeekV41InvocationBoundary::default())
 }
 
-struct DeepSeekV41;
+/// The request's tools give vLLM's schema coercion and wrapper unwrapping their schemas.
+struct DeepSeekV41 {
+    tools: Vec<Tool>,
+}
+
+impl DeepSeekV41 {
+    /// One call as vLLM's `_build_extracted_result` builds it: the stripped name (an empty
+    /// one is dropped) and `args::invoke_arguments` of the invoke body.
+    fn call(&self, name: &str, body: &str, tool_index: usize) -> Option<ToolCallDelta> {
+        let name = name.trim();
+        (!name.is_empty()).then(|| ToolCallDelta {
+            tool_index,
+            name: Some(name.to_string()),
+            arguments: args::invoke_arguments(body, name, &self.tools),
+            complete: true,
+        })
+    }
+}
 
 impl InvokeEmitter for DeepSeekV41 {
     fn parse_invoke(
@@ -590,32 +606,25 @@ impl InvokeEmitter for DeepSeekV41 {
             .strip_prefix(INVOKE_START)
             .and_then(|text| text.split_once("\">"))
             .context("invalid DeepSeek V4.1 invocation header")?;
-        anyhow::ensure!(!name.is_empty(), "empty DeepSeek V4.1 tool name");
-        let mut body = body
+        let body = body
             .strip_suffix(INVOKE_END)
             .context("incomplete DeepSeek V4.1 invocation")?;
-        let mut arguments = Map::new();
-        while !body.trim().is_empty() {
-            let (name, string, value) = parameter_header(body.trim_start())
-                .context("invalid DeepSeek V4.1 parameter header")?;
-            let (raw, remainder) = value
-                .split_once(PARAMETER_END)
-                .context("incomplete DeepSeek V4.1 parameter")?;
-            let value = if string {
-                Value::String(raw.to_string())
-            } else {
-                serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
-            };
-            // A repeated name keeps its first position with the last value (a Python dict).
-            arguments.insert(name.to_string(), value);
-            body = remainder;
-        }
-        Ok(Some(ToolCallDelta {
-            tool_index,
-            name: Some(name.to_string()),
-            arguments: python_json(&Value::Object(arguments)),
-            complete: true,
-        }))
+        Ok(self.call(name, body, tool_index))
+    }
+
+    /// vLLM closes a tool call still open at finish: the name streamed so far and the
+    /// parameters closed so far (`_dsml_arg_converter(partial=False)`), even mid-name.
+    fn parse_truncated_invoke(
+        &mut self,
+        invoke: &str,
+        tool_index: usize,
+    ) -> anyhow::Result<Option<ToolCallDelta>> {
+        let Some(rest) = invoke.strip_prefix(INVOKE_START) else {
+            return Ok(None);
+        };
+        let (name, body) = rest.split_once("\">").unwrap_or((rest, ""));
+        let body = body.find(INVOKE_END).map_or(body, |end| &body[..end]);
+        Ok(self.call(name, body, tool_index))
     }
 }
 
@@ -734,8 +743,9 @@ mod tests {
             ("plan</think>\n\n".to_string(), vec![reasoning("plan"), text("\n\n")]),
             (
                 "plan</think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"run\">\n<｜DSML｜ parameter name=\"a\" string=\"true\">x".to_string(),
-                vec![reasoning("plan")],
+                vec![reasoning("plan"), run()],
             ),
+            ("plan</think>\n\n<｜DSML｜ calls>\n</｜DSML｜ calls>".to_string(), vec![reasoning("plan"), text("\n\n")]),
             ("plan</think> \n answer".to_string(), vec![reasoning("plan"), text(" \n answer")]),
             ("r</think>Use <think> tags </think> ok".to_string(), vec![reasoning("r"), text("Use "), reasoning(" tags"), text(" ok")]),
         ] {
@@ -939,10 +949,156 @@ mod tests {
         );
     }
 
+    /// vLLM closes a call still open at finish with the parameters closed so far
+    /// (`_dsml_arg_converter(partial=False)`); outputs recorded from the prod image.
     #[test]
-    fn incomplete_arguments_do_not_emit_calls() {
-        let input = "<｜DSML｜ calls><｜DSML｜ invoke name=\"run\"><｜DSML｜ parameter name=\"text\" string=\"true\">unfinished";
-        assert_every_split(input, UnifiedParserStartingState::None, vec![]);
+    fn truncated_invoke_is_emitted_with_its_closed_parameters_like_vllm() {
+        let call = |name: &str, arguments: serde_json::Value| UnifiedEvent::ToolCall {
+            name: name.into(),
+            arguments,
+        };
+        let text = |text: &str| UnifiedEvent::Text { text: text.into() };
+        let invoke = "<｜DSML｜ invoke name=\"get_weather\">\n";
+        let open = format!("<｜DSML｜ calls>\n{invoke}");
+        let city = |v: &str| format!("<｜DSML｜ parameter name=\"city\" string=\"true\">{v}</｜DSML｜ parameter>");
+        for (input, expected) in [
+            (format!("Sure.\n\n{open}{}", city("Par")), vec![text("Sure.\n\n"), call("get_weather", serde_json::json!({"city": "Par"}))]),
+            (format!("{open}<｜DSML｜ parameter name=\"city\" string=\"true\">Par"), vec![call("get_weather", serde_json::json!({}))]),
+            (format!("{open}{}\n<｜DSML｜ parameter name=\"days\" string=\"false\">3", city("Paris")), vec![call("get_weather", serde_json::json!({"city": "Paris"}))]),
+            (format!("{open}<｜DSML｜ parameter name=\"ci"), vec![call("get_weather", serde_json::json!({}))]),
+            ("<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_wea".to_string(), vec![call("get_wea", serde_json::json!({}))]),
+            (format!("{open}{}\n</｜DSML｜ inv", city("Lima")), vec![call("get_weather", serde_json::json!({"city": "Lima"}))]),
+            (format!("Ok {invoke}{}", city("Bern")), vec![text("Ok "), call("get_weather", serde_json::json!({"city": "Bern"}))]),
+            ("Text.\n\n<｜DSML｜ calls>\n".to_string(), vec![text("Text.\n\n")]),
+        ] {
+            assert_every_split(&input, UnifiedParserStartingState::Response, expected);
+        }
+    }
+
+    /// vLLM's `TOOL_BETWEEN`: once a calls block opens, later text, reasoning and
+    /// reasoning markers are dropped, while later blocks and invokes still parse.
+    #[test]
+    fn text_after_a_calls_block_is_dropped_like_vllm() {
+        let paris = "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n<｜DSML｜ parameter name=\"city\" string=\"true\">Paris</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>";
+        let rome = "<｜DSML｜ invoke name=\"get_weather\">\n<｜DSML｜ parameter name=\"city\" string=\"true\">Rome</｜DSML｜ parameter>\n</｜DSML｜ invoke>";
+        let call = |city: &str| UnifiedEvent::ToolCall {
+            name: "get_weather".into(),
+            arguments: serde_json::json!({"city": city}),
+        };
+        let states = [UnifiedParserStartingState::Response, UnifiedParserStartingState::Reasoning];
+        for state in states {
+            for (input, expected) in [
+                (format!("{paris}\n\nDone. The answer is 42."), vec![call("Paris")]),
+                (format!("{paris}</think>Answer"), vec![call("Paris")]),
+                (format!("{paris}\nbetween\n<｜DSML｜ calls>\n{rome}\n</｜DSML｜ calls>\ntail"), vec![call("Paris"), call("Rome")]),
+                (format!("{paris}\n{rome}\ntail"), vec![call("Paris"), call("Rome")]),
+            ] {
+                assert_every_split(&input, state, expected);
+            }
+        }
+        // vLLM's non-streaming reasoning pass still honors a reasoning span opened after
+        // the block (its 1-token stream drops it; see the tk3 group-U residuals).
+        assert_every_split(
+            &format!("{paris}<think>R</think>Answer"),
+            UnifiedParserStartingState::Reasoning,
+            vec![call("Paris"), UnifiedEvent::Reasoning { text: "R".into() }],
+        );
+        let lead = |state: UnifiedParserStartingState, text: &str| match state {
+            UnifiedParserStartingState::Reasoning => UnifiedEvent::Reasoning { text: text.trim_end().into() },
+            _ => UnifiedEvent::Text { text: text.into() },
+        };
+        for state in states {
+            for (input, expected) in [
+                ("Lead.\n\n<｜DSML｜ calls>\n</｜DSML｜ calls>\n\nTail text.".to_string(), vec![lead(state, "Lead.\n\n")]),
+                ("Lead. <｜DSML｜ calls>junk</｜DSML｜ calls> tail".to_string(), vec![lead(state, "Lead. ")]),
+                ("Write \"<｜DSML｜ calls>\" literally. Then more.".to_string(), vec![lead(state, "Write \"")]),
+                (format!("Think.\n\n{paris}\nmore thinking</think>Answer"), vec![lead(state, "Think.\n\n"), call("Paris")]),
+            ] {
+                assert_every_split(&input, state, expected);
+            }
+        }
+    }
+
+    /// A bare invoke inside reasoning is reasoning text in vLLM (no REASONING +
+    /// INVOKE_PREFIX transition); outside reasoning it is a call.
+    #[test]
+    fn bare_invoke_in_reasoning_stays_reasoning_like_vllm() {
+        let invoke = "<｜DSML｜ invoke name=\"get_weather\">\n<｜DSML｜ parameter name=\"city\" string=\"true\">Bern</｜DSML｜ parameter>\n</｜DSML｜ invoke>";
+        let input = format!("Ok {invoke} after");
+        assert_every_split(
+            &input,
+            UnifiedParserStartingState::Reasoning,
+            vec![UnifiedEvent::Reasoning { text: input.clone() }],
+        );
+        assert_every_split(
+            &input,
+            UnifiedParserStartingState::Response,
+            vec![
+                UnifiedEvent::Text { text: "Ok ".into() },
+                UnifiedEvent::ToolCall {
+                    name: "get_weather".into(),
+                    arguments: serde_json::json!({"city": "Bern"}),
+                },
+            ],
+        );
+    }
+
+    /// `tool_choice: "none"`: vLLM suppresses call events, so the whitespace before a
+    /// block is kept and nothing after it surfaces.
+    #[test]
+    fn suppressed_calls_keep_leading_whitespace_like_vllm() {
+        let block = "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n<｜DSML｜ parameter name=\"city\" string=\"true\">Paris</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>";
+        let text = |text: &str| UnifiedEvent::Text { text: text.into() };
+        for (input, state, expected) in [
+            (format!("\n\n{block}\ntail"), UnifiedParserStartingState::Response, vec![text("\n\n")]),
+            (format!("R</think>\n\n{block}"), UnifiedParserStartingState::Reasoning, vec![UnifiedEvent::Reasoning { text: "R".into() }, text("\n\n")]),
+            (format!("Sure.\n\n{block}"), UnifiedParserStartingState::Response, vec![text("Sure.\n\n")]),
+        ] {
+            for split in (0..=input.len()).filter(|&i| input.is_char_boundary(i)) {
+                let mut parser = deepseek_v41_unified(&[]);
+                parser
+                    .initialize_request(UnifiedParserInit {
+                        starting_state: state,
+                        ..Default::default()
+                    })
+                    .unwrap();
+                parser.suppress_tool_calls();
+                let mut output = UnifiedParserOutput::default();
+                parser.parse_into(&input[..split], &mut output).unwrap();
+                parser.parse_into(&input[split..], &mut output).unwrap();
+                output.append(&mut parser.finish().unwrap());
+                assert_eq!(output.assembled(), expected, "{input:?} split {split}");
+            }
+        }
+    }
+
+    /// Arguments reach the client as vLLM builds them: schema coercion, wrapper
+    /// unwrapping, Python `json.dumps` text.
+    #[test]
+    fn arguments_follow_the_request_tool_schema() {
+        let tools = vec![Tool {
+            name: "send_money".into(),
+            description: None,
+            parameters: serde_json::json!({"type": "object", "properties": {
+                "recipient": {"type": "string"}, "amount": {"type": "number"}}}),
+            strict: None,
+        }];
+        let first_call = |input: &str| {
+            let mut parser = deepseek_v41_unified(&tools);
+            let events = parser.push(input).unwrap();
+            let Some(crate::unified::UnifiedParserEvent::ToolCall(call)) = events.into_iter().next() else {
+                panic!("expected a tool call for {input:?}");
+            };
+            call.arguments
+        };
+        assert_eq!(
+            first_call("<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"send_money\">\n<｜DSML｜ parameter name=\"recipient\" string=\"true\">GB29</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"amount\" string=\"false\">4.0</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>"),
+            r#"{"recipient": "GB29", "amount": 4}"#
+        );
+        assert_eq!(
+            first_call("<｜DSML｜ calls><｜DSML｜ invoke name=\"send_money\"><｜DSML｜ parameter name=\"arguments\" string=\"false\">{\"amount\": 10.0}</｜DSML｜ parameter></｜DSML｜ invoke></｜DSML｜ calls>"),
+            r#"{"amount": 10}"#
+        );
     }
 
     #[test]
@@ -982,12 +1138,19 @@ mod tests {
     }
 
     #[test]
-    fn invocation_requires_its_complete_closing_tag() {
+    fn invocation_waits_for_its_complete_closing_tag() {
         for suffix in ["", " invoke", " banana>"] {
             let input = format!("<｜DSML｜ calls><｜DSML｜ invoke name=\"run\"></｜DSML｜{suffix}");
             let mut parser = deepseek_v41_unified(&[]);
             assert!(parser.push(&input).unwrap().is_empty());
-            assert!(parser.finish().unwrap().events.is_empty());
+            // An invoke still open at EOF is closed as vLLM does.
+            assert_eq!(
+                parser.finish().unwrap().assembled(),
+                vec![UnifiedEvent::ToolCall {
+                    name: "run".into(),
+                    arguments: serde_json::json!({}),
+                }]
+            );
         }
     }
 
@@ -1069,22 +1232,19 @@ mod tests {
         assert_eq!(call.arguments, r#"{"a": {"k": [1, 1e-05, true]}, "b": "東京"}"#);
     }
 
+    /// vLLM's parameter regex needs a parameter close (or the next parameter's
+    /// header), so an unclosed parameter before the invoke close is dropped.
     #[test]
-    fn closed_malformed_parameter_is_an_error_at_eof() {
-        for input in [
-            "<｜DSML｜ calls><｜DSML｜ invoke name=\"run\"><｜DSML｜ parameter name=\"value\" string=\"false\">1</｜DSML｜ invoke></｜DSML｜ calls>",
-        ] {
-            for split in (0..=input.len()).filter(|&i| input.is_char_boundary(i)) {
-                let mut parser = deepseek_v41_unified(&[]);
-                let mut output = UnifiedParserOutput::default();
-                let result = parser
-                    .parse_into(&input[..split], &mut output)
-                    .and_then(|()| parser.parse_into(&input[split..], &mut output))
-                    .and_then(|()| parser.finish().map(|_| ()));
-                assert!(result.is_err(), "split {split}");
-                assert!(output.events.is_empty(), "split {split}");
-            }
-        }
+    fn unclosed_parameter_before_the_invoke_close_is_dropped_like_vllm() {
+        let input = "<｜DSML｜ calls><｜DSML｜ invoke name=\"run\"><｜DSML｜ parameter name=\"value\" string=\"false\">1</｜DSML｜ invoke></｜DSML｜ calls>";
+        assert_every_split(
+            input,
+            UnifiedParserStartingState::None,
+            vec![UnifiedEvent::ToolCall {
+                name: "run".into(),
+                arguments: serde_json::json!({}),
+            }],
+        );
     }
 
     #[test]

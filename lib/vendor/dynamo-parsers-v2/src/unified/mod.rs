@@ -332,6 +332,12 @@ pub trait UnifiedParser: Send {
     fn tool_call_id(&self, _tool_index: usize) -> Option<&str> {
         None
     }
+
+    /// DI: the request forbids tool calls (`tool_choice: "none"` with tools). A family that
+    /// mirrors vLLM's parser engine drops call events here, so they also stop counting as a
+    /// tool call for its whitespace rules; the default ignores it and the serving layer
+    /// removes the calls afterwards.
+    fn suppress_tool_calls(&mut self) {}
 }
 
 /// Allocation conveniences over the required [`UnifiedParser`] lifecycle.
@@ -4377,6 +4383,10 @@ impl UnifiedParser for DebugUnifiedParser {
 
     fn tool_call_id(&self, tool_index: usize) -> Option<&str> {
         self.inner.tool_call_id(tool_index)
+    }
+
+    fn suppress_tool_calls(&mut self) {
+        self.inner.suppress_tool_calls()
     }
 }
 
