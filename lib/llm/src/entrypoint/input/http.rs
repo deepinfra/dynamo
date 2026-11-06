@@ -298,7 +298,17 @@ where
             .collect::<Vec<String>>()
     );
 
-    let run_result = http_service.run(distributed_runtime.primary_token()).await;
+    // Drain HTTP before the runtime tears down routing. On SIGTERM,
+    // `DistributedRuntime::shutdown` cancels the endpoint token (phase 1), waits
+    // for registered graceful tasks (phase 2), and only then cancels the primary
+    // token (phase 3), which drops the router, discovery and worker streams.
+    // Watching the endpoint token and holding a graceful task keeps all of that
+    // alive while the HTTP server finishes the responses already in flight. The
+    // endpoint token is a child of the primary token, so any other shutdown path
+    // still stops the server.
+    let http_drain_guard = distributed_runtime.register_graceful_task();
+    let run_result = http_service.run(distributed_runtime.child_token()).await;
+    drop(http_drain_guard);
 
     // Initiate runtime shutdown whenever the server exits, including bind
     // failures, for both discovery-backed and in-process engines.

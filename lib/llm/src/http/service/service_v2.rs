@@ -928,29 +928,50 @@ impl HttpService {
             // Spawn canary after all fallible startup so it won't leak on early errors
             tokio::spawn(tokio_metrics_and_canary_loop(cancel_token.clone()));
 
+            // Shutdown closes connections first and drains second. The graceful
+            // signal below fires as soon as shutdown is requested, so axum stops
+            // accepting at once, closes idle keep-alive connections, and closes
+            // each busy connection after its current response. Clients that pool
+            // connections (deepapi holds keep-alive sockets to the Service, which
+            // conntrack pins to this pod) then reconnect to the remaining pods
+            // within seconds instead of feeding this one new requests until the
+            // drain times out. The stage stays Ready meanwhile: a request racing
+            // the close is served rather than rejected, and a terminating pod is
+            // already out of the Service, so readiness is moot. `serve` returns
+            // when the last connection closes; the timeout bounds that wait.
             let state = self.state.clone();
-            axum::serve(listener, router)
-                .with_graceful_shutdown(async move {
-                    observer.cancelled_owned().await;
-                    state.start_draining();
-                    tracing::info!("HTTP server shutdown requested");
-                    let shutdown_timeout =
-                        Duration::from_secs(get_graceful_shutdown_timeout() as u64);
-                    if !state.wait_inflight_zero_or_timeout(shutdown_timeout).await {
-                        tracing::warn!(
-                            inflight_requests = state.inflight_count(),
-                            "Timed out waiting for inflight inference requests to drain"
-                        );
-                    }
-                    state.start_stopping();
-                    state_cancel.cancel();
-                })
-                .await
-                .inspect_err(|_| {
-                    self.state.start_stopping();
-                    cancel_token.cancel()
-                })?;
+            let signal_observer = observer.clone();
+            let serve = axum::serve(listener, router).with_graceful_shutdown(async move {
+                signal_observer.cancelled_owned().await;
+                tracing::info!(
+                    inflight_requests = state.inflight_count(),
+                    timeout_secs = get_graceful_shutdown_timeout(),
+                    "HTTP server shutdown requested: closing idle keep-alive connections, \
+                     finishing in-flight responses"
+                );
+            });
+            let drain_deadline = async {
+                observer.cancelled().await;
+                tokio::time::sleep(Duration::from_secs(get_graceful_shutdown_timeout() as u64))
+                    .await;
+            };
+            tokio::select! {
+                result = serve => {
+                    result.inspect_err(|_| {
+                        self.state.start_stopping();
+                        cancel_token.cancel()
+                    })?;
+                    tracing::info!("HTTP server drained: all connections closed");
+                }
+                _ = drain_deadline => {
+                    tracing::warn!(
+                        inflight_requests = self.state.inflight_count(),
+                        "Timed out waiting for HTTP connections to drain"
+                    );
+                }
+            }
             self.state.start_stopping();
+            state_cancel.cancel();
             cancel_token.cancel();
         }
 
@@ -1905,6 +1926,59 @@ mod tests {
             handle.abort();
         })
         .await;
+    }
+
+    /// Shutdown must close idle keep-alive connections right away rather than
+    /// keep serving new requests on them until the drain times out. A client
+    /// that pools connections to a Service (deepapi) would otherwise keep
+    /// feeding a terminating frontend for the whole drain window.
+    #[tokio::test]
+    async fn test_shutdown_closes_idle_keepalive_connections() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let service = HttpService::builder().port(port).build().unwrap();
+        let token = CancellationToken::new();
+        let run_token = token.clone();
+        let handle =
+            tokio::spawn(async move { service.run_with_listener(run_token, listener).await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // One request on a keep-alive connection, then leave it idle.
+        let mut conn = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        conn.write_all(b"GET /live HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::time::timeout(Duration::from_secs(2), conn.read(&mut buf))
+            .await
+            .expect("response timed out")
+            .unwrap();
+        let head = String::from_utf8_lossy(&buf[..n]);
+        assert!(head.starts_with("HTTP/1.1 "), "unexpected response: {head}");
+        assert!(
+            !head.to_ascii_lowercase().contains("connection: close"),
+            "the connection must start out keep-alive: {head}"
+        );
+
+        token.cancel();
+
+        // The server closes the idle connection well inside the drain timeout
+        // (5 s by default), so this is the graceful close, not the deadline.
+        let n = tokio::time::timeout(Duration::from_secs(2), conn.read(&mut buf))
+            .await
+            .expect("idle keep-alive connection was not closed after shutdown")
+            .unwrap_or(0);
+        assert_eq!(n, 0, "expected EOF on the idle connection after shutdown");
+
+        let result = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("server did not exit after its connections closed")
+            .unwrap();
+        assert!(result.is_ok(), "server returned an error: {result:?}");
     }
 
     /// Verifies that unmatched routes return `404 Not Found` while registered
