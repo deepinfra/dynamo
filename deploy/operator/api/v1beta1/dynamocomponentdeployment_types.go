@@ -132,10 +132,11 @@ type DynamoComponentDeploymentSharedSpec struct {
 	// including for roles without a runtime init container.
 	// This field does not change container images.
 	//
-	// For non-LPX components, DGD admission requires this field when any runtime
-	// image tag lacks a parseable semantic version. Controller-generated DCDs may
-	// omit it. An override is also needed when the parsed tag differs from the
-	// Dynamo runtime version.
+	// For frontend, worker, prefill, decode, planner, and epp components, DGD
+	// admission requires this field when any runtime image tag lacks a parseable
+	// semantic version. Components without a type and controller-generated DCDs
+	// may omit it. An override is also needed when the parsed tag differs from
+	// the Dynamo runtime version.
 	//
 	// The value must use canonical MAJOR.MINOR.PATCH format, for example "1.4.0",
 	// and match the Dynamo version in every affected runtime container.
@@ -165,8 +166,7 @@ type DynamoComponentDeploymentSharedSpec struct {
 	// include a non-empty image and restartPolicy: Always.
 	//
 	// Sidecar mode supports worker, prefill, and decode components.
-	// Multinode sidecars currently support only backendFramework: sglang.
-	// Multinode support for vLLM and TensorRT-LLM is planned.
+	// Multinode sidecars support backendFramework: sglang, vllm, and trtllm.
 	// Multinode sidecars require complete leader and worker roles[].podTemplate
 	// definitions instead of this shared template.
 	// The leader must declare a runtime init container. The worker may omit it.
@@ -223,9 +223,9 @@ type DynamoComponentDeploymentSharedSpec struct {
 	// preserves the implicit multinode role layout.
 	//
 	// LPX components each require an agent role. A DGD may contain independent
-	// LPX components, each with its own conductor role, or a shared draft and
-	// target pair with a conductor role only on the target. Every LPX role
-	// requires its own podTemplate.
+	// LPX components, each serving through its own conductor role or agent
+	// runtime init container, or a draft and target pair in which only the
+	// target serves. Every LPX role requires its own podTemplate.
 	// +optional
 	// +kubebuilder:validation:MaxItems=2
 	// +listType=map

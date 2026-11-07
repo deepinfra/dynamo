@@ -10,6 +10,7 @@ use super::{
     TieredMatchDetails, WorkerTask,
 };
 use crate::protocols::*;
+use crate::session_prefix_index::SessionPrefixIndexer;
 
 /// One request's lookup in a [`SharedKvCache`].
 #[derive(Clone, Copy, Debug)]
@@ -42,6 +43,10 @@ pub trait SharedKvCache: Send + Sync {
     /// indexer applies it. Caches that name blocks by the engine's own hashes
     /// learn them here.
     fn observe_stored(&self, _worker: WorkerWithDpRank, _data: &KvCacheStoreData) {}
+
+    /// Hands the router's session prefix index to the cache so residency events that name
+    /// a session can update it. The default ignores the index.
+    fn attach_session_prefix_index(&self, _index: Arc<SessionPrefixIndexer>) {}
 }
 
 #[async_trait]

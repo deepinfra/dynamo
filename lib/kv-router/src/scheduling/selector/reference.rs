@@ -325,7 +325,10 @@ impl<C: Borrow<KvRouterConfig>> DefaultWorkerScorer<C> {
         let device_prefix_blocks = device_overlap_blocks.round().max(0.0) as u32;
         // Scoped caches answer per worker: only the stores this worker can load
         // from count.
-        let shared_beyond_device_blocks = match context.request.shared_cache_hits.as_ref() {
+        let shared_beyond_device_blocks = match context
+            .request
+            .and_then(|request| request.shared_cache_hits.as_ref())
+        {
             Some(hits) => hits
                 .for_worker(worker.worker_id)
                 .hits_beyond(device_prefix_blocks),
@@ -339,7 +342,9 @@ impl<C: Borrow<KvRouterConfig>> DefaultWorkerScorer<C> {
             .map_or(0, |source_blocks| {
                 let local_blocks = context
                     .request
-                    .transfer_local_prefix_blocks_for(worker)
+                    .map_or(0, |request| {
+                        request.transfer_local_prefix_blocks_for(worker)
+                    })
                     .saturating_add(cache.disk_overlap_blocks as usize);
                 source_blocks.saturating_sub(u32::try_from(local_blocks).unwrap_or(u32::MAX))
             });
@@ -390,7 +395,10 @@ impl<C: Borrow<KvRouterConfig>> DefaultWorkerScorer<C> {
             // `SchedulerQueueActor` task, so the logging layer cannot attach request identity to
             // it, and this branch returns early without reaching them.
             tracing::debug!(
-                request_id = context.request.mode.request_id().unwrap_or("-"),
+                request_id = context
+                    .request
+                    .and_then(|request| request.mode.request_id())
+                    .unwrap_or("-"),
                 worker_type = self.worker_type,
                 "{formula_name} for worker_id={} dp_rank={:?} with {effective_overlap_blocks:.2} effective cached blocks: {logit:.3} \
                  = max(0, decode_blocks - overlap_credit_blocks) + active_request_cost_blocks \
@@ -406,10 +414,10 @@ impl<C: Borrow<KvRouterConfig>> DefaultWorkerScorer<C> {
         let raw_prefill_tokens = if context.track_prefill_tokens {
             if load.available {
                 let cached_tokens = cache.estimated_cached_tokens;
-                let uncached_tokens = context.request.isl_tokens.saturating_sub(cached_tokens);
+                let uncached_tokens = context.isl_tokens.saturating_sub(cached_tokens);
                 (load.active_prefill_tokens + uncached_tokens).saturating_add(cached_tokens)
             } else {
-                context.request.isl_tokens
+                context.isl_tokens
             }
         } else {
             0
@@ -427,7 +435,10 @@ impl<C: Borrow<KvRouterConfig>> DefaultWorkerScorer<C> {
         // inside the macro so they cost nothing when DEBUG is disabled.
         if remote_blocks > 0 {
             tracing::debug!(
-                request_id = context.request.mode.request_id().unwrap_or("-"),
+                request_id = context
+                    .request
+                    .and_then(|request| request.mode.request_id())
+                    .unwrap_or("-"),
                 worker_type = self.worker_type,
                 "{formula_name} for worker_id={} dp_rank={:?} with {effective_overlap_blocks:.2} effective cached blocks, \
                  {} shared or fetchable blocks beyond the local prefix (multiplier={shared_cache_multiplier:.2}): {logit:.3} \
@@ -444,7 +455,10 @@ impl<C: Borrow<KvRouterConfig>> DefaultWorkerScorer<C> {
             );
         } else {
             tracing::debug!(
-                request_id = context.request.mode.request_id().unwrap_or("-"),
+                request_id = context
+                    .request
+                    .and_then(|request| request.mode.request_id())
+                    .unwrap_or("-"),
                 worker_type = self.worker_type,
                 "{formula_name} for worker_id={} dp_rank={:?} with {effective_overlap_blocks:.2} effective cached blocks: {logit:.3} \
                  = prefill_load_scale * adjusted_prefill_blocks + decode_blocks + active_request_cost_blocks \
@@ -639,6 +653,10 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
         true
     }
 
+    fn applies_worker_filters(&self) -> bool {
+        false
+    }
+
     fn required_worker_inputs(&self) -> WorkerInputs {
         WorkerInputs::CACHE | WorkerInputs::LOAD
     }
@@ -648,14 +666,11 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
         &self,
         input: WorkerSelectionInput<'_, C>,
     ) -> Result<WorkerSelectionResult, KvSchedulerError> {
-        let (workers, request, eligibility, block_size) = input.into_configured()?;
         select_worker_with_policy(
             self.worker_type,
             WorkerSelectionPolicyStateRef::Reference(&self.kv_router_config, &self.picker),
-            workers,
-            request,
-            eligibility,
-            block_size,
+            input,
+            None,
             None,
         )
         .map(|(result, _)| result)
