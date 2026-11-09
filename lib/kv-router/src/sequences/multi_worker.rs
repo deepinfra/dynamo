@@ -11,7 +11,7 @@
 
 use dynamo_tokens::SequenceHash;
 use parking_lot::{Mutex, RwLock};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::HashMap;
 use std::env;
 use std::future::Future;
@@ -25,7 +25,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::prefill_tracker::PrefillTimeLoad;
 use super::prompt_registry::{PromptRegistry, WorkerLoadSnapshot};
-use super::request_maps::{RequestBooking, RequestIndex};
+use super::request_maps::{LocalBooking, RequestBooking, RequestIndex};
 use super::single::{
     ActiveSequences, DEFAULT_ACTIVE_REQUEST_EXPIRY_DURATION, PromptMembershipDelta, RequestId,
 };
@@ -825,8 +825,34 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
     /// mutate `WorkerTable` under `workers.write()`, then clean up derived state
     /// after releasing the table lock.
     fn apply_worker_topology_change(&self, change: &WorkerTopologyChange) {
+        // Dropping a worker also drops this router's own bookings on it. Their
+        // later `free()` finds no booking and publishes nothing, so peers would
+        // keep mirroring them until request expiry. A transient fault
+        // inhibition (e.g. a TCP request timeout) removes and re-adds a worker
+        // within seconds, so under churn those orphans pile up into phantom
+        // load on every peer. Publish `Free` for each dropped local booking.
+        let dropped_local: Vec<LocalBooking> = if self.replica_sync && !change.removed.is_empty() {
+            let removed: FxHashSet<WorkerWithDpRank> =
+                change.removed.iter().map(|removed| removed.worker).collect();
+            self.request_index
+                .local_bookings()
+                .into_iter()
+                .filter(|local| removed.contains(&local.booking.worker))
+                .collect()
+        } else {
+            Vec::new()
+        };
         for removed in &change.removed {
             self.request_index.remove_worker_requests(removed.worker);
+        }
+        for local in dropped_local {
+            self.enqueue_publish_event(ActiveSequenceEvent {
+                request_id: local.request_id,
+                worker: local.booking.worker,
+                data: ActiveSequenceEventData::Free,
+                router_id: self.router_id,
+                lora_name: local.lora_name,
+            });
         }
         self.prompt_registry
             .apply_topology_change_without_cleanup(change);
@@ -2079,6 +2105,62 @@ mod tests {
             router_id,
             lora_name: None,
         }
+    }
+
+    /// A worker dropped by topology churn (e.g. a fault inhibition that re-adds it
+    /// seconds later) must release this router's bookings on it to peers. Without
+    /// the `Free`, the later `free()` finds no booking and peers keep the mirrors
+    /// until request expiry, which piles up as phantom load under churn.
+    #[test]
+    fn worker_removal_publishes_free_for_dropped_local_bookings_only() {
+        let w1 = WorkerWithDpRank::new(1, 0);
+        let w2 = WorkerWithDpRank::new(2, 0);
+        let (sequences, publisher) =
+            make_recording_sequences(HashMap::from([(1, (0, 1)), (2, (0, 1))]));
+        sequences
+            .add_request(local_sequence_request("on-w1", w1), Instant::now())
+            .unwrap();
+        sequences
+            .add_request(local_sequence_request("on-w2", w2), Instant::now())
+            .unwrap();
+        sequences.apply_replica_batch(vec![replica_add("mirrored-w1", w1, vec![1, 2, 3])]);
+        publisher.clear();
+
+        sequences
+            .reconcile_workers([WorkerDpRange::new(2, 0, 1)])
+            .unwrap();
+
+        {
+            let events = publisher.events.lock().unwrap();
+            assert!(
+                matches!(events.as_slice(), [ActiveSequenceEventData::Free]),
+                "only the local booking on the removed worker is released to peers, got {events:?}"
+            );
+        }
+
+        // Re-adding the worker must not resurrect the dropped booking, and its
+        // eventual completion stays a silent no-op.
+        publisher.clear();
+        sequences
+            .reconcile_workers([WorkerDpRange::new(1, 0, 1), WorkerDpRange::new(2, 0, 1)])
+            .unwrap();
+        sequences.free(&"on-w1".to_string(), Instant::now()).unwrap();
+        assert!(publisher.events.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn worker_removal_without_replica_sync_publishes_nothing() {
+        let w1 = WorkerWithDpRank::new(1, 0);
+        let (sequences, publisher) =
+            make_recording_sequences_without_replica_sync(HashMap::from([(1, (0, 1))]));
+        sequences
+            .add_request(local_sequence_request("on-w1", w1), Instant::now())
+            .unwrap();
+        publisher.clear();
+
+        sequences.reconcile_workers([]).unwrap();
+
+        assert!(publisher.events.lock().unwrap().is_empty());
     }
 
     #[test]
