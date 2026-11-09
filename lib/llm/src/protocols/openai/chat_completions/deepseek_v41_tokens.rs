@@ -73,7 +73,12 @@ pub(crate) struct DeepSeekV41TokenView {
     rewrite_markers: bool,
     count: ReasoningCount,
     thinking: bool,
+    /// Output ids per choice, kept only for the non-streaming `Full` count.
     output_ids: Mutex<HashMap<u32, Vec<u32>>>,
+    /// Running streaming counts per choice. Streamed chunks carry usage on every
+    /// chunk (`continuous_usage_stats`), so the count must advance with each new token
+    /// instead of re-detokenizing the whole output per chunk (O(n^2) per request).
+    stream_counters: Mutex<HashMap<u32, StreamReasoningCounter>>,
     aligners: Mutex<HashMap<u32, MarkerAligner>>,
 }
 
@@ -100,6 +105,7 @@ impl DeepSeekV41TokenView {
             count,
             thinking,
             output_ids: Mutex::new(HashMap::new()),
+            stream_counters: Mutex::new(HashMap::new()),
             aligners: Mutex::new(HashMap::new()),
         }))
     }
@@ -112,10 +118,23 @@ impl DeepSeekV41TokenView {
     /// tokens' marker text with the parser stand-ins.
     pub(crate) fn observe(&self, output: &mut BackendOutput) {
         let index = output.index.unwrap_or(0);
-        if let Ok(mut ids) = self.output_ids.lock() {
-            ids.entry(index)
-                .or_default()
-                .extend_from_slice(&output.token_ids);
+        match self.count {
+            ReasoningCount::Full => {
+                if let Ok(mut ids) = self.output_ids.lock() {
+                    ids.entry(index)
+                        .or_default()
+                        .extend_from_slice(&output.token_ids);
+                }
+            }
+            ReasoningCount::Stream if !self.thinking => {}
+            ReasoningCount::Stream => {
+                if let Ok(mut counters) = self.stream_counters.lock() {
+                    let counter = counters
+                        .entry(index)
+                        .or_insert_with(|| StreamReasoningCounter::new(self.tokenizer.clone()));
+                    counter.feed_all(&output.token_ids);
+                }
+            }
         }
         if !self.rewrite_markers {
             return;
@@ -134,17 +153,23 @@ impl DeepSeekV41TokenView {
 
     /// `usage.completion_tokens_details.reasoning_tokens` for everything observed.
     pub(crate) fn reasoning_tokens(&self) -> u32 {
+        if self.count == ReasoningCount::Stream {
+            if !self.thinking {
+                return 0;
+            }
+            let Ok(counters) = self.stream_counters.lock() else {
+                return 0;
+            };
+            return counters
+                .values()
+                .map(|counter| counter.count)
+                .fold(0u32, u32::saturating_add);
+        }
         let Ok(ids) = self.output_ids.lock() else {
             return 0;
         };
         ids.values()
-            .map(|ids| match self.count {
-                ReasoningCount::Stream if !self.thinking => 0,
-                ReasoningCount::Stream => stream_reasoning_tokens(self.tokenizer.clone(), ids),
-                ReasoningCount::Full => {
-                    full_reasoning_tokens(self.tokenizer.as_ref(), ids, self.thinking)
-                }
-            })
+            .map(|ids| full_reasoning_tokens(self.tokenizer.as_ref(), ids, self.thinking))
             .fold(0u32, u32::saturating_add)
     }
 }
@@ -272,41 +297,90 @@ fn plain_marker_count(run: &[u32], tokenizer: &dyn Tokenizer) -> usize {
 /// excluding a token whose chunk carried no text yet (an incomplete character) and
 /// stopping at `</think>` or a DSML calls block.
 fn stream_reasoning_tokens(tokenizer: Arc<dyn Tokenizer>, ids: &[u32]) -> u32 {
-    let mut decoder = crate::tokenizers::DecodeStream::new(tokenizer, &[], false);
-    let mut count = 0u32;
-    let mut emitted = 0usize;
-    let mut window = String::new();
-    let mut window_start = 0usize;
-    let mut starts: VecDeque<usize> = VecDeque::new();
-    for &id in ids {
-        match Marker::of(id) {
-            Some(Marker::End) => break,
-            Some(Marker::Start) => continue,
-            None => {}
-        }
-        let Ok(Some(text)) = decoder.step(id) else {
-            continue;
-        };
-        if text.is_empty() {
-            continue;
-        }
-        starts.push_back(emitted);
-        count += 1;
-        emitted += text.len();
-        window.push_str(&text);
-        if let Some(at) = window.find(TOOL_START) {
-            let tool_at = window_start + at;
-            let inside = starts.iter().filter(|start| **start >= tool_at).count() as u32;
-            return count - inside;
-        }
-        let keep_from = floor_boundary(&window, window.len().saturating_sub(TOOL_START.len()));
-        window_start += keep_from;
-        window.drain(..keep_from);
-        while starts.front().is_some_and(|start| *start < window_start) {
-            starts.pop_front();
+    let mut counter = StreamReasoningCounter::new(tokenizer);
+    counter.feed_all(ids);
+    counter.count
+}
+
+/// Incremental form of vLLM's streaming `reasoning_tokens` count: fed one output token at
+/// a time, it reaches the same count as a one-shot pass over the same ids, at O(1)
+/// amortized work per token. Once reasoning ends (`</think>` or a DSML calls block) the
+/// count is final and further tokens are ignored.
+struct StreamReasoningCounter {
+    decoder: crate::tokenizers::DecodeStream,
+    count: u32,
+    emitted: usize,
+    /// The last `TOOL_START.len()` bytes of emitted text, to see a calls block that
+    /// spans chunks.
+    window: String,
+    window_start: usize,
+    /// Byte offsets (in emitted text) at which counted tokens start, within `window`.
+    starts: VecDeque<usize>,
+    done: bool,
+}
+
+impl StreamReasoningCounter {
+    fn new(tokenizer: Arc<dyn Tokenizer>) -> Self {
+        Self {
+            decoder: crate::tokenizers::DecodeStream::new(tokenizer, &[], false),
+            count: 0,
+            emitted: 0,
+            window: String::new(),
+            window_start: 0,
+            starts: VecDeque::new(),
+            done: false,
         }
     }
-    count
+
+    fn feed_all(&mut self, ids: &[u32]) {
+        for &id in ids {
+            if self.done {
+                return;
+            }
+            self.feed(id);
+        }
+    }
+
+    fn feed(&mut self, id: u32) {
+        match Marker::of(id) {
+            Some(Marker::End) => {
+                self.done = true;
+                return;
+            }
+            Some(Marker::Start) => return,
+            None => {}
+        }
+        let Ok(Some(text)) = self.decoder.step(id) else {
+            return;
+        };
+        if text.is_empty() {
+            return;
+        }
+        self.starts.push_back(self.emitted);
+        self.count += 1;
+        self.emitted += text.len();
+        self.window.push_str(&text);
+        if let Some(at) = self.window.find(TOOL_START) {
+            let tool_at = self.window_start + at;
+            let inside = self.starts.iter().filter(|start| **start >= tool_at).count() as u32;
+            self.count -= inside;
+            self.done = true;
+            return;
+        }
+        let keep_from = floor_boundary(
+            &self.window,
+            self.window.len().saturating_sub(TOOL_START.len()),
+        );
+        self.window_start += keep_from;
+        self.window.drain(..keep_from);
+        while self
+            .starts
+            .front()
+            .is_some_and(|start| *start < self.window_start)
+        {
+            self.starts.pop_front();
+        }
+    }
 }
 
 fn floor_boundary(text: &str, mut at: usize) -> usize {
@@ -560,6 +634,87 @@ mod tests {
                     view.observe(&mut output);
                 }
                 assert_eq!(view.reasoning_tokens(), 5, "interval {interval} {count:?}");
+            }
+        }
+    }
+
+    /// The pre-incremental one-shot streaming count, verbatim, as the parity reference.
+    fn reference_stream_count(tokenizer: Arc<dyn Tokenizer>, ids: &[u32]) -> u32 {
+        let mut decoder = crate::tokenizers::DecodeStream::new(tokenizer, &[], false);
+        let mut count = 0u32;
+        let mut emitted = 0usize;
+        let mut window = String::new();
+        let mut window_start = 0usize;
+        let mut starts: VecDeque<usize> = VecDeque::new();
+        for &id in ids {
+            match Marker::of(id) {
+                Some(Marker::End) => break,
+                Some(Marker::Start) => continue,
+                None => {}
+            }
+            let Ok(Some(text)) = decoder.step(id) else {
+                continue;
+            };
+            if text.is_empty() {
+                continue;
+            }
+            starts.push_back(emitted);
+            count += 1;
+            emitted += text.len();
+            window.push_str(&text);
+            if let Some(at) = window.find(TOOL_START) {
+                let tool_at = window_start + at;
+                let inside = starts.iter().filter(|start| **start >= tool_at).count() as u32;
+                return count - inside;
+            }
+            let keep_from = floor_boundary(&window, window.len().saturating_sub(TOOL_START.len()));
+            window_start += keep_from;
+            window.drain(..keep_from);
+            while starts.front().is_some_and(|start| *start < window_start) {
+                starts.pop_front();
+            }
+        }
+        count
+    }
+
+    /// With `continuous_usage_stats` every chunk carries usage, so the streaming count is
+    /// read after every chunk. Each read must equal a one-shot count over the ids seen so
+    /// far (the running counter must not drift from the reference), for every chunking.
+    #[test]
+    fn streaming_count_read_after_every_chunk_matches_one_shot_prefix_count() {
+        let tokenizer = Vocab::new();
+        let sequences: [&[u32]; 4] = [
+            &[1, 2, 3, 1, 2, THINK_END_ID, 1, 2, 3],
+            &[1, 2, THINK_END_ID, 1, THINK_START_ID, 2, THINK_END_ID, 9],
+            &[1, 4, 5, 6, 7, 2],
+            &[1, 3, 8, 9, THINK_START_ID, 2, THINK_END_ID],
+        ];
+        for ids in sequences {
+            for interval in 1..=ids.len() {
+                let view = DeepSeekV41TokenView::new(
+                    tokenizer.clone(),
+                    true,
+                    ReasoningCount::Stream,
+                    true,
+                )
+                .unwrap();
+                let mut seen = 0;
+                for chunk in ids.chunks(interval) {
+                    let mut output: BackendOutput = serde_json::from_value(serde_json::json!({
+                        "token_ids": chunk,
+                        "tokens": [],
+                        "text": text_of(tokenizer.as_ref(), chunk),
+                        "index": 0,
+                    }))
+                    .unwrap();
+                    view.observe(&mut output);
+                    seen += chunk.len();
+                    assert_eq!(
+                        view.reasoning_tokens(),
+                        reference_stream_count(tokenizer.clone(), &ids[..seen]),
+                        "ids {ids:?} interval {interval} after {seen} tokens"
+                    );
+                }
             }
         }
     }
