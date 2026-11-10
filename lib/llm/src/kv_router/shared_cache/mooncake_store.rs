@@ -1352,26 +1352,31 @@ fn chunk_hash(group_id: &str, group_prefix: &str) -> Option<u64> {
     u64::from_str_radix(&hex[hex.len() - 16..], 16).ok()
 }
 
-/// The chunk an object belongs to: from its group id, or else from its key.
+/// The chunk an object belongs to: from its group id, or from its key when it has none.
 ///
 /// The connector derives an object's group id from the chunk hash that ends its key, so both name the same chunk.
 /// An object re-registered from the SSD tier after a master restart (`ReRegisterOffloadedObjects`) has no group id,
-/// only its key: without the key fallback a backfilled index misses every such chunk.
+/// only its key: without the key fallback a backfilled index misses every such chunk. A group id under another
+/// prefix is another store namespace's chunk, so its key is not consulted.
 fn object_chunk(
     group_id: Option<&str>,
     object_key: Option<&str>,
     group_prefix: &str,
 ) -> Option<u64> {
-    group_id
-        .and_then(|group_id| chunk_hash(group_id, group_prefix))
-        .or_else(|| object_key.and_then(|key| key_chunk_hash(key, group_prefix)))
+    match group_id {
+        Some(group_id) if !group_id.is_empty() => chunk_hash(group_id, group_prefix),
+        _ => object_key.and_then(|key| key_chunk_hash(key, group_prefix)),
+    }
 }
 
 /// The chunk hash of an object key `[{cache_prefix}@]{model}@tp_rank:…@{chunk hash hex}`, for the worker whose
 /// group prefix is `vllm-mooncake-store:[{cache_prefix}@]{model}@`.
+///
+/// The rank fields must follow the scope directly. vLLM puts a store namespace between them
+/// (`{model}@store_pp:…@store_format:…@tp_rank:…`) for another payload layout, whose chunks this worker cannot load.
 fn key_chunk_hash(object_key: &str, group_prefix: &str) -> Option<u64> {
     let scope = group_prefix.strip_prefix(GROUP_ID_PREFIX)?;
-    if scope.is_empty() || !object_key.starts_with(scope) {
+    if scope.is_empty() || !object_key.strip_prefix(scope)?.starts_with("tp_rank:") {
         return None;
     }
     let (_, hex) = object_key.rsplit_once('@')?;
@@ -1769,6 +1774,36 @@ mod tests {
         );
         assert_eq!(key_chunk_hash(&object_key(1), "no-group-prefix@"), None);
         assert_eq!(object_chunk(None, None, PREFIX), None);
+    }
+
+    #[test]
+    fn another_store_namespace_is_not_this_workers_chunk() {
+        // vLLM's heterogeneous-TP layouts put a store namespace after the model, in the
+        // group id and the key alike: the same chunk hash in a payload this worker cannot load.
+        const NAMESPACE: &str = "@store_pp:1@store_format:rank_local_tp4_layout_NHD";
+        let namespaced_key =
+            |hash: u64| object_key(hash).replacen('@', &format!("{NAMESPACE}@"), 1);
+        let namespaced_group =
+            |hash: u64| group_id(hash).replacen("V3.2@", &format!("V3.2{NAMESPACE}@"), 1);
+        assert!(namespaced_key(7).starts_with("DeepSeek-V3.2@store_pp:1@"));
+        assert_eq!(key_chunk_hash(&namespaced_key(7), PREFIX), None);
+        assert_eq!(
+            object_chunk(Some(&namespaced_group(7)), Some(&namespaced_key(7)), PREFIX),
+            None
+        );
+        assert_eq!(object_chunk(None, Some(&namespaced_key(7)), PREFIX), None);
+        // A foreign group id is not overridden by a key that would parse.
+        assert_eq!(
+            object_chunk(Some(&namespaced_group(7)), Some(&object_key(7)), PREFIX),
+            None
+        );
+        // The worker's own namespace, once its group prefix carries it, reads as usual.
+        let own_prefix = format!("vllm-mooncake-store:DeepSeek-V3.2{NAMESPACE}@");
+        assert_eq!(key_chunk_hash(&namespaced_key(7), &own_prefix), Some(7));
+        assert_eq!(
+            object_chunk(Some(&namespaced_group(7)), None, &own_prefix),
+            Some(7)
+        );
     }
 
     #[test]
