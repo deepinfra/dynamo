@@ -133,10 +133,7 @@ impl ReconcilableIndexer for KvIndexer {
     }
 }
 
-fn spawn_zmq_worker_reconciliation<I: ReconcilableIndexer>(
-    component: Component,
-    indexer: Arc<I>,
-) {
+fn spawn_zmq_worker_reconciliation<I: ReconcilableIndexer>(component: Component, indexer: Arc<I>) {
     const RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
     let token = component.drt().primary_token();
     // Publishes the tree's tracked-block count each tick. In kv-events mode the

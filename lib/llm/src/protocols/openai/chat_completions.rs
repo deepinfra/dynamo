@@ -1351,7 +1351,11 @@ mod tests {
 
     #[test]
     fn test_validate_accepts_namespaced_tool_names() {
-        for name in ["mcp-swarm.nmap_quick_scan", "github:create_issue", "fs/read_file"] {
+        for name in [
+            "mcp-swarm.nmap_quick_scan",
+            "github:create_issue",
+            "fs/read_file",
+        ] {
             let tools: Vec<dynamo_protocols::types::ChatCompletionTool> =
                 serde_json::from_value(json!([{
                     "type": "function",
