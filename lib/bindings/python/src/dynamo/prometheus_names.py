@@ -204,6 +204,13 @@ class frontend_service:
     # Active requests booked per worker, labeled by request phase
     # Gauge metric split into `prefill` (not yet marked prefill-complete) and `decode`
     WORKER_ACTIVE_REQUESTS = "worker_active_requests"
+    # Engine-reported KV blocks in use per worker (authoritative occupancy).
+    # Unlike WORKER_ACTIVE_DECODE_BLOCKS (the router's logical estimate), this
+    # mirrors the backend engine's own usedNumBlocks as published in ActiveLoad.
+    WORKER_KV_USED_BLOCKS = "worker_kv_used_blocks"
+    # Engine-reported total KV block capacity per worker, from the
+    # registration-time runtime config (same denominator the overload gate uses).
+    WORKER_KV_TOTAL_BLOCKS = "worker_kv_total_blocks"
     # Last observed time to first token per worker (in seconds)
     # Gauge metric tracking the most recent TTFT for each worker
     WORKER_LAST_TIME_TO_FIRST_TOKEN_SECONDS = "worker_last_time_to_first_token_seconds"
@@ -214,6 +221,19 @@ class frontend_service:
     # Last observed inter-token latency per worker (in seconds)
     # Gauge metric tracking the most recent ITL for each worker
     WORKER_LAST_INTER_TOKEN_LATENCY_SECONDS = "worker_last_inter_token_latency_seconds"
+    # Output sequence length per decode worker (in tokens)
+    # Histogram observed once per completed request, labeled by the decode
+    # worker that served it. Complements OUTPUT_SEQUENCE_TOKENS (model-level)
+    # with a per-worker breakdown; `_sum`/`_count` also yield true per-worker
+    # average OSL and completion rate.
+    WORKER_OUTPUT_SEQUENCE_TOKENS = "worker_output_sequence_tokens"
+    # Per-token negative log-probability per decode worker (nats)
+    # Histogram observed for every generated token whose backend response
+    # carries logprobs (client-requested, or sampled-in via
+    # DYN_FORCE_LOGPROBS_SAMPLE_RATE). Values are -logprob, so mass
+    # collapsing into the near-zero buckets signals degenerate/looping
+    # generation on that worker.
+    WORKER_TOKEN_NEG_LOGPROB = "worker_token_neg_logprob"
     # Number of requests pending in the router's scheduler queue (gauge per worker_type)
     ROUTER_QUEUE_PENDING_REQUESTS = "router_queue_pending_requests"
     # Number of replicas allocated for a LoRA adapter (gauge per LoRA)
