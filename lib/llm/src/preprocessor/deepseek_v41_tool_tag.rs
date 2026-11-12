@@ -13,6 +13,8 @@
 use dynamo_parsers::tool_calling::{ToolChoice, ToolDefinition};
 use serde_json::{Value, json};
 
+use crate::protocols::openai::xgrammar_schema;
+
 const CALLS_TRIGGER: &str = "<｜DSML｜ calls>";
 const CALLS_BEGIN: &str = "<｜DSML｜ calls>\n";
 const CALLS_END: &str = "</｜DSML｜ calls>";
@@ -79,7 +81,10 @@ fn invokes(tools: &[ToolDefinition], stop_after_first: bool) -> Value {
 
 fn invoke(tool: &ToolDefinition) -> Value {
     let schema = if tool.strict == Some(true) {
-        tool.parameters.clone().unwrap_or_else(|| json!({"type": "object", "properties": {}}))
+        match &tool.parameters {
+            Some(parameters) => xgrammar_schema::pinnable_or(parameters.clone(), || Value::Bool(true), &tool.name),
+            None => json!({"type": "object", "properties": {}}),
+        }
     } else {
         Value::Bool(true)
     };
@@ -137,6 +142,29 @@ mod tests {
         assert!(structural_tag(&ToolChoice::Required, &[], None).is_none());
         assert!(structural_tag(&ToolChoice::None, &tools(), None).is_none());
         assert!(structural_tag(&ToolChoice::Named("missing".to_string()), &tools(), None).is_none());
+    }
+
+    #[test]
+    fn strict_tool_with_an_uncompilable_schema_leaves_its_arguments_free() {
+        let tools = vec![
+            ToolDefinition {
+                name: "plot".to_string(),
+                parameters: Some(json!({
+                    "type": "object",
+                    "properties": {"xy": {"type": "array", "items": [{"type": "number"}, {"type": "number"}]}},
+                })),
+                strict: Some(true),
+            },
+            ToolDefinition {
+                name: "unit".to_string(),
+                parameters: Some(json!({"type": "object", "properties": {"u": {"enum": ["c", "f"]}}})),
+                strict: Some(true),
+            },
+        ];
+        let tag = structural_tag(&ToolChoice::Required, &tools, None).unwrap();
+        let invokes = &tag["format"]["elements"][1]["tags"];
+        assert_eq!(invokes[0]["content"]["json_schema"], json!(true));
+        assert_eq!(invokes[1]["content"]["json_schema"], tools[1].parameters.clone().unwrap());
     }
 
     #[test]
