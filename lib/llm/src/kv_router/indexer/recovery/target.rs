@@ -1,10 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use dynamo_kv_router::SharedKvCache;
-use dynamo_kv_router::protocols::{
-    DpRank, KvCacheEventData, RouterEvent, WorkerId, WorkerWithDpRank,
-};
+use dynamo_kv_events::event::{KvCacheEventData, RouterEvent};
+use dynamo_router_protocol::worker::{DpRank, WorkerId, WorkerWithDpRank};
+use dynamo_scheduler::host::SharedKvCache;
 use std::future::Future;
 use std::sync::Arc;
 
@@ -153,12 +152,12 @@ impl RecoveryTarget for IndexerRecoveryTarget {
 
 #[cfg(test)]
 mod tests {
-    use dynamo_kv_router::{
-        SharedCacheQuery,
-        indexer::KvRouterError,
-        protocols::{KvCacheStoreData, SharedCacheHits, StorageTier},
-        services::indexer::backend::create_indexer,
-    };
+    use dynamo_kv_events::event::KvCacheStoreData;
+    use dynamo_kv_events::residency::StorageTier;
+    use dynamo_kv_indexer::backend::create_indexer;
+    use dynamo_kv_indexer::host::KvRouterError;
+    use dynamo_scheduler::host::SharedCacheQuery;
+    use dynamo_worker_selection::host::SharedCacheHits;
 
     use super::*;
     use crate::kv_router::indexer::test_util::store_event;

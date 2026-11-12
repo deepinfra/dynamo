@@ -40,9 +40,9 @@
 use std::sync::{Arc, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
-use dynamo_kv_router::protocols::KvCacheStoreData;
-use dynamo_kv_router::sequences::ReplicaPromptObserver;
+use dynamo_kv_events::event::KvCacheStoreData;
 use dynamo_runtime::{component::Component, metrics::MetricsHierarchy};
+use dynamo_slot_tracker::host::ReplicaPromptObserver;
 use prometheus::{IntCounter, IntCounterVec, IntGauge, IntGaugeVec};
 
 use super::vllm_block_hash::{BLOCK_HASH_ENV, BlockHashScheme, VllmBlockHasher};

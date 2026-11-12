@@ -5,28 +5,25 @@
 //! from router configuration with runtime-backed metrics and, when configured,
 //! a request-plane remote primary.
 
+use dynamo_kv_indexer::host::{
+    ApproximateRetentionConfig, ConcurrentRadixTreeCompressed, KvIndexer, KvIndexerInterface,
+    KvIndexerMetrics, LowerTierIndexers, PruneConfig, SessionPrefixIndexer, SessionUpdateSender,
+    ThreadPoolIndexer,
+};
+use dynamo_kv_router::config::{ApproximateCachePolicyKind, KvRouterConfig};
+use dynamo_router_protocol::worker::WorkerId;
+mod runtime_metrics;
+pub use runtime_metrics::KvIndexerMetricsExt;
 use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use anyhow::Result;
-use dynamo_kv_router::{
-    ConcurrentRadixTreeCompressed, SessionPrefixIndexer,
-    approx::PruneConfig,
-    config::{ApproximateCachePolicyKind, KvRouterConfig},
-    indexer::{
-        ApproximateRetentionConfig, KvIndexer, KvIndexerInterface, KvIndexerMetrics,
-        LowerTierIndexers, ThreadPoolIndexer,
-    },
-    protocols::WorkerId,
-};
 
 // Re-export tiered-match types so internal callers (`indexer::TieredMatchDetails`)
 // keep working after these types moved to `dynamo-kv-router`.
-pub(crate) use dynamo_kv_router::indexer::TieredMatchDetails;
 #[allow(unused_imports)]
-pub(crate) use dynamo_kv_router::indexer::WireTieredMatchDetails;
-pub use dynamo_kv_router::services::indexer::backend::{Indexer, RemotePrimary, SideIndexer};
-pub(crate) use dynamo_kv_router::services::indexer::recording::ApproximateRequestLease;
-use dynamo_kv_router::services::indexer::session_updates::SessionUpdateSender;
+pub(crate) use dynamo_kv_indexer::host::WireTieredMatchDetails;
+pub(crate) use dynamo_kv_indexer::host::{ApproximateRequestLease, TieredMatchDetails};
+pub use dynamo_kv_indexer::host::{Indexer, RemotePrimary, SideIndexer};
 use dynamo_runtime::{
     component::Component, metrics::MetricsHierarchy, traits::DistributedRuntimeProvider,
 };
@@ -37,6 +34,7 @@ mod embedding_cache;
 mod ingress;
 mod recovery;
 pub mod remote;
+pub(crate) mod reply;
 
 pub use self::embedding_cache::{
     EmbeddingCacheIndexer, preprocessed_multimodal_cache_keys, try_build_cache_indexer,
@@ -424,11 +422,12 @@ fn predict_on_route_side_indexer(
 
 #[cfg(test)]
 pub(super) mod test_util {
-    use dynamo_kv_router::protocols::{
-        ExternalSequenceBlockHash, KvCacheEvent, KvCacheEventData, KvCacheStoreData,
-        KvCacheStoredBlockData, LocalBlockHash, RouterEvent, StorageTier,
-        compute_seq_hash_for_block,
+    use dynamo_kv_events::event::{
+        KvCacheEvent, KvCacheEventData, KvCacheStoreData, KvCacheStoredBlockData, RouterEvent,
     };
+    use dynamo_kv_events::residency::StorageTier;
+    use dynamo_kv_hashing::routing::compute_seq_hash_for_block;
+    use dynamo_kv_hashing::{ExternalSequenceBlockHash, LocalBlockHash};
 
     pub(crate) fn store_event(
         worker_id: u64,

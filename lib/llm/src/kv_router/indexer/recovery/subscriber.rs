@@ -5,8 +5,7 @@ use crate::kv_router::ideal_cache::IdealCache;
 use std::{sync::Arc, time::Duration};
 
 use anyhow::Result;
-use dynamo_kv_router::SharedKvCache;
-use dynamo_kv_router::protocols::{KV_EVENT_SUBJECT, RouterEvent};
+use dynamo_kv_events::event::{KV_EVENT_SUBJECT, RouterEvent};
 use dynamo_runtime::{
     component::{Component, Endpoint},
     discovery::EventTransportKind,
@@ -14,6 +13,7 @@ use dynamo_runtime::{
     traits::DistributedRuntimeProvider,
     transports::event_plane::{EventSubscriber, TypedEventSubscriber, uses_direct_zmq},
 };
+use dynamo_scheduler::host::SharedKvCache;
 use tokio::sync::{Semaphore, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -309,7 +309,7 @@ fn legacy_mismatch_count(view: &KvSourceMembershipView) -> usize {
 
 fn source_status_is_mismatch(
     view: &KvSourceMembershipView,
-    worker: &dynamo_kv_router::protocols::WorkerWithDpRank,
+    worker: &dynamo_router_protocol::worker::WorkerWithDpRank,
     status: &KvSourceStatus,
 ) -> bool {
     match status {
@@ -644,7 +644,7 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    use dynamo_kv_router::protocols::WorkerWithDpRank;
+    use dynamo_router_protocol::worker::WorkerWithDpRank;
 
     use crate::discovery::{KvEventSource, KvStateEndpointResolution};
 

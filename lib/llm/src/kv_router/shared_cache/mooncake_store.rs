@@ -50,12 +50,13 @@ use std::time::{Duration, Instant};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use async_trait::async_trait;
-use dynamo_kv_router::{
-    SharedCacheQuery, SharedKvCache,
-    indexer::KvRouterError,
-    protocols::{KvCacheStoreData, LocalBlockHash, SharedCacheHits, WorkerId, WorkerWithDpRank},
-};
+use dynamo_kv_events::event::KvCacheStoreData;
+use dynamo_kv_hashing::LocalBlockHash;
+use dynamo_kv_indexer::host::KvRouterError;
+use dynamo_router_protocol::worker::{WorkerId, WorkerWithDpRank};
 use dynamo_runtime::{component::Component, metrics::MetricsHierarchy};
+use dynamo_scheduler::host::{SharedCacheQuery, SharedKvCache};
+use dynamo_worker_selection::host::SharedCacheHits;
 use futures::StreamExt;
 use lru::LruCache;
 use parking_lot::{Mutex, RwLock};
@@ -1498,7 +1499,8 @@ impl MooncakeStoreMetrics {
 mod tests {
     use std::time::Duration;
 
-    use dynamo_kv_router::protocols::{ExternalSequenceBlockHash, KvCacheStoredBlockData};
+    use dynamo_kv_events::event::KvCacheStoredBlockData;
+    use dynamo_kv_hashing::ExternalSequenceBlockHash;
     use tokio::sync::watch;
 
     use super::*;
