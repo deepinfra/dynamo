@@ -437,3 +437,23 @@ fn test_generation_prompt_fields_omitted_default_none() {
     assert_eq!(request.common.add_generation_prompt, None);
     assert_eq!(request.common.continue_final_message, None);
 }
+
+#[test]
+fn test_more_than_four_stop_strings_pass_through_untruncated() {
+    let stops: Vec<String> = (0..16).map(|i| format!("stop-{i}")).collect();
+    let chat: NvCreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "Hello"}],
+        "stop": stops,
+    }))
+    .unwrap();
+    assert_eq!(chat.extract_stop_conditions().unwrap().stop, Some(stops.clone()));
+
+    let completion: NvCreateCompletionRequest = serde_json::from_value(serde_json::json!({
+        "model": "test-model",
+        "prompt": "Hello",
+        "stop": stops,
+    }))
+    .unwrap();
+    assert_eq!(completion.extract_stop_conditions().unwrap().stop, Some(stops));
+}
