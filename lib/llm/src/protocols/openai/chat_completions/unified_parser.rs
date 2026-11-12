@@ -941,6 +941,9 @@ fn detect_prefill(family: &str, content: &str) -> anyhow::Result<UnifiedParserSt
             },
         ),
         "gpt_oss" => Ok(UnifiedParserStartingState::None),
+        // Mistral output starts in visible content; the parser itself opens
+        // reasoning at `[THINK]`, so no prompt-opened state exists.
+        "mistral_4" => Ok(UnifiedParserStartingState::None),
         "muse_glimmer" | "muse_spark" => Ok(infer_marker_prefill(content, "<|start|>", "<|eom|>")),
         BEAM_UNIFIED_FAMILY => Ok(beam_prefill(content)),
         other => anyhow::bail!("no prefill detector for unified parser family '{other}'"),

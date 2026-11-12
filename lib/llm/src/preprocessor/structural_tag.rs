@@ -1761,7 +1761,12 @@ mod tests {
                 .unwrap()
                 .structural_tag
                 .unwrap();
-            let has_prefix = tag["format"]["elements"][0]["end"] == "<|close|>think<|sep|>";
+            // The reasoning prefix is either mandatory or, for K3, an optional
+            // block that a worker closing its own think block can skip.
+            let first = &tag["format"]["elements"][0];
+            let has_prefix = first["end"] == "<|close|>think<|sep|>"
+                || (first["type"] == "optional"
+                    && first["content"]["elements"][0]["end"] == "<|close|>think<|sep|>");
             assert_eq!(
                 has_prefix, expects_prefix,
                 "gate={gate:?}, require_reasoning={require_reasoning}, prompt_injected_reasoning={prompt_injected_reasoning}, choice={choice:?}"

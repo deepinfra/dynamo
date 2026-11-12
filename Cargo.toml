@@ -87,8 +87,8 @@ dynamo-lora = { path = "lib/lora", version = "1.7.0" }
 dynamo-sglang-generate = { path = "lib/generate-formats/sglang", version = "1.7.0" }
 dynamo-vllm-generate = { path = "lib/generate-formats/vllm", version = "1.7.0" }
 dynamo-rl = { path = "lib/rl", version = "1.7.0" }
-dynamo-tokenizers = { version = "=4.1.2" }
-dynamo-renderer = { version = "=10.1.0" }
+dynamo-tokenizers = { version = "=4.3.1" }
+dynamo-renderer = { version = "=10.4.3" }
 dynamo-tokens = { path = "lib/tokens", version = "1.7.0" }
 dynamo-truthy = { path = "lib/truthy", version = "1.7.0" }
 dynamo-error = { path = "lib/error", version = "1.7.0" }
@@ -111,13 +111,13 @@ dynamo-session-affinity = { path = "lib/router/session-affinity", version = "1.7
 dynamo-slot-tracker = { path = "lib/router/slot-tracker", version = "1.7.0" }
 dynamo-worker-selection = { path = "lib/router/worker-selection", version = "1.7.0" }
 dynamo-protocols = { version = "=10.0.1" }
-dynamo-decisions = { version = "=0.1.0", features = ["utoipa"] }
+dynamo-decisions = { version = "=0.1.1", features = ["utoipa"] }
 dynamo-parsers = { version = "=11.0.11" }
 
 # Published on crates.io. To see all available versions:
 #   web:          https://crates.io/crates/dynamo-parsers-v2/versions
 #   sparse index: curl https://index.crates.io/dy/na/dynamo-parsers-v2   (one JSON line per release; read the "vers" field)
-dynamo-parsers-v2 = { version = "=0.10.2" }
+dynamo-parsers-v2 = { version = "=0.10.5" }
 dynamo-backend-common = { path = "lib/backend-common", version = "1.7.0" }
 dynamo-sidecar-common = { path = "lib/sidecar/common", version = "1.7.0" }
 
@@ -269,3 +269,21 @@ lto = "thin"
 inherits = "release"
 debug = true
 strip = false
+
+# DeepInfra's model fixes to the frontend crates (parsers, renderer and the
+# crates they share types with) live on the di-main branch of
+# https://github.com/deepinfra/dynamo-frontend-crates, a fork of
+# ai-dynamo/frontend-crates on its upstream main. Every crate dynamo takes from
+# that repository is patched, so no type comes from two copies. The versions
+# pinned above must equal the fork's, or Cargo ignores the patch with only a
+# warning. Cargo.lock records the commit; `cargo update -p dynamo-parsers`
+# moves it to the branch head.
+[patch.crates-io]
+dynamo-decisions = { git = "https://github.com/deepinfra/dynamo-frontend-crates", branch = "di-main" }
+dynamo-multimodal = { git = "https://github.com/deepinfra/dynamo-frontend-crates", branch = "di-main" }
+dynamo-parsers = { git = "https://github.com/deepinfra/dynamo-frontend-crates", branch = "di-main" }
+dynamo-parsers-v2 = { git = "https://github.com/deepinfra/dynamo-frontend-crates", branch = "di-main" }
+dynamo-protocols = { git = "https://github.com/deepinfra/dynamo-frontend-crates", branch = "di-main" }
+dynamo-renderer = { git = "https://github.com/deepinfra/dynamo-frontend-crates", branch = "di-main" }
+dynamo-structural-tag = { git = "https://github.com/deepinfra/dynamo-frontend-crates", branch = "di-main" }
+dynamo-tokenizers = { git = "https://github.com/deepinfra/dynamo-frontend-crates", branch = "di-main" }

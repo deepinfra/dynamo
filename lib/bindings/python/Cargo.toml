@@ -152,3 +152,21 @@ tracing-subscriber = { version = "0.3", features = ["registry"] }
 inherits = "release"
 debug = true
 strip = false
+
+# DeepInfra's model fixes to the frontend crates (parsers, renderer and the
+# crates they share types with) live on the di-main branch of
+# https://github.com/deepinfra/dynamo-frontend-crates, a fork of
+# ai-dynamo/frontend-crates on its upstream main. Every crate dynamo takes from
+# that repository is patched, so no type comes from two copies. The versions
+# pinned above must equal the fork's, or Cargo ignores the patch with only a
+# warning. Cargo.lock records the commit; `cargo update -p dynamo-parsers`
+# moves it to the branch head.
+[patch.crates-io]
+dynamo-decisions = { git = "https://github.com/deepinfra/dynamo-frontend-crates", branch = "di-main" }
+dynamo-multimodal = { git = "https://github.com/deepinfra/dynamo-frontend-crates", branch = "di-main" }
+dynamo-parsers = { git = "https://github.com/deepinfra/dynamo-frontend-crates", branch = "di-main" }
+dynamo-parsers-v2 = { git = "https://github.com/deepinfra/dynamo-frontend-crates", branch = "di-main" }
+dynamo-protocols = { git = "https://github.com/deepinfra/dynamo-frontend-crates", branch = "di-main" }
+dynamo-renderer = { git = "https://github.com/deepinfra/dynamo-frontend-crates", branch = "di-main" }
+dynamo-structural-tag = { git = "https://github.com/deepinfra/dynamo-frontend-crates", branch = "di-main" }
+dynamo-tokenizers = { git = "https://github.com/deepinfra/dynamo-frontend-crates", branch = "di-main" }

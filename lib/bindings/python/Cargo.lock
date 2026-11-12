@@ -1388,7 +1388,7 @@ version = "3.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "faf9468729b8cbcea668e36183cb69d317348c2e08e994829fb56ebfdfbaac34"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -2113,7 +2113,7 @@ dependencies = [
  "clap",
  "dynamo-kv-hints",
  "dynamo-llm",
- "dynamo-protocols 10.0.1",
+ "dynamo-protocols",
  "dynamo-rl",
  "dynamo-runtime",
  "futures",
@@ -2130,11 +2130,10 @@ dependencies = [
 
 [[package]]
 name = "dynamo-decisions"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a45fccc7c4e78332eca3b9d1580bed699db2dea71d0b67a6ae1232472dd6b71f"
+version = "0.1.1"
+source = "git+https://github.com/deepinfra/dynamo-frontend-crates?branch=di-main#b545d348013143bbfdfe7cf54840413b671fc9fb"
 dependencies = [
- "dynamo-protocols 8.5.0",
+ "dynamo-protocols",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -2344,7 +2343,7 @@ dependencies = [
  "dynamo-multimodal",
  "dynamo-parsers",
  "dynamo-parsers-v2",
- "dynamo-protocols 10.0.1",
+ "dynamo-protocols",
  "dynamo-renderer",
  "dynamo-rl",
  "dynamo-router-policies",
@@ -2524,9 +2523,8 @@ dependencies = [
 
 [[package]]
 name = "dynamo-multimodal"
-version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "de29c14a8d1952ceb6dbeebfb144be1d7167d333008f3f829c1324c78dde6344"
+version = "0.2.6"
+source = "git+https://github.com/deepinfra/dynamo-frontend-crates?branch=di-main#b545d348013143bbfdfe7cf54840413b671fc9fb"
 dependencies = [
  "blake3",
  "gif",
@@ -2541,13 +2539,12 @@ dependencies = [
 [[package]]
 name = "dynamo-parsers"
 version = "11.0.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f8816a88cab33166978daa5090cea8f50e23519ddcdfd01bfd8463ee32e1032f"
+source = "git+https://github.com/deepinfra/dynamo-frontend-crates?branch=di-main#b545d348013143bbfdfe7cf54840413b671fc9fb"
 dependencies = [
  "aho-corasick",
  "anyhow",
  "async-stream",
- "dynamo-protocols 10.0.1",
+ "dynamo-protocols",
  "dynamo-structural-tag",
  "futures",
  "num-traits",
@@ -2565,9 +2562,8 @@ dependencies = [
 
 [[package]]
 name = "dynamo-parsers-v2"
-version = "0.10.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dd946b8d59920320e43e2d1b48b2bbb6553d50bc9c23b511293615714008476a"
+version = "0.10.5"
+source = "git+https://github.com/deepinfra/dynamo-frontend-crates?branch=di-main#b545d348013143bbfdfe7cf54840413b671fc9fb"
 dependencies = [
  "anyhow",
  "dynamo-structural-tag",
@@ -2584,28 +2580,8 @@ dependencies = [
 
 [[package]]
 name = "dynamo-protocols"
-version = "8.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "834c27ac7acebd32a223e36eec6e17d39abb4b1fc4db7610748d245f51af6b26"
-dependencies = [
- "async-openai",
- "derive_builder",
- "futures",
- "indexmap 2.14.0",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tracing",
- "url",
- "utoipa 5.5.0",
- "uuid",
-]
-
-[[package]]
-name = "dynamo-protocols"
 version = "10.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f53c5d0072e9d22fd046ff157d1ac14aa36534491d6fad07e314c8255d37873b"
+source = "git+https://github.com/deepinfra/dynamo-frontend-crates?branch=di-main#b545d348013143bbfdfe7cf54840413b671fc9fb"
 dependencies = [
  "async-openai",
  "derive_builder",
@@ -2677,15 +2653,16 @@ dependencies = [
 
 [[package]]
 name = "dynamo-renderer"
-version = "10.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "496579bc389ec35a495c9eb64f2d61cd0ec5a322f5aa7e09115b026c0d30eb8a"
+version = "10.4.3"
+source = "git+https://github.com/deepinfra/dynamo-frontend-crates?branch=di-main#b545d348013143bbfdfe7cf54840413b671fc9fb"
 dependencies = [
+ "aho-corasick",
  "anyhow",
  "chrono",
- "dynamo-protocols 10.0.1",
+ "dynamo-protocols",
  "dynamo-tokenizers",
  "either",
+ "memchr",
  "minijinja",
  "minijinja-contrib",
  "serde",
@@ -2873,7 +2850,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "dynamo-llm",
- "dynamo-protocols 10.0.1",
+ "dynamo-protocols",
  "dynamo-runtime",
  "serde",
  "serde_json",
@@ -2954,8 +2931,7 @@ dependencies = [
 [[package]]
 name = "dynamo-structural-tag"
 version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8350d3089f5f140c6f8dfcdbdf77b2c1e97b0bcc1b67b4d32a06a41426ea7085"
+source = "git+https://github.com/deepinfra/dynamo-frontend-crates?branch=di-main#b545d348013143bbfdfe7cf54840413b671fc9fb"
 dependencies = [
  "anyhow",
  "jsonschema",
@@ -2966,15 +2942,15 @@ dependencies = [
 
 [[package]]
 name = "dynamo-tokenizers"
-version = "4.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "24dd8e85a6aea1079e33bd1e82ed0e53127751e472539682edc5a4066f360179"
+version = "4.3.1"
+source = "git+https://github.com/deepinfra/dynamo-frontend-crates?branch=di-main#b545d348013143bbfdfe7cf54840413b671fc9fb"
 dependencies = [
  "aho-corasick",
  "anyhow",
  "base64 0.22.1",
  "basetenkenizer",
  "blake3",
+ "fancy-regex 0.13.0",
  "fastokens",
  "moka",
  "rayon",
@@ -3047,7 +3023,7 @@ dependencies = [
  "dynamo-kv-events",
  "dynamo-kv-hashing",
  "dynamo-llm",
- "dynamo-protocols 10.0.1",
+ "dynamo-protocols",
  "dynamo-runtime",
  "serde",
  "serde_json",
@@ -4354,7 +4330,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.4",
+ "socket2 0.5.10",
  "system-configuration",
  "tokio",
  "tower-service",
@@ -7057,7 +7033,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be769465445e8c1474e9c5dac2018218498557af32d9ed057325ec9a41ae81bf"
 dependencies = [
  "heck",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "log",
  "multimap",
  "once_cell",
@@ -7077,7 +7053,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03da047801ff44bb6a4d407d4860c05fd70bb81714e6b2f3812603d5b145b042"
 dependencies = [
  "heck",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "log",
  "multimap",
  "petgraph 0.8.3",
@@ -7098,7 +7074,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "syn 2.0.118",
@@ -7111,7 +7087,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "syn 2.0.118",
@@ -7394,7 +7370,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.2",
  "rustls",
- "socket2 0.6.4",
+ "socket2 0.5.10",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -7432,7 +7408,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.4",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.60.2",
 ]
@@ -10573,7 +10549,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
