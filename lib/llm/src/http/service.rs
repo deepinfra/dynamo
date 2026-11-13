@@ -39,6 +39,7 @@ pub mod metrics;
 pub mod mooncake_store;
 pub mod openapi_docs;
 pub mod realtime;
+pub mod response_headers;
 pub mod router_policy;
 pub mod service_v2;
 pub mod systemone;
