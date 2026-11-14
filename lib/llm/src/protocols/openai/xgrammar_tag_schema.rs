@@ -56,6 +56,146 @@ pub fn compiles_in_structural_tag(schema: &Value) -> bool {
     schema_ok(schema, schema)
 }
 
+/// Keywords whose meaning depends on sibling keywords of the same schema object, or on its position: an `allOf`
+/// with any of these in the parent or a branch is left as is.
+const ALL_OF_BLOCKERS: &[&str] = &[
+    "allOf",
+    "$ref",
+    "$defs",
+    "definitions",
+    "$id",
+    "$anchor",
+    "$dynamicRef",
+    "$dynamicAnchor",
+    "additionalProperties",
+    "unevaluatedProperties",
+    "unevaluatedItems",
+    "if",
+    "then",
+    "else",
+    "dependentSchemas",
+    "dependentRequired",
+    "dependencies",
+];
+/// Keywords that interact with each other: each group must come from a single schema object to be merged.
+const ALL_OF_GROUPS: &[&[&str]] = &[
+    &["items", "prefixItems"],
+    &["contains", "minContains", "maxContains"],
+];
+
+/// A copy of `schema` where every `allOf` that can be merged into its parent without changing what it accepts is
+/// merged, bottom-up. xgrammar renders a multi-branch `allOf` as any value, so `{"allOf": [{"type": "integer"},
+/// {"minimum": 0}]}` would otherwise let a string through. A node merges when every branch is an object schema, no
+/// object (parent or branch) holds an [`ALL_OF_BLOCKERS`] keyword, each [`ALL_OF_GROUPS`] group comes from one object,
+/// and keywords shared between objects are equal, except `required` (unioned) and `properties` (merged when each
+/// shared property name has an equal subschema). Anything else leaves that `allOf` untouched; a `$ref` pointing into
+/// an `allOf` leaves the whole schema untouched.
+pub fn flatten_all_of(schema: &Value) -> Value {
+    if refs_into_all_of(schema) {
+        return schema.clone();
+    }
+    flatten_node(schema)
+}
+
+fn refs_into_all_of(node: &Value) -> bool {
+    match node {
+        Value::Object(obj) => obj.iter().any(|(key, value)| {
+            (key == "$ref" && value.as_str().is_some_and(|r| r.contains("/allOf/")))
+                || refs_into_all_of(value)
+        }),
+        Value::Array(list) => list.iter().any(refs_into_all_of),
+        _ => false,
+    }
+}
+
+fn flatten_node(node: &Value) -> Value {
+    let Value::Object(obj) = node else {
+        return node.clone();
+    };
+    let out: Map<String, Value> = obj
+        .iter()
+        .map(|(key, value)| {
+            let key_str = key.as_str();
+            let child = match value {
+                Value::Object(map) if SCHEMA_MAPS.contains(&key_str) => Value::Object(
+                    map.iter()
+                        .map(|(name, child)| (name.clone(), flatten_node(child)))
+                        .collect(),
+                ),
+                Value::Array(list) if SCHEMA_LISTS.contains(&key_str) => {
+                    Value::Array(list.iter().map(flatten_node).collect())
+                }
+                _ if SCHEMA_VALUES.contains(&key_str) => flatten_node(value),
+                _ => value.clone(),
+            };
+            (key.clone(), child)
+        })
+        .collect();
+    Value::Object(merge_all_of(&out).unwrap_or(out))
+}
+
+/// `node` with its `allOf` merged in, or `None` when that would not be exactly equivalent.
+fn merge_all_of(node: &Map<String, Value>) -> Option<Map<String, Value>> {
+    let Some(Value::Array(branches)) = node.get("allOf") else {
+        return None;
+    };
+    let mut parent = node.clone();
+    parent.remove("allOf");
+    let mut sources = vec![&parent];
+    for branch in branches {
+        sources.push(branch.as_object()?);
+    }
+    if sources
+        .iter()
+        .any(|source| ALL_OF_BLOCKERS.iter().any(|key| source.contains_key(*key)))
+    {
+        return None;
+    }
+    for group in ALL_OF_GROUPS {
+        let holders = sources
+            .iter()
+            .filter(|source| group.iter().any(|key| source.contains_key(*key)))
+            .count();
+        if holders > 1 {
+            return None;
+        }
+    }
+    let mut merged = parent.clone();
+    for source in &sources[1..] {
+        for (key, value) in source.iter() {
+            let Some(existing) = merged.get_mut(key) else {
+                merged.insert(key.clone(), value.clone());
+                continue;
+            };
+            if existing == value {
+                continue;
+            }
+            match (key.as_str(), existing, value) {
+                ("required", Value::Array(have), Value::Array(add)) => {
+                    for name in add {
+                        if !have.contains(name) {
+                            have.push(name.clone());
+                        }
+                    }
+                }
+                ("properties", Value::Object(have), Value::Object(add)) => {
+                    for (name, schema) in add {
+                        match have.get(name) {
+                            None => {
+                                have.insert(name.clone(), schema.clone());
+                            }
+                            Some(current) if current == schema => {}
+                            Some(_) => return None,
+                        }
+                    }
+                }
+                _ => return None,
+            }
+        }
+    }
+    Some(merged)
+}
+
 /// A copy of `schema` with only what xgrammar cannot compile inside a structural tag relaxed, and the keywords that
 /// were relaxed. Every move widens what the schema accepts: an offending keyword is dropped (bad `pattern`, unknown
 /// `type`, empty or non-array `enum`, non-array `required`, malformed or empty-range bounds, impossible property
@@ -562,6 +702,80 @@ mod tests {
             serde_json::json!({"type": "object", "properties": {"a": {"type": "string"}}})
         );
         assert_eq!(keywords, vec!["if", "not"]);
+    }
+
+    #[test]
+    fn flatten_merges_independent_all_of_branches() {
+        use serde_json::json;
+        assert_eq!(
+            flatten_all_of(&json!({"allOf": [{"type": "integer"}, {"minimum": 0}]})),
+            json!({"type": "integer", "minimum": 0})
+        );
+        assert_eq!(
+            flatten_all_of(&json!({
+                "description": "d",
+                "allOf": [
+                    {"type": "integer", "minimum": 0},
+                    {"type": "integer", "maximum": 5},
+                ],
+            })),
+            json!({"description": "d", "type": "integer", "minimum": 0, "maximum": 5})
+        );
+        assert_eq!(
+            flatten_all_of(&json!({"allOf": [
+                {"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]},
+                {"properties": {"b": {"type": "integer"}}, "required": ["b", "a"]},
+            ]})),
+            json!({
+                "type": "object",
+                "properties": {"a": {"type": "string"}, "b": {"type": "integer"}},
+                "required": ["a", "b"],
+            })
+        );
+    }
+
+    #[test]
+    fn flatten_handles_nested_positions_bottom_up() {
+        use serde_json::json;
+        let schema = json!({"type": "object", "properties": {
+            "n": {"allOf": [{"type": "integer"}, {"minimum": 0}]},
+            "l": {"type": "array", "items": {"allOf": [{"type": "string"}, {"maxLength": 5}]}},
+            "deep": {"allOf": [{"allOf": [{"type": "number"}, {"maximum": 1}]}, {"minimum": 0}]},
+        }});
+        assert_eq!(
+            flatten_all_of(&schema),
+            json!({"type": "object", "properties": {
+                "n": {"type": "integer", "minimum": 0},
+                "l": {"type": "array", "items": {"type": "string", "maxLength": 5}},
+                "deep": {"type": "number", "maximum": 1, "minimum": 0},
+            }})
+        );
+    }
+
+    #[test]
+    fn flatten_leaves_non_equivalent_all_of_untouched() {
+        use serde_json::json;
+        let unchanged = [
+            json!({"allOf": [{"type": "integer"}, {"type": "string"}]}),
+            json!({"allOf": [
+                {"properties": {"a": {"type": "string"}}},
+                {"additionalProperties": false},
+            ]}),
+            json!({"allOf": [
+                {"properties": {"a": {"type": "string"}}},
+                {"properties": {"a": {"type": "integer"}}},
+            ]}),
+            json!({"allOf": [{"prefixItems": [{"type": "string"}]}, {"items": false}]}),
+            json!({"allOf": [{"type": "integer"}, true]}),
+            json!({"allOf": [{"$ref": "#/$defs/X"}], "description": "d", "$defs": {"X": {"type": "string"}}}),
+            json!({"if": {"properties": {"a": {"const": 1}}}, "allOf": [{"type": "object"}]}),
+            json!({
+                "properties": {"a": {"allOf": [{"type": "string"}, {"maxLength": 2}]}, "b": {"$ref": "#/properties/a/allOf/0"}},
+            }),
+        ];
+        for schema in unchanged {
+            assert_eq!(flatten_all_of(&schema), schema);
+        }
     }
 
     #[test]

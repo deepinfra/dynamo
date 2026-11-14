@@ -103,15 +103,17 @@ fn invokes(tools: &[ToolDefinition], stop_after_first: bool) -> Value {
     })
 }
 
-/// The tool's `parameters` as pinned in the tag: as sent, relaxed where xgrammar cannot compile them, or `true`.
+/// The tool's `parameters` as pinned in the tag: with mergeable `allOf`s flattened (xgrammar would otherwise accept
+/// any value there), then as is, relaxed where xgrammar cannot compile them, or `true`.
 fn arguments_schema(tool: &ToolDefinition) -> Value {
     let Some(parameters) = &tool.parameters else {
         return Value::Bool(true);
     };
-    if xgrammar_tag_schema::compiles_in_structural_tag(parameters) {
-        return parameters.clone();
+    let parameters = xgrammar_tag_schema::flatten_all_of(parameters);
+    if xgrammar_tag_schema::compiles_in_structural_tag(&parameters) {
+        return parameters;
     }
-    let (relaxed, keywords) = xgrammar_tag_schema::relax_for_structural_tag(parameters);
+    let (relaxed, keywords) = xgrammar_tag_schema::relax_for_structural_tag(&parameters);
     let unconstrained =
         relaxed == Value::Bool(true) || !xgrammar_tag_schema::compiles_in_structural_tag(&relaxed);
     log_relaxation(&tool.name, &keywords, unconstrained);
@@ -316,6 +318,24 @@ mod tests {
             schemas[4],
             tools[4].parameters.clone().unwrap(),
             "xgrammar compiles uniqueItems in a tag"
+        );
+    }
+
+    #[test]
+    fn all_of_parameters_are_pinned_flattened() {
+        let tools = [tool(
+            "count",
+            Some(json!({"type": "object", "properties": {
+                "n": {"allOf": [{"type": "integer"}, {"minimum": 0}], "description": "how many"},
+            }})),
+            None,
+        )];
+        let tag = structural_tag(&ToolChoice::Auto, &tools, None).unwrap();
+        assert_eq!(
+            invoke_schemas(&tag),
+            vec![json!({"type": "object", "properties": {
+                "n": {"type": "integer", "minimum": 0, "description": "how many"},
+            }})]
         );
     }
 
