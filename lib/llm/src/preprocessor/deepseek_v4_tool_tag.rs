@@ -112,7 +112,8 @@ fn arguments_schema(tool: &ToolDefinition) -> Value {
         return parameters.clone();
     }
     let (relaxed, keywords) = xgrammar_tag_schema::relax_for_structural_tag(parameters);
-    let unconstrained = !xgrammar_tag_schema::compiles_in_structural_tag(&relaxed);
+    let unconstrained =
+        relaxed == Value::Bool(true) || !xgrammar_tag_schema::compiles_in_structural_tag(&relaxed);
     log_relaxation(&tool.name, &keywords, unconstrained);
     if unconstrained {
         Value::Bool(true)
