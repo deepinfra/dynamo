@@ -32,7 +32,23 @@
     "p"
    ]
   },
-  "xgrammar_compiles": false
+  "xgrammar_compiles": false,
+  "relaxed": {
+   "type": "object",
+   "properties": {
+    "p": {
+     "type": "array",
+     "items": true
+    }
+   },
+   "required": [
+    "p"
+   ]
+  },
+  "relaxed_keywords": [
+   "items"
+  ],
+  "relaxed_xgrammar_compiles": true
  },
  {
   "name": "bad_type",
@@ -47,7 +63,20 @@
     "p"
    ]
   },
-  "xgrammar_compiles": false
+  "xgrammar_compiles": false,
+  "relaxed": {
+   "type": "object",
+   "properties": {
+    "p": {}
+   },
+   "required": [
+    "p"
+   ]
+  },
+  "relaxed_keywords": [
+   "type"
+  ],
+  "relaxed_xgrammar_compiles": true
  },
  {
   "name": "bad_type_list",
@@ -65,7 +94,20 @@
     "p"
    ]
   },
-  "xgrammar_compiles": false
+  "xgrammar_compiles": false,
+  "relaxed": {
+   "type": "object",
+   "properties": {
+    "p": {}
+   },
+   "required": [
+    "p"
+   ]
+  },
+  "relaxed_keywords": [
+   "type"
+  ],
+  "relaxed_xgrammar_compiles": true
  },
  {
   "name": "dangling_ref",
@@ -80,7 +122,20 @@
     "p"
    ]
   },
-  "xgrammar_compiles": false
+  "xgrammar_compiles": false,
+  "relaxed": {
+   "type": "object",
+   "properties": {
+    "p": true
+   },
+   "required": [
+    "p"
+   ]
+  },
+  "relaxed_keywords": [
+   "$ref"
+  ],
+  "relaxed_xgrammar_compiles": true
  },
  {
   "name": "remote_ref",
@@ -157,7 +212,22 @@
     "p"
    ]
   },
-  "xgrammar_compiles": false
+  "xgrammar_compiles": false,
+  "relaxed": {
+   "type": "object",
+   "properties": {
+    "p": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "p"
+   ]
+  },
+  "relaxed_keywords": [
+   "pattern"
+  ],
+  "relaxed_xgrammar_compiles": true
  },
  {
   "name": "pattern_neg_lookahead",
@@ -173,7 +243,22 @@
     "p"
    ]
   },
-  "xgrammar_compiles": false
+  "xgrammar_compiles": false,
+  "relaxed": {
+   "type": "object",
+   "properties": {
+    "p": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "p"
+   ]
+  },
+  "relaxed_keywords": [
+   "pattern"
+  ],
+  "relaxed_xgrammar_compiles": true
  },
  {
   "name": "pattern_lookbehind",
@@ -189,7 +274,22 @@
     "p"
    ]
   },
-  "xgrammar_compiles": false
+  "xgrammar_compiles": false,
+  "relaxed": {
+   "type": "object",
+   "properties": {
+    "p": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "p"
+   ]
+  },
+  "relaxed_keywords": [
+   "pattern"
+  ],
+  "relaxed_xgrammar_compiles": true
  },
  {
   "name": "pattern_backref",
@@ -205,7 +305,22 @@
     "p"
    ]
   },
-  "xgrammar_compiles": false
+  "xgrammar_compiles": false,
+  "relaxed": {
+   "type": "object",
+   "properties": {
+    "p": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "p"
+   ]
+  },
+  "relaxed_keywords": [
+   "pattern"
+  ],
+  "relaxed_xgrammar_compiles": true
  },
  {
   "name": "pattern_unicode_prop",
@@ -221,7 +336,22 @@
     "p"
    ]
   },
-  "xgrammar_compiles": false
+  "xgrammar_compiles": false,
+  "relaxed": {
+   "type": "object",
+   "properties": {
+    "p": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "p"
+   ]
+  },
+  "relaxed_keywords": [
+   "pattern"
+  ],
+  "relaxed_xgrammar_compiles": true
  },
  {
   "name": "pattern_named_group",
@@ -237,7 +367,22 @@
     "p"
    ]
   },
-  "xgrammar_compiles": false
+  "xgrammar_compiles": false,
+  "relaxed": {
+   "type": "object",
+   "properties": {
+    "p": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "p"
+   ]
+  },
+  "relaxed_keywords": [
+   "pattern"
+  ],
+  "relaxed_xgrammar_compiles": true
  },
  {
   "name": "pattern_named_group2",
@@ -285,7 +430,22 @@
     "p"
    ]
   },
-  "xgrammar_compiles": false
+  "xgrammar_compiles": false,
+  "relaxed": {
+   "type": "object",
+   "properties": {
+    "p": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "p"
+   ]
+  },
+  "relaxed_keywords": [
+   "pattern"
+  ],
+  "relaxed_xgrammar_compiles": true
  },
  {
   "name": "pattern_ok_email",
@@ -317,7 +477,22 @@
     "p"
    ]
   },
-  "xgrammar_compiles": false
+  "xgrammar_compiles": false,
+  "relaxed": {
+   "type": "object",
+   "properties": {
+    "p": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "p"
+   ]
+  },
+  "relaxed_keywords": [
+   "pattern"
+  ],
+  "relaxed_xgrammar_compiles": true
  },
  {
   "name": "pattern_invalid",
@@ -333,7 +508,22 @@
     "p"
    ]
   },
-  "xgrammar_compiles": false
+  "xgrammar_compiles": false,
+  "relaxed": {
+   "type": "object",
+   "properties": {
+    "p": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "p"
+   ]
+  },
+  "relaxed_keywords": [
+   "pattern"
+  ],
+  "relaxed_xgrammar_compiles": true
  },
  {
   "name": "min_gt_max_num",
@@ -350,7 +540,23 @@
     "p"
    ]
   },
-  "xgrammar_compiles": false
+  "xgrammar_compiles": false,
+  "relaxed": {
+   "type": "object",
+   "properties": {
+    "p": {
+     "type": "integer"
+    }
+   },
+   "required": [
+    "p"
+   ]
+  },
+  "relaxed_keywords": [
+   "maximum",
+   "minimum"
+  ],
+  "relaxed_xgrammar_compiles": true
  },
  {
   "name": "min_gt_max_items",
@@ -367,7 +573,23 @@
     "p"
    ]
   },
-  "xgrammar_compiles": false
+  "xgrammar_compiles": false,
+  "relaxed": {
+   "type": "object",
+   "properties": {
+    "p": {
+     "type": "array"
+    }
+   },
+   "required": [
+    "p"
+   ]
+  },
+  "relaxed_keywords": [
+   "maxItems",
+   "minItems"
+  ],
+  "relaxed_xgrammar_compiles": true
  },
  {
   "name": "min_gt_max_len",
@@ -384,7 +606,23 @@
     "p"
    ]
   },
-  "xgrammar_compiles": false
+  "xgrammar_compiles": false,
+  "relaxed": {
+   "type": "object",
+   "properties": {
+    "p": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "p"
+   ]
+  },
+  "relaxed_keywords": [
+   "maxLength",
+   "minLength"
+  ],
+  "relaxed_xgrammar_compiles": true
  },
  {
   "name": "min_props_impossible",
@@ -401,7 +639,23 @@
     "p"
    ]
   },
-  "xgrammar_compiles": false
+  "xgrammar_compiles": false,
+  "relaxed": {
+   "type": "object",
+   "properties": {
+    "p": {
+     "type": "object",
+     "additionalProperties": false
+    }
+   },
+   "required": [
+    "p"
+   ]
+  },
+  "relaxed_keywords": [
+   "minProperties"
+  ],
+  "relaxed_xgrammar_compiles": true
  },
  {
   "name": "excl_min_ge_max",
@@ -418,7 +672,23 @@
     "p"
    ]
   },
-  "xgrammar_compiles": false
+  "xgrammar_compiles": false,
+  "relaxed": {
+   "type": "object",
+   "properties": {
+    "p": {
+     "type": "number"
+    }
+   },
+   "required": [
+    "p"
+   ]
+  },
+  "relaxed_keywords": [
+   "exclusiveMaximum",
+   "exclusiveMinimum"
+  ],
+  "relaxed_xgrammar_compiles": true
  },
  {
   "name": "enum_empty",
@@ -433,7 +703,20 @@
     "p"
    ]
   },
-  "xgrammar_compiles": false
+  "xgrammar_compiles": false,
+  "relaxed": {
+   "type": "object",
+   "properties": {
+    "p": {}
+   },
+   "required": [
+    "p"
+   ]
+  },
+  "relaxed_keywords": [
+   "enum"
+  ],
+  "relaxed_xgrammar_compiles": true
  },
  {
   "name": "const_obj",
@@ -731,7 +1014,19 @@
    },
    "required": "a"
   },
-  "xgrammar_compiles": false
+  "xgrammar_compiles": false,
+  "relaxed": {
+   "type": "object",
+   "properties": {
+    "a": {
+     "type": "string"
+    }
+   }
+  },
+  "relaxed_keywords": [
+   "required"
+  ],
+  "relaxed_xgrammar_compiles": true
  },
  {
   "name": "properties_not_obj",
@@ -739,7 +1034,12 @@
    "type": "object",
    "properties": []
   },
-  "xgrammar_compiles": false
+  "xgrammar_compiles": false,
+  "relaxed": true,
+  "relaxed_keywords": [
+   "properties"
+  ],
+  "relaxed_xgrammar_compiles": true
  },
  {
   "name": "items_null",
@@ -755,7 +1055,23 @@
     "p"
    ]
   },
-  "xgrammar_compiles": false
+  "xgrammar_compiles": false,
+  "relaxed": {
+   "type": "object",
+   "properties": {
+    "p": {
+     "type": "array",
+     "items": true
+    }
+   },
+   "required": [
+    "p"
+   ]
+  },
+  "relaxed_keywords": [
+   "items"
+  ],
+  "relaxed_xgrammar_compiles": true
  },
  {
   "name": "enum_mixed",
@@ -809,7 +1125,23 @@
     "p"
    ]
   },
-  "xgrammar_compiles": false
+  "xgrammar_compiles": false,
+  "relaxed": {
+   "type": "object",
+   "properties": {
+    "p": {
+     "type": "integer"
+    }
+   },
+   "required": [
+    "p"
+   ]
+  },
+  "relaxed_keywords": [
+   "maximum",
+   "minimum"
+  ],
+  "relaxed_xgrammar_compiles": true
  },
  {
   "name": "format_date",
@@ -842,7 +1174,23 @@
     "p"
    ]
   },
-  "xgrammar_compiles": false
+  "xgrammar_compiles": false,
+  "relaxed": {
+   "type": "object",
+   "properties": {
+    "p": {
+     "type": "number",
+     "minimum": 0
+    }
+   },
+   "required": [
+    "p"
+   ]
+  },
+  "relaxed_keywords": [
+   "exclusiveMinimum"
+  ],
+  "relaxed_xgrammar_compiles": true
  },
  {
   "name": "minimum_string",
@@ -858,7 +1206,22 @@
     "p"
    ]
   },
-  "xgrammar_compiles": false
+  "xgrammar_compiles": false,
+  "relaxed": {
+   "type": "object",
+   "properties": {
+    "p": {
+     "type": "number"
+    }
+   },
+   "required": [
+    "p"
+   ]
+  },
+  "relaxed_keywords": [
+   "minimum"
+  ],
+  "relaxed_xgrammar_compiles": true
  },
  {
   "name": "pattern_props_lookahead",
@@ -870,7 +1233,12 @@
     }
    }
   },
-  "xgrammar_compiles": false
+  "xgrammar_compiles": false,
+  "relaxed": true,
+  "relaxed_keywords": [
+   "patternProperties"
+  ],
+  "relaxed_xgrammar_compiles": true
  },
  {
   "name": "propnames_lookahead",
@@ -880,7 +1248,15 @@
     "pattern": "^(?=a)"
    }
   },
-  "xgrammar_compiles": false
+  "xgrammar_compiles": false,
+  "relaxed": {
+   "type": "object",
+   "propertyNames": {}
+  },
+  "relaxed_keywords": [
+   "pattern"
+  ],
+  "relaxed_xgrammar_compiles": true
  },
  {
   "name": "ref_to_property",
@@ -912,7 +1288,22 @@
     }
    }
   },
-  "xgrammar_compiles": false
+  "xgrammar_compiles": false,
+  "relaxed": {
+   "type": "object",
+   "properties": {
+    "p": {
+     "$ref": "#/$defs/x"
+    }
+   },
+   "$defs": {
+    "x": true
+   }
+  },
+  "relaxed_keywords": [
+   "$ref"
+  ],
+  "relaxed_xgrammar_compiles": true
  },
  {
   "name": "prop_true",
@@ -969,7 +1360,20 @@
     "p"
    ]
   },
-  "xgrammar_compiles": false
+  "xgrammar_compiles": false,
+  "relaxed": {
+   "type": "object",
+   "properties": {
+    "p": {}
+   },
+   "required": [
+    "p"
+   ]
+  },
+  "relaxed_keywords": [
+   "enum"
+  ],
+  "relaxed_xgrammar_compiles": true
  },
  {
   "name": "pattern_dollar_escape",
@@ -1098,7 +1502,22 @@
     "p"
    ]
   },
-  "xgrammar_compiles": false
+  "xgrammar_compiles": false,
+  "relaxed": {
+   "type": "object",
+   "properties": {
+    "p": {
+     "type": "object"
+    }
+   },
+   "required": [
+    "p"
+   ]
+  },
+  "relaxed_keywords": [
+   "minProperties"
+  ],
+  "relaxed_xgrammar_compiles": true
  },
  {
   "name": "max_props_zero_required",
@@ -1114,6 +1533,21 @@
    ],
    "maxProperties": 0
   },
-  "xgrammar_compiles": false
+  "xgrammar_compiles": false,
+  "relaxed": {
+   "type": "object",
+   "properties": {
+    "a": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "a"
+   ]
+  },
+  "relaxed_keywords": [
+   "maxProperties"
+  ],
+  "relaxed_xgrammar_compiles": true
  }
 ]

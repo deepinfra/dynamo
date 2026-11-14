@@ -56,6 +56,200 @@ pub fn compiles_in_structural_tag(schema: &Value) -> bool {
     schema_ok(schema, schema)
 }
 
+/// A copy of `schema` with only what xgrammar cannot compile inside a structural tag relaxed, and the keywords that
+/// were relaxed. Every move widens what the schema accepts: an offending keyword is dropped (bad `pattern`, unknown
+/// `type`, empty or non-array `enum`, non-array `required`, malformed or empty-range bounds, impossible property
+/// counts); a non-schema child (tuple or null `items`, ...) or a node whose local `$ref` does not resolve becomes
+/// `true`; a node with non-object `properties` or an unsupported `patternProperties` regex becomes `true` (dropping
+/// either would admit fewer keys, as xgrammar closes objects by default); and `not` or `if` (with `then`/`else`) is
+/// dropped when anything inside it needs relaxing, since widening under them can narrow the whole. Callers re-check
+/// the result with [`compiles_in_structural_tag`].
+pub fn relax_for_structural_tag(schema: &Value) -> (Value, Vec<&'static str>) {
+    let mut relaxed = Vec::new();
+    let value = relax_schema(schema, schema, &mut relaxed);
+    relaxed.sort_unstable();
+    relaxed.dedup();
+    (value, relaxed)
+}
+
+fn relax_child(
+    node: &Value,
+    root: &Value,
+    keyword: &'static str,
+    relaxed: &mut Vec<&'static str>,
+) -> Value {
+    match node {
+        Value::Bool(_) | Value::Object(_) => relax_schema(node, root, relaxed),
+        _ => {
+            relaxed.push(keyword);
+            Value::Bool(true)
+        }
+    }
+}
+
+fn relax_schema(node: &Value, root: &Value, relaxed: &mut Vec<&'static str>) -> Value {
+    let Value::Object(obj) = node else {
+        return node.clone();
+    };
+    if let Some(Value::String(reference)) = obj.get("$ref")
+        && reference.starts_with('#')
+        && resolve_local_ref(root, reference).is_none()
+    {
+        relaxed.push("$ref");
+        return Value::Bool(true);
+    }
+    if obj.get("properties").is_some_and(|p| !p.is_object()) {
+        relaxed.push("properties");
+        return Value::Bool(true);
+    }
+    if obj.get("patternProperties").is_some_and(|p| {
+        p.as_object()
+            .is_none_or(|p| !p.keys().all(|k| regex_supported(k)))
+    }) {
+        relaxed.push("patternProperties");
+        return Value::Bool(true);
+    }
+
+    let mut out = obj.clone();
+    relax_keywords(&mut out, relaxed);
+    for &key in SCHEMA_MAPS {
+        let Some(current) = out.get(key).cloned() else {
+            continue;
+        };
+        match current {
+            Value::Object(map) => {
+                let map: Map<String, Value> = map
+                    .iter()
+                    .map(|(name, child)| (name.clone(), relax_child(child, root, key, relaxed)))
+                    .collect();
+                out.insert(key.to_string(), Value::Object(map));
+            }
+            _ => drop_if(&mut out, key, true, relaxed),
+        }
+    }
+    for &key in SCHEMA_LISTS {
+        let Some(current) = out.get(key).cloned() else {
+            continue;
+        };
+        match current {
+            Value::Array(list) => {
+                let list = list
+                    .iter()
+                    .map(|child| relax_child(child, root, key, relaxed))
+                    .collect();
+                out.insert(key.to_string(), Value::Array(list));
+            }
+            _ => drop_if(&mut out, key, true, relaxed),
+        }
+    }
+    for &key in SCHEMA_VALUES {
+        let Some(current) = out.get(key).cloned() else {
+            continue;
+        };
+        match key {
+            "not" | "if" => {
+                let mut inner = Vec::new();
+                relax_child(&current, root, key, &mut inner);
+                if !inner.is_empty() {
+                    drop_if(&mut out, key, true, relaxed);
+                    if key == "if" {
+                        out.remove("then");
+                        out.remove("else");
+                    }
+                }
+            }
+            "contains" if !(current.is_object() || current.is_boolean()) => {
+                drop_if(&mut out, key, true, relaxed);
+            }
+            _ => {
+                let child = relax_child(&current, root, key, relaxed);
+                out.insert(key.to_string(), child);
+            }
+        }
+    }
+    Value::Object(out)
+}
+
+fn relax_keywords(obj: &mut Map<String, Value>, relaxed: &mut Vec<&'static str>) {
+    let type_ok = match obj.get("type") {
+        None => true,
+        Some(Value::String(t)) => JSON_TYPES.contains(&t.as_str()),
+        Some(Value::Array(ts)) => ts
+            .iter()
+            .all(|t| t.as_str().is_some_and(|t| JSON_TYPES.contains(&t))),
+        Some(_) => false,
+    };
+    drop_if(obj, "type", !type_ok, relaxed);
+    let required_bad = obj.get("required").is_some_and(|v| !v.is_array());
+    drop_if(obj, "required", required_bad, relaxed);
+    let enum_bad = obj
+        .get("enum")
+        .is_some_and(|v| v.as_array().is_none_or(Vec::is_empty));
+    drop_if(obj, "enum", enum_bad, relaxed);
+    for &key in NUMERIC_KEYWORDS {
+        let bad = obj.get(key).is_some_and(|v| !v.is_number());
+        drop_if(obj, key, bad, relaxed);
+    }
+    for &key in COUNT_KEYWORDS {
+        let bad = obj.get(key).is_some_and(|v| v.as_u64().is_none());
+        drop_if(obj, key, bad, relaxed);
+    }
+    let pattern_bad = obj
+        .get("pattern")
+        .is_some_and(|p| p.as_str().is_none_or(|p| !regex_supported(p)));
+    drop_if(obj, "pattern", pattern_bad, relaxed);
+    let integer = match obj.get("type") {
+        Some(Value::String(t)) => t == "integer",
+        Some(Value::Array(ts)) => ts.iter().any(|t| t.as_str() == Some("integer")),
+        _ => false,
+    };
+    if integer {
+        for &key in &NUMERIC_KEYWORDS[..4] {
+            let bad = obj
+                .get(key)
+                .and_then(Value::as_f64)
+                .is_some_and(|v| v.fract() != 0.0);
+            drop_if(obj, key, bad, relaxed);
+        }
+    }
+    for (lo, hi) in [
+        ("minLength", "maxLength"),
+        ("minItems", "maxItems"),
+        ("minProperties", "maxProperties"),
+    ] {
+        let inverted = matches!(
+            (obj.get(lo).and_then(Value::as_u64), obj.get(hi).and_then(Value::as_u64)),
+            (Some(lo), Some(hi)) if lo > hi
+        );
+        drop_if(obj, lo, inverted, relaxed);
+        drop_if(obj, hi, inverted, relaxed);
+    }
+    if !ranges_ok(obj, integer) {
+        for &key in &NUMERIC_KEYWORDS[..4] {
+            let present = obj.contains_key(key);
+            drop_if(obj, key, present, relaxed);
+        }
+    }
+    if !property_counts_ok(obj) {
+        for key in ["minProperties", "maxProperties"] {
+            let present = obj.contains_key(key);
+            drop_if(obj, key, present, relaxed);
+        }
+    }
+}
+
+fn drop_if(
+    obj: &mut Map<String, Value>,
+    key: &'static str,
+    bad: bool,
+    relaxed: &mut Vec<&'static str>,
+) {
+    if bad {
+        obj.remove(key);
+        relaxed.push(key);
+    }
+}
+
 fn schema_ok(node: &Value, root: &Value) -> bool {
     let obj = match node {
         Value::Bool(_) => return true,
@@ -246,11 +440,16 @@ fn regex_supported(pattern: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// `relaxed*` are set for the cases the wheel rejects: the relaxed schema and keywords, and the wheel's verdict on
+    /// the relaxed schema.
     #[derive(serde::Deserialize)]
     struct Case {
         name: String,
         schema: Value,
         xgrammar_compiles: bool,
+        relaxed: Option<Value>,
+        relaxed_keywords: Option<Vec<String>>,
+        relaxed_xgrammar_compiles: Option<bool>,
     }
 
     fn cases() -> Vec<Case> {
@@ -284,6 +483,85 @@ mod tests {
                 case.schema
             );
         }
+    }
+
+    #[test]
+    fn relax_leaves_compiling_schemas_alone() {
+        for case in cases().into_iter().filter(|c| c.xgrammar_compiles) {
+            let (relaxed, keywords) = relax_for_structural_tag(&case.schema);
+            assert_eq!(relaxed, case.schema, "{}", case.name);
+            assert!(keywords.is_empty(), "{}: {keywords:?}", case.name);
+        }
+    }
+
+    #[test]
+    fn relax_matches_what_the_wheel_compiled() {
+        for case in cases().into_iter().filter(|c| !c.xgrammar_compiles) {
+            let (relaxed, keywords) = relax_for_structural_tag(&case.schema);
+            assert_eq!(Some(&relaxed), case.relaxed.as_ref(), "{}", case.name);
+            let expected: Vec<&str> = case
+                .relaxed_keywords
+                .iter()
+                .flatten()
+                .map(String::as_str)
+                .collect();
+            assert_eq!(keywords, expected, "{}", case.name);
+            if case.relaxed_xgrammar_compiles != Some(true) {
+                assert!(
+                    !compiles_in_structural_tag(&relaxed),
+                    "{}: the wheel rejects the relaxed schema, so it must fall back",
+                    case.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn relax_drops_only_the_offending_keyword() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "code": {"type": "string", "pattern": "^(?=.*[A-Z])[A-Za-z]+$", "maxLength": 8},
+                "count": {"type": "integer", "minimum": 0},
+                "point": {"type": "array", "items": [{"type": "number"}]},
+                "kind": {"type": "str"},
+            },
+            "required": ["code", "count"],
+        });
+        let (relaxed, keywords) = relax_for_structural_tag(&schema);
+        assert_eq!(
+            relaxed,
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "code": {"type": "string", "maxLength": 8},
+                    "count": {"type": "integer", "minimum": 0},
+                    "point": {"type": "array", "items": true},
+                    "kind": {},
+                },
+                "required": ["code", "count"],
+            })
+        );
+        assert_eq!(keywords, vec!["items", "pattern", "type"]);
+        assert!(compiles_in_structural_tag(&relaxed));
+    }
+
+    #[test]
+    fn relax_drops_not_and_if_when_their_insides_need_relaxing() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"a": {"type": "string"}},
+            "not": {"properties": {"a": {"pattern": "(?=x)"}}},
+            "if": {"properties": {"a": {"enum": []}}},
+            "then": {"required": ["a"]},
+            "else": {"required": []},
+        });
+        let (relaxed, keywords) = relax_for_structural_tag(&schema);
+        assert_eq!(
+            relaxed,
+            serde_json::json!({"type": "object", "properties": {"a": {"type": "string"}}})
+        );
+        assert_eq!(keywords, vec!["if", "not"]);
     }
 
     #[test]

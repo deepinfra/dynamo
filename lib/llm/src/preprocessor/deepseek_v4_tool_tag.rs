@@ -11,10 +11,15 @@
 //! come in any order (the model often writes an optional one before a required one); xgrammar then no longer enforces
 //! `required` or rejects a repeated parameter. Unlike the builtin, every tool's schema is pinned (also
 //! `strict: false`), and free text may not hold a bare `<｜DSML｜invoke name=` outside a calls block, which the V4
-//! parser would otherwise recover as a call to any name. A schema xgrammar cannot compile is left unconstrained for
-//! that tool only. The worker's reasoning parser holds the grammar until `</think>`, so reasoning stays free.
+//! parser would otherwise recover as a call to any name. Where xgrammar cannot compile a schema, only the offending
+//! keywords are relaxed (`xgrammar_tag_schema::relax_for_structural_tag`, logged under target `dsv4_tag_relax`); a
+//! tool whose relaxed schema still fails is left unconstrained. The worker's reasoning parser holds the grammar until
+//! `</think>`, so reasoning stays free.
 //! `required` and named choices keep the guided-JSON array, which streams arguments as they are generated. The golden
 //! in the tests is the builtin's output plus that one exclude.
+
+use std::collections::HashSet;
+use std::sync::{LazyLock, Mutex};
 
 use dynamo_parsers::tool_calling::{ToolChoice, ToolDefinition};
 use serde_json::{Value, json};
@@ -98,17 +103,50 @@ fn invokes(tools: &[ToolDefinition], stop_after_first: bool) -> Value {
     })
 }
 
-fn invoke(tool: &ToolDefinition) -> Value {
-    let schema = match &tool.parameters {
-        Some(parameters) if xgrammar_tag_schema::compiles_in_structural_tag(parameters) => {
-            parameters.clone()
-        }
-        Some(_) => {
-            tracing::debug!(tool = %tool.name, "tool schema not compilable by xgrammar; arguments left unconstrained");
-            Value::Bool(true)
-        }
-        None => Value::Bool(true),
+/// The tool's `parameters` as pinned in the tag: as sent, relaxed where xgrammar cannot compile them, or `true`.
+fn arguments_schema(tool: &ToolDefinition) -> Value {
+    let Some(parameters) = &tool.parameters else {
+        return Value::Bool(true);
     };
+    if xgrammar_tag_schema::compiles_in_structural_tag(parameters) {
+        return parameters.clone();
+    }
+    let (relaxed, keywords) = xgrammar_tag_schema::relax_for_structural_tag(parameters);
+    let unconstrained = !xgrammar_tag_schema::compiles_in_structural_tag(&relaxed);
+    log_relaxation(&tool.name, &keywords, unconstrained);
+    if unconstrained {
+        Value::Bool(true)
+    } else {
+        relaxed
+    }
+}
+
+/// Distinct (tool, keywords) pairs logged per process; past this, relaxations are no longer logged.
+const RELAX_LOG_CAPACITY: usize = 1000;
+
+/// Logs a relaxation once per tool name and keyword set. Only names are logged, never schema values or arguments.
+fn log_relaxation(tool: &str, keywords: &[&'static str], unconstrained: bool) {
+    static SEEN: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Default::default);
+    let keywords = keywords.join(",");
+    {
+        let Ok(mut seen) = SEEN.lock() else {
+            return;
+        };
+        if seen.len() >= RELAX_LOG_CAPACITY || !seen.insert(format!("{tool}\u{1f}{keywords}")) {
+            return;
+        }
+    }
+    tracing::info!(
+        target: "dsv4_tag_relax",
+        tool,
+        keywords = %keywords,
+        unconstrained,
+        "relaxed a tool schema xgrammar cannot compile in the DSML structural tag"
+    );
+}
+
+fn invoke(tool: &ToolDefinition) -> Value {
+    let schema = arguments_schema(tool);
     json!({
         "type": "tag",
         "begin": format!("<｜DSML｜invoke name=\"{}\">\n", tool.name),
@@ -223,26 +261,29 @@ mod tests {
     }
 
     #[test]
-    fn uncompilable_schema_frees_only_that_tools_arguments() {
+    fn uncompilable_keywords_are_relaxed_not_the_whole_tool() {
         let good = json!({"type": "object", "properties": {"q": {"type": "string"}}});
+        let int = json!({"type": "integer"});
         let tools = [
             tool(
                 "tuple",
-                Some(
-                    json!({"type": "object", "properties": {"xy": {"type": "array", "items": [{"type": "number"}]}}}),
-                ),
+                Some(json!({"type": "object", "properties": {
+                    "xy": {"type": "array", "items": [{"type": "number"}]}, "n": int,
+                }})),
                 None,
             ),
             tool(
                 "lookahead",
-                Some(
-                    json!({"type": "object", "properties": {"pw": {"type": "string", "pattern": "^(?=.*[A-Z])"}}}),
-                ),
+                Some(json!({"type": "object", "properties": {
+                    "pw": {"type": "string", "pattern": "^(?=.*[A-Z])"}, "n": int,
+                }})),
                 None,
             ),
             tool(
                 "dangling",
-                Some(json!({"type": "object", "properties": {"r": {"$ref": "#/$defs/missing"}}})),
+                Some(json!({"type": "object", "properties": {
+                    "r": {"$ref": "#/$defs/missing"}, "n": int,
+                }})),
                 None,
             ),
             tool("good", Some(good.clone()), None),
@@ -256,13 +297,37 @@ mod tests {
         ];
         let tag = structural_tag(&ToolChoice::Auto, &tools, None).unwrap();
         let schemas = invoke_schemas(&tag);
-        assert_eq!(&schemas[..3], &[json!(true), json!(true), json!(true)]);
+        // Only the offending keyword or subschema goes; the integer sibling stays pinned.
+        assert_eq!(
+            schemas[0],
+            json!({"type": "object", "properties": {"xy": {"type": "array", "items": true}, "n": int}})
+        );
+        assert_eq!(
+            schemas[1],
+            json!({"type": "object", "properties": {"pw": {"type": "string"}, "n": int}})
+        );
+        assert_eq!(
+            schemas[2],
+            json!({"type": "object", "properties": {"r": true, "n": int}})
+        );
         assert_eq!(schemas[3], good);
         assert_eq!(
             schemas[4],
             tools[4].parameters.clone().unwrap(),
             "xgrammar compiles uniqueItems in a tag"
         );
+    }
+
+    #[test]
+    fn a_tool_still_uncompilable_after_relaxing_is_left_unconstrained() {
+        // Relaxing the tuple `items` breaks the `$ref` that pointed into it.
+        let parameters = json!({"type": "object", "properties": {
+            "a": {"$ref": "#/properties/b/items/0"},
+            "b": {"type": "array", "items": [{"type": "string"}]},
+        }});
+        let tools = [tool("broken", Some(parameters), None)];
+        let tag = structural_tag(&ToolChoice::Auto, &tools, None).unwrap();
+        assert_eq!(invoke_schemas(&tag), vec![json!(true)]);
     }
 
     #[test]
