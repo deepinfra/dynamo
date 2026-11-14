@@ -768,5 +768,55 @@ mod tests {
             assert_eq!(constraint, GuidedToolConstraint::None);
             assert!(structural_tag(&common).is_none());
         }
+
+        /// The prompt is reordered exactly when the installed tag splits on `required`.
+        #[test]
+        fn prompt_reorders_exactly_when_the_tag_splits_on_required() {
+            use crate::preprocessor::deepseek_v4_tool_tag::{REQUIRED_FOR_TEST, prompt_tools};
+
+            let tools = json!([{"type": "function", "function": {"name": "post", "parameters": {
+                "type": "object",
+                "properties": {"text": {"type": "string"}, "id": {"type": "string"}},
+                "required": ["id"],
+            }}}]);
+            let cases = [
+                (json!({}), true),
+                (json!({"tool_choice": "auto"}), true),
+                (
+                    json!({"tool_choice": "auto", "response_format": {"type": "text"}}),
+                    true,
+                ),
+                (
+                    json!({"tool_choice": "auto", "response_format": {"type": "json_object"}}),
+                    false,
+                ),
+                (
+                    json!({"tool_choice": "auto", "guided_json": {"type": "object"}}),
+                    false,
+                ),
+                (json!({"tool_choice": "required"}), false),
+                (
+                    json!({"tool_choice": {"type": "function", "function": {"name": "post"}}}),
+                    false,
+                ),
+                (json!({"tool_choice": "none"}), false),
+            ];
+            for (extra, expected) in cases {
+                let mut extra = extra;
+                extra["tools"] = tools.clone();
+                REQUIRED_FOR_TEST.with(|g| g.set(Some(true)));
+                let (_, common) = apply("deepseek_v4", true, extra.clone());
+                GATE_FOR_TEST.with(|g| g.set(Some(true)));
+                let reordered =
+                    prompt_tools(Some("deepseek_v4"), &request(extra.clone())).is_some();
+                GATE_FOR_TEST.with(|g| g.set(None));
+                REQUIRED_FOR_TEST.with(|g| g.set(None));
+                let split = structural_tag(&common).is_some_and(|tag| {
+                    tag["format"]["tags"][0]["content"]["tags"][0]["content"]["type"] == "sequence"
+                });
+                assert_eq!(split, expected, "tag split: {extra}");
+                assert_eq!(reordered, expected, "prompt reordered: {extra}");
+            }
+        }
     }
 }
