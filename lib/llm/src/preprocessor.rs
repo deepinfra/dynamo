@@ -19,6 +19,7 @@ mod mm_routing;
 pub mod prompt;
 pub mod speculative_prefill;
 mod deepseek_v41_tool_tag;
+mod deepseek_v4_tool_tag;
 pub(crate) mod structural_tag;
 pub(crate) mod tool_choice;
 pub mod tools;
@@ -3059,14 +3060,20 @@ impl OpenAIPreprocessor {
         request: &R,
     ) -> Result<Option<RenderedPrompt>> {
         let continue_final = request.get_continue_final_message() == Some(true);
+        // DI: DeepSeek V4 tools listed required-first when the DSML tag splits on `required`.
+        let prompt_tools =
+            deepseek_v4_tool_tag::prompt_tools(self.tool_call_parser.as_deref(), request);
         let formatted_prompt = if self.normalize_tool_call_args || continue_final {
-            self.apply_template_inner(&NormalizedArgsRequest {
-                inner: request,
-                normalize_tool_call_args: self.normalize_tool_call_args,
-                continue_final_message: continue_final,
-            })?
+            self.apply_template_inner(
+                &NormalizedArgsRequest {
+                    inner: request,
+                    normalize_tool_call_args: self.normalize_tool_call_args,
+                    continue_final_message: continue_final,
+                },
+                prompt_tools.as_ref(),
+            )?
         } else {
-            self.apply_template_inner(request)?
+            self.apply_template_inner(request, prompt_tools.as_ref())?
         };
         let Some(prompt) = formatted_prompt else {
             return Ok(None);
@@ -3089,6 +3096,7 @@ impl OpenAIPreprocessor {
     >(
         &self,
         request: &R,
+        prompt_tools: Option<&deepseek_v4_tool_tag::PromptTools>,
     ) -> Result<Option<RenderedPrompt>> {
         if let PromptInput::Text(_) = request.prompt_input_type()
             && let Some(TextInput::Single(_)) = request.extract_text()
@@ -3102,20 +3110,34 @@ impl OpenAIPreprocessor {
                     Some(prompt) => RenderedPrompt::text(prompt),
                     None => {
                         tracing::warn!("Raw prompt requested but not available");
-                        self.formatter
-                            .render_prompt(request)
-                            .map_err(Self::map_prompt_render_error)?
+                        self.render_with_prompt_tools(request, prompt_tools)?
                     }
                 }
             } else {
-                self.formatter
-                    .render_prompt(request)
-                    .map_err(Self::map_prompt_render_error)?
+                self.render_with_prompt_tools(request, prompt_tools)?
             };
             Ok(Some(formatted_prompt))
         } else {
             Ok(None)
         }
+    }
+
+    fn render_with_prompt_tools(
+        &self,
+        request: &dyn OAIChatLikeRequest,
+        prompt_tools: Option<&deepseek_v4_tool_tag::PromptTools>,
+    ) -> Result<RenderedPrompt> {
+        match prompt_tools {
+            Some(tools) => {
+                self.formatter
+                    .render_prompt(&deepseek_v4_tool_tag::PromptToolsRequest {
+                        inner: request,
+                        tools,
+                    })
+            }
+            None => self.formatter.render_prompt(request),
+        }
+        .map_err(Self::map_prompt_render_error)
     }
 
     /// Replace inline `data:` URLs with empty strings in message content parts.
