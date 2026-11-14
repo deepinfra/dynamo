@@ -134,6 +134,23 @@ impl OpenAIPreprocessor {
             return Ok(GuidedToolConstraint::None);
         }
 
+        // DI: a V4 request that cannot call tools (none, or `tool_choice=none`) after a tool-calling history must not
+        // write DSML, which nothing would parse and would leak into `content` (see deepseek_v4_tool_tag::dsml_ban_tag).
+        if super::deepseek_v4_tool_tag::applies(self.tool_call_parser.as_deref())
+            && !is_forced_tool_choice
+            && (tools.is_empty() || matches!(tool_choice, ChatCompletionToolChoiceOption::None))
+            && super::deepseek_v4_tool_tag::history_has_tool_calls(&request.inner.messages)
+        {
+            let gd = common_request
+                .sampling_options
+                .guided_decoding
+                .get_or_insert_default();
+            if gd.structural_tag.is_none() {
+                gd.structural_tag = Some(super::deepseek_v4_tool_tag::dsml_ban_tag());
+            }
+            return Ok(GuidedToolConstraint::None);
+        }
+
         if self.apply_tool_choice_structural_tag(
             &convert_tool_choice(tool_choice),
             &convert_tools(tools),
@@ -816,6 +833,85 @@ mod tests {
                 });
                 assert_eq!(split, expected, "tag split: {extra}");
                 assert_eq!(reordered, expected, "prompt reordered: {extra}");
+            }
+        }
+
+        fn tool_history() -> Value {
+            json!([
+                {"role": "user", "content": "weather?"},
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "get_weather", "arguments": "{\"location\": \"Paris\"}"},
+                }]},
+                {"role": "tool", "tool_call_id": "c1", "content": "sunny"},
+                {"role": "user", "content": "thanks"},
+            ])
+        }
+
+        #[test]
+        fn no_callable_tools_after_a_tool_history_bans_dsml() {
+            use crate::preprocessor::deepseek_v4_tool_tag::dsml_ban_tag;
+
+            let banned = [
+                json!({"messages": tool_history()}),
+                json!({"messages": tool_history(), "tools": tools(), "tool_choice": "none"}),
+                json!({"messages": tool_history(), "tool_choice": "auto"}),
+            ];
+            for extra in banned {
+                let (constraint, common) = apply("deepseek_v4", true, extra.clone());
+                assert_eq!(constraint, GuidedToolConstraint::None, "{extra}");
+                assert_eq!(structural_tag(&common), Some(dsml_ban_tag()), "{extra}");
+            }
+
+            let response_format = json!({"type": "json_schema", "json_schema": {
+                "name": "answer", "schema": {"type": "object"},
+            }});
+            let untouched = [
+                json!({}),
+                json!({"tools": tools(), "tool_choice": "none"}),
+                json!({"messages": tool_history(), "response_format": response_format}),
+                json!({"messages": tool_history(), "guided_regex": "a+"}),
+            ];
+            for extra in untouched {
+                let (on, on_common) = apply("deepseek_v4", true, extra.clone());
+                let (off, off_common) = apply("deepseek_v4", false, extra.clone());
+                assert_eq!(on, off, "{extra}");
+                assert_eq!(
+                    guided_decoding(&on_common),
+                    guided_decoding(&off_common),
+                    "{extra}"
+                );
+            }
+        }
+
+        #[test]
+        fn the_dsml_ban_is_gated_and_v4_only() {
+            let cases = [
+                json!({"messages": tool_history()}),
+                json!({"messages": tool_history(), "tools": tools(), "tool_choice": "none"}),
+            ];
+            for extra in cases {
+                let (constraint, common) = apply("deepseek_v4", false, extra.clone());
+                assert!(structural_tag(&common).is_none(), "gate off: {extra}");
+                let today = guided_tool_constraint(
+                    &request(extra.clone()),
+                    Some("deepseek_v4"),
+                    None,
+                    false,
+                )
+                .unwrap();
+                assert_eq!(constraint, today, "gate off: {extra}");
+                for parser in ["deepseek_v41", "qwen3_coder", "glm47"] {
+                    let (on, on_common) = apply(parser, true, extra.clone());
+                    let (off, off_common) = apply(parser, false, extra.clone());
+                    assert_eq!(on, off, "{parser}: {extra}");
+                    assert_eq!(
+                        guided_decoding(&on_common),
+                        guided_decoding(&off_common),
+                        "{parser}: {extra}"
+                    );
+                }
             }
         }
     }

@@ -44,6 +44,7 @@ const CALLS_END: &str = "</｜DSML｜tool_calls>";
 const BARE_INVOKE: &str = "<｜DSML｜invoke name=";
 const INVOKE_END: &str = "</｜DSML｜invoke>\n";
 const ARGUMENT_STYLE: &str = "deepseek_xml";
+const DSML_MARKER: &str = "<｜DSML｜";
 
 #[cfg(test)]
 thread_local! {
@@ -320,6 +321,24 @@ fn required_split(parameters: &Value, prepared: &Value) -> Option<RequiredSplit>
     };
     let order = required.into_iter().chain(optional).collect();
     Some(RequiredSplit { order, content })
+}
+
+/// The tag for a request that cannot call tools (no tools, or `tool_choice=none`) after a tool-calling history: free
+/// text that never opens DSML markup, which nothing would parse into a call and would leak into `content`.
+pub(crate) fn dsml_ban_tag() -> Value {
+    json!({"type": "structural_tag", "format": {"type": "any_text", "excludes": [DSML_MARKER]}})
+}
+
+/// Whether the conversation holds an assistant tool call or a tool result.
+pub(crate) fn history_has_tool_calls(messages: &[ChatCompletionRequestMessage]) -> bool {
+    messages.iter().any(|message| match message {
+        ChatCompletionRequestMessage::Assistant(assistant) => assistant
+            .tool_calls
+            .as_ref()
+            .is_some_and(|calls| !calls.is_empty()),
+        ChatCompletionRequestMessage::Tool(_) => true,
+        _ => false,
+    })
 }
 
 fn contains_ref(node: &Value) -> bool {
