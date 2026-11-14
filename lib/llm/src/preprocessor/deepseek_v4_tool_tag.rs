@@ -96,7 +96,7 @@ fn calls_block(content: Value) -> Value {
     json!({
         "type": "sequence",
         "elements": [
-            {"type": "const_string", "value": [CALLS_PREFIX, CALLS_BEGIN].concat()},
+            {"type": "const_string", "value": ([CALLS_PREFIX, CALLS_BEGIN].concat())},
             content,
             {"type": "const_string", "value": CALLS_END},
         ],
@@ -106,7 +106,7 @@ fn calls_block(content: Value) -> Value {
 fn invokes(tools: &[ToolDefinition], stop_after_first: bool) -> Value {
     json!({
         "type": "tags_with_separator",
-        "tags": tools.iter().map(invoke).collect::<Vec<_>>(),
+        "tags": (tools.iter().map(invoke).collect::<Vec<_>>()),
         "separator": "",
         "at_least_one": true,
         "stop_after_first": stop_after_first,
