@@ -56,6 +56,66 @@ pub fn compiles_in_structural_tag(schema: &Value) -> bool {
     schema_ok(schema, schema)
 }
 
+/// A copy of `schema` with `additionalProperties` closed (`false`) on object nodes that declare properties, and
+/// whether anything changed. In `deepseek_xml` a declared parameter name also matches the additional-property branch,
+/// so on the tool's root `additionalProperties: true` (or `{}`) lets a declared string parameter take an array, and a
+/// schema-valued one lets it take that schema's type. `true` is closed on every node that declares properties;
+/// a schema object only on the root, the one level where the wheel shows the ambiguity (nested values are JSON, where
+/// declared keys are excluded from the additional branch). A node whose `minProperties` exceeds its declared
+/// properties is left open. This narrows the accept-set: undeclared extra arguments are no longer allowed.
+pub fn close_declared_objects(schema: &Value) -> (Value, bool) {
+    let mut closed = false;
+    let value = close_node(schema, true, &mut closed);
+    (value, closed)
+}
+
+fn close_node(node: &Value, root: bool, closed: &mut bool) -> Value {
+    let Value::Object(obj) = node else {
+        return node.clone();
+    };
+    let mut out = Map::new();
+    for (key, value) in obj {
+        let key_str = key.as_str();
+        let child = match value {
+            Value::Object(map) if SCHEMA_MAPS.contains(&key_str) => {
+                let mut children = Map::new();
+                for (name, child) in map {
+                    children.insert(name.clone(), close_node(child, false, closed));
+                }
+                Value::Object(children)
+            }
+            Value::Array(list) if SCHEMA_LISTS.contains(&key_str) => {
+                let mut children = Vec::with_capacity(list.len());
+                for child in list {
+                    children.push(close_node(child, false, closed));
+                }
+                Value::Array(children)
+            }
+            _ if SCHEMA_VALUES.contains(&key_str) => close_node(value, false, closed),
+            _ => value.clone(),
+        };
+        out.insert(key.clone(), child);
+    }
+    let declared = out
+        .get("properties")
+        .and_then(Value::as_object)
+        .map_or(0, Map::len) as u64;
+    let open = match out.get("additionalProperties") {
+        Some(Value::Bool(true)) => true,
+        Some(Value::Object(_)) => root,
+        _ => false,
+    };
+    let min_fits = out
+        .get("minProperties")
+        .and_then(Value::as_u64)
+        .is_none_or(|min| min <= declared);
+    if declared > 0 && open && min_fits {
+        out.insert("additionalProperties".to_string(), Value::Bool(false));
+        *closed = true;
+    }
+    Value::Object(out)
+}
+
 /// Keywords whose meaning depends on sibling keywords of the same schema object, or on its position: an `allOf`
 /// with any of these in the parent or a branch is left as is.
 const ALL_OF_BLOCKERS: &[&str] = &[
@@ -775,6 +835,62 @@ mod tests {
         ];
         for schema in unchanged {
             assert_eq!(flatten_all_of(&schema), schema);
+        }
+    }
+
+    #[test]
+    fn close_declared_objects_closes_only_objects_with_properties() {
+        use serde_json::json;
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "status": {"type": "string"},
+                "cfg": {
+                    "type": "object",
+                    "properties": {"a": {"type": "string"}},
+                    "additionalProperties": true,
+                },
+                "typed_extras": {
+                    "type": "object",
+                    "properties": {"a": {"type": "string"}},
+                    "additionalProperties": {"type": "integer"},
+                },
+                "map": {"type": "object", "additionalProperties": true},
+                "list": {"type": "array", "items": {
+                    "type": "object",
+                    "properties": {"k": {"type": "string"}},
+                    "additionalProperties": true,
+                }},
+            },
+            "additionalProperties": true,
+        });
+        let mut expected = schema.clone();
+        expected["additionalProperties"] = json!(false);
+        expected["properties"]["cfg"]["additionalProperties"] = json!(false);
+        expected["properties"]["list"]["items"]["additionalProperties"] = json!(false);
+        let (closed, changed) = close_declared_objects(&schema);
+        assert!(changed);
+        assert_eq!(closed, expected);
+
+        for (open, expect_closed) in [(json!({"type": "integer"}), true), (json!({}), true)] {
+            let root = json!({"type": "object", "properties": {"s": {"type": "string"}}, "additionalProperties": open});
+            let (closed, changed) = close_declared_objects(&root);
+            assert_eq!(changed, expect_closed, "{open}");
+            assert_eq!(closed["additionalProperties"], json!(false), "{open}");
+        }
+
+        let unchanged = [
+            json!({"type": "object", "additionalProperties": true}),
+            json!({"type": "object", "properties": {"s": {"type": "string"}}}),
+            json!({"type": "object", "properties": {"s": {"type": "string"}}, "additionalProperties": false}),
+            json!({"type": "object", "properties": {"s": {}}, "additionalProperties": true, "minProperties": 2}),
+        ];
+        for schema in unchanged {
+            assert_eq!(
+                close_declared_objects(&schema),
+                (schema.clone(), false),
+                "{schema}"
+            );
         }
     }
 

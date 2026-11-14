@@ -133,24 +133,39 @@ fn invokes(tools: &[ToolDefinition], stop_after_first: bool) -> Value {
 }
 
 /// The tool's `parameters` as pinned in the tag: with mergeable `allOf`s flattened (xgrammar would otherwise accept
-/// any value there), then as is, relaxed where xgrammar cannot compile them, or `true`.
+/// any value there), relaxed where xgrammar cannot compile them (or `true`), and with open objects that declare
+/// properties closed (`xgrammar_tag_schema::close_declared_objects`; logged as `additionalProperties_closed`). Only
+/// the grammar sees this schema; the prompt and response validation keep the one sent.
 fn arguments_schema(tool_name: &str, parameters: Option<&Value>) -> Value {
     let Some(parameters) = parameters else {
         return Value::Bool(true);
     };
-    let parameters = xgrammar_tag_schema::flatten_all_of(parameters);
-    if xgrammar_tag_schema::compiles_in_structural_tag(&parameters) {
-        return parameters;
-    }
-    let (relaxed, keywords) = xgrammar_tag_schema::relax_for_structural_tag(&parameters);
-    let unconstrained =
-        relaxed == Value::Bool(true) || !xgrammar_tag_schema::compiles_in_structural_tag(&relaxed);
-    log_relaxation(tool_name, &keywords, unconstrained);
-    if unconstrained {
-        Value::Bool(true)
+    let mut keywords = Vec::new();
+    let flattened = xgrammar_tag_schema::flatten_all_of(parameters);
+    let schema = if xgrammar_tag_schema::compiles_in_structural_tag(&flattened) {
+        flattened
     } else {
+        let (relaxed, relaxed_keywords) = xgrammar_tag_schema::relax_for_structural_tag(&flattened);
+        keywords = relaxed_keywords;
+        if relaxed == Value::Bool(true)
+            || !xgrammar_tag_schema::compiles_in_structural_tag(&relaxed)
+        {
+            log_relaxation(tool_name, &keywords, true);
+            return Value::Bool(true);
+        }
         relaxed
+    };
+    let (closed, changed) = xgrammar_tag_schema::close_declared_objects(&schema);
+    let schema = if changed && xgrammar_tag_schema::compiles_in_structural_tag(&closed) {
+        keywords.push("additionalProperties_closed");
+        closed
+    } else {
+        schema
+    };
+    if !keywords.is_empty() {
+        log_relaxation(tool_name, &keywords, false);
     }
+    schema
 }
 
 /// Distinct (tool, keywords) pairs logged per process; past this, relaxations are no longer logged.
@@ -173,7 +188,7 @@ fn log_relaxation(tool: &str, keywords: &[&'static str], unconstrained: bool) {
         tool,
         keywords = %keywords,
         unconstrained,
-        "relaxed a tool schema xgrammar cannot compile in the DSML structural tag"
+        "adjusted a tool schema for the DSML structural tag (relaxed where xgrammar cannot compile it, or closed)"
     );
 }
 
@@ -783,8 +798,6 @@ mod tests {
                 without("type"),
                 with("required", json!(["issue_id", "missing"])),
                 with("properties", json!({})),
-                with("additionalProperties", json!(true)),
-                with("additionalProperties", json!({"type": "string"})),
                 with("patternProperties", json!({"^x": {"type": "string"}})),
                 with("anyOf", json!([{"required": ["text"]}])),
                 with("oneOf", json!([{"required": ["text"]}])),
@@ -811,6 +824,41 @@ mod tests {
                     "{schema}"
                 );
             }
+        }
+
+        #[test]
+        fn an_open_root_is_closed_and_then_splits() {
+            for open in [json!(true), json!({}), json!({"type": "string"})] {
+                let mut schema = mixed();
+                schema["additionalProperties"] = open.clone();
+                assert_eq!(
+                    invoke_content(schema, true),
+                    invoke_content(mixed(), true),
+                    "{open}"
+                );
+            }
+        }
+
+        #[test]
+        fn open_objects_that_declare_properties_are_pinned_closed() {
+            let schema = json!({
+                "type": "object",
+                "properties": {
+                    "status": {"type": "string"},
+                    "cfg": {
+                        "type": "object",
+                        "properties": {"a": {"type": "string"}},
+                        "additionalProperties": true,
+                    },
+                    "meta": {"type": "object", "additionalProperties": true},
+                },
+                "required": ["status"],
+                "additionalProperties": true,
+            });
+            let mut closed = schema.clone();
+            closed["additionalProperties"] = json!(false);
+            closed["properties"]["cfg"]["additionalProperties"] = json!(false);
+            assert_eq!(invoke_content(schema, false), argument_content(closed));
         }
 
         #[test]
