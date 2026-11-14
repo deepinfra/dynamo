@@ -44,7 +44,7 @@ const CALLS_END: &str = "</｜DSML｜tool_calls>";
 const BARE_INVOKE: &str = "<｜DSML｜invoke name=";
 const INVOKE_END: &str = "</｜DSML｜invoke>\n";
 const ARGUMENT_STYLE: &str = "deepseek_xml";
-const DSML_MARKER: &str = "<｜DSML｜";
+const DSML_MARKER: &str = "｜DSML｜";
 
 #[cfg(test)]
 thread_local! {
@@ -324,7 +324,7 @@ fn required_split(parameters: &Value, prepared: &Value) -> Option<RequiredSplit>
 }
 
 /// The tag for a request that cannot call tools (no tools, or `tool_choice=none`) after a tool-calling history: free
-/// text that never opens DSML markup, which nothing would parse into a call and would leak into `content`.
+/// text that never holds the DSML marker (opening or closing tags alike), which would leak into `content`.
 pub(crate) fn dsml_ban_tag() -> Value {
     json!({"type": "structural_tag", "format": {"type": "any_text", "excludes": [DSML_MARKER]}})
 }
