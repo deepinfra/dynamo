@@ -116,9 +116,9 @@ impl OpenAIPreprocessor {
             return Ok(GuidedToolConstraint::None);
         }
 
-        // DI: DeepSeek V4 DSML structural tag behind DI_DSV4_TOOL_STRUCTURAL_TAG (see deepseek_v4_tool_tag). `auto`
-        // keeps today's native DSML stream parser; a forced choice is reported as a structural tag so the jail parses
-        // DSML instead of the guided-JSON array it would otherwise expect.
+        // DI: DeepSeek V4 DSML structural tag for `auto` behind DI_DSV4_TOOL_STRUCTURAL_TAG (see deepseek_v4_tool_tag).
+        // The output stays native DSML for today's stream parser, so no constraint is reported. Forced choices get no
+        // tag and keep the guided-JSON array below.
         if super::deepseek_v4_tool_tag::applies(self.tool_call_parser.as_deref())
             && let Some(tag) = super::deepseek_v4_tool_tag::structural_tag(
                 &convert_tool_choice(tool_choice),
@@ -131,7 +131,7 @@ impl OpenAIPreprocessor {
                 .guided_decoding
                 .get_or_insert_default()
                 .structural_tag = Some(tag);
-            return Ok(deepseek_v4_tag_constraint(is_forced_tool_choice));
+            return Ok(GuidedToolConstraint::None);
         }
 
         if self.apply_tool_choice_structural_tag(
@@ -303,9 +303,6 @@ pub(crate) fn guided_tool_constraint(
     if has_explicit_guided_decoding(request) {
         return Ok(GuidedToolConstraint::None);
     }
-    if super::deepseek_v4_tool_tag::applies(tool_call_parser) {
-        return Ok(deepseek_v4_tag_constraint(is_forced_tool_choice));
-    }
     // K3 forced requests are served by a prompt-level XTML instruction; no JSON schema.
     if uses_kimi_k3_parser(tool_call_parser, reasoning_parser) {
         return Ok(GuidedToolConstraint::None);
@@ -326,16 +323,6 @@ pub(crate) fn guided_tool_constraint(
         Ok(Some(_)) => Ok(installed_json_constraint(tool_choice)),
         Ok(None) => Ok(GuidedToolConstraint::None),
         Err(e) => Err(invalid_argument(e.to_string())),
-    }
-}
-
-/// The constraint a DeepSeek V4 DSML tag reports: forced choices parse as structural-tag DSML, `auto` stays on the
-/// native stream parser it uses without the tag.
-fn deepseek_v4_tag_constraint(is_forced_tool_choice: bool) -> GuidedToolConstraint {
-    if is_forced_tool_choice {
-        GuidedToolConstraint::StructuralTag
-    } else {
-        GuidedToolConstraint::None
     }
 }
 
@@ -667,50 +654,74 @@ mod tests {
                 .and_then(|gd| gd.structural_tag.clone())
         }
 
-        fn choices() -> [(Value, GuidedToolConstraint); 3] {
+        fn guided_decoding(common: &PreprocessedRequest) -> Value {
+            serde_json::to_value(&common.sampling_options.guided_decoding).unwrap()
+        }
+
+        fn reconstructed(extra: Value, gate: bool) -> GuidedToolConstraint {
+            GATE_FOR_TEST.with(|g| g.set(Some(gate)));
+            let constraint = guided_tool_constraint(
+                &request(extra),
+                Some("deepseek_v4"),
+                Some("deepseek_v4"),
+                false,
+            )
+            .unwrap();
+            GATE_FOR_TEST.with(|g| g.set(None));
+            constraint
+        }
+
+        fn forced_choices() -> [Value; 2] {
             [
-                (json!("auto"), GuidedToolConstraint::None),
-                (json!("required"), GuidedToolConstraint::StructuralTag),
-                (
-                    json!({"type": "function", "function": {"name": "get_weather"}}),
-                    GuidedToolConstraint::StructuralTag,
-                ),
+                json!("required"),
+                json!({"type": "function", "function": {"name": "get_weather"}}),
             ]
         }
 
-        #[test]
-        fn gate_on_installs_the_dsml_tag_for_every_tool_choice() {
-            for (tool_choice, expected) in choices() {
-                let extra = json!({"tools": tools(), "tool_choice": tool_choice});
-                let (constraint, common) = apply("deepseek_v4", true, extra.clone());
-                assert_eq!(constraint, expected, "{tool_choice}");
-                let tag = structural_tag(&common).expect("tag installed");
-                assert!(
-                    tag.to_string()
-                        .contains("<｜DSML｜invoke name=\\\"get_weather\\\">")
-                );
-                let gd = common.sampling_options.guided_decoding.as_ref().unwrap();
-                assert!(gd.json.is_none() && gd.regex.is_none(), "{tool_choice}");
+        fn choices() -> [Value; 3] {
+            let [required, named] = forced_choices();
+            [json!("auto"), required, named]
+        }
 
-                GATE_FOR_TEST.with(|g| g.set(Some(true)));
-                let reconstructed = guided_tool_constraint(
-                    &request(extra),
-                    Some("deepseek_v4"),
-                    Some("deepseek_v4"),
-                    false,
-                )
-                .unwrap();
-                GATE_FOR_TEST.with(|g| g.set(None));
+        #[test]
+        fn gate_on_installs_the_dsml_tag_for_auto_only() {
+            let extra = json!({"tools": tools(), "tool_choice": "auto"});
+            let (constraint, common) = apply("deepseek_v4", true, extra.clone());
+            assert_eq!(constraint, GuidedToolConstraint::None);
+            let tag = structural_tag(&common).expect("tag installed");
+            assert!(
+                tag.to_string()
+                    .contains("<｜DSML｜invoke name=\\\"get_weather\\\">")
+            );
+            let gd = common.sampling_options.guided_decoding.as_ref().unwrap();
+            assert!(gd.json.is_none() && gd.regex.is_none());
+            assert_eq!(reconstructed(extra, true), GuidedToolConstraint::None);
+        }
+
+        #[test]
+        fn gate_on_forced_choices_match_gate_off_exactly() {
+            for tool_choice in forced_choices() {
+                let extra = json!({"tools": tools(), "tool_choice": tool_choice});
+                let (on, on_common) = apply("deepseek_v4", true, extra.clone());
+                let (off, off_common) = apply("deepseek_v4", false, extra.clone());
+                assert_eq!(on, off, "{tool_choice}");
                 assert_eq!(
-                    reconstructed, expected,
-                    "HTTP-side reconstruction agrees: {tool_choice}"
+                    guided_decoding(&on_common),
+                    guided_decoding(&off_common),
+                    "{tool_choice}"
+                );
+                assert!(structural_tag(&on_common).is_none(), "{tool_choice}");
+                assert_eq!(
+                    reconstructed(extra.clone(), true),
+                    reconstructed(extra, false),
+                    "HTTP-side reconstruction: {tool_choice}"
                 );
             }
         }
 
         #[test]
         fn gate_off_keeps_todays_behavior() {
-            for (tool_choice, _) in choices() {
+            for tool_choice in choices() {
                 let extra = json!({"tools": tools(), "tool_choice": tool_choice});
                 let (constraint, common) = apply("deepseek_v4", false, extra.clone());
                 assert!(structural_tag(&common).is_none(), "{tool_choice}");
@@ -725,7 +736,7 @@ mod tests {
         fn gate_on_leaves_other_families_alone() {
             for parser in ["deepseek_v41", "qwen3_coder", "glm47"] {
                 for gate in [false, true] {
-                    for (tool_choice, _) in choices() {
+                    for tool_choice in choices() {
                         let extra = json!({"tools": tools(), "tool_choice": tool_choice});
                         let (constraint, common) = apply(parser, gate, extra);
                         let tag = structural_tag(&common)

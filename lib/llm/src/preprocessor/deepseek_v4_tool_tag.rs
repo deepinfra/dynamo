@@ -1,17 +1,20 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! DI: DeepSeek V4 tool-call structural tags, gated by `DI_DSV4_TOOL_STRUCTURAL_TAG=1` (default off).
+//! DI: DeepSeek V4 tool-call structural tag for `tool_choice=auto`, gated by `DI_DSV4_TOOL_STRUCTURAL_TAG=1`
+//! (default off).
 //!
-//! The tag is xgrammar's `deepseek_v4` builtin (`get_model_structural_tag("deepseek_v4", reasoning="disabled")`):
-//! the DSML `<｜DSML｜tool_calls>` envelope, one `<｜DSML｜invoke name="..">` tag per declared tool, and each tool's
-//! `parameters` as `deepseek_xml` content, which renders a string value raw under `string="true"` and every other value
-//! as JSON under `string="false"`, as the V4 chat template does. `auto` leaves text free until the calls trigger,
-//! `required` must open one calls block, a named choice must call that tool. Unlike the builtin, every tool's schema is
-//! pinned (also `strict: false`), and free text may not hold a bare `<｜DSML｜invoke name=` outside a calls block,
-//! which the V4 parser would otherwise recover as a call to any name. A schema xgrammar cannot compile is left
-//! unconstrained for that tool only. The worker's reasoning parser holds the grammar until `</think>`, so reasoning
-//! stays free. The golden in the tests is the builtin's output plus that one exclude.
+//! The tag is xgrammar's `deepseek_v4` builtin (`get_model_structural_tag("deepseek_v4", reasoning="disabled",
+//! any_order=True)`): text stays free until `<｜DSML｜tool_calls>`, then one `<｜DSML｜invoke name="..">` tag per
+//! declared tool with the tool's `parameters` as `deepseek_xml` content, which renders a string value raw under
+//! `string="true"` and every other value as JSON under `string="false"`, as the V4 chat template does. Parameters may
+//! come in any order (the model often writes an optional one before a required one); xgrammar then no longer enforces
+//! `required` or rejects a repeated parameter. Unlike the builtin, every tool's schema is pinned (also
+//! `strict: false`), and free text may not hold a bare `<｜DSML｜invoke name=` outside a calls block, which the V4
+//! parser would otherwise recover as a call to any name. A schema xgrammar cannot compile is left unconstrained for
+//! that tool only. The worker's reasoning parser holds the grammar until `</think>`, so reasoning stays free.
+//! `required` and named choices keep the guided-JSON array, which streams arguments as they are generated. The golden
+//! in the tests is the builtin's output plus that one exclude.
 
 use dynamo_parsers::tool_calling::{ToolChoice, ToolDefinition};
 use serde_json::{Value, json};
@@ -23,7 +26,6 @@ pub(crate) const ENABLE_ENV: &str = "DI_DSV4_TOOL_STRUCTURAL_TAG";
 const CALLS_TRIGGER: &str = "<｜DSML｜tool_calls>";
 const CALLS_BEGIN: &str = "<｜DSML｜tool_calls>\n";
 const CALLS_END: &str = "</｜DSML｜tool_calls>";
-const CALLS_PREFIX: &str = "\n\n";
 const BARE_INVOKE: &str = "<｜DSML｜invoke name=";
 const INVOKE_END: &str = "</｜DSML｜invoke>\n";
 const ARGUMENT_STYLE: &str = "deepseek_xml";
@@ -57,20 +59,20 @@ pub(crate) fn applies(tool_call_parser: Option<&str>) -> bool {
     ) && gate_on()
 }
 
-/// The `guided_decoding.structural_tag` for a request with tools; `None` when no tag applies (`tool_choice=none`,
-/// no tools, or a named tool that is not among them, which the caller rejects).
+/// The `guided_decoding.structural_tag` for a `tool_choice=auto` request with tools; `None` for any other choice
+/// or without tools.
 pub(crate) fn structural_tag(
     tool_choice: &ToolChoice,
     tools: &[ToolDefinition],
     parallel_tool_calls: Option<bool>,
 ) -> Option<Value> {
-    if tools.is_empty() {
+    if tools.is_empty() || !matches!(tool_choice, ToolChoice::Auto) {
         return None;
     }
     let stop_after_first = parallel_tool_calls == Some(false);
-    let format = match tool_choice {
-        ToolChoice::None => return None,
-        ToolChoice::Auto => json!({
+    Some(json!({
+        "type": "structural_tag",
+        "format": {
             "type": "triggered_tags",
             "triggers": [CALLS_TRIGGER],
             "tags": [{
@@ -82,25 +84,8 @@ pub(crate) fn structural_tag(
             "at_least_one": false,
             "stop_after_first": stop_after_first,
             "excludes": ["<think>", "</think>", BARE_INVOKE],
-        }),
-        ToolChoice::Required => calls_block(invokes(tools, stop_after_first)),
-        ToolChoice::Named(name) => {
-            let tool = tools.iter().find(|tool| &tool.name == name)?;
-            calls_block(invoke(tool))
-        }
-    };
-    Some(json!({"type": "structural_tag", "format": format}))
-}
-
-fn calls_block(content: Value) -> Value {
-    json!({
-        "type": "sequence",
-        "elements": [
-            {"type": "const_string", "value": ([CALLS_PREFIX, CALLS_BEGIN].concat())},
-            content,
-            {"type": "const_string", "value": CALLS_END},
-        ],
-    })
+        },
+    }))
 }
 
 fn invokes(tools: &[ToolDefinition], stop_after_first: bool) -> Value {
@@ -131,7 +116,7 @@ fn invoke(tool: &ToolDefinition) -> Value {
             "type": "json_schema",
             "json_schema": schema,
             "style": ARGUMENT_STYLE,
-            "any_order": false,
+            "any_order": true,
             "max_whitespace_cnt": null,
             "excludes": [],
         },
@@ -186,14 +171,13 @@ mod tests {
             .collect()
     }
 
+    /// The golden is the builtin generated with `any_order=True`, where we deliberately differ from its default.
     #[test]
     fn tags_match_xgrammar_deepseek_v4_builtin() {
         let golden = golden();
         let cases = [
             ("auto", ToolChoice::Auto, None),
             ("auto_single_call", ToolChoice::Auto, Some(false)),
-            ("required", ToolChoice::Required, None),
-            ("named", ToolChoice::Named("create_task".to_string()), None),
         ];
         for (label, choice, parallel) in cases {
             assert_eq!(
@@ -234,10 +218,8 @@ mod tests {
             .enumerate()
             .map(|(i, s)| tool(&format!("t{i}"), Some(s.clone()), None))
             .collect();
-        for choice in [ToolChoice::Auto, ToolChoice::Required] {
-            let tag = structural_tag(&choice, &tools, None).unwrap();
-            assert_eq!(invoke_schemas(&tag), schemas.to_vec());
-        }
+        let tag = structural_tag(&ToolChoice::Auto, &tools, None).unwrap();
+        assert_eq!(invoke_schemas(&tag), schemas.to_vec());
     }
 
     #[test]
@@ -272,7 +254,7 @@ mod tests {
                 None,
             ),
         ];
-        let tag = structural_tag(&ToolChoice::Required, &tools, None).unwrap();
+        let tag = structural_tag(&ToolChoice::Auto, &tools, None).unwrap();
         let schemas = invoke_schemas(&tag);
         assert_eq!(&schemas[..3], &[json!(true), json!(true), json!(true)]);
         assert_eq!(schemas[3], good);
@@ -284,17 +266,18 @@ mod tests {
     }
 
     #[test]
-    fn no_tag_for_none_no_tools_or_unknown_named_tool() {
+    fn no_tag_unless_auto_with_tools() {
         assert!(structural_tag(&ToolChoice::Auto, &[], None).is_none());
-        assert!(structural_tag(&ToolChoice::None, &golden_tools(), None).is_none());
-        assert!(
-            structural_tag(
-                &ToolChoice::Named("missing".to_string()),
-                &golden_tools(),
-                None
-            )
-            .is_none()
-        );
+        for choice in [
+            ToolChoice::None,
+            ToolChoice::Required,
+            ToolChoice::Named("create_task".to_string()),
+        ] {
+            assert!(
+                structural_tag(&choice, &golden_tools(), None).is_none(),
+                "{choice:?}"
+            );
+        }
     }
 
     #[test]

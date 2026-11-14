@@ -139,7 +139,7 @@
            ]
           },
           "style": "deepseek_xml",
-          "any_order": false,
+          "any_order": true,
           "max_whitespace_cnt": null,
           "excludes": []
          },
@@ -201,7 +201,7 @@
            "additionalProperties": false
           },
           "style": "deepseek_xml",
-          "any_order": false,
+          "any_order": true,
           "max_whitespace_cnt": null,
           "excludes": []
          },
@@ -214,7 +214,7 @@
           "type": "json_schema",
           "json_schema": true,
           "style": "deepseek_xml",
-          "any_order": false,
+          "any_order": true,
           "max_whitespace_cnt": null,
           "excludes": []
          },
@@ -280,7 +280,7 @@
            ]
           },
           "style": "deepseek_xml",
-          "any_order": false,
+          "any_order": true,
           "max_whitespace_cnt": null,
           "excludes": []
          },
@@ -342,7 +342,7 @@
            "additionalProperties": false
           },
           "style": "deepseek_xml",
-          "any_order": false,
+          "any_order": true,
           "max_whitespace_cnt": null,
           "excludes": []
          },
@@ -355,7 +355,7 @@
           "type": "json_schema",
           "json_schema": true,
           "style": "deepseek_xml",
-          "any_order": false,
+          "any_order": true,
           "max_whitespace_cnt": null,
           "excludes": []
          },
@@ -375,218 +375,6 @@
      "<think>",
      "</think>",
      "<｜DSML｜invoke name="
-    ]
-   }
-  },
-  "required": {
-   "type": "structural_tag",
-   "format": {
-    "type": "sequence",
-    "elements": [
-     {
-      "type": "const_string",
-      "value": "\n\n<｜DSML｜tool_calls>\n"
-     },
-     {
-      "type": "tags_with_separator",
-      "tags": [
-       {
-        "type": "tag",
-        "begin": "<｜DSML｜invoke name=\"get_weather\">\n",
-        "content": {
-         "type": "json_schema",
-         "json_schema": {
-          "type": "object",
-          "properties": {
-           "location": {
-            "type": "string"
-           },
-           "unit": {
-            "type": "string",
-            "enum": [
-             "celsius",
-             "fahrenheit"
-            ]
-           },
-           "days": {
-            "type": "integer",
-            "minimum": 1,
-            "maximum": 14
-           }
-          },
-          "required": [
-           "location"
-          ]
-         },
-         "style": "deepseek_xml",
-         "any_order": false,
-         "max_whitespace_cnt": null,
-         "excludes": []
-        },
-        "end": "</｜DSML｜invoke>\n"
-       },
-       {
-        "type": "tag",
-        "begin": "<｜DSML｜invoke name=\"create_task\">\n",
-        "content": {
-         "type": "json_schema",
-         "json_schema": {
-          "type": "object",
-          "properties": {
-           "title": {
-            "type": "string"
-           },
-           "priority": {
-            "type": "number"
-           },
-           "done": {
-            "type": "boolean"
-           },
-           "tags": {
-            "type": "array",
-            "items": {
-             "type": "string"
-            }
-           },
-           "owner": {
-            "type": "object",
-            "properties": {
-             "id": {
-              "type": "integer"
-             },
-             "name": {
-              "type": "string"
-             }
-            },
-            "required": [
-             "id"
-            ],
-            "additionalProperties": false
-           },
-           "note": {
-            "type": [
-             "string",
-             "null"
-            ]
-           }
-          },
-          "required": [
-           "title",
-           "priority",
-           "done",
-           "tags",
-           "owner",
-           "note"
-          ],
-          "additionalProperties": false
-         },
-         "style": "deepseek_xml",
-         "any_order": false,
-         "max_whitespace_cnt": null,
-         "excludes": []
-        },
-        "end": "</｜DSML｜invoke>\n"
-       },
-       {
-        "type": "tag",
-        "begin": "<｜DSML｜invoke name=\"ping\">\n",
-        "content": {
-         "type": "json_schema",
-         "json_schema": true,
-         "style": "deepseek_xml",
-         "any_order": false,
-         "max_whitespace_cnt": null,
-         "excludes": []
-        },
-        "end": "</｜DSML｜invoke>\n"
-       }
-      ],
-      "separator": "",
-      "at_least_one": true,
-      "stop_after_first": false
-     },
-     {
-      "type": "const_string",
-      "value": "</｜DSML｜tool_calls>"
-     }
-    ]
-   }
-  },
-  "named": {
-   "type": "structural_tag",
-   "format": {
-    "type": "sequence",
-    "elements": [
-     {
-      "type": "const_string",
-      "value": "\n\n<｜DSML｜tool_calls>\n"
-     },
-     {
-      "type": "tag",
-      "begin": "<｜DSML｜invoke name=\"create_task\">\n",
-      "content": {
-       "type": "json_schema",
-       "json_schema": {
-        "type": "object",
-        "properties": {
-         "title": {
-          "type": "string"
-         },
-         "priority": {
-          "type": "number"
-         },
-         "done": {
-          "type": "boolean"
-         },
-         "tags": {
-          "type": "array",
-          "items": {
-           "type": "string"
-          }
-         },
-         "owner": {
-          "type": "object",
-          "properties": {
-           "id": {
-            "type": "integer"
-           },
-           "name": {
-            "type": "string"
-           }
-          },
-          "required": [
-           "id"
-          ],
-          "additionalProperties": false
-         },
-         "note": {
-          "type": [
-           "string",
-           "null"
-          ]
-         }
-        },
-        "required": [
-         "title",
-         "priority",
-         "done",
-         "tags",
-         "owner",
-         "note"
-        ],
-        "additionalProperties": false
-       },
-       "style": "deepseek_xml",
-       "any_order": false,
-       "max_whitespace_cnt": null,
-       "excludes": []
-      },
-      "end": "</｜DSML｜invoke>\n"
-     },
-     {
-      "type": "const_string",
-      "value": "</｜DSML｜tool_calls>"
-     }
     ]
    }
   }
