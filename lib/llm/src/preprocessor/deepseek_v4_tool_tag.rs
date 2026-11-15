@@ -39,6 +39,7 @@ pub(crate) const ENABLE_ENV: &str = "DI_DSV4_TOOL_STRUCTURAL_TAG";
 pub(crate) const REQUIRED_ENV: &str = "DI_DSV4_TOOL_TAG_REQUIRED";
 pub(crate) const EMPTY_USER_ENV: &str = "DI_DSV4_EMPTY_USER_TURN";
 pub(crate) const TOOL_NONE_FLATTEN_ENV: &str = "DI_DSV4_TOOL_NONE_FLATTEN";
+pub(crate) const FORCED_NO_WHITESPACE_ENV: &str = "DI_DSV4_FORCED_NO_WHITESPACE";
 
 const CALLS_TRIGGER: &str = "<｜DSML｜tool_calls>";
 const CALLS_BEGIN: &str = "<｜DSML｜tool_calls>\n";
@@ -55,6 +56,7 @@ thread_local! {
     pub(crate) static REQUIRED_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
     pub(crate) static EMPTY_USER_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
     pub(crate) static FLATTEN_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    pub(crate) static FORCED_WHITESPACE_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 #[cfg(test)]
@@ -95,6 +97,49 @@ fn flatten_override() -> Option<bool> {
 #[cfg(not(test))]
 fn flatten_override() -> Option<bool> {
     None
+}
+
+#[cfg(test)]
+fn forced_whitespace_override() -> Option<bool> {
+    FORCED_WHITESPACE_FOR_TEST.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+fn forced_whitespace_override() -> Option<bool> {
+    None
+}
+
+/// Most consecutive whitespace characters the forced tool-call JSON may hold: room for `": "`, `", "` and a
+/// pretty-printed newline plus indentation, never a run to `max_tokens`.
+const FORCED_MAX_WHITESPACE: u64 = 16;
+
+/// With `DI_DSV4_FORCED_NO_WHITESPACE` on and the deepseek_v4 parser, the forced (`required`/named) tool-call JSON
+/// schema as a structural tag whose `json_schema` content bounds consecutive whitespace; `None` keeps guided JSON.
+///
+/// vLLM's xgrammar backend compiles guided JSON with `any_whitespace` from its server config only (the request's
+/// `disable_any_whitespace`/`whitespace_pattern` are not read, and the dynamo worker forwards only the latter), so a
+/// forced call can decode `[` and then whitespace until `length`. A structural tag carries `max_whitespace_cnt` per
+/// request. The output is the same JSON array, so the reported guided-JSON constraint and the parsers stay as they
+/// are. A schema the tag cannot compile keeps guided JSON.
+pub(crate) fn bounded_forced_json(tool_call_parser: Option<&str>, schema: &Value) -> Option<Value> {
+    let on = forced_whitespace_override().unwrap_or_else(|| env_on(FORCED_NO_WHITESPACE_ENV));
+    if !is_v4_parser(tool_call_parser)
+        || !on
+        || !xgrammar_tag_schema::compiles_in_structural_tag(schema)
+    {
+        return None;
+    }
+    Some(json!({
+        "type": "structural_tag",
+        "format": {
+            "type": "json_schema",
+            "json_schema": schema,
+            "style": "json",
+            "any_order": false,
+            "max_whitespace_cnt": FORCED_MAX_WHITESPACE,
+            "excludes": [],
+        },
+    }))
 }
 
 fn env_on(name: &str) -> bool {

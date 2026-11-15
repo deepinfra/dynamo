@@ -204,7 +204,16 @@ impl OpenAIPreprocessor {
                     .guided_decoding
                     .get_or_insert_default();
                 match guidance {
-                    ToolChoiceGuidance::Json(schema) => gd.json = Some(schema),
+                    ToolChoiceGuidance::Json(schema) => {
+                        // DI: DeepSeek V4 may carry it as a whitespace-bounded structural tag instead.
+                        match super::deepseek_v4_tool_tag::bounded_forced_json(
+                            self.tool_call_parser.as_deref(),
+                            &schema,
+                        ) {
+                            Some(tag) => gd.structural_tag = Some(tag),
+                            None => gd.json = Some(schema),
+                        }
+                    }
                     ToolChoiceGuidance::Regex(regex) => gd.regex = Some(regex),
                 }
 
@@ -910,6 +919,71 @@ mod tests {
                         guided_decoding(&on_common),
                         guided_decoding(&off_common),
                         "{parser}: {extra}"
+                    );
+                }
+            }
+        }
+
+        fn apply_forced(
+            parser: &str,
+            on: bool,
+            extra: Value,
+        ) -> (GuidedToolConstraint, PreprocessedRequest) {
+            use crate::preprocessor::deepseek_v4_tool_tag::FORCED_WHITESPACE_FOR_TEST;
+
+            FORCED_WHITESPACE_FOR_TEST.with(|g| g.set(Some(on)));
+            let out = apply(parser, false, extra);
+            FORCED_WHITESPACE_FOR_TEST.with(|g| g.set(None));
+            out
+        }
+
+        #[test]
+        fn forced_json_is_carried_whitespace_bounded_only_with_the_switch_on() {
+            for tool_choice in forced_choices() {
+                let extra = json!({"tools": tools(), "tool_choice": tool_choice});
+                let (off, off_common) = apply_forced("deepseek_v4", false, extra.clone());
+                let (today, today_common) = apply("deepseek_v4", false, extra.clone());
+                assert_eq!(off, today, "{tool_choice}");
+                assert_eq!(guided_decoding(&off_common), guided_decoding(&today_common));
+
+                let (on, on_common) = apply_forced("deepseek_v4", true, extra.clone());
+                assert_eq!(on, off, "same reported constraint: {tool_choice}");
+                let off_gd = off_common
+                    .sampling_options
+                    .guided_decoding
+                    .as_ref()
+                    .unwrap();
+                let on_gd = on_common.sampling_options.guided_decoding.as_ref().unwrap();
+                assert!(on_gd.json.is_none(), "{tool_choice}");
+                let format = &on_gd.structural_tag.as_ref().expect("tag")["format"];
+                assert_eq!(format["type"], "json_schema");
+                assert_eq!(format["style"], "json");
+                assert_eq!(format["max_whitespace_cnt"], 16);
+                assert_eq!(
+                    Some(&format["json_schema"]),
+                    off_gd.json.as_ref(),
+                    "{tool_choice}"
+                );
+            }
+        }
+
+        #[test]
+        fn forced_whitespace_switch_leaves_auto_and_other_parsers_alone() {
+            let auto = json!({"tools": tools(), "tool_choice": "auto"});
+            let (on, on_common) = apply_forced("deepseek_v4", true, auto.clone());
+            let (off, off_common) = apply_forced("deepseek_v4", false, auto);
+            assert_eq!(on, off);
+            assert_eq!(guided_decoding(&on_common), guided_decoding(&off_common));
+            for parser in ["deepseek_v41", "qwen3_coder", "glm47"] {
+                for tool_choice in forced_choices() {
+                    let extra = json!({"tools": tools(), "tool_choice": tool_choice});
+                    let (on, on_common) = apply_forced(parser, true, extra.clone());
+                    let (off, off_common) = apply_forced(parser, false, extra);
+                    assert_eq!(on, off, "{parser}");
+                    assert_eq!(
+                        guided_decoding(&on_common),
+                        guided_decoding(&off_common),
+                        "{parser}"
                     );
                 }
             }
