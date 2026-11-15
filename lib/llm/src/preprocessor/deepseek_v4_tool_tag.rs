@@ -37,6 +37,7 @@ use crate::protocols::openai::xgrammar_tag_schema;
 
 pub(crate) const ENABLE_ENV: &str = "DI_DSV4_TOOL_STRUCTURAL_TAG";
 pub(crate) const REQUIRED_ENV: &str = "DI_DSV4_TOOL_TAG_REQUIRED";
+pub(crate) const EMPTY_USER_ENV: &str = "DI_DSV4_EMPTY_USER_TURN";
 
 const CALLS_TRIGGER: &str = "<｜DSML｜tool_calls>";
 const CALLS_BEGIN: &str = "<｜DSML｜tool_calls>\n";
@@ -51,6 +52,7 @@ thread_local! {
     /// Tests flip the gates per thread instead of mutating the process environment.
     pub(crate) static GATE_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
     pub(crate) static REQUIRED_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    pub(crate) static EMPTY_USER_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 #[cfg(test)]
@@ -73,6 +75,16 @@ fn required_override() -> Option<bool> {
     None
 }
 
+#[cfg(test)]
+fn empty_user_override() -> Option<bool> {
+    EMPTY_USER_FOR_TEST.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+fn empty_user_override() -> Option<bool> {
+    None
+}
+
 fn env_on(name: &str) -> bool {
     matches!(std::env::var(name).as_deref(), Ok("1" | "true"))
 }
@@ -88,10 +100,14 @@ fn required_split_on() -> bool {
 
 /// Whether this frontend builds V4 tool tags: the `deepseek_v4` tool parser with the env gate on.
 pub(crate) fn applies(tool_call_parser: Option<&str>) -> bool {
+    is_v4_parser(tool_call_parser) && gate_on()
+}
+
+fn is_v4_parser(tool_call_parser: Option<&str>) -> bool {
     matches!(
         tool_call_parser,
         Some("deepseek_v4" | "deepseek-v4" | "deepseekv4")
-    ) && gate_on()
+    )
 }
 
 /// The `guided_decoding.structural_tag` for a `tool_choice=auto` request with tools; `None` for any other choice
@@ -430,10 +446,64 @@ fn required_first(tools: &Value, raw_tools: &Value) -> Option<Value> {
     changed.then_some(Value::Array(out))
 }
 
-/// A request rendered with [`PromptTools`] in place of its own tools; every other method delegates.
+/// What a V4 prompt renders in place of the request's own fields: [`prompt_tools`], and the messages with an empty
+/// user turn ([`empty_user_turn`]).
+pub(crate) struct PromptOverride {
+    tools: Option<PromptTools>,
+    messages: Option<Value>,
+}
+
+/// The V4 prompt overrides for a request, or `None` to render it as is.
+pub(crate) fn prompt_override<R: OAIChatLikeRequest + CommonExtProvider>(
+    tool_call_parser: Option<&str>,
+    request: &R,
+) -> Option<PromptOverride> {
+    let tools = prompt_tools(tool_call_parser, request);
+    let messages = empty_user_turn(tool_call_parser, request);
+    (tools.is_some() || messages.is_some()).then_some(PromptOverride { tools, messages })
+}
+
+/// With `DI_DSV4_EMPTY_USER_TURN` on, a V4 conversation of system messages only, rendered with a generation prompt,
+/// gets an empty user message after them: the template then closes with `<｜User｜><｜Assistant｜>` instead of
+/// leaving the model to continue the system text. A developer message already renders as a user turn, so any
+/// non-system message keeps the conversation as is.
+fn empty_user_turn<R: OAIChatLikeRequest>(
+    tool_call_parser: Option<&str>,
+    request: &R,
+) -> Option<Value> {
+    let on = empty_user_override().unwrap_or_else(|| env_on(EMPTY_USER_ENV));
+    if !is_v4_parser(tool_call_parser) || !on || !request.should_add_generation_prompt() {
+        return None;
+    }
+    let mut messages = serde_json::to_value(request.messages()).ok()?;
+    let list = messages.as_array_mut()?;
+    let system_only = !list.is_empty()
+        && list
+            .iter()
+            .all(|message| message.get("role").and_then(Value::as_str) == Some("system"));
+    if !system_only {
+        return None;
+    }
+    list.push(json!({"role": "user", "content": ""}));
+    Some(messages)
+}
+
+/// A request rendered with a [`PromptOverride`]'s tools and messages in place of its own; every other method
+/// delegates.
 pub(crate) struct PromptToolsRequest<'a> {
     pub(crate) inner: &'a dyn OAIChatLikeRequest,
-    pub(crate) tools: &'a PromptTools,
+    pub(crate) tools: Option<&'a PromptTools>,
+    pub(crate) messages: Option<&'a Value>,
+}
+
+impl<'a> PromptToolsRequest<'a> {
+    pub(crate) fn new(inner: &'a dyn OAIChatLikeRequest, prompt: &'a PromptOverride) -> Self {
+        Self {
+            inner,
+            tools: prompt.tools.as_ref(),
+            messages: prompt.messages.as_ref(),
+        }
+    }
 }
 
 impl OAIChatLikeRequest for PromptToolsRequest<'_> {
@@ -442,7 +512,10 @@ impl OAIChatLikeRequest for PromptToolsRequest<'_> {
     }
 
     fn messages(&self) -> JinjaValue {
-        self.inner.messages()
+        match self.messages {
+            Some(messages) => JinjaValue::from_serialize(messages),
+            None => self.inner.messages(),
+        }
     }
 
     fn typed_messages(&self) -> Option<&[ChatCompletionRequestMessage]> {
@@ -450,11 +523,17 @@ impl OAIChatLikeRequest for PromptToolsRequest<'_> {
     }
 
     fn tools(&self) -> Option<JinjaValue> {
-        Some(JinjaValue::from_serialize(&self.tools.tools))
+        match self.tools {
+            Some(tools) => Some(JinjaValue::from_serialize(&tools.tools)),
+            None => self.inner.tools(),
+        }
     }
 
     fn raw_tools(&self) -> Option<Value> {
-        Some(self.tools.raw_tools.clone())
+        match self.tools {
+            Some(tools) => Some(tools.raw_tools.clone()),
+            None => self.inner.raw_tools(),
+        }
     }
 
     fn tool_choice(&self) -> Option<JinjaValue> {
@@ -915,7 +994,8 @@ mod tests {
                 Some(tools) => formatter
                     .render(&PromptToolsRequest {
                         inner: request,
-                        tools,
+                        tools: Some(tools),
+                        messages: None,
                     })
                     .unwrap(),
                 None => formatter.render(request).unwrap(),
@@ -962,6 +1042,85 @@ mod tests {
                 property_order(&rendered(&text_format, true, true)),
                 ["issue_id", "n", "text", "author"]
             );
+        }
+    }
+
+    mod empty_user_turn {
+        use super::*;
+        use crate::protocols::openai::chat_completions::NvCreateChatCompletionRequest;
+        use dynamo_renderer::OAIPromptFormatter;
+        use dynamo_renderer::deepseek::v4::DeepSeekV4Formatter;
+
+        const USER: &str = "<｜User｜>";
+        const ASSISTANT: &str = "<｜Assistant｜>";
+        const THINK_END: &str = "</think>";
+
+        fn request(messages: Value) -> NvCreateChatCompletionRequest {
+            serde_json::from_value(json!({"model": "m", "messages": messages})).unwrap()
+        }
+
+        fn rendered(request: &NvCreateChatCompletionRequest, parser: &str, on: bool) -> String {
+            EMPTY_USER_FOR_TEST.with(|gate| gate.set(Some(on)));
+            let prompt = prompt_override(Some(parser), request);
+            EMPTY_USER_FOR_TEST.with(|gate| gate.set(None));
+            let formatter = DeepSeekV4Formatter::new_chat();
+            match &prompt {
+                Some(prompt) => formatter
+                    .render(&PromptToolsRequest::new(request, prompt))
+                    .unwrap(),
+                None => formatter.render(request).unwrap(),
+            }
+        }
+
+        #[test]
+        fn system_only_gets_an_empty_user_turn_before_the_assistant() {
+            let request = request(json!([{"role": "system", "content": "You are terse."}]));
+            let today = rendered(&request, "deepseek_v4", false);
+            assert_eq!(
+                today,
+                DeepSeekV4Formatter::new_chat().render(&request).unwrap()
+            );
+            assert!(!today.contains(USER), "{today}");
+            let on = rendered(&request, "deepseek_v4", true);
+            assert!(
+                on.ends_with(&format!("You are terse.{USER}{ASSISTANT}{THINK_END}")),
+                "{on}"
+            );
+        }
+
+        #[test]
+        fn conversations_with_a_user_turn_or_other_parsers_are_untouched() {
+            let unchanged = [
+                json!([{"role": "system", "content": "s"}, {"role": "user", "content": "hi"}]),
+                json!([{"role": "user", "content": "hi"}]),
+                json!([{"role": "system", "content": "s"}, {"role": "developer", "content": "d"}]),
+                json!([
+                    {"role": "system", "content": "s"},
+                    {"role": "user", "content": "weather?"},
+                    {"role": "assistant", "content": "", "tool_calls": [{
+                        "id": "c1", "type": "function",
+                        "function": {"name": "f", "arguments": "{}"},
+                    }]},
+                    {"role": "tool", "tool_call_id": "c1", "content": "sunny"},
+                ]),
+            ];
+            for messages in unchanged {
+                let request = request(messages.clone());
+                assert_eq!(
+                    rendered(&request, "deepseek_v4", true),
+                    rendered(&request, "deepseek_v4", false),
+                    "{messages}"
+                );
+            }
+            let system_only = request(json!([{"role": "system", "content": "s"}]));
+            for parser in ["deepseek_v41", "qwen3_coder", "glm47"] {
+                EMPTY_USER_FOR_TEST.with(|gate| gate.set(Some(true)));
+                assert!(
+                    prompt_override(Some(parser), &system_only).is_none(),
+                    "{parser}"
+                );
+                EMPTY_USER_FOR_TEST.with(|gate| gate.set(None));
+            }
         }
     }
 }

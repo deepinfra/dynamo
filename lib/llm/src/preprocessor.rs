@@ -3060,9 +3060,10 @@ impl OpenAIPreprocessor {
         request: &R,
     ) -> Result<Option<RenderedPrompt>> {
         let continue_final = request.get_continue_final_message() == Some(true);
-        // DI: DeepSeek V4 tools listed required-first when the DSML tag splits on `required`.
+        // DI: DeepSeek V4 prompt overrides (tools listed required-first when the DSML tag splits on `required`, an
+        // empty user turn after a system-only conversation).
         let prompt_tools =
-            deepseek_v4_tool_tag::prompt_tools(self.tool_call_parser.as_deref(), request);
+            deepseek_v4_tool_tag::prompt_override(self.tool_call_parser.as_deref(), request);
         let formatted_prompt = if self.normalize_tool_call_args || continue_final {
             self.apply_template_inner(
                 &NormalizedArgsRequest {
@@ -3096,7 +3097,7 @@ impl OpenAIPreprocessor {
     >(
         &self,
         request: &R,
-        prompt_tools: Option<&deepseek_v4_tool_tag::PromptTools>,
+        prompt_tools: Option<&deepseek_v4_tool_tag::PromptOverride>,
     ) -> Result<Option<RenderedPrompt>> {
         if let PromptInput::Text(_) = request.prompt_input_type()
             && let Some(TextInput::Single(_)) = request.extract_text()
@@ -3125,15 +3126,14 @@ impl OpenAIPreprocessor {
     fn render_with_prompt_tools(
         &self,
         request: &dyn OAIChatLikeRequest,
-        prompt_tools: Option<&deepseek_v4_tool_tag::PromptTools>,
+        prompt_tools: Option<&deepseek_v4_tool_tag::PromptOverride>,
     ) -> Result<RenderedPrompt> {
         match prompt_tools {
-            Some(tools) => {
+            Some(prompt) => {
                 self.formatter
-                    .render_prompt(&deepseek_v4_tool_tag::PromptToolsRequest {
-                        inner: request,
-                        tools,
-                    })
+                    .render_prompt(&deepseek_v4_tool_tag::PromptToolsRequest::new(
+                        request, prompt,
+                    ))
             }
             None => self.formatter.render_prompt(request),
         }
