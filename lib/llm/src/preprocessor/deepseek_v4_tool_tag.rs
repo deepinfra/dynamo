@@ -38,6 +38,7 @@ use crate::protocols::openai::xgrammar_tag_schema;
 pub(crate) const ENABLE_ENV: &str = "DI_DSV4_TOOL_STRUCTURAL_TAG";
 pub(crate) const REQUIRED_ENV: &str = "DI_DSV4_TOOL_TAG_REQUIRED";
 pub(crate) const EMPTY_USER_ENV: &str = "DI_DSV4_EMPTY_USER_TURN";
+pub(crate) const TOOL_NONE_FLATTEN_ENV: &str = "DI_DSV4_TOOL_NONE_FLATTEN";
 
 const CALLS_TRIGGER: &str = "<｜DSML｜tool_calls>";
 const CALLS_BEGIN: &str = "<｜DSML｜tool_calls>\n";
@@ -53,6 +54,7 @@ thread_local! {
     pub(crate) static GATE_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
     pub(crate) static REQUIRED_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
     pub(crate) static EMPTY_USER_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    pub(crate) static FLATTEN_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 #[cfg(test)]
@@ -82,6 +84,16 @@ fn empty_user_override() -> Option<bool> {
 
 #[cfg(not(test))]
 fn empty_user_override() -> Option<bool> {
+    None
+}
+
+#[cfg(test)]
+fn flatten_override() -> Option<bool> {
+    FLATTEN_FOR_TEST.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+fn flatten_override() -> Option<bool> {
     None
 }
 
@@ -446,8 +458,8 @@ fn required_first(tools: &Value, raw_tools: &Value) -> Option<Value> {
     changed.then_some(Value::Array(out))
 }
 
-/// What a V4 prompt renders in place of the request's own fields: [`prompt_tools`], and the messages with an empty
-/// user turn ([`empty_user_turn`]).
+/// What a V4 prompt renders in place of the request's own fields: [`prompt_tools`], and the messages with the tool
+/// history as plain text ([`flattened_tool_history`]) or with an empty user turn ([`empty_user_turn`]).
 pub(crate) struct PromptOverride {
     tools: Option<PromptTools>,
     messages: Option<Value>,
@@ -459,7 +471,8 @@ pub(crate) fn prompt_override<R: OAIChatLikeRequest + CommonExtProvider>(
     request: &R,
 ) -> Option<PromptOverride> {
     let tools = prompt_tools(tool_call_parser, request);
-    let messages = empty_user_turn(tool_call_parser, request);
+    let messages = flattened_tool_history(tool_call_parser, request)
+        .or_else(|| empty_user_turn(tool_call_parser, request));
     (tools.is_some() || messages.is_some()).then_some(PromptOverride { tools, messages })
 }
 
@@ -486,6 +499,122 @@ fn empty_user_turn<R: OAIChatLikeRequest>(
     }
     list.push(json!({"role": "user", "content": ""}));
     Some(messages)
+}
+
+const TOOLS_UNAVAILABLE_NOTE: &str = "\n\n(Tools are not available for this reply. Answer the user now in plain text \
+     using only the results above; if something is missing, say so.)";
+
+/// With `DI_DSV4_TOOL_NONE_FLATTEN` on, a V4 request that cannot call tools (`tool_choice=none`, or no tools) after a
+/// tool-calling history gets that history as plain text: the DSML calls the history would render teach the model to
+/// keep calling. Each assistant tool call becomes a `[tool call] name(arguments)` line under the message's text, each
+/// run of tool results one user message of `[tool result] name: content` lines, and when the conversation ends on
+/// tool results they get [`TOOLS_UNAVAILABLE_NOTE`]. Other messages are kept as they are.
+fn flattened_tool_history<R: OAIChatLikeRequest>(
+    tool_call_parser: Option<&str>,
+    request: &R,
+) -> Option<Value> {
+    let on = flatten_override().unwrap_or_else(|| env_on(TOOL_NONE_FLATTEN_ENV));
+    let no_callable_tools = request
+        .tool_choice()
+        .is_some_and(|choice| choice.as_str() == Some("none"))
+        || request
+            .raw_tools()
+            .is_none_or(|tools| tools.as_array().is_none_or(Vec::is_empty));
+    if !is_v4_parser(tool_call_parser) || !on || !no_callable_tools {
+        return None;
+    }
+    flatten_tool_history(&serde_json::to_value(request.messages()).ok()?)
+}
+
+fn role(message: &Value) -> Option<&str> {
+    message.get("role").and_then(Value::as_str)
+}
+
+fn tool_calls(message: &Value) -> Option<&Vec<Value>> {
+    message
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .filter(|calls| !calls.is_empty())
+}
+
+/// A message `content` as text: a string as is, text parts joined, anything else empty.
+fn text_content(content: Option<&Value>) -> String {
+    match content {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// `messages` with assistant tool calls and tool results rewritten as plain text, or `None` without either.
+fn flatten_tool_history(messages: &Value) -> Option<Value> {
+    let list = messages.as_array()?;
+    if !list
+        .iter()
+        .any(|message| tool_calls(message).is_some() || role(message) == Some("tool"))
+    {
+        return None;
+    }
+    let mut call_names: HashMap<String, String> = HashMap::new();
+    let mut out: Vec<Value> = Vec::with_capacity(list.len());
+    let mut last_is_result = false;
+    for message in list {
+        if let Some(calls) = tool_calls(message) {
+            let text = text_content(message.get("content"));
+            let mut lines: Vec<String> = Vec::new();
+            if !text.is_empty() {
+                lines.push(text);
+            }
+            for call in calls {
+                let function = &call["function"];
+                let name = function["name"].as_str().unwrap_or("tool");
+                let arguments = match &function["arguments"] {
+                    Value::String(arguments) => arguments.clone(),
+                    Value::Null => String::new(),
+                    other => other.to_string(),
+                };
+                if let Some(id) = call["id"].as_str() {
+                    call_names.insert(id.to_string(), name.to_string());
+                }
+                lines.push(format!("[tool call] {name}({arguments})"));
+            }
+            let mut rewritten = message.clone();
+            let fields = rewritten.as_object_mut()?;
+            fields.remove("tool_calls");
+            fields.insert("content".to_string(), Value::String(lines.join("\n")));
+            out.push(rewritten);
+            last_is_result = false;
+        } else if role(message) == Some("tool") {
+            let name = message["tool_call_id"]
+                .as_str()
+                .and_then(|id| call_names.get(id).cloned())
+                .or_else(|| message["name"].as_str().map(str::to_string))
+                .unwrap_or_else(|| "tool".to_string());
+            let line = format!(
+                "[tool result] {name}: {}",
+                text_content(message.get("content"))
+            );
+            if last_is_result && let Some(previous) = out.last_mut() {
+                let content = previous["content"].as_str().unwrap_or_default().to_string();
+                previous["content"] = Value::String(format!("{content}\n{line}"));
+            } else {
+                out.push(json!({"role": "user", "content": line}));
+            }
+            last_is_result = true;
+        } else {
+            out.push(message.clone());
+            last_is_result = false;
+        }
+    }
+    if last_is_result && let Some(last) = out.last_mut() {
+        let content = last["content"].as_str().unwrap_or_default().to_string();
+        last["content"] = Value::String(content + TOOLS_UNAVAILABLE_NOTE);
+    }
+    Some(Value::Array(out))
 }
 
 /// A request rendered with a [`PromptOverride`]'s tools and messages in place of its own; every other method
@@ -1120,6 +1249,178 @@ mod tests {
                     "{parser}"
                 );
                 EMPTY_USER_FOR_TEST.with(|gate| gate.set(None));
+            }
+        }
+    }
+
+    mod tool_none_flatten {
+        use super::*;
+        use crate::protocols::openai::chat_completions::NvCreateChatCompletionRequest;
+        use dynamo_renderer::OAIPromptFormatter;
+        use dynamo_renderer::deepseek::v4::DeepSeekV4Formatter;
+
+        const NOTE: &str = "\n\n(Tools are not available for this reply. Answer the user now in plain text using \
+                            only the results above; if something is missing, say so.)";
+
+        fn weather_tool() -> Value {
+            json!([{"type": "function", "function": {
+                "name": "get_weather",
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
+            }}])
+        }
+
+        fn history() -> Value {
+            json!([
+                {"role": "user", "content": "Weather in Paris and Rome?"},
+                {"role": "assistant", "content": "", "tool_calls": [
+                    {"id": "c1", "type": "function",
+                     "function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}},
+                    {"id": "c2", "type": "function",
+                     "function": {"name": "get_weather", "arguments": "{\"city\": \"Rome\"}"}},
+                ]},
+                {"role": "tool", "tool_call_id": "c1", "content": "18C sunny"},
+                {"role": "tool", "tool_call_id": "c2", "content": "22C clear"},
+            ])
+        }
+
+        fn request(messages: Value, extra: Value) -> NvCreateChatCompletionRequest {
+            let mut body = json!({"model": "m", "messages": messages});
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            serde_json::from_value(body).unwrap()
+        }
+
+        fn overridden(
+            request: &NvCreateChatCompletionRequest,
+            parser: &str,
+            on: bool,
+        ) -> Option<Value> {
+            FLATTEN_FOR_TEST.with(|gate| gate.set(Some(on)));
+            let prompt = prompt_override(Some(parser), request);
+            FLATTEN_FOR_TEST.with(|gate| gate.set(None));
+            prompt.and_then(|prompt| prompt.messages)
+        }
+
+        fn rendered(request: &NvCreateChatCompletionRequest, on: bool) -> String {
+            FLATTEN_FOR_TEST.with(|gate| gate.set(Some(on)));
+            let prompt = prompt_override(Some("deepseek_v4"), request);
+            FLATTEN_FOR_TEST.with(|gate| gate.set(None));
+            let formatter = DeepSeekV4Formatter::new_chat();
+            match &prompt {
+                Some(prompt) => formatter
+                    .render(&PromptToolsRequest::new(request, prompt))
+                    .unwrap(),
+                None => formatter.render(request).unwrap(),
+            }
+        }
+
+        /// The (role, content) of each message, in order.
+        fn turns(messages: &Value) -> Vec<(String, String)> {
+            messages
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| {
+                    (
+                        m["role"].as_str().unwrap().to_string(),
+                        m["content"].as_str().unwrap_or_default().to_string(),
+                    )
+                })
+                .collect()
+        }
+
+        #[test]
+        fn tool_history_becomes_plain_text_when_no_tools_are_callable() {
+            let expected = vec![
+                ("user".to_string(), "Weather in Paris and Rome?".to_string()),
+                (
+                    "assistant".to_string(),
+                    "[tool call] get_weather({\"city\": \"Paris\"})\n[tool call] get_weather({\"city\": \"Rome\"})"
+                        .to_string(),
+                ),
+                (
+                    "user".to_string(),
+                    format!("[tool result] get_weather: 18C sunny\n[tool result] get_weather: 22C clear{NOTE}"),
+                ),
+            ];
+            for extra in [
+                json!({}),
+                json!({"tools": weather_tool(), "tool_choice": "none"}),
+            ] {
+                let request = request(history(), extra.clone());
+                let messages = overridden(&request, "deepseek_v4", true).expect("flattened");
+                assert_eq!(turns(&messages), expected, "{extra}");
+                assert!(messages[1].get("tool_calls").is_none(), "{extra}");
+                let prompt = rendered(&request, true);
+                assert!(!prompt.contains("｜DSML｜"), "{prompt}");
+                assert!(
+                    prompt.contains("[tool result] get_weather: 18C sunny"),
+                    "{prompt}"
+                );
+            }
+        }
+
+        #[test]
+        fn results_followed_by_a_user_turn_get_no_note() {
+            let mut messages = history();
+            messages
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"role": "user", "content": "And tomorrow?"}));
+            let request = request(messages, json!({}));
+            let flattened = overridden(&request, "deepseek_v4", true).unwrap();
+            let turns = turns(&flattened);
+            assert_eq!(
+                turns[2].1,
+                "[tool result] get_weather: 18C sunny\n[tool result] get_weather: 22C clear"
+            );
+            assert_eq!(turns[3], ("user".to_string(), "And tomorrow?".to_string()));
+        }
+
+        #[test]
+        fn a_result_names_its_call_then_its_name_then_tool() {
+            let messages = json!([
+                {"role": "user", "content": "q"},
+                {"role": "tool", "tool_call_id": "unknown", "content": "a"},
+                {"role": "user", "content": "q2"},
+                {"role": "tool", "tool_call_id": "x", "content": "b"},
+            ]);
+            let request = request(messages, json!({}));
+            let flattened = overridden(&request, "deepseek_v4", true).unwrap();
+            assert_eq!(turns(&flattened)[1].1, "[tool result] tool: a");
+            assert_eq!(
+                turns(&flattened)[3].1,
+                format!("[tool result] tool: b{NOTE}")
+            );
+        }
+
+        #[test]
+        fn untouched_without_tool_history_with_callable_tools_or_switch_off() {
+            let plain = request(
+                json!([{"role": "user", "content": "hi"}]),
+                json!({"tool_choice": "none"}),
+            );
+            assert!(overridden(&plain, "deepseek_v4", true).is_none());
+            for extra in [
+                json!({"tools": weather_tool(), "tool_choice": "auto"}),
+                json!({"tools": weather_tool()}),
+                json!({"tools": weather_tool(), "tool_choice": "required"}),
+            ] {
+                let request = request(history(), extra.clone());
+                assert!(
+                    overridden(&request, "deepseek_v4", true).is_none(),
+                    "{extra}"
+                );
+            }
+            let request = request(history(), json!({}));
+            assert_eq!(
+                rendered(&request, false),
+                DeepSeekV4Formatter::new_chat().render(&request).unwrap(),
+                "switch off"
+            );
+            for parser in ["deepseek_v41", "qwen3_coder", "glm47"] {
+                assert!(overridden(&request, parser, true).is_none(), "{parser}");
             }
         }
     }
