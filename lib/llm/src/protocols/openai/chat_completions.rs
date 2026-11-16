@@ -341,6 +341,149 @@ pub(super) fn stream_choice_chunk_from_template(
     chunk
 }
 
+/// Fold the choices of one stream chunk that share an `index` into one entry, in order.
+///
+/// OpenAI and vLLM send at most one choice per index per chunk, and clients that key
+/// choices by index keep only the last one. Content, reasoning, refusal, tool-call
+/// arguments and logprobs concatenate; the first role and the last finish reason win.
+pub(crate) fn fold_same_index_choices(choices: &mut Vec<ChatChoiceStream>) {
+    if choices.len() < 2 {
+        return;
+    }
+    let mut seen = std::collections::HashSet::with_capacity(choices.len());
+    if choices.iter().all(|choice| seen.insert(choice.index)) {
+        return;
+    }
+    let mut folded: Vec<ChatChoiceStream> = Vec::with_capacity(seen.len());
+    for choice in choices.drain(..) {
+        match folded.iter_mut().find(|kept| kept.index == choice.index) {
+            Some(kept) => fold_choice_into(kept, choice),
+            None => folded.push(choice),
+        }
+    }
+    *choices = folded;
+}
+
+#[allow(deprecated)]
+fn fold_choice_into(kept: &mut ChatChoiceStream, next: ChatChoiceStream) {
+    let ChatChoiceStream {
+        delta,
+        finish_reason,
+        logprobs,
+        ..
+    } = next;
+    let target = &mut kept.delta;
+    if target.role.is_none() {
+        target.role = delta.role;
+    }
+    target.content = concat_content(target.content.take(), delta.content);
+    append_text(&mut target.reasoning_content, delta.reasoning_content);
+    append_text(&mut target.refusal, delta.refusal);
+    match (target.function_call.as_mut(), delta.function_call) {
+        (_, None) => {}
+        (None, Some(call)) => target.function_call = Some(call),
+        (Some(call), Some(more)) => {
+            if call.name.is_none() {
+                call.name = more.name;
+            }
+            append_text(&mut call.arguments, more.arguments);
+        }
+    }
+    if let Some(calls) = delta.tool_calls {
+        let target_calls = target.tool_calls.get_or_insert_with(Vec::new);
+        for call in calls {
+            fold_tool_call_chunk(target_calls, call);
+        }
+    }
+    if finish_reason.is_some() {
+        kept.finish_reason = finish_reason;
+    }
+    match (kept.logprobs.as_mut(), logprobs) {
+        (_, None) => {}
+        (None, Some(more)) => kept.logprobs = Some(more),
+        (Some(target), Some(more)) => {
+            append_vec(&mut target.content, more.content);
+            append_vec(&mut target.refusal, more.refusal);
+        }
+    }
+}
+
+/// One tool index is one call, so a second chunk for it only extends the arguments.
+fn fold_tool_call_chunk(
+    calls: &mut Vec<ChatCompletionMessageToolCallChunk>,
+    call: ChatCompletionMessageToolCallChunk,
+) {
+    let Some(kept) = calls.iter_mut().find(|kept| kept.index == call.index) else {
+        calls.push(call);
+        return;
+    };
+    if kept.id.is_none() {
+        kept.id = call.id;
+    }
+    if kept.r#type.is_none() {
+        kept.r#type = call.r#type;
+    }
+    match (kept.function.as_mut(), call.function) {
+        (_, None) => {}
+        (None, Some(function)) => kept.function = Some(function),
+        (Some(function), Some(more)) => {
+            if function.name.is_none() {
+                function.name = more.name;
+            }
+            append_text(&mut function.arguments, more.arguments);
+        }
+    }
+}
+
+fn concat_content(
+    first: Option<ChatCompletionMessageContent>,
+    second: Option<ChatCompletionMessageContent>,
+) -> Option<ChatCompletionMessageContent> {
+    use ChatCompletionMessageContent::{Parts, Text};
+    use dynamo_protocols::types::{
+        ChatCompletionResponseContentPart, ChatCompletionResponseContentPartText,
+    };
+    let text_part = |text: String| {
+        ChatCompletionResponseContentPart::Text(ChatCompletionResponseContentPartText { text })
+    };
+    match (first, second) {
+        (None, content) | (content, None) => content,
+        (Some(Text(mut a)), Some(Text(b))) => {
+            a.push_str(&b);
+            Some(Text(a))
+        }
+        (Some(Parts(mut a)), Some(Parts(b))) => {
+            a.extend(b);
+            Some(Parts(a))
+        }
+        (Some(Text(a)), Some(Parts(b))) if a.is_empty() => Some(Parts(b)),
+        (Some(Parts(a)), Some(Text(b))) if b.is_empty() => Some(Parts(a)),
+        (Some(Text(a)), Some(Parts(b))) => {
+            Some(Parts(std::iter::once(text_part(a)).chain(b).collect()))
+        }
+        (Some(Parts(mut a)), Some(Text(b))) => {
+            a.push(text_part(b));
+            Some(Parts(a))
+        }
+    }
+}
+
+fn append_text(target: &mut Option<String>, more: Option<String>) {
+    match (target.as_mut(), more) {
+        (_, None) => {}
+        (None, Some(more)) => *target = Some(more),
+        (Some(text), Some(more)) => text.push_str(&more),
+    }
+}
+
+fn append_vec<T>(target: &mut Option<Vec<T>>, more: Option<Vec<T>>) {
+    match (target.as_mut(), more) {
+        (_, None) => {}
+        (None, Some(more)) => *target = Some(more),
+        (Some(items), Some(more)) => items.extend(more),
+    }
+}
+
 /// Implements `NvExtProvider` for `NvCreateChatCompletionRequest`,
 /// providing access to NVIDIA-specific extensions.
 impl NvExtProvider for NvCreateChatCompletionRequest {
@@ -654,6 +797,101 @@ mod tests {
     };
     use dynamo_protocols::types::{ChatCompletionTool, ChatCompletionToolType, FunctionObject};
     use serde_json::json;
+
+    fn stream_choice(value: serde_json::Value) -> ChatChoiceStream {
+        serde_json::from_value(value).expect("stream choice")
+    }
+
+    #[test]
+    fn tool_choice_fold_same_index_choices_merges_prod_duplicate() {
+        let token = |token: &str| json!({"token": token, "logprob": -0.5, "top_logprobs": []});
+        let mut choices = vec![
+            stream_choice(json!({
+                "index": 0,
+                "delta": {"content": "", "tool_calls": [
+                    {"index": 0, "function": {"arguments": " release\"}"}}
+                ]},
+                "finish_reason": null,
+                "logprobs": null
+            })),
+            stream_choice(json!({
+                "index": 0,
+                "delta": {"content": ""},
+                "finish_reason": null,
+                "logprobs": {"content": [token(" release"), token("\"}")]}
+            })),
+        ];
+
+        fold_same_index_choices(&mut choices);
+
+        assert_eq!(choices.len(), 1);
+        assert_eq!(
+            choices[0],
+            stream_choice(json!({
+                "index": 0,
+                "delta": {"content": "", "tool_calls": [
+                    {"index": 0, "function": {"arguments": " release\"}"}}
+                ]},
+                "finish_reason": null,
+                "logprobs": {"content": [token(" release"), token("\"}")]}
+            }))
+        );
+    }
+
+    #[test]
+    fn tool_choice_fold_same_index_choices_concatenates_in_order() {
+        let mut choices = vec![
+            stream_choice(json!({
+                "index": 0,
+                "delta": {"role": "assistant", "content": "a", "reasoning_content": "r1",
+                          "tool_calls": [{"index": 0, "id": "call-1", "type": "function",
+                                          "function": {"name": "f", "arguments": "{\"x\""}}]}
+            })),
+            stream_choice(json!({"index": 1, "delta": {"content": "other"}})),
+            stream_choice(json!({
+                "index": 0,
+                "delta": {"content": "b", "reasoning_content": "r2",
+                          "tool_calls": [{"index": 0, "function": {"arguments": ": 1}"}},
+                                         {"index": 1, "id": "call-2", "type": "function",
+                                          "function": {"name": "g", "arguments": "{}"}}]},
+                "finish_reason": "tool_calls"
+            })),
+        ];
+
+        fold_same_index_choices(&mut choices);
+
+        assert_eq!(
+            choices
+                .iter()
+                .map(|choice| choice.index)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(
+            choices[0],
+            stream_choice(json!({
+                "index": 0,
+                "delta": {"role": "assistant", "content": "ab", "reasoning_content": "r1r2",
+                          "tool_calls": [{"index": 0, "id": "call-1", "type": "function",
+                                          "function": {"name": "f", "arguments": "{\"x\": 1}"}},
+                                         {"index": 1, "id": "call-2", "type": "function",
+                                          "function": {"name": "g", "arguments": "{}"}}]},
+                "finish_reason": "tool_calls",
+                "logprobs": null
+            }))
+        );
+    }
+
+    #[test]
+    fn tool_choice_fold_same_index_choices_leaves_distinct_indices_untouched() {
+        let original = vec![
+            stream_choice(json!({"index": 0, "delta": {"content": "a"}})),
+            stream_choice(json!({"index": 1, "delta": {"content": "b"}})),
+        ];
+        let mut choices = original.clone();
+        fold_same_index_choices(&mut choices);
+        assert_eq!(choices, original);
+    }
 
     #[test]
     fn test_top_k_sentinel_contract() {

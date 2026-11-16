@@ -5687,11 +5687,19 @@ impl OpenAIPreprocessor {
         };
         let pending_out = Arc::clone(&pending);
         let pending_eof = Arc::clone(&pending);
-        let jailed_output = jailed.flat_map(move |a| {
+        let jailed_output = jailed.flat_map(move |mut a| {
             debug_assert!(
                 a.error.is_none(),
                 "dynamo-parsers must not construct errors"
             );
+            // The jail's default packed emission puts a choice's released guided-call
+            // fragment and its completed-jail remainder in one chunk as two entries with
+            // the same index; index-keyed clients then keep only the empty second one.
+            if let Some(data) = a.data.as_mut() {
+                crate::protocols::openai::chat_completions::fold_same_index_choices(
+                    &mut data.choices,
+                );
+            }
             // Metrics can ride on payload-only usage chunks because the HTTP
             // layer observes them before removing the chunk. Client-visible
             // nvext must wait for a non-payload-usage output with a choice.
@@ -7917,6 +7925,144 @@ mod tests {
             roles,
             vec![Some(Role::Assistant), Some(Role::Assistant), None, None,]
         );
+    }
+
+    /// Drives the legacy jail as a forced DeepSeek-V4 request does: guided JSON, incremental release.
+    async fn deepseek_v4_forced_stream(
+        tool_choice: ChatCompletionToolChoiceOption,
+        payload: &str,
+        chunk_chars: usize,
+    ) -> Vec<Annotated<NvCreateChatCompletionStreamResponse>> {
+        let tools = vec![dynamo_parsers::tool_calling::ToolDefinition {
+            name: "get_weather".to_string(),
+            parameters: Some(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "location": {"type": "string"},
+                    "note": {"type": "string"}
+                },
+                "required": ["location", "note"]
+            })),
+            strict: None,
+        }];
+        let chars: Vec<char> = payload.chars().collect();
+        let mut chunks: Vec<_> = chars
+            .chunks(chunk_chars)
+            .enumerate()
+            .map(|(position, piece)| {
+                let mut chunk = chat_stream_chunk(0, (position == 0).then_some(Role::Assistant));
+                chunk.data.as_mut().unwrap().inner.choices[0].delta.content =
+                    Some(ChatCompletionMessageContent::Text(piece.iter().collect()));
+                chunk
+            })
+            .collect();
+        // The EOS step arrives as its own empty chunk. On the payload-closing chunk the
+        // jail's terminal normalizer would drop the empty trailing choice and hide the bug.
+        let mut terminal = chat_stream_chunk(0, None);
+        let choice = &mut terminal.data.as_mut().unwrap().inner.choices[0];
+        choice.delta.content = Some(ChatCompletionMessageContent::Text(String::new()));
+        choice.finish_reason = Some(FinishReason::Stop);
+        chunks.push(terminal);
+
+        OpenAIPreprocessor::apply_tool_calling_jail(
+            Some("deepseek_v4".to_string()),
+            Some(tool_choice),
+            Some(tools),
+            false,
+            true,
+            stream::iter(chunks),
+        )
+        .collect()
+        .await
+    }
+
+    /// At most one choice per index per chunk, and the call's arguments reassemble intact.
+    fn assert_one_choice_per_index_and_intact_call(
+        responses: &[Annotated<NvCreateChatCompletionStreamResponse>],
+        expected_arguments: &serde_json::Value,
+        context: &str,
+    ) {
+        for (position, response) in responses.iter().enumerate() {
+            let Some(data) = response.data.as_ref() else {
+                continue;
+            };
+            let mut seen = HashSet::new();
+            for choice in &data.inner.choices {
+                assert!(
+                    seen.insert(choice.index),
+                    "{context}: chunk {position} holds two choices with index {}: {:?}",
+                    choice.index,
+                    data.inner.choices
+                );
+            }
+        }
+
+        let calls: Vec<_> = responses
+            .iter()
+            .filter_map(|response| response.data.as_ref())
+            .flat_map(|data| data.inner.choices.iter())
+            .filter_map(|choice| choice.delta.tool_calls.as_ref())
+            .flatten()
+            .collect();
+        assert!(!calls.is_empty(), "{context}: no tool call was emitted");
+        assert!(
+            calls.iter().all(|call| call.index == 0),
+            "{context}: one call expected: {calls:?}"
+        );
+        assert_eq!(
+            calls.iter().filter(|call| call.id.is_some()).count(),
+            1,
+            "{context}: the call id must be sent exactly once"
+        );
+        let name: String = calls
+            .iter()
+            .filter_map(|call| call.function.as_ref()?.name.as_deref())
+            .collect();
+        assert_eq!(name, "get_weather", "{context}");
+        let arguments: String = calls
+            .iter()
+            .filter_map(|call| call.function.as_ref()?.arguments.as_deref())
+            .collect();
+        let parsed: serde_json::Value = serde_json::from_str(&arguments).unwrap_or_else(|error| {
+            panic!("{context}: arguments {arguments:?} do not parse: {error}")
+        });
+        assert_eq!(&parsed, expected_arguments, "{context}");
+    }
+
+    #[tokio::test]
+    async fn test_tool_choice_deepseek_v4_forced_stream_emits_one_choice_per_index() {
+        let expected = serde_json::json!({"location": "NYC", "note": "ship the release"});
+        let named = ChatCompletionToolChoiceOption::Named(
+            dynamo_protocols::types::ChatCompletionNamedToolChoice {
+                r#type: dynamo_protocols::types::ChatCompletionToolType::Function,
+                function: dynamo_protocols::types::FunctionName {
+                    name: "get_weather".to_string(),
+                },
+            },
+        );
+        let cases = [
+            (
+                "named",
+                named,
+                r#"{"location": "NYC", "note": "ship the release"}"#,
+            ),
+            (
+                "required",
+                ChatCompletionToolChoiceOption::Required,
+                r#"[{"name": "get_weather", "parameters": {"location": "NYC", "note": "ship the release"}}]"#,
+            ),
+        ];
+        for (label, tool_choice, payload) in cases {
+            for chunk_chars in 1..=12 {
+                let responses =
+                    deepseek_v4_forced_stream(tool_choice.clone(), payload, chunk_chars).await;
+                assert_one_choice_per_index_and_intact_call(
+                    &responses,
+                    &expected,
+                    &format!("{label}, {chunk_chars}-char chunks"),
+                );
+            }
+        }
     }
 
     fn kimi_k3_reasoning_chunk(reasoning: &str) -> Annotated<NvCreateChatCompletionStreamResponse> {
