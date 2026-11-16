@@ -395,6 +395,31 @@ pub(super) fn encode_messages_with_encoding(
     Ok(prompt)
 }
 
+/// Whether DeepSeek V4 reasoning effort renders as the vLLM v0.25 tokenizer did.
+///
+/// Opt-in with `VLLM_DS4_EFFORT_COMPAT=1` (the env knob vLLM's own `deepseek_v4`
+/// encoder reads for the same remap) or `DYN_DS4_EFFORT_COMPAT=1`. Read once per
+/// process. Only the V4 formatter consults it; V4.1 (`Encoding::V41`) and V3.2
+/// are untouched.
+fn effort_compat_v025() -> bool {
+    static COMPAT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *COMPAT.get_or_init(|| {
+        let on = ["VLLM_DS4_EFFORT_COMPAT", "DYN_DS4_EFFORT_COMPAT"]
+            .iter()
+            .any(|name| {
+                std::env::var(name).is_ok_and(|v| {
+                    matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes")
+                })
+            });
+        if on {
+            tracing::info!(
+                "DeepSeek V4 reasoning effort: vLLM v0.25 compat (only max/xhigh add a preamble)"
+            );
+        }
+        on
+    })
+}
+
 /// DeepSeek V4 Prompt Formatter
 #[derive(Debug)]
 pub struct DeepSeekV4Formatter {
@@ -417,6 +442,30 @@ impl DeepSeekV4Formatter {
     }
 
     fn resolve_reasoning_effort(v: Option<&JsonValue>) -> (bool, Option<ReasoningEffort>) {
+        if effort_compat_v025() {
+            return Self::resolve_reasoning_effort_v025(v);
+        }
+        Self::resolve_reasoning_effort_api(v)
+    }
+
+    /// vLLM v0.25 `deepseek_v4` tokenizer parity (`VLLM_DS4_EFFORT_COMPAT`).
+    ///
+    /// v0.25 knew two tiers: only `max`/`xhigh` added a preamble, and that
+    /// preamble is the text this crate calls `REASONING_EFFORT_HIGH`
+    /// ("Absolute maximum ..."). `none` switched to chat mode; every other
+    /// string, an absent value and a non-string all rendered no preamble.
+    /// The newer encoding (and [`Self::resolve_reasoning_effort_api`]) moved
+    /// that text to `high` and the API default, and added a longer `max`
+    /// ("Beyond maximum ..."), so the same request gains a preamble.
+    fn resolve_reasoning_effort_v025(v: Option<&JsonValue>) -> (bool, Option<ReasoningEffort>) {
+        match v.and_then(JsonValue::as_str) {
+            Some("none") => (true, None),
+            Some("max") | Some("xhigh") => (false, Some(ReasoningEffort::High)),
+            _ => (false, None),
+        }
+    }
+
+    fn resolve_reasoning_effort_api(v: Option<&JsonValue>) -> (bool, Option<ReasoningEffort>) {
         match v.and_then(JsonValue::as_str) {
             Some("none") => (true, None),
             Some("max") => (false, Some(ReasoningEffort::Max)),
@@ -894,10 +943,56 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_reasoning_effort_v025_compat() {
+        let effort = |v: JsonValue| DeepSeekV4Formatter::resolve_reasoning_effort_v025(Some(&v));
+
+        // v0.25: only max/xhigh add a preamble, and it is the "Absolute maximum" text.
+        assert_eq!(effort(json!("max")), (false, Some(ReasoningEffort::High)));
+        assert_eq!(effort(json!("xhigh")), (false, Some(ReasoningEffort::High)));
+        for v in ["high", "medium", "low", "minimal", "bogus"] {
+            assert_eq!(effort(json!(v)), (false, None), "{v}");
+        }
+        assert_eq!(effort(json!("none")), (true, None));
+        assert_eq!(effort(json!(null)), (false, None));
+        assert_eq!(effort(json!(3)), (false, None));
+        assert_eq!(
+            DeepSeekV4Formatter::resolve_reasoning_effort_v025(None),
+            (false, None)
+        );
+    }
+
+    #[test]
+    fn test_v025_compat_prompts_match_vllm_v025() {
+        // Byte parity with vLLM v0.25's encode_messages for what deepapi sends:
+        // chat_template_kwargs {thinking: true, reasoning_effort: None | "high" | "max"}.
+        let messages = json!([{"role": "user", "content": "What is 2+2?"}]);
+        let render = |v: Option<JsonValue>| {
+            let (_, effort) = DeepSeekV4Formatter::resolve_reasoning_effort_v025(v.as_ref());
+            encode_messages_with_options(
+                messages.as_array().unwrap(),
+                ThinkingMode::Thinking,
+                true,
+                true,
+                effort,
+            )
+            .unwrap()
+        };
+        let plain = "<｜begin▁of▁sentence｜><｜User｜>What is 2+2?<｜Assistant｜><think>";
+        assert_eq!(render(None), plain);
+        assert_eq!(render(Some(json!("high"))), plain);
+        assert_eq!(
+            render(Some(json!("max"))),
+            format!(
+                "<｜begin▁of▁sentence｜>{REASONING_EFFORT_HIGH}<｜User｜>What is 2+2?<｜Assistant｜><think>"
+            )
+        );
+    }
+
+    #[test]
     fn test_resolve_reasoning_effort_accepts_full_range() {
         let effort = |v: &str| {
             let value = json!(v);
-            DeepSeekV4Formatter::resolve_reasoning_effort(Some(&value))
+            DeepSeekV4Formatter::resolve_reasoning_effort_api(Some(&value))
         };
 
         assert_eq!(effort("max"), (false, Some(ReasoningEffort::Max)));
@@ -909,7 +1004,7 @@ mod tests {
         assert_eq!(effort("none"), (true, None));
         assert_eq!(effort("bogus"), (false, Some(ReasoningEffort::High)));
         assert_eq!(
-            DeepSeekV4Formatter::resolve_reasoning_effort(None),
+            DeepSeekV4Formatter::resolve_reasoning_effort_api(None),
             (false, Some(ReasoningEffort::High))
         );
     }

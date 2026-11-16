@@ -191,10 +191,15 @@ fn admits_only_empty_object(schema: &Value) -> bool {
 }
 
 fn clone_parameters(function: &FunctionObject) -> Value {
-    function
-        .parameters
-        .clone()
-        .unwrap_or_else(|| json!({"type": "object", "properties": {}}))
+    match &function.parameters {
+        // DI: a schema the worker cannot compile would 400 the request; constrain only the call, not its arguments.
+        Some(parameters) => super::xgrammar_schema::pinnable_or(
+            parameters.clone(),
+            || json!({"type": "object"}),
+            &function.name,
+        ),
+        None => json!({"type": "object", "properties": {}}),
+    }
 }
 
 /// Builds a JSON Schema for `tool_choice=required` that enforces an array of tool calls.
@@ -494,6 +499,36 @@ mod tests {
                 },
             },
         )
+    }
+
+    #[test]
+    fn forced_choice_leaves_an_uncompilable_tool_schema_unconstrained() {
+        let mut tools = sample_tools();
+        tools[0].function.parameters = Some(json!({
+            "type": "object",
+            "properties": {"labels": {"type": "array", "items": {"type": "string"}, "uniqueItems": true}},
+            "required": ["labels"],
+        }));
+
+        let required = get_json_schema_from_tools(
+            Some(&ChatCompletionToolChoiceOption::Required),
+            Some(&tools),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        let branches = required["items"]["anyOf"].as_array().unwrap();
+        assert_eq!(branches[0]["properties"]["parameters"], json!({"type": "object"}));
+        assert_eq!(
+            branches[1]["properties"]["parameters"],
+            tools[1].function.parameters.clone().unwrap()
+        );
+
+        let named =
+            get_json_schema_from_tools(Some(&named_choice("add_numbers")), Some(&tools), None)
+                .unwrap()
+                .unwrap();
+        assert_eq!(named, json!({"type": "object"}));
     }
 
     /// GH-13789: a named choice on a tool whose schema admits only `{}` needs an exact regex.

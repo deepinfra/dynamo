@@ -31,6 +31,8 @@ pub mod stream_aggregator;
 pub mod tools;
 pub mod validate;
 pub mod videos;
+pub mod xgrammar_schema;
+pub mod xgrammar_tag_schema;
 
 use validate::{
     BEST_OF_RANGE, FREQUENCY_PENALTY_RANGE, MIN_P_RANGE, N_RANGE, PRESENCE_PENALTY_RANGE,
@@ -226,16 +228,8 @@ impl<T: OpenAIStopConditionsProvider> StopConditionsProvider for T {
         let stop_token_ids = self.get_stop_token_ids();
         let max_thinking_tokens = self.get_max_thinking_tokens();
 
-        if let Some(stop) = &stop
-            && stop.len() > 4
-        {
-            anyhow::bail!("stop conditions must be less than 4")
-        }
-        if let Some(stop_token_ids) = &stop_token_ids
-            && stop_token_ids.len() > 4
-        {
-            anyhow::bail!("stop token IDs must be less than 4")
-        }
+        // DI: no count limit here. `validate::validate_stop` caps a request at MAX_STOP_SEQUENCES (a 400), and the
+        // engine enforces its own cap (VLLM_MAX_STOP_STRINGS); a hard error here surfaced as a 500 for 5+ stops.
 
         // Use the trait method to get ignore_eos, which handles precedence
         let ignore_eos = self.get_ignore_eos();
