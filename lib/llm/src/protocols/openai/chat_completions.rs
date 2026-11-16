@@ -345,7 +345,8 @@ pub(super) fn stream_choice_chunk_from_template(
 ///
 /// OpenAI and vLLM send at most one choice per index per chunk, and clients that key
 /// choices by index keep only the last one. Content, reasoning, refusal, tool-call
-/// arguments and logprobs concatenate; the first role and the last finish reason win.
+/// arguments and logprobs concatenate; the first role and the first finish reason win
+/// (see `fold_finish_reason`).
 pub(crate) fn fold_same_index_choices(choices: &mut Vec<ChatChoiceStream>) {
     if choices.len() < 2 {
         return;
@@ -389,15 +390,17 @@ fn fold_choice_into(kept: &mut ChatChoiceStream, next: ChatChoiceStream) {
             append_text(&mut call.arguments, more.arguments);
         }
     }
-    if let Some(calls) = delta.tool_calls {
+    if let Some(calls) = delta.tool_calls.filter(|calls| !calls.is_empty()) {
         let target_calls = target.tool_calls.get_or_insert_with(Vec::new);
         for call in calls {
             fold_tool_call_chunk(target_calls, call);
         }
     }
-    if finish_reason.is_some() {
-        kept.finish_reason = finish_reason;
-    }
+    let carries_tool_calls = target
+        .tool_calls
+        .as_ref()
+        .is_some_and(|calls| !calls.is_empty());
+    kept.finish_reason = fold_finish_reason(kept.finish_reason, finish_reason, carries_tool_calls);
     match (kept.logprobs.as_mut(), logprobs) {
         (_, None) => {}
         (None, Some(more)) => kept.logprobs = Some(more),
@@ -408,12 +411,37 @@ fn fold_choice_into(kept: &mut ChatChoiceStream, next: ChatChoiceStream) {
     }
 }
 
-/// One tool index is one call, so a second chunk for it only extends the arguments.
+/// The first non-null finish reason wins, except that a folded delta carrying tool calls
+/// finishes with `tool_calls`: a released call next to the jail's EOS remainder (`stop`)
+/// must not read as a final text answer.
+fn fold_finish_reason(
+    first: Option<FinishReason>,
+    next: Option<FinishReason>,
+    carries_tool_calls: bool,
+) -> Option<FinishReason> {
+    match first.or(next) {
+        Some(FinishReason::Stop)
+            if carries_tool_calls
+                && (first == Some(FinishReason::ToolCalls)
+                    || next == Some(FinishReason::ToolCalls)) =>
+        {
+            Some(FinishReason::ToolCalls)
+        }
+        reason => reason,
+    }
+}
+
+/// One tool index is one call, so a second chunk for it only extends the arguments. Chunks
+/// with different ids stay separate calls. Names arrive whole from the jail, so the first
+/// name wins and a differing one is not appended.
 fn fold_tool_call_chunk(
     calls: &mut Vec<ChatCompletionMessageToolCallChunk>,
     call: ChatCompletionMessageToolCallChunk,
 ) {
-    let Some(kept) = calls.iter_mut().find(|kept| kept.index == call.index) else {
+    let Some(kept) = calls.iter_mut().find(|kept| {
+        kept.index == call.index
+            && !(kept.id.is_some() && call.id.is_some() && kept.id != call.id)
+    }) else {
         calls.push(call);
         return;
     };
@@ -879,6 +907,52 @@ mod tests {
                 "finish_reason": "tool_calls",
                 "logprobs": null
             }))
+        );
+    }
+
+    #[test]
+    fn tool_choice_fold_same_index_choices_keeps_tool_calls_finish_over_stop() {
+        let call = json!([{"index": 0, "function": {"arguments": "}"}}]);
+        for (first, second) in [("tool_calls", "stop"), ("stop", "tool_calls")] {
+            let mut choices = vec![
+                stream_choice(json!({"index": 0, "delta": {"tool_calls": call},
+                                     "finish_reason": first})),
+                stream_choice(json!({"index": 0, "delta": {"content": ""},
+                                     "finish_reason": second})),
+            ];
+            fold_same_index_choices(&mut choices);
+            assert_eq!(choices.len(), 1);
+            assert_eq!(choices[0].finish_reason, Some(FinishReason::ToolCalls));
+        }
+
+        let mut text = vec![
+            stream_choice(json!({"index": 0, "delta": {"content": "a"}, "finish_reason": "stop"})),
+            stream_choice(json!({"index": 0, "delta": {"content": "b"}, "finish_reason": "length"})),
+        ];
+        fold_same_index_choices(&mut text);
+        assert_eq!(text[0].finish_reason, Some(FinishReason::Stop));
+    }
+
+    #[test]
+    fn tool_choice_fold_same_index_choices_skips_empty_tool_calls_and_keeps_distinct_ids() {
+        let mut empty = vec![
+            stream_choice(json!({"index": 0, "delta": {"content": "a"}})),
+            stream_choice(json!({"index": 0, "delta": {"content": "b", "tool_calls": []}})),
+        ];
+        fold_same_index_choices(&mut empty);
+        assert_eq!(empty[0].delta.tool_calls, None);
+
+        let mut ids = vec![
+            stream_choice(json!({"index": 0, "delta": {"tool_calls": [
+                {"index": 0, "id": "a", "type": "function", "function": {"name": "f", "arguments": "{}"}}]}})),
+            stream_choice(json!({"index": 0, "delta": {"tool_calls": [
+                {"index": 0, "id": "b", "type": "function", "function": {"name": "g", "arguments": "{}"}}]}})),
+        ];
+        fold_same_index_choices(&mut ids);
+        let calls = ids[0].delta.tool_calls.as_ref().expect("tool calls");
+        assert_eq!(
+            calls.iter().map(|call| call.id.as_deref()).collect::<Vec<_>>(),
+            vec![Some("a"), Some("b")]
         );
     }
 
