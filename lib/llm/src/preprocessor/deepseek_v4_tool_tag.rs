@@ -113,6 +113,24 @@ fn forced_whitespace_override() -> Option<bool> {
 /// pretty-printed newline plus indentation, never a run to `max_tokens`.
 const FORCED_MAX_WHITESPACE: u64 = 16;
 
+/// Largest forced-call schema (serialized JSON bytes) that gets the whitespace bound. Default for
+/// `DI_DSV4_FORCED_NO_WHITESPACE_MAX_BYTES`.
+///
+/// xgrammar's per-token mask cost for the `json_schema` structural tag grows with schema size, while guided JSON stays
+/// flat: offline on the DSV4 tokenizer, ~0.02 ms at a few KB but ~0.3 ms mean and ~1 ms worst at ~270 KB, against
+/// ~0.01 ms for guided JSON. The mask is filled on the decode step's critical path for every draft position, and a
+/// DP+EP decode pod runs its ranks in lock-step, so one forced request with a large tool set slowed a whole prod decode
+/// pod ~8x. Small schemas keep the bound; larger ones keep guided JSON.
+const FORCED_MAX_SCHEMA_BYTES_DEFAULT: usize = 16 * 1024;
+pub(crate) const FORCED_MAX_SCHEMA_BYTES_ENV: &str = "DI_DSV4_FORCED_NO_WHITESPACE_MAX_BYTES";
+
+fn forced_max_schema_bytes() -> usize {
+    std::env::var(FORCED_MAX_SCHEMA_BYTES_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(FORCED_MAX_SCHEMA_BYTES_DEFAULT)
+}
+
 /// With `DI_DSV4_FORCED_NO_WHITESPACE` on and the deepseek_v4 parser, the forced (`required`/named) tool-call JSON
 /// schema as a structural tag whose `json_schema` content bounds consecutive whitespace; `None` keeps guided JSON.
 ///
@@ -120,11 +138,12 @@ const FORCED_MAX_WHITESPACE: u64 = 16;
 /// `disable_any_whitespace`/`whitespace_pattern` are not read, and the dynamo worker forwards only the latter), so a
 /// forced call can decode `[` and then whitespace until `length`. A structural tag carries `max_whitespace_cnt` per
 /// request. The output is the same JSON array, so the reported guided-JSON constraint and the parsers stay as they
-/// are. A schema the tag cannot compile keeps guided JSON.
+/// are. A schema the tag cannot compile, or one larger than `DI_DSV4_FORCED_NO_WHITESPACE_MAX_BYTES`, keeps guided JSON.
 pub(crate) fn bounded_forced_json(tool_call_parser: Option<&str>, schema: &Value) -> Option<Value> {
     let on = forced_whitespace_override().unwrap_or_else(|| env_on(FORCED_NO_WHITESPACE_ENV));
     if !is_v4_parser(tool_call_parser)
         || !on
+        || schema.to_string().len() > forced_max_schema_bytes()
         || !xgrammar_tag_schema::compiles_in_structural_tag(schema)
     {
         return None;

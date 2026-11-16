@@ -968,6 +968,42 @@ mod tests {
         }
 
         #[test]
+        fn forced_json_over_the_size_cap_keeps_guided_json() {
+            // ~40 KB of tools: over the 16 KB default, so the switch must not swap in the costlier tag.
+            let big: Vec<Value> = (0..40)
+                .map(|i| {
+                    let props: serde_json::Map<String, Value> = (0..12)
+                        .map(|j| {
+                            (
+                                format!("field_{j}"),
+                                json!({"type": "string", "description": "x".repeat(40)}),
+                            )
+                        })
+                        .collect();
+                    json!({"type": "function", "function": {"name": format!("tool_{i}"),
+                        "parameters": {"type": "object", "properties": props, "required": ["field_0"]}}})
+                })
+                .collect();
+            for tool_choice in [
+                json!("required"),
+                json!({"type": "function", "function": {"name": "tool_0"}}),
+            ] {
+                let extra = json!({"tools": big, "tool_choice": tool_choice});
+                let (on, on_common) = apply_forced("deepseek_v4", true, extra.clone());
+                let (off, off_common) = apply_forced("deepseek_v4", false, extra.clone());
+                let gd = on_common.sampling_options.guided_decoding.as_ref().unwrap();
+                if tool_choice == json!("required") {
+                    assert!(gd.structural_tag.is_none(), "big required schema stays guided JSON");
+                    assert_eq!(on, off);
+                    assert_eq!(guided_decoding(&on_common), guided_decoding(&off_common));
+                } else {
+                    // A named choice carries only that tool's small schema, so it keeps the bound.
+                    assert!(gd.structural_tag.is_some(), "small named schema keeps the bound");
+                }
+            }
+        }
+
+        #[test]
         fn forced_whitespace_switch_leaves_auto_and_other_parsers_alone() {
             let auto = json!({"tools": tools(), "tool_choice": "auto"});
             let (on, on_common) = apply_forced("deepseek_v4", true, auto.clone());
