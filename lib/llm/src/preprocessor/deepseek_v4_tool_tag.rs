@@ -40,6 +40,7 @@ pub(crate) const REQUIRED_ENV: &str = "DI_DSV4_TOOL_TAG_REQUIRED";
 pub(crate) const EMPTY_USER_ENV: &str = "DI_DSV4_EMPTY_USER_TURN";
 pub(crate) const TOOL_NONE_FLATTEN_ENV: &str = "DI_DSV4_TOOL_NONE_FLATTEN";
 pub(crate) const FORCED_NO_WHITESPACE_ENV: &str = "DI_DSV4_FORCED_NO_WHITESPACE";
+pub(crate) const DECLARE_REQUIRED_ENV: &str = "DI_DSV4_DECLARE_REQUIRED";
 
 const CALLS_TRIGGER: &str = "<｜DSML｜tool_calls>";
 const CALLS_BEGIN: &str = "<｜DSML｜tool_calls>\n";
@@ -57,6 +58,104 @@ thread_local! {
     pub(crate) static EMPTY_USER_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
     pub(crate) static FLATTEN_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
     pub(crate) static FORCED_WHITESPACE_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    pub(crate) static DECLARE_REQUIRED_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn declare_required_override() -> Option<bool> {
+    DECLARE_REQUIRED_FOR_TEST.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+fn declare_required_override() -> Option<bool> {
+    None
+}
+
+fn declare_required_on() -> bool {
+    declare_required_override().unwrap_or_else(|| env_on(DECLARE_REQUIRED_ENV))
+}
+
+/// Keys whose values are maps of subschemas, lists of subschemas, or a single subschema.
+const DECLARE_SCHEMA_MAPS: &[&str] = &["properties", "patternProperties", "$defs", "definitions"];
+const DECLARE_SCHEMA_LISTS: &[&str] = &["anyOf", "oneOf", "allOf", "prefixItems"];
+const DECLARE_SCHEMA_VALUES: &[&str] =
+    &["items", "additionalProperties", "not", "if", "then", "else", "contains"];
+
+/// A copy of `schema` where every object node's `required` names that are missing from its `properties` are declared
+/// there as `{}` (any JSON value), appended after the declared ones, and whether anything changed.
+///
+/// Many client schemas list a key in `required` without declaring it. JSON Schema still requires the key, and
+/// OpenRouter's validator (Draft 7) flags a call without it as a schema mismatch. xgrammar only generates declared
+/// properties, so without this the grammar can never emit such a key: the model drops it or puts its value under
+/// the one declared key. Declaring it as any-JSON keeps every other constraint and lets `required` be met.
+pub(crate) fn declare_required(schema: &Value) -> (Value, bool) {
+    let mut changed = false;
+    let value = declare_node(schema, &mut changed);
+    (value, changed)
+}
+
+fn declare_node(node: &Value, changed: &mut bool) -> Value {
+    let Value::Object(obj) = node else {
+        return node.clone();
+    };
+    let mut out = Map::new();
+    for (key, value) in obj {
+        let child = match value {
+            Value::Object(map) if DECLARE_SCHEMA_MAPS.contains(&key.as_str()) => Value::Object(
+                map.iter()
+                    .map(|(name, sub)| (name.clone(), declare_node(sub, changed)))
+                    .collect(),
+            ),
+            Value::Array(list) if DECLARE_SCHEMA_LISTS.contains(&key.as_str()) => {
+                Value::Array(list.iter().map(|sub| declare_node(sub, changed)).collect())
+            }
+            Value::Array(list) if key == "items" => {
+                Value::Array(list.iter().map(|sub| declare_node(sub, changed)).collect())
+            }
+            Value::Object(_) if DECLARE_SCHEMA_VALUES.contains(&key.as_str()) => {
+                declare_node(value, changed)
+            }
+            _ => value.clone(),
+        };
+        out.insert(key.clone(), child);
+    }
+    let is_object = match out.get("type") {
+        None => out.contains_key("properties"),
+        Some(Value::String(t)) => t == "object",
+        Some(Value::Array(ts)) => ts.iter().any(|t| t == "object"),
+        Some(_) => false,
+    };
+    let required: Vec<String> = match out.get("required") {
+        Some(Value::Array(names)) if is_object => names
+            .iter()
+            .filter_map(|n| n.as_str().map(str::to_owned))
+            .collect(),
+        _ => Vec::new(),
+    };
+    if !required.is_empty() && matches!(out.get("properties"), None | Some(Value::Object(_))) {
+        let properties = out
+            .entry("properties")
+            .or_insert_with(|| Value::Object(Map::new()))
+            .as_object_mut()
+            .expect("properties is an object");
+        for name in required {
+            if !properties.contains_key(&name) {
+                properties.insert(name, json!({}));
+                *changed = true;
+            }
+        }
+    }
+    Value::Object(out)
+}
+
+/// With `DI_DSV4_DECLARE_REQUIRED` on and the deepseek_v4 parser, the forced (`required`/named) tool-call JSON schema
+/// with required-but-undeclared keys declared (see [`declare_required`]); `None` keeps it as is.
+pub(crate) fn declared_forced_json(tool_call_parser: Option<&str>, schema: &Value) -> Option<Value> {
+    if !is_v4_parser(tool_call_parser) || !declare_required_on() {
+        return None;
+    }
+    let (declared, changed) = declare_required(schema);
+    changed.then_some(declared)
 }
 
 #[cfg(test)]
@@ -235,6 +334,15 @@ fn arguments_schema(tool_name: &str, parameters: Option<&Value>) -> Value {
     };
     let mut keywords = Vec::new();
     let flattened = xgrammar_tag_schema::flatten_all_of(parameters);
+    let flattened = if declare_required_on() {
+        let (declared, changed) = declare_required(&flattened);
+        if changed {
+            keywords.push("required_declared");
+        }
+        declared
+    } else {
+        flattened
+    };
     let schema = if xgrammar_tag_schema::compiles_in_structural_tag(&flattened) {
         flattened
     } else {
@@ -373,7 +481,20 @@ fn required_split(parameters: &Value, prepared: &Value) -> Option<RequiredSplit>
         return None;
     }
     let raw_properties = raw.get("properties")?.as_object()?;
-    if !raw_properties.keys().eq(properties.keys()) || raw.get("required") != root.get("required") {
+    // Keys `declare_required` added (required but undeclared in the raw schema) follow the raw ones, in order.
+    let added: Vec<&str> = properties
+        .keys()
+        .map(String::as_str)
+        .filter(|name| !raw_properties.contains_key(*name))
+        .collect();
+    if !added.iter().all(|name| required.contains(name))
+        || !raw_properties
+            .keys()
+            .map(String::as_str)
+            .chain(added.iter().copied())
+            .eq(properties.keys().map(String::as_str))
+        || raw.get("required") != root.get("required")
+    {
         return None;
     }
     let (required, optional): (Vec<String>, Vec<String>) = properties
@@ -502,15 +623,18 @@ fn required_first(tools: &Value, raw_tools: &Value) -> Option<Value> {
         else {
             continue;
         };
-        if split.order.len() != properties.len() || split.order.iter().eq(properties.keys()) {
+        if split.order.len() < properties.len() || split.order.iter().eq(properties.keys()) {
             continue;
         }
+        // A key the grammar declared (required but undeclared) is shown to the model with its prepared schema.
+        let declared = prepared.get("properties").and_then(Value::as_object);
         let reordered: Option<Map<String, Value>> = split
             .order
             .iter()
             .map(|name| {
                 properties
                     .get(name)
+                    .or_else(|| declared.and_then(|d| d.get(name)))
                     .map(|value| (name.clone(), value.clone()))
             })
             .collect();
@@ -1069,6 +1193,86 @@ mod tests {
                 invoke_content(all_optional, true),
                 element(json!({"a": {"type": "string"}}), json!([]))
             );
+        }
+
+        fn with_declare<T>(on: bool, f: impl FnOnce() -> T) -> T {
+            DECLARE_REQUIRED_FOR_TEST.with(|gate| gate.set(Some(on)));
+            let out = f();
+            DECLARE_REQUIRED_FOR_TEST.with(|gate| gate.set(None));
+            out
+        }
+
+        fn undeclared() -> Value {
+            json!({"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city", "units"]})
+        }
+
+        #[test]
+        fn declare_required_adds_undeclared_keys_at_every_level() {
+            let schema = json!({
+                "type": "object",
+                "properties": {
+                    "a": {"type": "string"},
+                    "nested": {"type": "object", "properties": {"x": {"type": "integer"}}, "required": ["x", "y"]},
+                    "list": {"type": "array", "items": {"type": "object", "required": ["id"]}},
+                },
+                "required": ["a", "b"],
+            });
+            let (declared, changed) = declare_required(&schema);
+            assert!(changed);
+            let keys: Vec<&String> = declared["properties"].as_object().unwrap().keys().collect();
+            assert_eq!(keys, ["a", "nested", "list", "b"], "added after the declared ones");
+            assert_eq!(declared["properties"]["b"], json!({}));
+            assert_eq!(declared["properties"]["nested"]["properties"]["y"], json!({}));
+            assert_eq!(declared["properties"]["list"]["items"]["properties"]["id"], json!({}));
+            assert_eq!(declared["required"], schema["required"], "required is unchanged");
+
+            let complete = json!({"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]});
+            assert_eq!(declare_required(&complete), (complete.clone(), false));
+            let not_object = json!({"type": "string", "required": ["a"]});
+            assert_eq!(declare_required(&not_object), (not_object.clone(), false));
+        }
+
+        #[test]
+        fn undeclared_required_keys_get_their_own_split_element() {
+            let on = with_declare(true, || invoke_content(undeclared(), true));
+            assert_eq!(
+                on,
+                json!({"type": "sequence", "elements": [
+                    element(json!({"city": {"type": "string"}}), json!(["city"])),
+                    element(json!({"units": {}}), json!(["units"])),
+                ]})
+            );
+            let off = with_declare(false, || invoke_content(undeclared(), true));
+            assert!(
+                off["json_schema"]["properties"].get("units").is_none(),
+                "switch off keeps today's grammar: {off}"
+            );
+        }
+
+        #[test]
+        fn the_prompt_shows_the_declared_key_in_split_order() {
+            let tools = json!([{"type": "function", "function": {"name": "w", "parameters": undeclared()}}]);
+            let out = with_declare(true, || required_first(&tools, &tools)).expect("reordered");
+            let props = out[0]["function"]["parameters"]["properties"].as_object().unwrap();
+            let keys: Vec<&String> = props.keys().collect();
+            assert_eq!(keys, ["city", "units"]);
+            assert_eq!(props["units"], json!({}));
+            assert!(with_declare(false, || required_first(&tools, &tools)).is_none());
+        }
+
+        #[test]
+        fn forced_json_declares_undeclared_required_keys_for_v4_only() {
+            let forced = json!({"type": "array", "minItems": 1, "items": {"type": "object", "anyOf": [
+                {"properties": {"name": {"type": "string", "enum": ["w"]}, "parameters": undeclared()},
+                 "required": ["name", "parameters"]}
+            ]}});
+            let declared = with_declare(true, || declared_forced_json(Some("deepseek_v4"), &forced)).unwrap();
+            assert_eq!(
+                declared["items"]["anyOf"][0]["properties"]["parameters"]["properties"]["units"],
+                json!({})
+            );
+            assert!(with_declare(true, || declared_forced_json(Some("deepseek_v41"), &forced)).is_none());
+            assert!(with_declare(false, || declared_forced_json(Some("deepseek_v4"), &forced)).is_none());
         }
 
         #[test]

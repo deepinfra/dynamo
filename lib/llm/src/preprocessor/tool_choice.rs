@@ -205,6 +205,12 @@ impl OpenAIPreprocessor {
                     .get_or_insert_default();
                 match guidance {
                     ToolChoiceGuidance::Json(schema) => {
+                        // DI: DeepSeek V4 declares required-but-undeclared keys so the grammar can emit them.
+                        let schema = super::deepseek_v4_tool_tag::declared_forced_json(
+                            self.tool_call_parser.as_deref(),
+                            &schema,
+                        )
+                        .unwrap_or(schema);
                         // DI: DeepSeek V4 may carry it as a whitespace-bounded structural tag instead.
                         match super::deepseek_v4_tool_tag::bounded_forced_json(
                             self.tool_call_parser.as_deref(),
