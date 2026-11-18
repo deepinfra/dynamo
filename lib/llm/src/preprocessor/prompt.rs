@@ -24,6 +24,7 @@ use dynamo_renderer::{
 };
 
 use crate::model_card::{ModelDeploymentCard, PromptFormatterArtifact};
+use crate::protocols::common::extensions::{NvExt, NvExtProvider};
 use crate::protocols::openai::{
     chat_completions::NvCreateChatCompletionRequest, completions::NvCreateCompletionRequest,
 };
@@ -376,6 +377,100 @@ impl OAIChatLikeRequest for NvCreateCompletionRequest {
 impl MediaRequestExt for NvCreateCompletionRequest {
     fn media_io_kwargs(&self) -> Option<&serde_json::Value> {
         None
+    }
+}
+
+/// DeepInfra: a `/v1/completions` request seen through the chat media path.
+///
+/// Media gathering (`gather_multi_modal_data`) walks chat content parts. A
+/// completion has none, so its top-level `data` media is exposed here as one
+/// synthetic user message of `image_url` / `video_url` parts, in request order.
+/// Only media collection sees this view; the prompt is still tokenized raw,
+/// with no chat template.
+pub(crate) struct CompletionMediaView<'a> {
+    inner: &'a NvCreateCompletionRequest,
+    messages: Vec<dynamo_protocols::types::ChatCompletionRequestMessage>,
+}
+
+impl<'a> CompletionMediaView<'a> {
+    /// `Ok(None)` when the request carries no media.
+    pub(crate) fn new(inner: &'a NvCreateCompletionRequest) -> anyhow::Result<Option<Self>> {
+        let Some(media) = inner.completion_media()? else {
+            return Ok(None);
+        };
+        let parts: Vec<serde_json::Value> = media
+            .image
+            .iter()
+            .map(|url| serde_json::json!({"type": "image_url", "image_url": {"url": url}}))
+            .chain(
+                media
+                    .video
+                    .iter()
+                    .map(|url| serde_json::json!({"type": "video_url", "video_url": {"url": url}})),
+            )
+            .collect();
+        let message: dynamo_protocols::types::ChatCompletionRequestMessage =
+            serde_json::from_value(serde_json::json!({"role": "user", "content": parts}))?;
+        Ok(Some(Self {
+            inner,
+            messages: vec![message],
+        }))
+    }
+}
+
+impl OAIChatLikeRequest for CompletionMediaView<'_> {
+    fn model(&self) -> String {
+        self.inner.model()
+    }
+
+    /// The synthetic message as media collection records it in
+    /// `extra_args.messages`. Nothing downstream reads it for a completion, so
+    /// inline `data:` payloads are blanked instead of crossing the request plane
+    /// a second time next to `multi_modal_data`.
+    fn messages(&self) -> Value {
+        let mut messages = serde_json::to_value(&self.messages).unwrap_or_default();
+        super::OpenAIPreprocessor::strip_inline_data_urls(&mut messages);
+        Value::from_serialize(&messages)
+    }
+
+    fn typed_messages(&self) -> Option<&[dynamo_protocols::types::ChatCompletionRequestMessage]> {
+        Some(self.messages.as_slice())
+    }
+
+    fn should_add_generation_prompt(&self) -> bool {
+        self.inner.should_add_generation_prompt()
+    }
+
+    fn prompt_input_type(&self) -> PromptInput {
+        self.inner.prompt_input_type()
+    }
+
+    fn extract_tokens(&self) -> Option<TokenInput> {
+        self.inner.extract_tokens()
+    }
+
+    fn extract_text(&self) -> Option<TextInput> {
+        self.inner.extract_text()
+    }
+}
+
+impl MediaRequestExt for CompletionMediaView<'_> {
+    fn media_io_kwargs(&self) -> Option<&serde_json::Value> {
+        self.inner.media_io_kwargs()
+    }
+}
+
+impl NvExtProvider for CompletionMediaView<'_> {
+    fn nvext(&self) -> Option<&NvExt> {
+        NvExtProvider::nvext(self.inner)
+    }
+
+    fn raw_prompt(&self) -> Option<String> {
+        NvExtProvider::raw_prompt(self.inner)
+    }
+
+    fn unsupported_fields(&self) -> Option<&std::collections::HashMap<String, serde_json::Value>> {
+        NvExtProvider::unsupported_fields(self.inner)
     }
 }
 

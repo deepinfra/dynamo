@@ -7313,9 +7313,19 @@ impl
         // Gather multimodal data (works with both embeddings and text prompts)
         // Returned MM entries are unused on the embeddings path; routing info is
         // not built here.
-        let _ = self
-            .gather_multi_modal_data(&request, &mut builder, None, &[])
-            .await?;
+        // DeepInfra: media in the top-level `data` field goes through the same
+        // fetch/decode path as chat `image_url` / `video_url` parts.
+        if let Some(media_view) = crate::preprocessor::prompt::CompletionMediaView::new(&request)
+            .map_err(|e| invalid_argument_error(e.to_string()))?
+        {
+            let _ = self
+                .gather_multi_modal_data(&media_view, &mut builder, None, &[])
+                .await?;
+        } else {
+            let _ = self
+                .gather_multi_modal_data(&request, &mut builder, None, &[])
+                .await?;
+        }
 
         let mut common_request = builder.build()?;
         Self::validate_preprocessed_token_budget(&common_request, self.token_budget.as_ref())?;
@@ -11884,5 +11894,110 @@ mod tests {
             image,
             video(2)
         ]));
+    }
+}
+
+/// DeepInfra: `/v1/completions` media in the top-level `data` field.
+#[cfg(test)]
+mod completion_media_tests {
+    use super::*;
+    use crate::model_card::ModelDeploymentCard;
+    use crate::preprocessor::prompt::CompletionMediaView;
+    use crate::protocols::common::preprocessor::MultimodalData;
+
+    fn test_preprocessor() -> OpenAIPreprocessor {
+        let mdc = ModelDeploymentCard::load_from_disk(
+            "tests/data/sample-models/mock-llama-3.1-8b-instruct",
+            None,
+        )
+        .unwrap();
+        let preprocessor = OpenAIPreprocessor::new(mdc).unwrap();
+        match Arc::try_unwrap(preprocessor) {
+            Ok(preprocessor) => preprocessor,
+            Err(_) => panic!("test preprocessor unexpectedly shared"),
+        }
+    }
+
+    fn png(tag: &str) -> String {
+        format!(
+            "data:image/png;name={tag};base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+        )
+    }
+
+    fn builder() -> PreprocessedRequestBuilder {
+        let mut builder = PreprocessedRequestBuilder::default();
+        builder
+            .model("m".into())
+            .token_ids(Vec::new())
+            .stop_conditions(Default::default())
+            .sampling_options(Default::default())
+            .output_options(Default::default());
+        builder
+    }
+
+    fn urls(media: &[MultimodalData]) -> Vec<&str> {
+        media
+            .iter()
+            .map(|item| match item {
+                MultimodalData::Url(url) => url.as_str(),
+                other => panic!("expected URL, got {other:?}"),
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn completion_data_images_reach_multi_modal_data_in_order() {
+        let preprocessor = test_preprocessor();
+        let (a, b) = (png("a"), png("b"));
+        let request: NvCreateCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "prompt": "<|vision_start|><|image_pad|><|vision_end|><|vision_start|><|image_pad|><|vision_end|>what?",
+            "data": {"image": [a, b], "video": []}
+        }))
+        .unwrap();
+        let view = CompletionMediaView::new(&request).unwrap().expect("media view");
+        let mut builder = builder();
+        preprocessor
+            .gather_multi_modal_data(&view, &mut builder, None, &[])
+            .await
+            .unwrap();
+        let result = builder.build().unwrap();
+        let media = result.multi_modal_data.expect("media attached");
+        assert_eq!(urls(&media["image_url"]), [a.as_str(), b.as_str()]);
+        assert!(!media.contains_key("video_url"));
+        // Inline payloads are not duplicated into extra_args.messages.
+        let extra = result.extra_args.expect("extra_args");
+        assert_eq!(extra["messages"][0]["content"][0]["image_url"]["url"], "");
+    }
+
+    #[tokio::test]
+    async fn completion_data_video_maps_to_video_url() {
+        let preprocessor = test_preprocessor();
+        let request: NvCreateCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "prompt": "<|vision_start|><|video_pad|><|vision_end|>",
+            "data": {"video": ["https://example.com/v.mp4"]}
+        }))
+        .unwrap();
+        let view = CompletionMediaView::new(&request).unwrap().expect("media view");
+        let mut builder = builder();
+        preprocessor
+            .gather_multi_modal_data(&view, &mut builder, None, &[])
+            .await
+            .unwrap();
+        let media = builder.build().unwrap().multi_modal_data.expect("media");
+        assert_eq!(urls(&media["video_url"]), ["https://example.com/v.mp4"]);
+    }
+
+    #[tokio::test]
+    async fn completion_without_data_has_no_media_view() {
+        for data in [None, Some(serde_json::Value::Null), Some(serde_json::json!({}))] {
+            let mut body = serde_json::json!({"model": "m", "prompt": "hi"});
+            if let Some(data) = data {
+                body["data"] = data;
+            }
+            let request: NvCreateCompletionRequest = serde_json::from_value(body).unwrap();
+            assert!(CompletionMediaView::new(&request).unwrap().is_none());
+        }
     }
 }
