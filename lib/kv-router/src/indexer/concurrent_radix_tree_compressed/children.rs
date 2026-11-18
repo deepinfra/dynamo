@@ -17,6 +17,19 @@ const SMALL_CHILD_LIMIT: usize = 4;
 
 type ShardedChildren = DashMap<LocalBlockHash, SharedNode, FxBuildHasher>;
 
+/// Shard count for a promoted child map. Must be a power of two greater than one.
+///
+/// `DashMap`'s default is `4 * available_parallelism` rounded up to a power of two, and each
+/// shard is a cache-padded 128-byte lock. On a 256-CPU host that is a 128 KiB shard array for
+/// every node with more than `SMALL_CHILD_LIMIT` children, which dominated frontend heap usage
+/// (tens of thousands of such nodes, several GiB). Child maps are written by the handful of
+/// indexer event threads, so a small fixed count keeps contention low at 2 KiB per node.
+const SHARDED_CHILD_SHARDS: usize = 16;
+
+fn new_sharded_children() -> ShardedChildren {
+    ShardedChildren::with_hasher_and_shard_amount(FxBuildHasher, SHARDED_CHILD_SHARDS)
+}
+
 #[derive(Clone)]
 struct ChildEntry {
     hash: LocalBlockHash,
@@ -50,7 +63,7 @@ impl fmt::Debug for NodeChildren {
 impl NodeChildren {
     pub(super) fn from_map(children: FxHashMap<LocalBlockHash, SharedNode>) -> Self {
         let state = if children.len() > SMALL_CHILD_LIMIT {
-            let sharded = ShardedChildren::with_hasher(FxBuildHasher);
+            let sharded = new_sharded_children();
             for (key, child) in children {
                 sharded.insert(key, child);
             }
@@ -274,7 +287,7 @@ impl NodeChildren {
             let current = self.state.load_full();
             let replacement = match current.as_ref() {
                 ChildrenState::Sharded(_) => {
-                    ChildrenState::Sharded(ShardedChildren::with_hasher(FxBuildHasher))
+                    ChildrenState::Sharded(new_sharded_children())
                 }
                 ChildrenState::Empty | ChildrenState::Singleton(_) | ChildrenState::Small(_) => {
                     ChildrenState::Empty
@@ -300,7 +313,7 @@ impl NodeChildren {
             return Self::compact_state(entries);
         }
 
-        let sharded = ShardedChildren::with_hasher(FxBuildHasher);
+        let sharded = new_sharded_children();
         for entry in entries {
             sharded.insert(entry.hash, entry.node);
         }
@@ -322,7 +335,7 @@ impl NodeChildren {
             return ChildrenState::Small(entries.into_boxed_slice());
         }
 
-        let sharded = ShardedChildren::with_hasher(FxBuildHasher);
+        let sharded = new_sharded_children();
         for entry in entries {
             sharded.insert(entry.hash, entry.node);
         }
@@ -391,6 +404,20 @@ mod tests {
         children.remove(&LocalBlockHash(0)).unwrap();
         assert_eq!(children.kind(), ChildrenKind::Empty);
         assert!(children.is_empty());
+    }
+
+    #[test]
+    fn sharded_children_use_fixed_shard_count() {
+        assert!(SHARDED_CHILD_SHARDS > 1 && SHARDED_CHILD_SHARDS.is_power_of_two());
+        // The shard array must not scale with the host CPU count: 16 cache-padded
+        // shards are 2 KiB, versus 128 KiB for DashMap's default on a 256-CPU host.
+        assert!(SHARDED_CHILD_SHARDS <= 64);
+        let sharded = new_sharded_children();
+        for key in 0..1024u64 {
+            sharded.insert(LocalBlockHash(key), child());
+        }
+        assert_eq!(sharded.len(), 1024);
+        assert!(sharded.get(&LocalBlockHash(1023)).is_some());
     }
 
     #[test]
