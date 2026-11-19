@@ -432,4 +432,111 @@ mod tests {
 
         runtime.shutdown();
     }
+
+    /// A request reserves its decode slot before prefill is dispatched and holds it
+    /// until decode is booked. The prefill leg is not cancelled with its client, so
+    /// a prefill response that never arrives used to hold the slot forever: enough
+    /// of them and every later request was refused as `active_decode_requests`
+    /// while the decode workers sat idle.
+    #[tokio::test]
+    async fn disconnected_request_releases_its_decode_slot_when_prefill_never_answers() {
+        use dynamo_runtime::{
+            error::{ErrorType, match_error_chain},
+            pipeline::{AsyncEngineContextProvider, Operator},
+        };
+
+        use crate::kv_router::prefill_router::{
+            admission::ABANDONED_PREFILL_TIMEOUT,
+            tests::{CountingDecodeHost, decode_slot_fixture, slot_request},
+        };
+
+        let fixture = decode_slot_fixture("model-abandoned-prefill").await;
+        let discovery_root = tempfile::tempdir().unwrap();
+        let dispatch = Arc::new(RecordingDispatch::pending());
+        let (prefill_host, bound, runtimes, workers) = shared_router(
+            &fixture.runtime,
+            discovery_root.path(),
+            "abandoned-prefill",
+            RouterMode::LeastLoaded,
+            dispatch.clone(),
+        )
+        .await;
+        // The decode-slot router, with a prefill set whose worker never answers.
+        fixture.router.binding.store(bound.binding.load_full());
+        fixture.router.lifecycle.store(
+            PrefillLifecycleState::Active as u8,
+            std::sync::atomic::Ordering::Release,
+        );
+        let prefill_occupancy = || {
+            workers
+                .iter()
+                .map(|worker| prefill_host.occupancy_for_test(*worker))
+                .sum::<u64>()
+        };
+
+        let downstream = Arc::new(CountingDecodeHost::default());
+        let request = slot_request(None);
+        let client = request.context();
+        let generate = tokio::spawn({
+            let router = fixture.router.clone();
+            let downstream = downstream.clone();
+            async move { router.generate(request, downstream).await.map(|_| ()) }
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while dispatch.worker_ids.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("prefill must be dispatched");
+        assert_eq!(prefill_occupancy(), 1);
+        assert!(
+            fixture
+                .decode
+                .admit_active_decode(Some("no-queue"), 3)
+                .is_err(),
+            "the request waiting on prefill holds the rank's only no-queue slot"
+        );
+
+        // What the HTTP layer does when the client goes away.
+        client.kill();
+        tokio::time::pause();
+        let result = tokio::time::timeout(ABANDONED_PREFILL_TIMEOUT * 2, generate)
+            .await
+            .expect("a disconnected request must not wait on prefill forever")
+            .unwrap();
+
+        let error = result.unwrap_err();
+        assert!(
+            match_error_chain(error.as_ref(), &[ErrorType::Cancelled], &[]),
+            "{error:?}"
+        );
+        assert!(
+            fixture
+                .decode
+                .admit_active_decode(Some("no-queue"), 3)
+                .is_ok(),
+            "the abandoned request must give its decode slot back"
+        );
+        assert_eq!(
+            prefill_occupancy(),
+            0,
+            "the abandoned prefill attempt must release its worker"
+        );
+        assert_eq!(
+            downstream
+                .requests
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "decode must not be dispatched for a prefill that never completed"
+        );
+
+        drop(runtimes);
+        let crate::kv_router::prefill_router::tests::DecodeSlotFixture {
+            runtime, router, ..
+        } = fixture;
+        drop(router);
+        runtime.shutdown();
+    }
 }
