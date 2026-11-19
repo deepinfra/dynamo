@@ -9000,9 +9000,19 @@ impl
         // Gather multimodal data (works with both embeddings and text prompts)
         // Returned MM entries are unused on the embeddings path; routing info is
         // not built here.
-        let _ = self
-            .gather_multi_modal_data(&request, &mut builder, None, &[])
-            .await?;
+        // DeepInfra: media in the top-level `data` field goes through the same
+        // fetch/decode path as chat `image_url` / `video_url` parts.
+        if let Some(media_view) = crate::preprocessor::prompt::CompletionMediaView::new(&request)
+            .map_err(|e| invalid_argument_error(e.to_string()))?
+        {
+            let _ = self
+                .gather_multi_modal_data(&media_view, &mut builder, None, &[])
+                .await?;
+        } else {
+            let _ = self
+                .gather_multi_modal_data(&request, &mut builder, None, &[])
+                .await?;
+        }
 
         let mut common_request = builder.build()?;
         // Backends can distinguish legacy completion defaults from chat defaults.

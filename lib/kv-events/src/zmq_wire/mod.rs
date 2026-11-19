@@ -20,6 +20,7 @@ use dynamo_router_protocol::worker::{DpRank, WorkerWithDpRank};
 
 mod convert;
 mod deserialize;
+mod di_group_refs;
 mod extra_keys;
 mod filter;
 mod mm_exclusion;
@@ -91,6 +92,8 @@ pub struct ZmqEventNormalizer {
     /// partial tail (vLLM `--prefix-match-unit` below the block size), not a
     /// misconfiguration, and is filtered quietly instead of warned about.
     full_block_workers: FxHashSet<WorkerWithDpRank>,
+    /// DeepInfra: balance per-copy stores with per-hash removes (`DI_KV_GROUP_REFCOUNT`).
+    di_group_refs: Option<di_group_refs::GroupRefState>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,6 +149,7 @@ impl ZmqEventNormalizer {
             video_token_id: None,
             warning_count: Arc::new(AtomicU32::new(0)),
             group_metadata: FxHashMap::default(),
+            di_group_refs: di_group_refs::GroupRefState::from_env(),
             cache_namespaces: FxHashMap::default(),
             engine_mm: mm_exclusion::EngineMmState::new(false),
             full_block_workers: FxHashSet::default(),
@@ -159,6 +163,7 @@ impl ZmqEventNormalizer {
             video_token_id: None,
             warning_count,
             group_metadata: FxHashMap::default(),
+            di_group_refs: di_group_refs::GroupRefState::from_env(),
             cache_namespaces: FxHashMap::default(),
             engine_mm: mm_exclusion::EngineMmState::new(false),
             full_block_workers: FxHashSet::default(),
@@ -295,6 +300,11 @@ impl ZmqEventNormalizer {
         }
         if !is_lower_tier {
             self.propagate_cache_namespace(&mut raw, worker)?;
+        }
+        // DeepInfra (DI_KV_GROUP_REFCOUNT): list a removed hash once per counted store, so the
+        // downstream refcount reaches zero when vLLM (dedup on) removes a hash once for N copies.
+        if let Some(refs) = self.di_group_refs.as_mut() {
+            refs.apply(&mut raw, worker.dp_rank, metadata.group_idx.unwrap_or(0));
         }
         Ok(raw)
     }

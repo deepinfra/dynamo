@@ -37,6 +37,28 @@ pub fn extra_keys_to_cache_namespace(
     })
 }
 
+/// DeepInfra: with `DI_KV_NATIVE_MM_HASH=1`, a native vLLM MM identifier in `extra_keys` (any
+/// string key that is neither a Dynamo routing marker nor the tagged cache salt) also becomes a
+/// block MM object, keyed by its xxh3. Without it, blocks holding different images or audio clips
+/// get the same router token hash while vLLM's block hashes differ, which breaks the indexer's
+/// one-local-chain-one-external-chain invariant and leaves stale entries (MiMo-V2.6-Flash: 1.5%
+/// of stored blocks). Only for models without exact MM routing, where these infos are mixed into
+/// the token hash and no placeholder is rewritten.
+fn native_mm_hash_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("DI_KV_NATIVE_MM_HASH").ok().as_deref(),
+            Some("1" | "true")
+        )
+    })
+}
+
+fn native_mm_hash(s: &str) -> Option<u64> {
+    (!s.is_empty() && !s.starts_with(DYNAMO_CACHE_SALT_PREFIX))
+        .then(|| xxhash_rust::xxh3::xxh3_64(s.as_bytes()))
+}
+
 /// Convert vLLM BlockStored extra_keys to block-level MM infos.
 /// extra_keys is a list aligned with blocks:
 /// - None => no MM content in that block
@@ -45,6 +67,13 @@ pub fn extra_keys_to_cache_namespace(
 ///   start offsets (vLLM 0.19+)
 pub fn extra_keys_to_block_mm_infos(
     extra_keys: Option<Vec<Option<Vec<ExtraKeyItem>>>>,
+) -> Option<Vec<Option<BlockExtraInfo>>> {
+    extra_keys_to_block_mm_infos_with(extra_keys, native_mm_hash_enabled())
+}
+
+fn extra_keys_to_block_mm_infos_with(
+    extra_keys: Option<Vec<Option<Vec<ExtraKeyItem>>>>,
+    native: bool,
 ) -> Option<Vec<Option<BlockExtraInfo>>> {
     let extra_keys = extra_keys?;
     if extra_keys.is_empty() {
@@ -62,6 +91,7 @@ pub fn extra_keys_to_block_mm_infos(
                     | ExtraKeyItem::HashWithSignedOffset((hash, _))
                     | ExtraKeyItem::HashWithUnsignedOffset((hash, _)) => {
                         parse_mm_hash_from_extra_key(hash)
+                            .or_else(|| native.then(|| native_mm_hash(hash)).flatten())
                     }
                     ExtraKeyItem::Bytes(_)
                     | ExtraKeyItem::Signed(_)
@@ -96,6 +126,39 @@ pub fn extra_keys_to_block_mm_infos(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dynamo_kv_hashing::multimodal::mark_mm_hash_for_extra_key;
+
+    #[test]
+    fn di_native_mm_hashes_separate_blocks_only_when_enabled() {
+        use dynamo_kv_hashing::routing::{BlockHashOptions, compute_block_hash_for_seq};
+        let native = |h: &str| Some(vec![Some(vec![ExtraKeyItem::Hash(h.to_string())])]);
+        let (img_a, img_b) = ("a".repeat(64), "b".repeat(64));
+        // Off: native hashes are ignored, as upstream.
+        assert_eq!(extra_keys_to_block_mm_infos_with(native(&img_a), false), None);
+        // On: two images give two MM objects, so the same placeholder tokens hash differently.
+        let infos_a = extra_keys_to_block_mm_infos_with(native(&img_a), true).unwrap();
+        let infos_b = extra_keys_to_block_mm_infos_with(native(&img_b), true).unwrap();
+        let tokens = [7u32; 4];
+        let hash = |infos: &[Option<BlockExtraInfo>]| {
+            compute_block_hash_for_seq(
+                &tokens,
+                4,
+                BlockHashOptions {
+                    block_mm_infos: Some(infos),
+                    lora_name: None,
+                    cache_namespace: None,
+                    is_eagle: None,
+                },
+            )[0]
+        };
+        assert_ne!(hash(&infos_a), hash(&infos_b));
+        // The tagged cache salt and Dynamo routing markers keep their meaning.
+        let salt = Some(vec![Some(vec![ExtraKeyItem::Hash(format!("{DYNAMO_CACHE_SALT_PREFIX}t"))])]);
+        assert_eq!(extra_keys_to_block_mm_infos_with(salt, true), None);
+        let marker = mark_mm_hash_for_extra_key(42);
+        let infos = extra_keys_to_block_mm_infos_with(native(&marker), true).unwrap();
+        assert_eq!(infos[0].as_ref().unwrap().mm_objects[0].mm_hash, 42);
+    }
 
     #[test]
     fn prompt_embedding_bytes_are_not_cache_namespace() {

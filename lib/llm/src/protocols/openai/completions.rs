@@ -64,6 +64,52 @@ pub struct NvCreateCompletionRequest {
     pub unsupported_fields: std::collections::HashMap<String, serde_json::Value>,
 }
 
+/// Top-level `/v1/completions` field carrying media for a raw prompt.
+///
+/// DeepInfra extension, wire-compatible with the vLLM `mmcompl1` patch and
+/// DeepAPI's `OpenAICompletionsIn.data`: `{"image": [url, ...], "video": [url, ...]}`.
+/// The prompt must already contain one model placeholder per item (e.g.
+/// `<|vision_start|><|image_pad|><|vision_end|>` for MiMo / Qwen-VL); the
+/// worker's multimodal processor expands it exactly as on the chat path.
+pub const COMPLETION_MEDIA_FIELD: &str = "data";
+
+/// Parsed form of [`COMPLETION_MEDIA_FIELD`]. Unknown modalities are rejected
+/// rather than silently dropped.
+#[derive(Deserialize, Debug, Clone, Default, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CompletionMedia {
+    #[serde(default)]
+    pub image: Vec<String>,
+    #[serde(default)]
+    pub video: Vec<String>,
+}
+
+impl NvCreateCompletionRequest {
+    /// Media sent in the top-level `data` field, or `None` when absent, null or
+    /// empty. Kept in `unsupported_fields` so the struct (and every literal
+    /// construction of it) stays unchanged.
+    pub fn completion_media(&self) -> Result<Option<CompletionMedia>, anyhow::Error> {
+        let Some(value) = self.unsupported_fields.get(COMPLETION_MEDIA_FIELD) else {
+            return Ok(None);
+        };
+        if value.is_null() {
+            return Ok(None);
+        }
+        let media: CompletionMedia = serde_json::from_value(value.clone()).map_err(|e| {
+            anyhow::anyhow!(
+                "`data` must be an object like {{\"image\": [\"data:image/png;base64,...\"]}}: {e}"
+            )
+        })?;
+        if media.image.iter().chain(media.video.iter()).any(|url| url.is_empty()) {
+            anyhow::bail!("`data` media URLs must be non-empty strings");
+        }
+        if media.image.is_empty() && media.video.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(media))
+    }
+}
+
 #[derive(ToSchema, Serialize, Deserialize, Validate, Debug, Clone)]
 pub struct NvCreateCompletionResponse {
     #[serde(flatten)]
@@ -596,7 +642,23 @@ impl OpenAIOutputOptionsProvider for NvCreateCompletionRequest {
 /// allowing us to validate the data.
 impl ValidateRequest for NvCreateCompletionRequest {
     fn validate(&self) -> Result<(), anyhow::Error> {
-        validate::validate_no_unsupported_fields(&self.unsupported_fields)?;
+        // DeepInfra: `data` carries completion media (see `completion_media`); it is
+        // validated there, so the generic unknown-field check must not see it.
+        if self.unsupported_fields.contains_key(COMPLETION_MEDIA_FIELD) {
+            let mut fields = self.unsupported_fields.clone();
+            fields.remove(COMPLETION_MEDIA_FIELD);
+            validate::validate_no_unsupported_fields(&fields)?;
+            if self.completion_media()?.is_some() {
+                if self.inner.prompt_embeds.is_some() {
+                    anyhow::bail!("`data` (multi-modal media) cannot be combined with `prompt_embeds`");
+                }
+                if get_prompt_batch_size(&self.inner.prompt) != 1 {
+                    anyhow::bail!("`data` (multi-modal media) requires a single prompt, not a batch");
+                }
+            }
+        } else {
+            validate::validate_no_unsupported_fields(&self.unsupported_fields)?;
+        }
         validate::validate_guided_decoding(self)?;
         validate::validate_model(&self.inner.model)?;
 
@@ -1156,5 +1218,73 @@ mod tests {
             serde_json::from_value(request_json).expect("Failed to deserialize request");
 
         assert!(ValidateRequest::validate(&request).is_err());
+    }
+}
+
+/// DeepInfra: validation of the `/v1/completions` top-level `data` media field.
+#[cfg(test)]
+mod completion_media_validation_tests {
+    use super::*;
+    use crate::engines::ValidateRequest;
+
+    fn req(body: serde_json::Value) -> NvCreateCompletionRequest {
+        serde_json::from_value(body).expect("deserialize")
+    }
+
+    #[test]
+    fn data_with_images_is_accepted_and_parsed() {
+        let request = req(serde_json::json!({
+            "model": "m", "prompt": "<|image_pad|>x",
+            "data": {"image": ["data:image/png;base64,AAAA"], "video": []}
+        }));
+        ValidateRequest::validate(&request).expect("data must be accepted");
+        let media = request.completion_media().unwrap().unwrap();
+        assert_eq!(media.image, ["data:image/png;base64,AAAA"]);
+        assert!(media.video.is_empty());
+    }
+
+    #[test]
+    fn null_or_empty_data_is_accepted_as_no_media() {
+        for data in [serde_json::Value::Null, serde_json::json!({}),
+                     serde_json::json!({"image": [], "video": []})] {
+            let request = req(serde_json::json!({"model": "m", "prompt": "x", "data": data}));
+            ValidateRequest::validate(&request).expect("empty data is fine");
+            assert!(request.completion_media().unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn other_unknown_fields_are_still_rejected_alongside_data() {
+        let request = req(serde_json::json!({
+            "model": "m", "prompt": "x",
+            "data": {"image": ["data:image/png;base64,AAAA"]},
+            "bogus": 1
+        }));
+        let err = ValidateRequest::validate(&request).unwrap_err().to_string();
+        assert!(err.contains("`bogus`"), "{err}");
+        assert!(!err.contains("`data`"), "{err}");
+    }
+
+    #[test]
+    fn malformed_data_is_rejected() {
+        for data in [
+            serde_json::json!({"audio": ["data:audio/wav;base64,AAAA"]}),
+            serde_json::json!({"image": "data:image/png;base64,AAAA"}),
+            serde_json::json!({"image": [""]}),
+            serde_json::json!(["data:image/png;base64,AAAA"]),
+        ] {
+            let request = req(serde_json::json!({"model": "m", "prompt": "x", "data": data}));
+            assert!(ValidateRequest::validate(&request).is_err(), "{data}");
+        }
+    }
+
+    #[test]
+    fn data_with_batch_prompt_is_rejected() {
+        let request = req(serde_json::json!({
+            "model": "m", "prompt": ["a", "b"],
+            "data": {"image": ["data:image/png;base64,AAAA"]}
+        }));
+        let err = ValidateRequest::validate(&request).unwrap_err().to_string();
+        assert!(err.contains("single prompt"), "{err}");
     }
 }
