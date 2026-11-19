@@ -3551,12 +3551,13 @@ impl OpenAIPreprocessor {
         TEMPLATE_SECONDS.observe(template_start.elapsed().as_secs_f64());
 
         let tokenize_start = Instant::now();
-        let (token_ids, annotations) = {
+        let (mut token_ids, annotations) = {
             let _nvtx = dynamo_nvtx_range!("preprocess.tokenize");
             self.gather_tokens(request, formatted_prompt.as_ref(), tracker)
                 .await
                 .with_context(|| "Failed to gather tokens")?
         };
+        di_strip_image_seed_pad(&mut token_ids);
         TOKENIZE_SECONDS.observe(tokenize_start.elapsed().as_secs_f64());
 
         let (_mm_routing_entries, image_tokens) = self
@@ -8780,6 +8781,7 @@ impl
             &mut common_request,
             prompt_injected_reasoning.clone(),
         )?;
+        di_attach_worker_grammar_request(&request, &mut common_request);
         let tool_processing_route =
             self.tool_processing_route(&request, &guided_tool_constraint)?;
         let payload_parsing_options = payload_handle.as_ref().map(|_| {
@@ -21351,5 +21353,77 @@ mod beam_route_tests {
         let mut omitted = history_request(None);
         preprocessor.apply_preserve_thinking(&mut omitted).unwrap();
         assert!(omitted.chat_template_args.is_none());
+    }
+}
+
+/// DeepInfra (Inkling-2): the checkpoint chat template writes each image as
+/// `<|content_image|><|unused_200054|>`, but the prod Python renderer writes the
+/// bare marker and the vLLM worker expands the marker into marker + N pads. The
+/// template's seed pad then becomes one extra prompt token per image (billing,
+/// KV block hashes). `DYN_DI_IMAGE_SEED_PAD=<marker_id>:<pad_id>` drops a pad
+/// that directly follows the marker. Unset = unchanged.
+fn di_strip_image_seed_pad(token_ids: &mut Vec<crate::protocols::TokenIdType>) {
+    static IDS: OnceLock<Option<(crate::protocols::TokenIdType, crate::protocols::TokenIdType)>> =
+        OnceLock::new();
+    let ids = IDS.get_or_init(|| {
+        let v = std::env::var("DYN_DI_IMAGE_SEED_PAD").ok()?;
+        let (m, p) = v.trim().split_once(':')?;
+        Some((m.trim().parse().ok()?, p.trim().parse().ok()?))
+    });
+    let Some((marker, pad)) = *ids else {
+        return;
+    };
+    if !token_ids.contains(&marker) {
+        return;
+    }
+    let mut out = Vec::with_capacity(token_ids.len());
+    let mut prev_marker = false;
+    for &t in token_ids.iter() {
+        if prev_marker && t == pad {
+            prev_marker = false;
+            continue;
+        }
+        prev_marker = t == marker;
+        out.push(t);
+    }
+    *token_ids = out;
+}
+
+/// DeepInfra: `DYN_DI_WORKER_GRAMMAR=1` forwards the request fields that decide the
+/// structured-output grammar to the worker (`extra_args.di_grammar`), where the vLLM
+/// worker builds it with vLLM's own model parser (`adjust_request`), exactly as a plain
+/// vLLM server would, and replaces the frontend's `guided_decoding` with it. Unset =
+/// unchanged.
+fn di_attach_worker_grammar_request(
+    request: &NvCreateChatCompletionRequest,
+    common_request: &mut PreprocessedRequest,
+) {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("DYN_DI_WORKER_GRAMMAR").is_ok_and(|v| v == "1")) {
+        return;
+    }
+    let inner = &request.inner;
+    if inner.tools.is_none() && inner.response_format.is_none() {
+        return;
+    }
+    let mut fields = serde_json::Map::new();
+    let mut put = |key: &str, value: serde_json::Result<serde_json::Value>| {
+        if let Ok(value) = value
+            && !value.is_null()
+        {
+            fields.insert(key.to_string(), value);
+        }
+    };
+    put("tools", serde_json::to_value(&inner.tools));
+    put("tool_choice", serde_json::to_value(&inner.tool_choice));
+    put("response_format", serde_json::to_value(&inner.response_format));
+    put("reasoning_effort", serde_json::to_value(&inner.reasoning_effort));
+    put("parallel_tool_calls", serde_json::to_value(inner.parallel_tool_calls));
+    put("chat_template_kwargs", serde_json::to_value(&request.chat_template_args));
+    let extra_args = common_request
+        .extra_args
+        .get_or_insert_with(|| serde_json::json!({}));
+    if let Some(map) = extra_args.as_object_mut() {
+        map.insert("di_grammar".to_string(), serde_json::Value::Object(fields));
     }
 }
