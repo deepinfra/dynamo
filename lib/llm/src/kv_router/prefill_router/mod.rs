@@ -516,7 +516,9 @@ where
         let router = &binding.router;
         let endpoint_id = &binding.endpoint_id;
         let mut prefill_details_rx = None;
-        let prefill_result: Result<(PrefillOutcome, Option<RoutingConstraints>)> = async {
+        // Boxed: the leg is a large future, and handing it to the wait below by
+        // value copies it through the stack.
+        let prefill_leg = Box::pin(async {
             let (prepared, prefill_stream) = router
                 .select_and_dispatch_prefill(prefill_context, |request, target| {
                     self.prepare_prefill_dispatch(request, target, endpoint_id)
@@ -526,7 +528,13 @@ where
             let outcome = if let Some(bootstrap_info) = prepared.bootstrap_info {
                 let (details_tx, details_rx) = tokio::sync::oneshot::channel();
                 prefill_details_rx = Some(details_rx);
-                self.spawn_prefill_task(prefill_stream, tracker, prefill_phase_barrier, details_tx);
+                self.spawn_prefill_task(
+                    prefill_stream,
+                    tracker,
+                    prefill_phase_barrier,
+                    details_tx,
+                    engine_ctx.clone(),
+                );
                 PrefillOutcome::Bootstrap {
                     bootstrap_info,
                     worker_id: prepared.worker_id,
@@ -560,9 +568,18 @@ where
                     PrefillCompletion::Terminal { output } => PrefillOutcome::Terminal { output },
                 }
             };
-            Ok((outcome, topology_constraints))
-        }
-        .await;
+            Ok::<_, anyhow::Error>((outcome, topology_constraints))
+        });
+        // The prefill context is not linked to the client's, so nothing in this leg
+        // observes a disconnect. Without a bound, a prefill response that never
+        // arrives holds this request, and the decode slot admitted above, forever.
+        let prefill_result: Result<(PrefillOutcome, Option<RoutingConstraints>)> =
+            admission::await_prefill_unless_abandoned(
+                engine_ctx.as_ref(),
+                "prefill.dispatch",
+                prefill_leg,
+            )
+            .await?;
         let (outcome, topology_constraints) = match prefill_result {
             Ok(result) => result,
             Err(error) => {
@@ -943,8 +960,8 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct CountingDecodeHost {
-        requests: AtomicUsize,
+    pub(super) struct CountingDecodeHost {
+        pub(super) requests: AtomicUsize,
     }
 
     #[async_trait]
@@ -963,10 +980,10 @@ mod tests {
         }
     }
 
-    struct DecodeSlotFixture {
-        runtime: dynamo_runtime::Runtime,
-        decode: Arc<crate::kv_router::KvRouter>,
-        router: Arc<PrefillRouter>,
+    pub(super) struct DecodeSlotFixture {
+        pub(super) runtime: dynamo_runtime::Runtime,
+        pub(super) decode: Arc<crate::kv_router::KvRouter>,
+        pub(super) router: Arc<PrefillRouter>,
         worker: dynamo_kv_router::protocols::WorkerWithDpRank,
         _workers_tx: watch::Sender<HashMap<u64, ModelRuntimeConfig>>,
         _policy: tempfile::NamedTempFile,
@@ -974,7 +991,7 @@ mod tests {
 
     /// One decode rank behind a KV decode router with standard=2 and no-queue=1 slots,
     /// installed on a Pending PrefillRouter.
-    async fn decode_slot_fixture(model: &str) -> DecodeSlotFixture {
+    pub(super) async fn decode_slot_fixture(model: &str) -> DecodeSlotFixture {
         use crate::kv_router::KvRouter;
         use dynamo_kv_router::protocols::WorkerWithDpRank;
         use dynamo_runtime::{
@@ -1076,7 +1093,7 @@ policy_classes:
         }
     }
 
-    fn slot_request(policy_class: Option<&str>) -> SingleIn<PreprocessedRequest> {
+    pub(super) fn slot_request(policy_class: Option<&str>) -> SingleIn<PreprocessedRequest> {
         let mut req = query_only_request();
         req.annotations.clear();
         let metadata = policy_class

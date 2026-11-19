@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::sync::Arc;
+use std::{future::Future, sync::Arc, time::Duration};
 
 use anyhow::Result;
 use futures::StreamExt;
@@ -12,9 +12,66 @@ use tracing::Instrument;
 use dynamo_kv_router::selector::WorkerSelector;
 
 use dynamo_runtime::{
-    pipeline::ManyOut,
+    error::{DynamoError, ErrorType},
+    pipeline::{AsyncEngineContext, Error, ManyOut},
     protocols::{annotated::Annotated, maybe_error::MaybeError},
 };
+
+/// How long a remote prefill may keep its request's frontend state once the
+/// client is gone. Matches the decode leg's cleanup budget in
+/// `routing_host/cancellation.rs`.
+///
+/// The prefill leg runs on a context that is deliberately not linked to the
+/// client's (NVBugs 5969206: a propagated kill tears down the transport under an
+/// in-flight KV transfer), so a disconnect never reaches it and it has no
+/// deadline of its own. A prefill whose response never arrives — the worker
+/// stalled, was removed, or lost the response connection — would otherwise park
+/// the request forever, together with the decode slot it reserved at admission,
+/// its router bookings and its dispatch-stage gauge.
+pub(super) const ABANDONED_PREFILL_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Await a prefill-leg `operation` without cancelling it when the client goes
+/// away, but stop waiting [`ABANDONED_PREFILL_TIMEOUT`] after `client` stops.
+///
+/// A live client never arms the timeout. A prefill that finishes inside the
+/// window is returned as usual, so the decode leg still runs and releases the
+/// staged KV. On expiry `operation` is dropped, which releases what it held.
+pub(super) async fn await_prefill_unless_abandoned<T>(
+    client: &dyn AsyncEngineContext,
+    stage: &'static str,
+    operation: impl Future<Output = T>,
+) -> Result<T, Error> {
+    tokio::pin!(operation);
+    tokio::select! {
+        biased;
+
+        result = &mut operation => Ok(result),
+        _ = client.stopped() => {
+            match tokio::time::timeout(ABANDONED_PREFILL_TIMEOUT, &mut operation).await {
+                Ok(result) => Ok(result),
+                Err(_) => Err(abandoned_prefill(client.id(), stage)),
+            }
+        }
+    }
+}
+
+/// `Cancelled` keeps migration from retrying a request whose client is gone.
+fn abandoned_prefill(context_id: &str, stage: &'static str) -> Error {
+    tracing::warn!(
+        request_id = %context_id,
+        stage,
+        timeout_secs = ABANDONED_PREFILL_TIMEOUT.as_secs(),
+        "client disconnected and remote prefill did not finish in time; abandoning the request"
+    );
+    DynamoError::builder()
+        .error_type(ErrorType::Cancelled)
+        .message(format!(
+            "Request {context_id} was abandoned at {stage}: its client disconnected and \
+             remote prefill did not finish"
+        ))
+        .build()
+        .into()
+}
 
 use super::{PrefillCompletion, PrefillError, PrefillRouter};
 use crate::{
@@ -154,13 +211,24 @@ where
         tracker: Option<Arc<RequestTracker>>,
         phase_transition_permit: OwnedSemaphorePermit,
         prompt_details_tx: oneshot::Sender<Option<PromptTokensDetails>>,
+        client: Arc<dyn AsyncEngineContext>,
     ) {
         let span = tracing::Span::current();
         let task_guard = self.task_guard.clone();
         tokio::spawn(
             async move {
                 drop(phase_transition_permit);
-                match Self::consume_prefill_stream(prefill_stream, tracker, task_guard).await {
+                let consumed = await_prefill_unless_abandoned(
+                    client.as_ref(),
+                    "prefill.background_stream",
+                    Self::consume_prefill_stream(prefill_stream, tracker, task_guard),
+                )
+                .await;
+                // Already logged; dropping the stream released the prefill attempt.
+                let Ok(consumed) = consumed else {
+                    return;
+                };
+                match consumed {
                     Ok(completion) => {
                         let details = match completion {
                             PrefillCompletion::Handoff { result, .. } => {
@@ -206,6 +274,80 @@ mod tests {
             disaggregated_params: Some(json!({})),
             ..Default::default()
         })
+    }
+
+    /// Never completes; records that it was dropped.
+    struct PendingUntilDropped(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Future for PendingUntilDropped {
+        type Output = ();
+
+        fn poll(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Self::Output> {
+            std::task::Poll::Pending
+        }
+    }
+
+    impl Drop for PendingUntilDropped {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// The HTTP layer kills the context when the client disconnects. A prefill
+    /// that never answers must then be given up, and dropped, after the timeout.
+    #[tokio::test(start_paused = true)]
+    async fn disconnected_client_abandons_a_prefill_that_never_answers() {
+        let client = Controller::new("abandoned-prefill".to_string());
+        client.kill();
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let started = tokio::time::Instant::now();
+
+        let error =
+            await_prefill_unless_abandoned(&client, "test", PendingUntilDropped(dropped.clone()))
+                .await
+                .unwrap_err();
+
+        assert_eq!(started.elapsed(), ABANDONED_PREFILL_TIMEOUT);
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+        let error = error
+            .downcast_ref::<DynamoError>()
+            .expect("abandonment should return DynamoError");
+        // Anything but Cancelled would make migration retry for a client that is gone.
+        assert_eq!(error.error_type(), ErrorType::Cancelled);
+    }
+
+    /// NVBugs 5969206: a disconnect must not cut short a prefill that is still
+    /// making progress, or the decode leg never runs to release the staged KV.
+    #[tokio::test(start_paused = true)]
+    async fn prefill_finishing_after_the_disconnect_is_still_returned() {
+        let client = Controller::new("late-prefill".to_string());
+        client.kill();
+
+        let result = await_prefill_unless_abandoned(&client, "test", async {
+            tokio::time::sleep(ABANDONED_PREFILL_TIMEOUT - Duration::from_secs(1)).await;
+            42
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(result, 42);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn live_client_never_arms_the_abandonment_timeout() {
+        let client = Controller::new("slow-prefill".to_string());
+
+        let result = await_prefill_unless_abandoned(&client, "test", async {
+            tokio::time::sleep(ABANDONED_PREFILL_TIMEOUT * 10).await;
+            42
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(result, 42);
     }
 
     #[tokio::test]
