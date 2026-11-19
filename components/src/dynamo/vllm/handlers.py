@@ -133,6 +133,18 @@ from .state_agent import state_agent_settings
 
 configure_dynamo_logging()
 logger = logging.getLogger(__name__)
+
+def _di_tok_hash(ids):
+    import hashlib
+    if not ids or not os.environ.get("DI_WORKER_TOKHASH"):
+        return "-"
+    return hashlib.md5(",".join(map(str, ids)).encode()).hexdigest()[:12]
+
+
+_DI_TIMING_FH = (
+    open(os.environ['DI_WORKER_TIMING_FILE'], 'a', buffering=1)
+    if os.environ.get('DI_WORKER_TIMING_FILE') else None
+)
 _FULL_VOCAB_LOGPROBS_SENTINEL = 2**32 - 1
 
 
@@ -3814,6 +3826,15 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         self._external_encoder_handoff_consumer: Optional[
             ExternalEncoderHandoffConsumer
         ] = None
+        if _DI_WORKER_GRAMMAR:
+            # Pay the parser/xgrammar initialisation (~0.2-0.6 s) at startup, not on the first request.
+            try:
+                _di_worker_grammar(
+                    self.engine_client,
+                    {"extra_args": {"di_grammar": {"response_format": {"type": "json_object"}}}},
+                )
+            except Exception as e:  # never block startup on the warm-up
+                logger.warning("DI worker grammar warm-up failed: %s", e)
 
     async def generate(self, request, context):
         normalize_request_token_ids(request)
@@ -3822,6 +3843,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
             raise InvalidArgument("artifact capture requires token-in/token-out mode")
         # Use context ID for request tracking and correlation
         request_id = context.id()
+        _di_t_in = time.time()  # DI worker timing (DI_WORKER_TIMING_FILE)
         logger.debug(f"Decode Request ID: {request_id}")
         routing = request.get("routing") or {}
         if self._first_token_source is not None:
@@ -3853,6 +3875,12 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                 if first_token:
                     decode_timer.stop_interval()
                     first_token = False
+                    if _DI_TIMING_FH is not None:
+                        _DI_TIMING_FH.write(
+                            f"{request_id} {_di_t_in:.6f} {time.time():.6f} "
+                            f"{len(request.get('token_ids') or [])} "
+                            f"{_di_tok_hash(request.get('token_ids'))}\n"
+                        )
                 if not self.use_vllm_tokenizer and not first_token_output_seen:
                     token_ids = chunk.get("token_ids") or []
                     if token_ids:
@@ -4165,6 +4193,12 @@ class DecodeWorkerHandler(BaseWorkerHandler):
 
         trace_headers = context.trace_headers()
         reasoning_ended, reasoning_parser_kwargs = _request_reasoning_metadata(request)
+        _di_so = _di_worker_grammar(self.engine_client, request)
+        if _di_so is not None:
+            # DI: the model parser's grammar replaces the frontend's guided_decoding,
+            # and (as plain vLLM does for parser grammars) constrains from token 0.
+            sampling_params.structured_outputs = _di_so
+            reasoning_ended = True
         session_id = session_id_from_request(request)
         # For P/D, apply hints only to prefill workers (kv_params is None).
         kv_hints = _build_vllm_kv_hints(request) if kv_params is None else None
@@ -5238,3 +5272,58 @@ def _pooling_output_to_base64(data: Any) -> str:
         return base64.b64encode(vec.tobytes()).decode("ascii")
     # Fallback for non-tensor pooling outputs (rare): reuse the list path.
     return _encode_floats_to_base64(_pooling_output_to_list(data))
+
+
+# --- DeepInfra: worker-side structured-output grammar (DI_WORKER_INKLING_GRAMMAR=1) ---
+# The Rust preprocessor forwards tools / tool_choice / response_format / reasoning_effort /
+# parallel_tool_calls / chat_template_kwargs in extra_args.di_grammar (DYN_DI_WORKER_GRAMMAR=1 on the
+# frontend). Build the grammar with vLLM's own model parser (adjust_request), as a plain vLLM server
+# does, so grammar parity holds by construction (same code, same VLLM_DI_INKLING2_* env knobs).
+_DI_WORKER_GRAMMAR = os.environ.get("DI_WORKER_INKLING_GRAMMAR") == "1"
+_DI_GRAMMAR_PARSER = os.environ.get("DI_WORKER_GRAMMAR_PARSER", "inkling")
+_di_grammar_state: dict = {}
+_DI_GRAMMAR_TIMING_FH = (
+    open(os.environ["DI_WORKER_GRAMMAR_TIMING_FILE"], "a", buffering=1)
+    if os.environ.get("DI_WORKER_GRAMMAR_TIMING_FILE") else None
+)
+
+
+def _di_worker_grammar(engine_client, request):
+    if not _DI_WORKER_GRAMMAR:
+        return None
+    extra = request.get("extra_args")
+    fields = extra.get("di_grammar") if isinstance(extra, dict) else None
+    if not isinstance(fields, dict):
+        return None
+    t0 = time.perf_counter()
+    st = _di_grammar_state
+    if "cls" not in st:
+        from vllm.parser import ParserManager
+
+        st["tok"] = engine_client.get_tokenizer()
+        st["model_config"] = getattr(engine_client, "model_config", None)
+        st["cls"] = ParserManager.get_parser(
+            tool_parser_name=_DI_GRAMMAR_PARSER,
+            reasoning_parser_name=_DI_GRAMMAR_PARSER,
+            enable_auto_tools=True,
+            model_name=getattr(st["model_config"], "model", None),
+            is_harmony=False,
+            tokenizer=st["tok"],
+        )
+    from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
+
+    body = {k: v for k, v in fields.items() if k != "chat_template_kwargs"}
+    ctk = fields.get("chat_template_kwargs")
+    if ctk:
+        body["chat_template_kwargs"] = ctk
+    req = ChatCompletionRequest(model="di", messages=[{"role": "user", "content": ""}], **body)
+    parser = st["cls"](st["tok"], req.tools, chat_template_kwargs=ctk, model_config=st["model_config"])
+    req = parser.adjust_request(req)
+    so = getattr(req, "structured_outputs", None)
+    if so is None and getattr(req, "response_format", None) is not None:
+        so = req.extract_structured_outputs() if hasattr(req, "extract_structured_outputs") else None
+    if _DI_GRAMMAR_TIMING_FH is not None:
+        _DI_GRAMMAR_TIMING_FH.write(
+            f"{time.time():.6f} {(time.perf_counter() - t0) * 1e3:.3f} {len(fields.get('tools') or [])} {int(so is not None)}\n"
+        )
+    return so

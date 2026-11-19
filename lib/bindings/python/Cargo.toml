@@ -162,11 +162,11 @@ strip = false
 # warning. Cargo.lock records the commit; `cargo update -p dynamo-parsers`
 # moves it to the branch head.
 [patch.crates-io]
-dynamo-decisions = { git = "https://github.com/deepinfra/dynamo-frontend-crates", branch = "di-main" }
-dynamo-multimodal = { git = "https://github.com/deepinfra/dynamo-frontend-crates", branch = "di-main" }
-dynamo-parsers = { git = "https://github.com/deepinfra/dynamo-frontend-crates", branch = "di-main" }
-dynamo-parsers-v2 = { git = "https://github.com/deepinfra/dynamo-frontend-crates", branch = "di-main" }
-dynamo-protocols = { git = "https://github.com/deepinfra/dynamo-frontend-crates", branch = "di-main" }
-dynamo-renderer = { git = "https://github.com/deepinfra/dynamo-frontend-crates", branch = "di-main" }
-dynamo-structural-tag = { git = "https://github.com/deepinfra/dynamo-frontend-crates", branch = "di-main" }
-dynamo-tokenizers = { git = "https://github.com/deepinfra/dynamo-frontend-crates", branch = "di-main" }
+dynamo-decisions = { git = "https://github.com/deepinfra/dynamo-frontend-crates", branch = "bo-inkling2-frontend-parity" }
+dynamo-multimodal = { git = "https://github.com/deepinfra/dynamo-frontend-crates", branch = "bo-inkling2-frontend-parity" }
+dynamo-parsers = { git = "https://github.com/deepinfra/dynamo-frontend-crates", branch = "bo-inkling2-frontend-parity" }
+dynamo-parsers-v2 = { git = "https://github.com/deepinfra/dynamo-frontend-crates", branch = "bo-inkling2-frontend-parity" }
+dynamo-protocols = { git = "https://github.com/deepinfra/dynamo-frontend-crates", branch = "bo-inkling2-frontend-parity" }
+dynamo-renderer = { git = "https://github.com/deepinfra/dynamo-frontend-crates", branch = "bo-inkling2-frontend-parity" }
+dynamo-structural-tag = { git = "https://github.com/deepinfra/dynamo-frontend-crates", branch = "bo-inkling2-frontend-parity" }
+dynamo-tokenizers = { git = "https://github.com/deepinfra/dynamo-frontend-crates", branch = "bo-inkling2-frontend-parity" }
