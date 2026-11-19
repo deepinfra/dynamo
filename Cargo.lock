@@ -2452,7 +2452,7 @@ dependencies = [
 [[package]]
 name = "dynamo-decisions"
 version = "0.1.1"
-source = "git+https://github.com/deepinfra/dynamo-frontend-crates?branch=di-main#b545d348013143bbfdfe7cf54840413b671fc9fb"
+source = "git+https://github.com/deepinfra/dynamo-frontend-crates?branch=bo-inkling2-frontend-parity#6b009a0847203d2de2b063536c9ac668f7e5c8ab"
 dependencies = [
  "dynamo-protocols",
  "serde",
@@ -3131,7 +3131,7 @@ dependencies = [
 [[package]]
 name = "dynamo-multimodal"
 version = "0.2.6"
-source = "git+https://github.com/deepinfra/dynamo-frontend-crates?branch=di-main#b545d348013143bbfdfe7cf54840413b671fc9fb"
+source = "git+https://github.com/deepinfra/dynamo-frontend-crates?branch=bo-inkling2-frontend-parity#6b009a0847203d2de2b063536c9ac668f7e5c8ab"
 dependencies = [
  "blake3",
  "gif",
@@ -3146,7 +3146,7 @@ dependencies = [
 [[package]]
 name = "dynamo-parsers"
 version = "11.0.11"
-source = "git+https://github.com/deepinfra/dynamo-frontend-crates?branch=di-main#b545d348013143bbfdfe7cf54840413b671fc9fb"
+source = "git+https://github.com/deepinfra/dynamo-frontend-crates?branch=bo-inkling2-frontend-parity#6b009a0847203d2de2b063536c9ac668f7e5c8ab"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -3170,7 +3170,7 @@ dependencies = [
 [[package]]
 name = "dynamo-parsers-v2"
 version = "0.10.5"
-source = "git+https://github.com/deepinfra/dynamo-frontend-crates?branch=di-main#b545d348013143bbfdfe7cf54840413b671fc9fb"
+source = "git+https://github.com/deepinfra/dynamo-frontend-crates?branch=bo-inkling2-frontend-parity#6b009a0847203d2de2b063536c9ac668f7e5c8ab"
 dependencies = [
  "anyhow",
  "dynamo-structural-tag",
@@ -3188,7 +3188,7 @@ dependencies = [
 [[package]]
 name = "dynamo-protocols"
 version = "10.0.1"
-source = "git+https://github.com/deepinfra/dynamo-frontend-crates?branch=di-main#b545d348013143bbfdfe7cf54840413b671fc9fb"
+source = "git+https://github.com/deepinfra/dynamo-frontend-crates?branch=bo-inkling2-frontend-parity#6b009a0847203d2de2b063536c9ac668f7e5c8ab"
 dependencies = [
  "async-openai",
  "derive_builder",
@@ -3206,7 +3206,7 @@ dependencies = [
 [[package]]
 name = "dynamo-renderer"
 version = "10.4.3"
-source = "git+https://github.com/deepinfra/dynamo-frontend-crates?branch=di-main#b545d348013143bbfdfe7cf54840413b671fc9fb"
+source = "git+https://github.com/deepinfra/dynamo-frontend-crates?branch=bo-inkling2-frontend-parity#6b009a0847203d2de2b063536c9ac668f7e5c8ab"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -3573,7 +3573,7 @@ dependencies = [
 [[package]]
 name = "dynamo-structural-tag"
 version = "0.1.2"
-source = "git+https://github.com/deepinfra/dynamo-frontend-crates?branch=di-main#b545d348013143bbfdfe7cf54840413b671fc9fb"
+source = "git+https://github.com/deepinfra/dynamo-frontend-crates?branch=bo-inkling2-frontend-parity#6b009a0847203d2de2b063536c9ac668f7e5c8ab"
 dependencies = [
  "anyhow",
  "jsonschema 0.29.1",
@@ -3585,7 +3585,7 @@ dependencies = [
 [[package]]
 name = "dynamo-tokenizers"
 version = "4.3.1"
-source = "git+https://github.com/deepinfra/dynamo-frontend-crates?branch=di-main#b545d348013143bbfdfe7cf54840413b671fc9fb"
+source = "git+https://github.com/deepinfra/dynamo-frontend-crates?branch=bo-inkling2-frontend-parity#6b009a0847203d2de2b063536c9ac668f7e5c8ab"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -5138,7 +5138,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.6.4",
  "system-configuration 0.6.1",
  "tokio",
  "tower-service",
@@ -8255,7 +8255,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.2",
  "rustls",
- "socket2 0.5.10",
+ "socket2 0.6.4",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -8293,7 +8293,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.4",
  "tracing",
  "windows-sys 0.60.2",
 ]
