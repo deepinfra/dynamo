@@ -55,6 +55,7 @@ where
     replica_request_lease_observer: Option<Arc<DeferredReplicaRequestLeaseObserver>>,
     queue_metrics: Vec<RouterQueueMetricHandles>,
     queue_metric_indices: HashMap<String, usize>,
+    default_policy_class: String,
     metric_model: String,
 }
 
@@ -197,6 +198,7 @@ where
             .enumerate()
             .map(|(index, class)| (class.name.clone(), index))
             .collect();
+        let default_policy_class = profile.default_class().name.clone();
         let profile_class_names: Vec<String> = profile
             .classes()
             .iter()
@@ -296,8 +298,19 @@ where
             replica_request_lease_observer,
             queue_metrics,
             queue_metric_indices,
+            default_policy_class,
             metric_model: metric_model.to_string(),
         })
+    }
+
+    /// Whether the policy profile defines a class of this name.
+    pub fn has_policy_class(&self, name: &str) -> bool {
+        self.queue_metric_indices.contains_key(name)
+    }
+
+    /// The class a request that names none is admitted under.
+    pub fn default_policy_class(&self) -> &str {
+        &self.default_policy_class
     }
 
     /// Decode admission for a request of `policy_class`; see

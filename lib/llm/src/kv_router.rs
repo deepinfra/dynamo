@@ -52,6 +52,7 @@ pub use dynamo_kv_router::protocols;
 pub use dynamo_kv_router::scheduling;
 pub use dynamo_kv_router::selector;
 
+pub mod admission_class;
 pub mod encoder_router;
 pub mod indexer;
 pub mod metrics;
@@ -899,6 +900,28 @@ where
 
     pub(crate) fn routed_prefixes(&self) -> Option<&Arc<routed_prefix_sync::RoutedPrefixTracker>> {
         self.routed_prefixes.as_ref()
+    }
+
+    /// The policy class to admit a prefill request under, given how much of
+    /// its prompt the replica set has seen; see [`admission_class`].
+    pub(crate) fn admission_class(
+        &self,
+        requested: Option<String>,
+        prompt_tokens: usize,
+        known_tokens: usize,
+    ) -> (admission_class::PromptFamiliarity, Option<String>) {
+        let familiarity = admission_class::PromptFamiliarity::of(
+            prompt_tokens,
+            known_tokens,
+            admission_class::AdmissionClassSettings::from_env(),
+        );
+        let class = admission_class::admission_class(
+            requested,
+            self.scheduler.default_policy_class(),
+            familiarity,
+            |name| self.scheduler.has_policy_class(name),
+        );
+        (familiarity, class)
     }
 
     pub(crate) fn set_endpoint_registration(

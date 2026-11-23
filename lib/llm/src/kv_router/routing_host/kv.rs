@@ -48,6 +48,26 @@ where
             (Some(header), Some(routed)) => Some(header.max(routed)),
             (header, routed) => header.or(routed),
         };
+        // With the replica set's memory of routed prompts, admit by how
+        // familiar this one is: seen, new, or arriving cold mid-conversation.
+        let policy_class = if routed_prefixes.is_some() {
+            let prompt_tokens = request.content().block_mm_routing_info().0.len();
+            let (familiarity, class) = self.kv_router().admission_class(
+                policy_class,
+                prompt_tokens,
+                cached_tokens_hint.unwrap_or(0),
+            );
+            tracing::debug!(
+                prompt_tokens,
+                known_tokens = cached_tokens_hint.unwrap_or(0),
+                ?familiarity,
+                policy_class = class.as_deref().unwrap_or("<default>"),
+                "admission class for request"
+            );
+            class
+        } else {
+            policy_class
+        };
         let session_context = request
             .agent_context
             .as_ref()
