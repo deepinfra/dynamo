@@ -41,6 +41,8 @@ pub enum QueueLimitKind {
     Requests,
     RawIslTokens,
     CachedTokens,
+    /// Queued prompt tokens that still have to be computed: the queue's work.
+    UncachedTokens,
     ActiveDecodeRequests,
 }
 
@@ -50,6 +52,7 @@ impl std::fmt::Display for QueueLimitKind {
             Self::Requests => formatter.write_str("requests"),
             Self::RawIslTokens => formatter.write_str("raw_isl_tokens"),
             Self::CachedTokens => formatter.write_str("cached_tokens"),
+            Self::UncachedTokens => formatter.write_str("uncached_tokens"),
             Self::ActiveDecodeRequests => formatter.write_str("active_decode_requests"),
         }
     }
@@ -72,6 +75,7 @@ pub struct PolicyQueueStats {
     pub requests: usize,
     pub raw_isl_tokens: usize,
     pub cached_tokens: usize,
+    pub uncached_tokens: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -801,6 +805,11 @@ fn queue_rejection<T>(class: &PolicyClassQueue<T>, worker_count: usize) -> Optio
             class.stats.cached_tokens,
             class.config.cached_token_queue_limit_per_worker,
         ),
+        (
+            QueueLimitKind::UncachedTokens,
+            class.stats.uncached_tokens,
+            class.config.uncached_token_queue_limit_per_worker,
+        ),
     ] {
         let limit = limit_per_worker.map(|limit| limit.saturating_mul(worker_count));
         if limit.is_some_and(|limit| current >= limit) {
@@ -820,12 +829,18 @@ fn add_stats(stats: &mut PolicyQueueStats, snapshot: QueueSnapshot) {
     stats.requests += 1;
     stats.raw_isl_tokens = stats.raw_isl_tokens.saturating_add(snapshot.raw_isl_tokens);
     stats.cached_tokens = stats.cached_tokens.saturating_add(snapshot.cached_tokens);
+    stats.uncached_tokens = stats
+        .uncached_tokens
+        .saturating_add(snapshot.uncached_tokens);
 }
 
 fn subtract_stats(stats: &mut PolicyQueueStats, snapshot: QueueSnapshot) {
     stats.requests = stats.requests.saturating_sub(1);
     stats.raw_isl_tokens = stats.raw_isl_tokens.saturating_sub(snapshot.raw_isl_tokens);
     stats.cached_tokens = stats.cached_tokens.saturating_sub(snapshot.cached_tokens);
+    stats.uncached_tokens = stats
+        .uncached_tokens
+        .saturating_sub(snapshot.uncached_tokens);
 }
 
 #[cfg(test)]
@@ -1204,6 +1219,48 @@ policy_classes:
             "keep"
         );
         assert_eq!(queue.pending_count(), 0);
+    }
+
+    #[test]
+    fn uncached_token_cap_counts_work_not_requests() {
+        let mut queue = PolicyQueue::new(profile(
+            r#"
+default_policy_family: work
+uncached_isl_buckets:
+  - min_tokens: 0
+    bucket: all
+policy_classes:
+  - name: work
+    policy_family: work
+    cache_bucket: all
+    quantum: 1
+    uncached_token_queue_limit_per_worker: 100
+"#,
+        ));
+        let mut enqueue = |snapshot: QueueSnapshot, payload: &'static str| {
+            queue.enqueue(0, 2, snapshot, 0.0, 0.0, 0, WorkerPlacement::Any, payload)
+        };
+
+        // Fully cached prompts carry no work: many of them never reach the cap
+        // (2 workers x 100 uncached tokens), however long they are.
+        for payload in ["warm-1", "warm-2", "warm-3", "warm-4"] {
+            enqueue(QueueSnapshot::new(1_000, 990), payload).unwrap();
+        }
+        // A cold prompt is admitted while the queue is under the cap, even
+        // though it alone crosses it...
+        enqueue(QueueSnapshot::new(500, 0), "cold").unwrap();
+        // ...and then everything is refused, warm or cold, until it drains.
+        let (rejection, payload) = enqueue(QueueSnapshot::new(1_000, 990), "warm-5").unwrap_err();
+        assert_eq!(payload, "warm-5");
+        assert_eq!(rejection.limit_kind, QueueLimitKind::UncachedTokens);
+        assert_eq!(rejection.current, 540);
+        assert_eq!(rejection.limit, 200);
+        assert!(rejection.to_string().contains("uncached_tokens"));
+
+        assert_eq!(queue.class_stats(0).requests, 5);
+        assert_eq!(queue.class_stats(0).uncached_tokens, 540);
+        while queue.pop_next(|_, _, _| true).is_some() {}
+        assert_eq!(queue.class_stats(0).uncached_tokens, 0);
     }
 
     #[test]

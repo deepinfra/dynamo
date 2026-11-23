@@ -43,6 +43,10 @@ pub struct PolicyClassConfig {
     pub request_queue_limit_per_worker: Option<usize>,
     pub raw_isl_token_queue_limit_per_worker: Option<usize>,
     pub cached_token_queue_limit_per_worker: Option<usize>,
+    /// Reject once the class's queued uncached prompt tokens (prompt minus
+    /// what the queue snapshot counts as cached) reach this many per worker.
+    /// Bounds the queue by the work waiting in it instead of by request count.
+    pub uncached_token_queue_limit_per_worker: Option<usize>,
     /// Admit a request only while some decode rank has fewer active requests
     /// than this (the router's own per-(worker, dp_rank) bookings).
     pub max_active_decode_requests_per_rank: Option<usize>,
@@ -153,6 +157,7 @@ impl PolicyProfile {
             request_queue_limit_per_worker: None,
             raw_isl_token_queue_limit_per_worker: None,
             cached_token_queue_limit_per_worker: None,
+            uncached_token_queue_limit_per_worker: None,
             max_active_decode_requests_per_rank: None,
         };
         Self {
@@ -359,6 +364,8 @@ struct RawPolicyClassConfig {
     #[serde(default)]
     cached_token_queue_limit_per_worker: Option<usize>,
     #[serde(default)]
+    uncached_token_queue_limit_per_worker: Option<usize>,
+    #[serde(default)]
     max_active_decode_requests_per_rank: Option<usize>,
 }
 
@@ -554,6 +561,7 @@ fn resolve_policy_class(
             request_queue_limit_per_worker: raw.request_queue_limit_per_worker,
             raw_isl_token_queue_limit_per_worker: raw.raw_isl_token_queue_limit_per_worker,
             cached_token_queue_limit_per_worker: raw.cached_token_queue_limit_per_worker,
+            uncached_token_queue_limit_per_worker: raw.uncached_token_queue_limit_per_worker,
             max_active_decode_requests_per_rank: raw.max_active_decode_requests_per_rank,
         },
         binding,

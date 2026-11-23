@@ -471,6 +471,9 @@ where
                 dynamo_kv_router::scheduling::QueueLimitKind::CachedTokens => {
                     metrics.cached_token_limit_rejections.inc();
                 }
+                dynamo_kv_router::scheduling::QueueLimitKind::UncachedTokens => {
+                    metrics.uncached_token_limit_rejections.inc();
+                }
                 dynamo_kv_router::scheduling::QueueLimitKind::ActiveDecodeRequests => {}
             }
         }
