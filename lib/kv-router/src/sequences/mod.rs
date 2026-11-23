@@ -9,6 +9,7 @@ mod prompt_membership_trie;
 mod prompt_registry;
 mod replica_sync;
 mod request_maps;
+pub mod routed_prefixes;
 pub mod single;
 pub mod topology;
 

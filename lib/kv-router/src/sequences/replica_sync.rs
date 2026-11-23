@@ -322,6 +322,13 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
                 expected_output_tokens,
                 prefill_load_hint,
             } => {
+                // A peer routed this prompt to the pool: the shared store will
+                // hold it whichever replica sees its continuation.
+                self.record_routed_prefix(
+                    token_sequence.as_deref(),
+                    track_prefill_tokens,
+                    decay_now,
+                );
                 let Ok(attempt_id) = self.request_index.try_insert_request_from(
                     request_id.clone(),
                     event_worker,
