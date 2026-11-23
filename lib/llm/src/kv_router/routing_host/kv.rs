@@ -35,31 +35,48 @@ where
             .as_ref()
             .zip(routed_marks.as_ref())
             .map(|(routed, marks)| routed.cached_tokens(marks));
+        // A replica that just started has not relearned the conversations in
+        // progress, so its "unseen" verdict is not usable yet: while warming
+        // up it assumes an unknown prompt is mostly cached and keeps the
+        // class the request asked for.
+        let prompt_tokens = request.content().block_mm_routing_info().0.len();
+        let warming_up = routed_prefixes
+            .as_ref()
+            .is_some_and(|routed| routed.warming_up());
+        let warmup_assumed_tokens = routed_prefixes
+            .as_ref()
+            .filter(|_| warming_up)
+            .map(|routed| routed.warmup_assumed_cached_tokens(prompt_tokens));
         if let (Some(routed), Some(routed_cached_tokens)) = (&routed_prefixes, routed_cached_tokens) {
             tracing::debug!(
                 routed_cached_tokens,
                 header_hint,
                 held_hashes = routed.held_hashes(),
+                warming_up,
                 ?phase,
                 "routed-prefix estimate for request"
             );
         }
-        let cached_tokens_hint = match (header_hint, routed_cached_tokens.filter(|tokens| *tokens > 0)) {
-            (Some(header), Some(routed)) => Some(header.max(routed)),
-            (header, routed) => header.or(routed),
-        };
+        let cached_tokens_hint = [
+            header_hint,
+            routed_cached_tokens.filter(|tokens| *tokens > 0),
+            warmup_assumed_tokens,
+        ]
+        .into_iter()
+        .flatten()
+        .max();
         // With the replica set's memory of routed prompts, admit by how
         // familiar this one is: seen, new, or arriving cold mid-conversation.
-        let policy_class = if routed_prefixes.is_some() {
-            let prompt_tokens = request.content().block_mm_routing_info().0.len();
-            let (familiarity, class) = self.kv_router().admission_class(
-                policy_class,
-                prompt_tokens,
-                cached_tokens_hint.unwrap_or(0),
-            );
+        let policy_class = if routed_prefixes.is_some() && !warming_up {
+            let known_tokens = header_hint
+                .unwrap_or(0)
+                .max(routed_cached_tokens.unwrap_or(0));
+            let (familiarity, class) =
+                self.kv_router()
+                    .admission_class(policy_class, prompt_tokens, known_tokens);
             tracing::debug!(
                 prompt_tokens,
-                known_tokens = cached_tokens_hint.unwrap_or(0),
+                known_tokens,
                 ?familiarity,
                 policy_class = class.as_deref().unwrap_or("<default>"),
                 "admission class for request"

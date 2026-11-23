@@ -20,6 +20,15 @@
 //! 1024), independent of the router's block hashing: the prefill router runs
 //! with active-block tracking off and has no sequence hashes of its own.
 //! Set the window no longer than the store keeps a block.
+//!
+//! A replica starts with an empty memory and relearns each conversation at
+//! its next turn through any replica. Until then its "unseen" verdict means
+//! nothing, so for `DYN_ROUTER_ROUTED_PREFIX_WARMUP_SECS` after start (default
+//! 600) it is not used: requests keep the class they asked for, and a prompt
+//! the replica does not know is booked as if
+//! `DYN_ROUTER_ROUTED_PREFIX_WARMUP_ASSUMED_CACHED_FRACTION` of it (default
+//! 0.9) were cached. A warming replica therefore cannot shed cold prompts,
+//! which is what every replica did before this tracking existed.
 
 use std::sync::Arc;
 
@@ -39,6 +48,8 @@ use crate::protocols::TokenIdType;
 pub const ROUTER_ROUTED_PREFIXES_SUBJECT: &str = "router_routed_prefixes";
 
 const DEFAULT_MARK_TOKENS: usize = 1024;
+const DEFAULT_WARMUP_SECS: f64 = 600.0;
+const DEFAULT_WARMUP_ASSUMED_CACHED_FRACTION: f64 = 0.9;
 /// Routing never waits on the publish queue; when it is full the newest
 /// announcement is dropped and peers learn the prefix on its next turn.
 const PUBLISH_QUEUE_CAPACITY: usize = 4096;
@@ -55,6 +66,30 @@ pub struct RoutedPrefixTracker {
     mark_tokens: usize,
     router_id: u64,
     publish_tx: Option<mpsc::Sender<RoutedPrefixEvent>>,
+    started_at: Instant,
+    warmup: std::time::Duration,
+    warmup_assumed_cached_fraction: f64,
+}
+
+fn warmup_from_env() -> (std::time::Duration, f64) {
+    parse_warmup(
+        std::env::var("DYN_ROUTER_ROUTED_PREFIX_WARMUP_SECS").ok().as_deref(),
+        std::env::var("DYN_ROUTER_ROUTED_PREFIX_WARMUP_ASSUMED_CACHED_FRACTION")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn parse_warmup(secs: Option<&str>, fraction: Option<&str>) -> (std::time::Duration, f64) {
+    let secs = secs
+        .and_then(|raw| raw.trim().parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .unwrap_or(DEFAULT_WARMUP_SECS);
+    let fraction = fraction
+        .and_then(|raw| raw.trim().parse::<f64>().ok())
+        .filter(|value| value.is_finite() && (0.0..=1.0).contains(value))
+        .unwrap_or(DEFAULT_WARMUP_ASSUMED_CACHED_FRACTION);
+    (std::time::Duration::from_secs_f64(secs), fraction)
 }
 
 fn mark_tokens_from_env() -> usize {
@@ -92,7 +127,32 @@ impl RoutedPrefixTracker {
             mark_tokens,
             router_id,
             publish_tx,
+            started_at: Instant::now(),
+            warmup: std::time::Duration::ZERO,
+            warmup_assumed_cached_fraction: DEFAULT_WARMUP_ASSUMED_CACHED_FRACTION,
         }
+    }
+
+    fn with_warmup(mut self, warmup: std::time::Duration, assumed_cached_fraction: f64) -> Self {
+        self.warmup = warmup;
+        self.warmup_assumed_cached_fraction = assumed_cached_fraction;
+        self
+    }
+
+    /// True while this replica has not been up long enough to have relearned
+    /// the conversations in progress: its "unseen" verdict is not yet usable.
+    pub fn warming_up(&self) -> bool {
+        self.warming_up_at(Instant::now())
+    }
+
+    fn warming_up_at(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.started_at) < self.warmup
+    }
+
+    /// What to count as cached for a prompt while warming up, when the
+    /// replica cannot yet tell a continuing conversation from a cold one.
+    pub fn warmup_assumed_cached_tokens(&self, prompt_tokens: usize) -> usize {
+        (prompt_tokens as f64 * self.warmup_assumed_cached_fraction) as usize
     }
 
     /// `None` unless `DYN_ROUTER_ROUTED_PREFIX_TTL_SECS` is set. Replicas
@@ -107,9 +167,17 @@ impl RoutedPrefixTracker {
             return Ok(None);
         };
         let mark_tokens = mark_tokens_from_env();
+        let (warmup, warmup_fraction) = warmup_from_env();
         if !share_with_replicas {
-            tracing::info!(?ttl, mark_tokens, "Routed-prefix tracking enabled (this replica only)");
-            return Ok(Some(Arc::new(Self::new(ttl, mark_tokens, router_id, None))));
+            tracing::info!(
+                ?ttl,
+                mark_tokens,
+                ?warmup,
+                "Routed-prefix tracking enabled (this replica only)"
+            );
+            return Ok(Some(Arc::new(
+                Self::new(ttl, mark_tokens, router_id, None).with_warmup(warmup, warmup_fraction),
+            )));
         }
 
         let transport_kind = endpoint.drt().default_event_transport_kind();
@@ -128,7 +196,10 @@ impl RoutedPrefixTracker {
         .typed::<RoutedPrefixEvent>();
 
         let (publish_tx, mut publish_rx) = mpsc::channel(PUBLISH_QUEUE_CAPACITY);
-        let tracker = Arc::new(Self::new(ttl, mark_tokens, router_id, Some(publish_tx)));
+        let tracker = Arc::new(
+            Self::new(ttl, mark_tokens, router_id, Some(publish_tx))
+                .with_warmup(warmup, warmup_fraction),
+        );
 
         let publish_cancel = cancellation_token.clone();
         tokio::spawn(async move {
@@ -167,6 +238,7 @@ impl RoutedPrefixTracker {
             ?ttl,
             mark_tokens,
             router_id,
+            ?warmup,
             "Routed-prefix tracking enabled: prefixes routed by any replica count as cached for booking"
         );
         Ok(Some(tracker))
@@ -271,6 +343,37 @@ mod tests {
         let c = tracker(3);
         c.apply_peer_event(&RoutedPrefixEvent { mark_tokens: 8, ..event });
         assert_eq!(c.held_hashes(), 0);
+    }
+
+    #[test]
+    fn a_fresh_replica_warms_up_before_its_verdict_counts() {
+        let warm = tracker(1);
+        assert!(!warm.warming_up());
+
+        let fresh = tracker(1).with_warmup(std::time::Duration::from_secs(600), 0.9);
+        let start = fresh.started_at;
+        assert!(fresh.warming_up_at(start));
+        assert!(fresh.warming_up_at(start + std::time::Duration::from_secs(599)));
+        assert!(!fresh.warming_up_at(start + std::time::Duration::from_secs(600)));
+        // While warming, an unknown 150K prompt is booked as mostly cached.
+        assert_eq!(fresh.warmup_assumed_cached_tokens(150_000), 135_000);
+        // It still learns what it routes during warm-up.
+        let turn = prompt(5, 16);
+        fresh.record(fresh.marks(&turn));
+        assert_eq!(fresh.cached_tokens(&fresh.marks(&turn)), 16);
+    }
+
+    #[test]
+    fn warmup_settings_fall_back_to_defaults() {
+        let (warmup, fraction) = parse_warmup(None, None);
+        assert_eq!(warmup, std::time::Duration::from_secs(600));
+        assert_eq!(fraction, 0.9);
+        let (warmup, fraction) = parse_warmup(Some("0"), Some("0.5"));
+        assert_eq!(warmup, std::time::Duration::ZERO);
+        assert_eq!(fraction, 0.5);
+        let (warmup, fraction) = parse_warmup(Some("-3"), Some("7"));
+        assert_eq!(warmup, std::time::Duration::from_secs(600));
+        assert_eq!(fraction, 0.9);
     }
 
     #[test]
