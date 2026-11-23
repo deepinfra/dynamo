@@ -1650,12 +1650,14 @@ impl<
 
         let booked_cached_tokens =
             self.booked_cached_tokens(&request, selected.selection.cached_tokens);
-        if booked_cached_tokens > selected.selection.cached_tokens {
+        let routed_cached_tokens = self.routed_cached_tokens(&request);
+        if booked_cached_tokens > selected.selection.cached_tokens || routed_cached_tokens > 0 {
             tracing::debug!(
                 isl_tokens = request.isl_tokens,
                 selected_cached_tokens = selected.selection.cached_tokens,
                 cached_tokens_hint = request.cached_tokens_hint(),
-                routed_cached_tokens = self.routed_cached_tokens(&request),
+                routed_cached_tokens,
+                routed_prefix_hashes = self.slots.routed_prefix_hashes(),
                 booked_cached_tokens,
                 "booking prefill load with shared-store cached tokens"
             );

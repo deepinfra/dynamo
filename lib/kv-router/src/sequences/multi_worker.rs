@@ -582,6 +582,14 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
         }
     }
 
+    /// Hashes currently held by the routed-prefix set (0 when it is off); its
+    /// memory is proportional to this.
+    pub fn routed_prefix_hashes(&self) -> usize {
+        self.routed_prefixes
+            .as_ref()
+            .map_or(0, super::routed_prefixes::RoutedPrefixes::len)
+    }
+
     /// Leading blocks of this prompt that some replica routed to some worker
     /// recently; 0 when the tracking is off or the prompt has no hashes.
     pub fn routed_prefix_blocks(&self, token_sequence: Option<&[SequenceHash]>, now: Instant) -> usize {
