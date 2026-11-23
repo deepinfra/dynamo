@@ -59,6 +59,7 @@ pub mod prefill_router;
 pub mod publisher;
 pub mod queue_usage_sync;
 mod request_lease;
+pub mod routed_prefix_sync;
 mod route_lookup;
 mod routing_host;
 pub(crate) mod routing_load;
@@ -550,6 +551,9 @@ where
     tracking_model_name: String,
     approximate_lru_ranks: ApproximateLruRanks,
     request_leases: request_lease::RequestLeaseManager,
+    /// Prefixes the replica set routed to this (prefill) pool recently; see
+    /// [`routed_prefix_sync`]. `None` unless enabled, and never on a decode pool.
+    routed_prefixes: Option<Arc<routed_prefix_sync::RoutedPrefixTracker>>,
     _served_indexer_handle: Option<ServedIndexerHandle>,
     /// Optional external shared KV cache pool. When present, `find_best_match`
     /// queries it in parallel with the indexer and factors shared hits into scoring.
@@ -852,6 +856,20 @@ where
             None
         };
 
+        // Decode bookings are not prompts a worker computes and stores, so only
+        // a pool that prefills tracks routed prefixes.
+        let routed_prefixes = if metric_worker_type == crate::protocols::common::timing::WORKER_TYPE_DECODE {
+            None
+        } else {
+            routed_prefix_sync::RoutedPrefixTracker::from_env(
+                &endpoint,
+                endpoint.drt().discovery().instance_id(),
+                kv_router_config.router_replica_sync,
+                cancellation_token.child_token(),
+            )
+            .await?
+        };
+
         tracing::info!("KV Routing initialized");
         let cancellation_token = cancellation_guard.disarm();
         Ok(Self {
@@ -870,12 +888,17 @@ where
             tracking_model_name,
             approximate_lru_ranks,
             request_leases,
+            routed_prefixes,
             _served_indexer_handle: served_indexer_handle,
             shared_cache,
             lora_filter,
             endpoint_registration: None,
             teardown_task_guard: None,
         })
+    }
+
+    pub(crate) fn routed_prefixes(&self) -> Option<&Arc<routed_prefix_sync::RoutedPrefixTracker>> {
+        self.routed_prefixes.as_ref()
     }
 
     pub(crate) fn set_endpoint_registration(

@@ -22,7 +22,32 @@ where
         let context_id = request.context().id().to_string();
         let staged_kv = StagedKv::for_request(request.content());
         let policy_class = request.metadata().get("policy-class").cloned();
-        let cached_tokens_hint = kv_selection::cached_tokens_hint_from_metadata(request.metadata());
+        let header_hint = kv_selection::cached_tokens_hint_from_metadata(request.metadata());
+        // What the replica set routed to this pool recently is in the pool's
+        // shared store whichever worker is chosen: fold it into the hint.
+        let routed_prefixes = (!matches!(phase, RequestPhase::Decode))
+            .then(|| self.kv_router().routed_prefixes().cloned())
+            .flatten();
+        let routed_marks = routed_prefixes
+            .as_ref()
+            .map(|routed| routed.marks(request.content().block_mm_routing_info().0));
+        let routed_cached_tokens = routed_prefixes
+            .as_ref()
+            .zip(routed_marks.as_ref())
+            .map(|(routed, marks)| routed.cached_tokens(marks));
+        if let (Some(routed), Some(routed_cached_tokens)) = (&routed_prefixes, routed_cached_tokens) {
+            tracing::debug!(
+                routed_cached_tokens,
+                header_hint,
+                held_hashes = routed.held_hashes(),
+                ?phase,
+                "routed-prefix estimate for request"
+            );
+        }
+        let cached_tokens_hint = match (header_hint, routed_cached_tokens.filter(|tokens| *tokens > 0)) {
+            (Some(header), Some(routed)) => Some(header.max(routed)),
+            (header, routed) => header.or(routed),
+        };
         let session_context = request
             .agent_context
             .as_ref()
@@ -54,7 +79,7 @@ where
             )
             .instrument(tracing::info_span!("kv_router.select_worker"));
 
-        await_with_cleanup_policy(
+        let outcome = await_with_cleanup_policy(
             request_context.as_ref(),
             phase,
             staged_kv,
@@ -62,7 +87,16 @@ where
             budget,
             selection_future,
         )
-        .await?
+        .await?;
+        // A prompt actually routed for prefill will be in the store: remember
+        // it, and tell the peers. A query-only preview routes nothing.
+        if !is_query_only
+            && matches!(outcome, Ok(SelectionOutcome::Routed(_)))
+            && let (Some(routed), Some(marks)) = (routed_prefixes, routed_marks)
+        {
+            routed.record(marks);
+        }
+        outcome
     }
 
     async fn select_request(

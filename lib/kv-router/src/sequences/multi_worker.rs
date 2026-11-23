@@ -412,9 +412,6 @@ pub struct ActiveSequencesMultiWorker<P: SequencePublisher> {
     worker_type: &'static str,
     /// When each peer router last published a lifecycle event or refresh.
     pub(super) peer_last_seen: Mutex<FxHashMap<u64, Instant>>,
-    /// Prefixes this replica set routed to the pool recently; see
-    /// [`super::routed_prefixes`]. `None` unless enabled by environment.
-    pub(super) routed_prefixes: Option<super::routed_prefixes::RoutedPrefixes>,
 }
 
 impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
@@ -560,42 +557,6 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
             replica_request_lease_observer: OnceLock::new(),
             worker_type,
             peer_last_seen: Mutex::new(FxHashMap::default()),
-            routed_prefixes: super::routed_prefixes::RoutedPrefixes::from_env(Instant::now()),
-        }
-    }
-
-    /// Note a prefill booking's prompt as routed to the pool. Only bookings
-    /// that track prefill tokens count: those are the ones a worker computes
-    /// (and the shared store then holds); a decode booking's hashes are not
-    /// prompt-prefix hashes.
-    pub(super) fn record_routed_prefix(
-        &self,
-        token_sequence: Option<&[SequenceHash]>,
-        track_prefill_tokens: bool,
-        now: Instant,
-    ) {
-        if !track_prefill_tokens {
-            return;
-        }
-        if let (Some(routed), Some(sequence)) = (&self.routed_prefixes, token_sequence) {
-            routed.record(sequence, now);
-        }
-    }
-
-    /// Hashes currently held by the routed-prefix set (0 when it is off); its
-    /// memory is proportional to this.
-    pub fn routed_prefix_hashes(&self) -> usize {
-        self.routed_prefixes
-            .as_ref()
-            .map_or(0, super::routed_prefixes::RoutedPrefixes::len)
-    }
-
-    /// Leading blocks of this prompt that some replica routed to some worker
-    /// recently; 0 when the tracking is off or the prompt has no hashes.
-    pub fn routed_prefix_blocks(&self, token_sequence: Option<&[SequenceHash]>, now: Instant) -> usize {
-        match (&self.routed_prefixes, token_sequence) {
-            (Some(routed), Some(sequence)) => routed.matched_blocks(sequence, now),
-            _ => 0,
         }
     }
 
@@ -955,11 +916,6 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
             router_id: self.router_id,
             lora_name: req.lora_name.clone(),
         });
-        self.record_routed_prefix(
-            req.token_sequence.as_deref(),
-            req.track_prefill_tokens,
-            decay_now,
-        );
         let attempt_id = self.add_request_local(req, decay_now, lazily_register_worker)?;
         if let Some(event) = event {
             self.enqueue_publish_event(event);

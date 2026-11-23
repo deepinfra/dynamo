@@ -60,20 +60,18 @@ fn shared_prefix_credit() -> f64 {
 }
 
 /// Cache overlap sampled once for a request: the best any eligible worker has,
-/// or what a shared store should hold when that is longer (the caller's hint,
-/// or the prefix the replica set routed recently).
+/// or what a shared store should hold when that is longer (the request's
+/// cached-tokens hint).
 fn queue_snapshot<C: WorkerConfigLike>(
     request: &SchedulingRequest,
     workers: &HashMap<WorkerId, C>,
-    routed_cached_tokens: usize,
 ) -> QueueSnapshot {
     let context = SchedulingContext::new(request, workers);
     QueueSnapshot::new(
         request.isl_tokens,
         context
             .best_cached_tokens()
-            .max(request.cached_tokens_hint())
-            .max(routed_cached_tokens),
+            .max(request.cached_tokens_hint()),
     )
 }
 
@@ -1176,8 +1174,7 @@ impl<
             (class_index, None)
         } else {
             let workers = self.workers_with_configs.borrow();
-            let snapshot =
-                Self::snapshot_for_with(&request, &workers, self.routed_cached_tokens(&request));
+            let snapshot = Self::snapshot_for_with(&request, &workers);
             let class_index = self
                 .profile
                 .resolve_class_index(request.policy_class.as_deref(), snapshot.uncached_tokens);
@@ -1246,26 +1243,16 @@ impl<
 
     fn snapshot_for(&self, request: &SchedulingRequest) -> QueueSnapshot {
         let workers = self.workers_with_configs.borrow();
-        Self::snapshot_for_with(request, &workers, self.routed_cached_tokens(request))
+        Self::snapshot_for_with(request, &workers)
     }
 
     fn snapshot_for_with(
         request: &SchedulingRequest,
         workers: &HashMap<WorkerId, C>,
-        routed_cached_tokens: usize,
     ) -> QueueSnapshot {
         // Cache overlap is sampled once and reused for classification, queue
         // limits, ordering, DRR cost, and counters.
-        queue_snapshot(request, workers, routed_cached_tokens)
-    }
-
-    /// Prompt tokens the replica set routed to the pool recently, so a shared
-    /// store should hold them; 0 unless routed-prefix tracking is on.
-    fn routed_cached_tokens(&self, request: &SchedulingRequest) -> usize {
-        self.slots
-            .routed_prefix_blocks(request.token_seq.as_deref(), Instant::now())
-            .saturating_mul(self.block_size as usize)
-            .min(request.isl_tokens)
+        queue_snapshot(request, workers)
     }
 
     /// Cached tokens the booked prefill load is reduced by: the selected
@@ -1274,9 +1261,7 @@ impl<
     /// `DYN_ROUTER_SHARED_PREFIX_CREDIT`, by that share of the best overlap
     /// any eligible worker has. Selection itself still uses per-worker overlap.
     fn booked_cached_tokens(&self, request: &SchedulingRequest, selected_cached: usize) -> usize {
-        let mut cached = selected_cached
-            .max(request.cached_tokens_hint())
-            .max(self.routed_cached_tokens(request));
+        let mut cached = selected_cached.max(request.cached_tokens_hint());
         let credit = shared_prefix_credit();
         if credit > 0.0 {
             let workers = self.workers_with_configs.borrow();
@@ -1650,14 +1635,11 @@ impl<
 
         let booked_cached_tokens =
             self.booked_cached_tokens(&request, selected.selection.cached_tokens);
-        let routed_cached_tokens = self.routed_cached_tokens(&request);
-        if booked_cached_tokens > selected.selection.cached_tokens || routed_cached_tokens > 0 {
+        if booked_cached_tokens > selected.selection.cached_tokens {
             tracing::debug!(
                 isl_tokens = request.isl_tokens,
                 selected_cached_tokens = selected.selection.cached_tokens,
                 cached_tokens_hint = request.cached_tokens_hint(),
-                routed_cached_tokens,
-                routed_prefix_hashes = self.slots.routed_prefix_hashes(),
                 booked_cached_tokens,
                 "booking prefill load with shared-store cached tokens"
             );
@@ -3721,12 +3703,11 @@ policy_classes:
     fn queue_snapshot_counts_hinted_tokens_as_cached() {
         let workers = HashMap::from([(0, SimpleWorkerConfig::default())]);
         let (req, _rx) = make_request("snapshot", 256);
-        let unhinted = queue_snapshot(&req, &workers, 0);
+        let unhinted = queue_snapshot(&req, &workers);
         assert_eq!(unhinted.uncached_tokens, 256);
 
         let req = with_cached_tokens_hint(req, 200);
-        let hinted = queue_snapshot(&req, &workers, 0);
-        assert_eq!(queue_snapshot(&req, &workers, 230).uncached_tokens, 26);
+        let hinted = queue_snapshot(&req, &workers);
         assert_eq!(hinted.cached_tokens, 200);
         assert_eq!(hinted.uncached_tokens, 56);
     }

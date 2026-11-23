@@ -1,21 +1,17 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Prompt prefixes this router replica set routed to the worker pool recently.
+//! Prompt prefixes a router replica set routed to its worker pool recently.
 //!
 //! When the pool's workers load each other's prefixes from a shared KV store,
 //! a prefix any of them computed is cheap on all of them for as long as the
 //! store keeps it. The per-worker overlap index cannot see that: it mirrors
 //! each worker's own cache. This set answers the pool-wide question instead:
-//! "how much of this prompt did some replica route to some worker within the
-//! last `ttl`?". The scheduler uses the answer for the prefill load it books
-//! and for the queue's uncached-token accounting, never for worker selection.
+//! "how much of this prompt was routed to some worker within the last `ttl`?".
 //!
-//! It is fed by every prefill booking: local ones as they are admitted and
-//! peers' as their `AddRequest` replica events arrive, which already carry the
-//! request's sequence hashes. A sequence hash identifies the whole prefix up
-//! to its block, so one hash per `stride` blocks is enough to find how deep a
-//! new prompt's prefix reaches.
+//! A caller describes a prompt by its sequence of prefix hashes ("marks"):
+//! element `i` identifies everything up to the `i`-th mark. With a stride of
+//! `n`, only every `n`-th mark is stored and matches round down to it.
 
 use std::collections::VecDeque;
 use std::env;
@@ -29,7 +25,6 @@ use tokio::time::{Duration, Instant};
 /// costs nothing per entry. An entry lives between `ttl * (SLICES - 1) / SLICES`
 /// and `ttl`.
 const SLICES: usize = 8;
-const DEFAULT_STRIDE_BLOCKS: usize = 16;
 
 pub struct RoutedPrefixes {
     slice_len: Duration,
@@ -58,16 +53,11 @@ impl RoutedPrefixes {
         }
     }
 
-    /// Enabled by `DYN_ROUTER_ROUTED_PREFIX_TTL_SECS` (> 0). The stride is
-    /// `DYN_ROUTER_ROUTED_PREFIX_STRIDE_BLOCKS` (default 16).
-    pub fn from_env(now: Instant) -> Option<Self> {
-        let ttl_secs = parse_ttl_secs(env::var("DYN_ROUTER_ROUTED_PREFIX_TTL_SECS").ok().as_deref())?;
-        let stride = env::var("DYN_ROUTER_ROUTED_PREFIX_STRIDE_BLOCKS")
-            .ok()
-            .and_then(|raw| raw.trim().parse::<usize>().ok())
-            .filter(|stride| *stride > 0)
-            .unwrap_or(DEFAULT_STRIDE_BLOCKS);
-        Some(Self::new(Duration::from_secs_f64(ttl_secs), stride, now))
+    /// The window configured by `DYN_ROUTER_ROUTED_PREFIX_TTL_SECS`; `None`
+    /// (tracking off) when unset or 0.
+    pub fn ttl_from_env() -> Option<Duration> {
+        parse_ttl_secs(env::var("DYN_ROUTER_ROUTED_PREFIX_TTL_SECS").ok().as_deref())
+            .map(Duration::from_secs_f64)
     }
 
     fn rotate(&self, state: &mut State, now: Instant) {
