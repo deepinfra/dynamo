@@ -567,6 +567,7 @@ struct RouterConfigOverrideSerde {
     assume_kv_reuse: Option<bool>,
     track_prefill_tokens: Option<bool>,
     shared_cache_multiplier: Option<f64>,
+    cached_tokens_hint: Option<usize>,
 }
 
 /// Override configuration for router settings that can be specified per-request
@@ -596,6 +597,14 @@ pub struct RouterConfigOverride {
     /// Per-request override of `shared_cache_multiplier`.
     #[builder(default)]
     pub shared_cache_multiplier: Option<f64>,
+
+    /// Caller's estimate of how many leading prompt tokens are already cached
+    /// somewhere every worker can load them from (a KV store shared by the
+    /// pool), whichever worker is chosen. It lowers the prefill load booked for
+    /// the request and the uncached size the queue classifies it by; it does not
+    /// change which worker is selected.
+    #[builder(default)]
+    pub cached_tokens_hint: Option<usize>,
 }
 
 impl RouterConfigOverride {
@@ -638,6 +647,7 @@ impl TryFrom<RouterConfigOverrideSerde> for RouterConfigOverride {
             assume_kv_reuse: compat.assume_kv_reuse,
             track_prefill_tokens: compat.track_prefill_tokens,
             shared_cache_multiplier: compat.shared_cache_multiplier,
+            cached_tokens_hint: compat.cached_tokens_hint,
         };
         config.validate()?;
         Ok(config)
@@ -2485,6 +2495,16 @@ models:
     }
 
     #[test]
+    fn test_router_config_override_reads_cached_tokens_hint() {
+        let config: RouterConfigOverride =
+            serde_json::from_str(r#"{"cached_tokens_hint":131072}"#).unwrap();
+        assert_eq!(config.cached_tokens_hint, Some(131072));
+
+        let config: RouterConfigOverride = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.cached_tokens_hint, None);
+    }
+
+    #[test]
     fn test_router_config_override_maps_deprecated_overlap_weight_zero_to_credit_zero() {
         let config: RouterConfigOverride =
             serde_json::from_str(r#"{"overlap_score_weight":0.0}"#).unwrap();
@@ -2553,6 +2573,7 @@ models:
             assume_kv_reuse: None,
             track_prefill_tokens: None,
             shared_cache_multiplier: Some(-0.1),
+            cached_tokens_hint: None,
         };
         let too_large = RouterConfigOverride {
             overlap_score_credit: None,
@@ -2561,6 +2582,7 @@ models:
             assume_kv_reuse: None,
             track_prefill_tokens: None,
             shared_cache_multiplier: Some(1.1),
+            cached_tokens_hint: None,
         };
 
         assert!(too_small.validate().is_err());
@@ -2576,6 +2598,7 @@ models:
             assume_kv_reuse: None,
             track_prefill_tokens: None,
             shared_cache_multiplier: None,
+            cached_tokens_hint: None,
         };
 
         assert!(amplified.validate().is_ok());
@@ -2587,6 +2610,7 @@ models:
                 assume_kv_reuse: None,
                 track_prefill_tokens: None,
                 shared_cache_multiplier: None,
+                cached_tokens_hint: None,
             };
             assert!(invalid.validate().is_err());
         }

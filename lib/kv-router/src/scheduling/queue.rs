@@ -43,6 +43,51 @@ pub const DEFAULT_MAX_BATCHED_TOKENS: u64 = 10_000_000;
 
 const ADMISSION_CHANNEL_CAPACITY: usize = 65_536;
 
+/// Share (0..=1) of the best overlap any eligible worker has that the booked
+/// prefill load also credits to the selected worker, for pools whose workers
+/// load each other's prefixes from a shared store. Read once from
+/// `DYN_ROUTER_SHARED_PREFIX_CREDIT`; 0 (the default) keeps booking on the
+/// selected worker's own overlap.
+fn shared_prefix_credit() -> f64 {
+    static CREDIT: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *CREDIT.get_or_init(|| {
+        parse_shared_prefix_credit(
+            std::env::var("DYN_ROUTER_SHARED_PREFIX_CREDIT")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// Cache overlap sampled once for a request: the best any eligible worker has,
+/// or the caller's shared-store hint when that is longer.
+fn queue_snapshot<C: WorkerConfigLike>(
+    request: &SchedulingRequest,
+    workers: &HashMap<WorkerId, C>,
+) -> QueueSnapshot {
+    let context = SchedulingContext::new(request, workers);
+    QueueSnapshot::new(
+        request.isl_tokens,
+        context
+            .best_cached_tokens()
+            .max(request.cached_tokens_hint()),
+    )
+}
+
+fn parse_shared_prefix_credit(raw: Option<&str>) -> f64 {
+    let Some(raw) = raw else { return 0.0 };
+    match raw.trim().parse::<f64>() {
+        Ok(value) if value.is_finite() && (0.0..=1.0).contains(&value) => value,
+        _ => {
+            tracing::warn!(
+                value = raw,
+                "ignoring DYN_ROUTER_SHARED_PREFIX_CREDIT: expected a number in 0..=1"
+            );
+            0.0
+        }
+    }
+}
+
 struct ClassQueueCounters {
     pending_count: AtomicUsize,
     pending_isl_tokens: AtomicUsize,
@@ -1150,8 +1195,23 @@ impl<
     ) -> QueueSnapshot {
         // Cache overlap is sampled once and reused for classification, queue
         // limits, ordering, DRR cost, and counters.
-        let context = SchedulingContext::new(request, workers);
-        QueueSnapshot::new(request.isl_tokens, context.best_cached_tokens())
+        queue_snapshot(request, workers)
+    }
+
+    /// Cached tokens the booked prefill load is reduced by: the selected
+    /// worker's own overlap, or more when a shared store holds a longer prefix.
+    /// The store is described by the request's hint and, with
+    /// `DYN_ROUTER_SHARED_PREFIX_CREDIT`, by that share of the best overlap
+    /// any eligible worker has. Selection itself still uses per-worker overlap.
+    fn booked_cached_tokens(&self, request: &SchedulingRequest, selected_cached: usize) -> usize {
+        let mut cached = selected_cached.max(request.cached_tokens_hint());
+        let credit = shared_prefix_credit();
+        if credit > 0.0 {
+            let workers = self.workers_with_configs.borrow();
+            let best = SchedulingContext::new(request, &workers).best_cached_tokens();
+            cached = cached.max((best as f64 * credit) as usize);
+        }
+        cached.min(request.isl_tokens)
     }
 
     fn drain_cleanup(&mut self) -> bool {
@@ -1516,9 +1576,20 @@ impl<
             .expect("tracked mode always has a request ID")
             .to_string();
 
+        let booked_cached_tokens =
+            self.booked_cached_tokens(&request, selected.selection.cached_tokens);
+        if booked_cached_tokens > selected.selection.cached_tokens {
+            tracing::debug!(
+                isl_tokens = request.isl_tokens,
+                selected_cached_tokens = selected.selection.cached_tokens,
+                cached_tokens_hint = request.cached_tokens_hint(),
+                booked_cached_tokens,
+                "booking prefill load with shared-store cached tokens"
+            );
+        }
         let prefill_load_hint = self.prefill_load_hint_for(
             request.isl_tokens,
-            selected.selection.cached_tokens,
+            booked_cached_tokens,
             request.track_prefill_tokens,
         );
 
@@ -3512,6 +3583,87 @@ policy_classes:
         let second_resp = second_resp.expect("scheduling returned error");
         assert_eq!(second_resp.best_worker, WorkerWithDpRank::new(1, 0));
         assert_eq!(queue.pending_count(), 0);
+    }
+
+    fn booked_prefill_tokens(
+        slots: &ActiveSequencesMultiWorker<NoopSequencePublisher>,
+        worker: WorkerWithDpRank,
+    ) -> Option<usize> {
+        slots.active_tokens(decay_now()).get(&worker).copied()
+    }
+
+    fn with_cached_tokens_hint(mut request: SchedulingRequest, hint: usize) -> SchedulingRequest {
+        request.router_config_override = Some(crate::config::RouterConfigOverride {
+            cached_tokens_hint: Some(hint),
+            ..Default::default()
+        });
+        request
+    }
+
+    #[tokio::test]
+    async fn cached_tokens_hint_lowers_booked_prefill_tokens() {
+        let (queue, slots) = make_queue(1, 16, 256, None);
+        let worker = WorkerWithDpRank::new(0, 0);
+
+        // No overlap on the worker, but the caller says 192 of 256 prompt
+        // tokens sit in a store the worker can load from.
+        let (req, rx) = make_request("hinted", 256);
+        queue.enqueue(with_cached_tokens_hint(req, 192)).await;
+        let response = rx.await.unwrap().unwrap();
+        assert_eq!(booked_prefill_tokens(&slots, worker), Some(64));
+        // The response still reports what the selected worker itself holds.
+        assert_eq!(response.cached_tokens, 0);
+
+        let _ = slots.mark_prefill_completed(&"hinted".to_string(), decay_now());
+        let _ = slots.free(&"hinted".to_string(), decay_now());
+    }
+
+    #[tokio::test]
+    async fn cached_tokens_hint_never_raises_booked_prefill_tokens() {
+        let (queue, slots) = make_queue(1, 16, 256, None);
+        let worker = WorkerWithDpRank::new(0, 0);
+
+        // The worker's own overlap (224) beats a smaller hint (64).
+        let (mut req, rx) = make_request("local-wins", 256);
+        req.overlap.effective_overlap_blocks.insert(worker, 14.0);
+        req.overlap.effective_cached_tokens.insert(worker, 224);
+        queue.enqueue(with_cached_tokens_hint(req, 64)).await;
+        let _ = rx.await.unwrap().unwrap();
+        assert_eq!(booked_prefill_tokens(&slots, worker), Some(32));
+        let _ = slots.mark_prefill_completed(&"local-wins".to_string(), decay_now());
+        let _ = slots.free(&"local-wins".to_string(), decay_now());
+
+        // A hint longer than the prompt is clamped to it: nothing left to book.
+        let (req, rx) = make_request("over-hinted", 256);
+        queue.enqueue(with_cached_tokens_hint(req, 10_000)).await;
+        let _ = rx.await.unwrap().unwrap();
+        assert_eq!(booked_prefill_tokens(&slots, worker), Some(0));
+        let _ = slots.mark_prefill_completed(&"over-hinted".to_string(), decay_now());
+        let _ = slots.free(&"over-hinted".to_string(), decay_now());
+    }
+
+    #[test]
+    fn queue_snapshot_counts_hinted_tokens_as_cached() {
+        let workers = HashMap::from([(0, SimpleWorkerConfig::default())]);
+        let (req, _rx) = make_request("snapshot", 256);
+        let unhinted = queue_snapshot(&req, &workers);
+        assert_eq!(unhinted.uncached_tokens, 256);
+
+        let req = with_cached_tokens_hint(req, 200);
+        let hinted = queue_snapshot(&req, &workers);
+        assert_eq!(hinted.cached_tokens, 200);
+        assert_eq!(hinted.uncached_tokens, 56);
+    }
+
+    #[test]
+    fn shared_prefix_credit_accepts_only_a_fraction() {
+        assert_eq!(parse_shared_prefix_credit(None), 0.0);
+        assert_eq!(parse_shared_prefix_credit(Some("0.9")), 0.9);
+        assert_eq!(parse_shared_prefix_credit(Some(" 1 ")), 1.0);
+        assert_eq!(parse_shared_prefix_credit(Some("1.5")), 0.0);
+        assert_eq!(parse_shared_prefix_credit(Some("-0.1")), 0.0);
+        assert_eq!(parse_shared_prefix_credit(Some("nan")), 0.0);
+        assert_eq!(parse_shared_prefix_credit(Some("yes")), 0.0);
     }
 
     #[tokio::test(flavor = "multi_thread")]

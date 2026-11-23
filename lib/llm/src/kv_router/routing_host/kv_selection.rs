@@ -71,11 +71,28 @@ impl<'a> RoutingRequestParts<'a> {
     }
 }
 
+/// Request metadata key (`x-dynamo-meta-cached-tokens-hint` on the HTTP
+/// request) carrying the caller's estimate of prompt tokens a store shared by
+/// the worker pool already holds.
+pub(super) const CACHED_TOKENS_HINT_METADATA_KEY: &str = "cached-tokens-hint";
+
+/// A malformed value is ignored rather than failing the request: the hint
+/// only tunes load accounting.
+pub(super) fn cached_tokens_hint_from_metadata(
+    metadata: &std::collections::BTreeMap<String, String>,
+) -> Option<usize> {
+    metadata
+        .get(CACHED_TOKENS_HINT_METADATA_KEY)
+        .and_then(|value| value.trim().parse::<usize>().ok())
+}
+
 pub(super) struct SelectionOptions {
     pub(super) pinned_target: Option<AffinityTarget>,
     pub(super) affinity_target: Option<AffinityTarget>,
     pub(super) planned_worker: Option<WorkerWithDpRank>,
     pub(super) policy_class: Option<String>,
+    /// Prompt tokens the caller expects a store shared by the pool to hold.
+    pub(super) cached_tokens_hint: Option<usize>,
     pub(super) session_context: Option<dynamo_kv_router::SessionContext>,
     pub(super) admission: FindBestMatchAdmission,
 }
@@ -236,9 +253,19 @@ where
             affinity_target,
             planned_worker,
             policy_class,
+            cached_tokens_hint,
             session_context,
             admission,
         } = options;
+        // The hint rides on the per-request router override so the scheduler
+        // sees it without another parameter on every selection entry point.
+        let hinted_override = cached_tokens_hint.map(|cached_tokens_hint| RouterConfigOverride {
+            cached_tokens_hint: Some(cached_tokens_hint),
+            ..request.router_config_override.clone().unwrap_or_default()
+        });
+        let router_config_override = hinted_override
+            .as_ref()
+            .or(request.router_config_override.as_ref());
         let worker_only_affinity = pinned_target.filter(|target| target.dp_rank.is_none());
         if let Some(target) = worker_only_affinity {
             match &mut allowed_worker_ids {
@@ -298,7 +325,7 @@ where
                 .select_best_match(BestMatchArgs {
                     context_id,
                     routing_parts,
-                    router_config_override: request.router_config_override.as_ref(),
+                    router_config_override,
                     update_states: !is_query_only,
                     return_routing_hashes,
                     lora_name,
@@ -366,7 +393,7 @@ where
         self.select_best_match(BestMatchArgs {
             context_id,
             routing_parts,
-            router_config_override: request.router_config_override.as_ref(),
+            router_config_override,
             update_states: !is_query_only,
             return_routing_hashes,
             lora_name,
@@ -446,11 +473,30 @@ mod tests {
         scheduling::{RoutingEligibility, WorkerEligibilityError},
     };
 
-    use super::{merge_affinity_pin, pinned_worker_hint, resolve_pinned_worker_rank};
+    use super::{
+        CACHED_TOKENS_HINT_METADATA_KEY, cached_tokens_hint_from_metadata, merge_affinity_pin,
+        pinned_worker_hint, resolve_pinned_worker_rank,
+    };
     use crate::{
         local_model::runtime_config::ModelRuntimeConfig,
         protocols::common::{preprocessor::RoutingHints, timing::RequestPhase},
     };
+
+    #[test]
+    fn cached_tokens_hint_is_read_from_metadata_and_bad_values_are_ignored() {
+        let metadata = |value: &str| {
+            std::collections::BTreeMap::from([(
+                CACHED_TOKENS_HINT_METADATA_KEY.to_string(),
+                value.to_string(),
+            )])
+        };
+        assert_eq!(cached_tokens_hint_from_metadata(&Default::default()), None);
+        assert_eq!(cached_tokens_hint_from_metadata(&metadata("131072")), Some(131072));
+        assert_eq!(cached_tokens_hint_from_metadata(&metadata(" 42 ")), Some(42));
+        assert_eq!(cached_tokens_hint_from_metadata(&metadata("-5")), None);
+        assert_eq!(cached_tokens_hint_from_metadata(&metadata("0.9")), None);
+        assert_eq!(cached_tokens_hint_from_metadata(&metadata("lots")), None);
+    }
 
     #[test]
     fn resolve_pinned_worker_rank_uses_explicit_rank_including_zero() {

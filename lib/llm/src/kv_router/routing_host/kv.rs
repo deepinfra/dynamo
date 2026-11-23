@@ -22,6 +22,7 @@ where
         let context_id = request.context().id().to_string();
         let staged_kv = StagedKv::for_request(request.content());
         let policy_class = request.metadata().get("policy-class").cloned();
+        let cached_tokens_hint = kv_selection::cached_tokens_hint_from_metadata(request.metadata());
         let session_context = request
             .agent_context
             .as_ref()
@@ -46,6 +47,7 @@ where
                     },
                     planned_worker,
                     policy_class,
+                    cached_tokens_hint,
                     session_context,
                     admission,
                 },

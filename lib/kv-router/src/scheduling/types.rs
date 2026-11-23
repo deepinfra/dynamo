@@ -503,6 +503,16 @@ impl SchedulingRequest {
         )
     }
 
+    /// Prompt tokens the caller says any worker can load from a shared store,
+    /// clamped to the prompt length. Zero without a hint.
+    pub(crate) fn cached_tokens_hint(&self) -> usize {
+        self.router_config_override
+            .as_ref()
+            .and_then(|config| config.cached_tokens_hint)
+            .unwrap_or(0)
+            .min(self.isl_tokens)
+    }
+
     pub(crate) fn effective_cached_tokens_for(&self, worker: WorkerWithDpRank) -> usize {
         self.overlap
             .effective_cached_tokens
