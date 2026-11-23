@@ -22,6 +22,7 @@ use super::metrics::{
     DECODE_ADMISSION_REJECTIONS, ROUTER_QUEUE_METRICS, RouterQueueMetricHandles,
     RouterRequestMetrics,
 };
+use super::queue_usage_sync::{queue_usage_sync_enabled, start_queue_usage_sync};
 use super::sequence::{
     DeferredReplicaRequestLeaseObserver, RuntimeSequencePublisher, SequenceError, SequenceRequest,
     create_multi_worker_sequences_with_observer,
@@ -157,6 +158,7 @@ where
             workers_with_configs.borrow().clone();
 
         let router_id = endpoint.drt().discovery().instance_id();
+        let queue_usage_endpoint = endpoint.clone();
         let replica_request_lease_observer = use_shared_request_leases
             .then(|| Arc::new(DeferredReplicaRequestLeaseObserver::default()));
         let observer = replica_request_lease_observer
@@ -194,6 +196,11 @@ where
             .iter()
             .enumerate()
             .map(|(index, class)| (class.name.clone(), index))
+            .collect();
+        let profile_class_names: Vec<String> = profile
+            .classes()
+            .iter()
+            .map(|class| class.name.clone())
             .collect();
 
         let inner = Arc::new(LocalScheduler::new_with_policy_profile(
@@ -237,6 +244,21 @@ where
                     "non-max-overlap observer is already installed".to_string(),
                 ));
             }
+        }
+
+        if kv_router_config.router_replica_sync && queue_usage_sync_enabled() {
+            let stats_scheduler = Arc::clone(&inner);
+            start_queue_usage_sync(
+                &queue_usage_endpoint,
+                router_id,
+                worker_type,
+                profile_class_names,
+                Arc::new(move |class_index| stats_scheduler.class_queue_stats(class_index)),
+                Arc::clone(inner.peer_queue_usage()),
+                cancellation_token.child_token(),
+            )
+            .await
+            .map_err(|error| KvSchedulerError::InitFailed(error.to_string()))?;
         }
 
         let metrics_scheduler = Arc::clone(&inner);

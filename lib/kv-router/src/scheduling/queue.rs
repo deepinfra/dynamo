@@ -19,7 +19,7 @@ use super::overlap_refresh::{
     NoopOverlapScoresRefresh, OverlapScoresRefresh, read_overlap_refresh_after, refresh_overlap,
 };
 use super::policy_config::{PolicyClassConfig, PolicyProfile};
-use super::policy_queue::{PolicyQueue, QueueSnapshot};
+use super::policy_queue::{PolicyQueue, PolicyQueueStats, QueueSnapshot};
 use super::prefill_load::{PrefillLoadEstimator, effective_prefill_tokens};
 use super::queue_admission::WorkerPlacement;
 use super::selector::{DefaultWorkerSelector, WorkerSelectionInput, WorkerSelector};
@@ -99,6 +99,50 @@ pub struct ClassQueueStats {
     pub pending_count: usize,
     pub pending_isl_tokens: usize,
     pub pending_cached_tokens: usize,
+}
+
+/// How long a peer's report stays in the totals. A peer that stops reporting
+/// (gone, partitioned, or sync turned off) drops out instead of holding the
+/// limits down forever.
+pub const PEER_QUEUE_USAGE_MAX_AGE: Duration = Duration::from_secs(2);
+
+/// What other router replicas hold queued, per policy class, against the same
+/// workers. Replicas report periodically; the queue adds the fresh reports to
+/// its own usage when it checks a class's queue limits, so a limit bounds the
+/// queue of the whole replica set rather than of each replica.
+#[derive(Default)]
+pub struct PeerQueueUsage {
+    peers: Mutex<HashMap<u64, (Instant, Vec<PolicyQueueStats>)>>,
+}
+
+impl PeerQueueUsage {
+    /// Replace `router_id`'s report; `classes` is indexed like the local profile.
+    pub fn report(&self, router_id: u64, classes: Vec<PolicyQueueStats>, now: Instant) {
+        self.peers.lock().insert(router_id, (now, classes));
+    }
+
+    /// Sum of the fresh reports for one class. Stale reports are dropped.
+    pub fn total(&self, class_index: usize, now: Instant) -> PolicyQueueStats {
+        let mut peers = self.peers.lock();
+        peers.retain(|_, (reported_at, _)| {
+            now.saturating_duration_since(*reported_at) <= PEER_QUEUE_USAGE_MAX_AGE
+        });
+        let mut total = PolicyQueueStats::default();
+        for (_, classes) in peers.values() {
+            let Some(stats) = classes.get(class_index) else {
+                continue;
+            };
+            total.requests = total.requests.saturating_add(stats.requests);
+            total.raw_isl_tokens = total.raw_isl_tokens.saturating_add(stats.raw_isl_tokens);
+            total.cached_tokens = total.cached_tokens.saturating_add(stats.cached_tokens);
+            total.uncached_tokens = total.uncached_tokens.saturating_add(stats.uncached_tokens);
+        }
+        total
+    }
+
+    pub fn peer_count(&self) -> usize {
+        self.peers.lock().len()
+    }
 }
 
 struct QueuedRequest {
@@ -461,6 +505,7 @@ struct SchedulerQueueActor<
     pending_count: Arc<AtomicUsize>,
     pending_isl_tokens: Arc<AtomicUsize>,
     class_counters: Arc<Vec<ClassQueueCounters>>,
+    peer_queue_usage: Arc<PeerQueueUsage>,
     slots: Arc<ActiveSequencesMultiWorker<P>>,
     workers_with_configs: watch::Receiver<HashMap<WorkerId, C>>,
     start_time: Instant,
@@ -493,6 +538,7 @@ pub struct SchedulerQueue<
     /// Incremented after push, decremented after pop. Lock-free reads via `Relaxed` load.
     pending_isl_tokens: Arc<AtomicUsize>,
     class_counters: Arc<Vec<ClassQueueCounters>>,
+    peer_queue_usage: Arc<PeerQueueUsage>,
     slots: Arc<ActiveSequencesMultiWorker<P>>,
     workers_with_configs: watch::Receiver<HashMap<WorkerId, C>>,
     queueing_enabled: bool,
@@ -618,6 +664,7 @@ impl<
                 })
                 .collect(),
         );
+        let peer_queue_usage = Arc::new(PeerQueueUsage::default());
         let (admission_tx, admission_rx) = mpsc::channel(admission_channel_capacity);
         let cleanup = Arc::new(AdmissionCleanup::default());
         let non_max_overlap_selection_observer = Arc::new(OnceLock::new());
@@ -628,6 +675,7 @@ impl<
             pending_count: Arc::clone(&pending_count),
             pending_isl_tokens: Arc::clone(&pending_isl_tokens),
             class_counters: Arc::clone(&class_counters),
+            peer_queue_usage: Arc::clone(&peer_queue_usage),
             slots: Arc::clone(&slots),
             workers_with_configs: workers_with_configs.clone(),
             start_time: Instant::now(),
@@ -647,6 +695,7 @@ impl<
             pending_count,
             pending_isl_tokens,
             class_counters,
+            peer_queue_usage,
             slots,
             workers_with_configs,
             queueing_enabled,
@@ -976,6 +1025,11 @@ impl<
         })
     }
 
+    /// Where peer replicas' queue usage is reported; see [`PeerQueueUsage`].
+    pub fn peer_queue_usage(&self) -> &Arc<PeerQueueUsage> {
+        &self.peer_queue_usage
+    }
+
     pub fn supports_overlap_refresh(&self) -> bool {
         self.supports_overlap_refresh
     }
@@ -1149,7 +1203,8 @@ impl<
             block_hashes,
         };
         let worker_count = self.workers_with_configs.borrow().len();
-        if let Err((rejection, queued)) = self.pending.enqueue(
+        let peer_usage = self.peer_queue_usage.total(class_index, decay_now);
+        if let Err((rejection, queued)) = self.pending.enqueue_with_peer_usage(
             class_index,
             worker_count,
             snapshot,
@@ -1157,6 +1212,7 @@ impl<
             priority_jump,
             strict_priority,
             placement,
+            peer_usage,
             queued,
         ) {
             let mut request = queued.request;

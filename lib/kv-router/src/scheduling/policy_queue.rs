@@ -533,8 +533,37 @@ impl<T> PolicyQueue<T> {
         placement: WorkerPlacement,
         payload: T,
     ) -> Result<(), (QueueRejection, T)> {
+        self.enqueue_with_peer_usage(
+            class_index,
+            worker_count,
+            snapshot,
+            arrival_offset_secs,
+            priority_jump,
+            strict_priority,
+            placement,
+            PolicyQueueStats::default(),
+            payload,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    /// [`Self::enqueue`] with the limits also counting `peer_usage`: what other
+    /// router replicas hold queued for this class against the same workers.
+    /// A rejection reports the combined usage as `current`.
+    pub fn enqueue_with_peer_usage(
+        &mut self,
+        class_index: usize,
+        worker_count: usize,
+        snapshot: QueueSnapshot,
+        arrival_offset_secs: f64,
+        priority_jump: f64,
+        strict_priority: u32,
+        placement: WorkerPlacement,
+        peer_usage: PolicyQueueStats,
+        payload: T,
+    ) -> Result<(), (QueueRejection, T)> {
         let class = &mut self.classes[class_index];
-        if let Some(rejection) = queue_rejection(class, worker_count) {
+        if let Some(rejection) = queue_rejection(class, worker_count, peer_usage) {
             return Err((rejection, payload));
         }
 
@@ -786,28 +815,41 @@ fn queue_policy_score(
     }
 }
 
-fn queue_rejection<T>(class: &PolicyClassQueue<T>, worker_count: usize) -> Option<QueueRejection> {
+fn queue_rejection<T>(
+    class: &PolicyClassQueue<T>,
+    worker_count: usize,
+    peer_usage: PolicyQueueStats,
+) -> Option<QueueRejection> {
     // Limits scale from the current discovered endpoint count and intentionally
     // compare only existing usage; the request that crosses a cap is accepted.
     for (limit_kind, current, limit_per_worker) in [
         (
             QueueLimitKind::Requests,
-            class.stats.requests,
+            class.stats.requests.saturating_add(peer_usage.requests),
             class.config.request_queue_limit_per_worker,
         ),
         (
             QueueLimitKind::RawIslTokens,
-            class.stats.raw_isl_tokens,
+            class
+                .stats
+                .raw_isl_tokens
+                .saturating_add(peer_usage.raw_isl_tokens),
             class.config.raw_isl_token_queue_limit_per_worker,
         ),
         (
             QueueLimitKind::CachedTokens,
-            class.stats.cached_tokens,
+            class
+                .stats
+                .cached_tokens
+                .saturating_add(peer_usage.cached_tokens),
             class.config.cached_token_queue_limit_per_worker,
         ),
         (
             QueueLimitKind::UncachedTokens,
-            class.stats.uncached_tokens,
+            class
+                .stats
+                .uncached_tokens
+                .saturating_add(peer_usage.uncached_tokens),
             class.config.uncached_token_queue_limit_per_worker,
         ),
     ] {
@@ -1261,6 +1303,62 @@ policy_classes:
         assert_eq!(queue.class_stats(0).uncached_tokens, 540);
         while queue.pop_next(|_, _, _| true).is_some() {}
         assert_eq!(queue.class_stats(0).uncached_tokens, 0);
+    }
+
+    #[test]
+    fn limits_count_what_peer_replicas_hold_queued() {
+        let mut queue = PolicyQueue::new(profile(
+            r#"
+default_policy_family: work
+uncached_isl_buckets:
+  - min_tokens: 0
+    bucket: all
+policy_classes:
+  - name: work
+    policy_family: work
+    cache_bucket: all
+    quantum: 1
+    request_queue_limit_per_worker: 2
+    uncached_token_queue_limit_per_worker: 100
+"#,
+        ));
+        let peers = |requests: usize, uncached_tokens: usize| PolicyQueueStats {
+            requests,
+            raw_isl_tokens: uncached_tokens,
+            cached_tokens: 0,
+            uncached_tokens,
+        };
+        let mut enqueue = |peer_usage: PolicyQueueStats, payload: &'static str| {
+            queue.enqueue_with_peer_usage(
+                0,
+                2,
+                QueueSnapshot::new(10, 0),
+                0.0,
+                0.0,
+                0,
+                WorkerPlacement::Any,
+                peer_usage,
+                payload,
+            )
+        };
+
+        // Empty locally, but peers already hold the whole budget of work
+        // (2 workers x 100 uncached tokens).
+        let (rejection, _) = enqueue(peers(1, 200), "work-full").unwrap_err();
+        assert_eq!(rejection.limit_kind, QueueLimitKind::UncachedTokens);
+        assert_eq!(rejection.current, 200);
+        assert_eq!(rejection.limit, 200);
+
+        // Peers hold 3 of the 4 allowed requests: one more fits here, then no more.
+        enqueue(peers(3, 30), "fits").unwrap();
+        let (rejection, _) = enqueue(peers(3, 30), "count-full").unwrap_err();
+        assert_eq!(rejection.limit_kind, QueueLimitKind::Requests);
+        assert_eq!(rejection.current, 4);
+        assert_eq!(rejection.limit, 4);
+
+        // Peer usage is never added to the local accounting.
+        assert_eq!(queue.class_stats(0).requests, 1);
+        assert_eq!(queue.class_stats(0).uncached_tokens, 10);
     }
 
     #[test]

@@ -31,7 +31,8 @@ pub use policy_config::{
     WorkerSelectionConfig, WorkerSelectionInstance,
 };
 pub use policy_queue::{
-    PolicyQueue, PolicyQueueEntry, QueueLimitKind, QueueRejection, QueueSnapshot,
+    PolicyQueue, PolicyQueueEntry, PolicyQueueStats, QueueLimitKind, QueueRejection,
+    QueueSnapshot,
 };
 pub use prefill_load::{
     InvalidEffectivePrefillTokens, PrefillLoadEstimator, effective_prefill_tokens,

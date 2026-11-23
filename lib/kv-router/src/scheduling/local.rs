@@ -687,6 +687,12 @@ where
         self.queue.class_queue_stats(class_index)
     }
 
+    /// Where peer replicas' queue usage is reported so this scheduler's queue
+    /// limits count it; see [`super::queue::PeerQueueUsage`].
+    pub fn peer_queue_usage(&self) -> &Arc<super::queue::PeerQueueUsage> {
+        self.queue.peer_queue_usage()
+    }
+
     pub fn supports_overlap_refresh(&self) -> bool {
         self.queue.supports_overlap_refresh()
     }

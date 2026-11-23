@@ -57,6 +57,7 @@ pub mod indexer;
 pub mod metrics;
 pub mod prefill_router;
 pub mod publisher;
+pub mod queue_usage_sync;
 mod request_lease;
 mod route_lookup;
 mod routing_host;
