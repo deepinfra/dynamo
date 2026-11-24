@@ -10,6 +10,7 @@ pub mod backend;
 pub mod common;
 mod direct_zmq_fan_in;
 pub mod discovery;
+pub mod early_reject;
 pub mod endpoint_type;
 pub mod engines;
 pub mod entrypoint;

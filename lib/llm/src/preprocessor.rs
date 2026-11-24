@@ -7021,6 +7021,23 @@ impl
         let request_id = context.id().to_string();
         let original_stream_flag = request.inner.stream.unwrap_or(false);
 
+        // A byte-for-byte repeat of a request the router has just rejected as cold gets the same
+        // rejection here, before the prompt is rendered and tokenized again.
+        let early_reject = crate::early_reject::global();
+        let early_reject_fingerprint = if early_reject.enabled() {
+            crate::early_reject::EarlyReject::fingerprint(
+                &request.inner.model,
+                &(&request.inner.messages, &request.inner.tools),
+            )
+        } else {
+            None
+        };
+        if let Some(fingerprint) = early_reject_fingerprint {
+            if let Some(rejection) = early_reject.check(fingerprint) {
+                return Err(anyhow::Error::new(rejection));
+            }
+        }
+
         // Build request payload handle (None if request trace is disabled / not eligible).
         // The handle snapshots the pristine request and its arrival time here;
         // the single payload record is published once at stream completion
@@ -7169,7 +7186,15 @@ impl
         };
 
         // forward the common completion request to the next operator
-        let response_stream = next.generate(common_request).await?;
+        let response_stream = match next.generate(common_request).await {
+            Ok(response_stream) => response_stream,
+            Err(err) => {
+                if let Some(fingerprint) = early_reject_fingerprint {
+                    early_reject.record_error(fingerprint, &err);
+                }
+                return Err(err);
+            }
+        };
         // Extract context once
         let context = response_stream.context();
         let response_stream: Pin<Box<dyn Stream<Item = Annotated<BackendOutput>> + Send>> =
