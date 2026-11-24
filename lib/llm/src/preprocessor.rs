@@ -2680,8 +2680,24 @@ impl OpenAIPreprocessor {
         let template_start = Instant::now();
         let formatted_prompt = {
             let _nvtx = dynamo_nvtx_range!("preprocess.template");
-            self.apply_template(request)
-                .with_context(|| "Failed to apply prompt template")?
+            // Rendering a prompt of a few hundred thousand tokens takes long enough to stall the
+            // async worker it runs on. On the multi-thread runtime, hand this worker's other
+            // tasks to another thread for the duration of the render, so request-plane I/O and
+            // health checks keep running while many long prompts are being rendered.
+            let render = || {
+                self.apply_template(request)
+                    .with_context(|| "Failed to apply prompt template")
+            };
+            let on_multi_thread_runtime = tokio::runtime::Handle::try_current()
+                .map(|handle| {
+                    handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+                })
+                .unwrap_or(false);
+            if on_multi_thread_runtime {
+                tokio::task::block_in_place(render)?
+            } else {
+                render()?
+            }
         };
         TEMPLATE_SECONDS.observe(template_start.elapsed().as_secs_f64());
 
