@@ -246,6 +246,11 @@ impl ActiveSequences {
         outcome
     }
 
+    /// Whether a request still counts toward this worker's prompt (prefill) load.
+    pub(super) fn prefill_pending(&self, request_id: &RequestId) -> bool {
+        self.prefill.prefills.contains_key(request_id)
+    }
+
     /// Mark prefill as completed for a request, removing it from prompt-load tracking.
     pub(super) fn mark_prefill_completed(
         &mut self,

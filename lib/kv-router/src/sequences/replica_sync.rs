@@ -162,6 +162,11 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
     /// A re-announcement is an `AddRequest` without blocks: a peer that already mirrors the
     /// booking refreshes its lease, and one that missed it books it again. Routers without
     /// this refresh ignore it as a duplicate.
+    ///
+    /// The event plane is lossy: a subscriber that falls behind skips messages. The refresh
+    /// is therefore also what repairs a peer that missed a `Free` or a `MarkPrefillCompleted`:
+    /// `track_prefill_tokens` says whether the booking still carries prompt load here, and a
+    /// mirror its owner no longer announces while it announces others is dropped.
     pub fn start_replica_refresh(
         self: &Arc<Self>,
         interval: Duration,
@@ -192,6 +197,7 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
         }
         self.republish_local_bookings();
         self.purge_silent_peers(now, peer_silence);
+        self.purge_unannounced_mirrors(now, peer_silence);
     }
 
     fn republish_local_bookings(&self) {
@@ -199,12 +205,14 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
             if self.request_index.booking_for(&local.request_id) != Some(local.booking) {
                 continue;
             }
+            let track_prefill_tokens =
+                self.prefill_pending(&local.request_id, local.booking.worker);
             self.enqueue_publish_event(ActiveSequenceEvent {
                 request_id: local.request_id,
                 worker: local.booking.worker,
                 data: ActiveSequenceEventData::AddRequest {
                     token_sequence: None,
-                    track_prefill_tokens: false,
+                    track_prefill_tokens,
                     expected_output_tokens: None,
                     prefill_load_hint: None,
                 },
@@ -212,6 +220,51 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
                 lora_name: local.lora_name,
             });
         }
+    }
+
+    /// Drop the mirrored bookings a live peer has stopped announcing: it freed them and the
+    /// `Free` never reached this router. Without this they stay booked, prompt load included,
+    /// until the request lease expires.
+    fn purge_unannounced_mirrors(&self, now: Instant, max_age: Duration) {
+        let refreshing: FxHashMap<u64, Instant> = {
+            let mut last_refresh = self.peer_last_refresh.lock();
+            last_refresh.retain(|_, seen| now.saturating_duration_since(*seen) <= max_age);
+            last_refresh.clone()
+        };
+        if refreshing.is_empty() {
+            return;
+        }
+
+        let mut dropped: FxHashMap<u64, usize> = FxHashMap::default();
+        let mut effects = ReplicaBatchEffects::default();
+        for mirror in self.request_index.unannounced_mirrors(now, max_age) {
+            // A peer that refreshes nothing is either silent (purge_silent_peers) or runs
+            // without the refresh; neither says anything about this one booking.
+            if !refreshing.contains_key(&mirror.origin) {
+                continue;
+            }
+            self.apply_replica_lifecycle(
+                ActiveSequenceEvent {
+                    request_id: mirror.request_id,
+                    worker: mirror.booking.worker,
+                    data: ActiveSequenceEventData::Free,
+                    router_id: mirror.origin,
+                    lora_name: None,
+                },
+                &mut effects,
+            );
+            *dropped.entry(mirror.origin).or_default() += 1;
+        }
+        for (origin, bookings) in dropped {
+            tracing::warn!(
+                router_id = origin,
+                worker_type = self.worker_type(),
+                bookings,
+                unannounced_secs = max_age.as_secs(),
+                "Peer router no longer announces these bookings; dropping the stale mirrors"
+            );
+        }
+        self.flush_replica_batch_effects(&mut effects);
     }
 
     fn purge_silent_peers(&self, now: Instant, peer_silence: Duration) {
@@ -265,14 +318,22 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
     }
 
     /// A refresh from the peer that owns this mirrored booking keeps its lease alive.
-    fn touch_mirrored_booking(&self, request_id: &str, worker: WorkerWithDpRank, origin: u64) {
+    /// Returns whether the event was such a refresh.
+    fn touch_mirrored_booking(
+        &self,
+        request_id: &str,
+        worker: WorkerWithDpRank,
+        origin: u64,
+    ) -> bool {
         let request_id = request_id.to_string();
         let Some(current) = self.request_index.booking_for(&request_id) else {
-            return;
+            return false;
         };
-        if current.worker != worker || self.request_index.origin_for(&request_id) != Some(origin) {
-            return;
+        let now = Instant::now();
+        if current.worker != worker || !self.request_index.touch_origin(&request_id, origin, now) {
+            return false;
         }
+        self.peer_last_refresh.lock().insert(origin, now);
         if let Some(observer) = self.replica_request_lease_observer() {
             observer.progressed(&SchedulerBookingDescriptor {
                 request_id,
@@ -280,6 +341,7 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
                 attempt_id: current.attempt_id,
             });
         }
+        true
     }
 
     fn apply_replica_event(&self, event: ActiveSequenceEvent, effects: &mut ReplicaBatchEffects) {
@@ -322,13 +384,30 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
                 expected_output_tokens,
                 prefill_load_hint,
             } => {
+                // A refresh carries no blocks; its `track_prefill_tokens` is the owner's
+                // current view of whether the booking still has prompt load.
+                let prefill_done_at_owner = token_sequence.is_none() && !track_prefill_tokens;
                 let Ok(attempt_id) = self.request_index.try_insert_request_from(
                     request_id.clone(),
                     event_worker,
                     lora_name,
                     Some(router_id),
                 ) else {
-                    self.touch_mirrored_booking(&request_id, event_worker, router_id);
+                    if self.touch_mirrored_booking(&request_id, event_worker, router_id)
+                        && prefill_done_at_owner
+                    {
+                        // No-op unless the owner's MarkPrefillCompleted was lost.
+                        self.apply_replica_lifecycle(
+                            ActiveSequenceEvent {
+                                request_id,
+                                worker: event_worker,
+                                data: ActiveSequenceEventData::MarkPrefillCompleted,
+                                router_id,
+                                lora_name: None,
+                            },
+                            effects,
+                        );
+                    }
                     return;
                 };
                 let booking = SchedulerBookingDescriptor {

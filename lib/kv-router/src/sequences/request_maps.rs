@@ -6,6 +6,8 @@ use rustc_hash::FxHashSet;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use tokio::time::{Duration, Instant};
+
 use super::single::RequestId;
 use crate::protocols::WorkerWithDpRank;
 use crate::scheduling::AttemptId;
@@ -16,12 +18,27 @@ pub(super) struct RequestBooking {
     pub(super) attempt_id: AttemptId,
 }
 
+/// The peer router that owns a mirrored booking and when it last announced it.
+#[derive(Debug, Clone, Copy)]
+struct MirrorOrigin {
+    router_id: u64,
+    announced_at: Instant,
+}
+
+/// A mirrored booking whose owner has not announced it for a while.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct UnannouncedMirror {
+    pub(super) request_id: RequestId,
+    pub(super) booking: RequestBooking,
+    pub(super) origin: u64,
+}
+
 #[derive(Debug, Default)]
 pub(super) struct RequestIndex {
     request_to_booking: DashMap<RequestId, RequestBooking>,
     request_to_lora: DashMap<RequestId, String>,
     /// Peer router that owns a mirrored booking. Bookings absent here are this router's own.
-    request_to_origin: DashMap<RequestId, u64>,
+    request_to_origin: DashMap<RequestId, MirrorOrigin>,
     next_attempt_id: AtomicU64,
 }
 
@@ -57,7 +74,13 @@ impl RequestIndex {
                 let attempt_id =
                     AttemptId::new(self.next_attempt_id.fetch_add(1, Ordering::Relaxed) + 1);
                 if let Some(origin) = origin {
-                    self.request_to_origin.insert(request_id.clone(), origin);
+                    self.request_to_origin.insert(
+                        request_id.clone(),
+                        MirrorOrigin {
+                            router_id: origin,
+                            announced_at: Instant::now(),
+                        },
+                    );
                 }
                 entry.insert(RequestBooking { worker, attempt_id });
                 if let Some(lora_name) = lora_name {
@@ -93,8 +116,41 @@ impl RequestIndex {
         self.request_to_booking.get(request_id).map(|entry| *entry)
     }
 
-    pub(super) fn origin_for(&self, request_id: &RequestId) -> Option<u64> {
-        self.request_to_origin.get(request_id).map(|entry| *entry)
+    /// Record that `origin` announced its mirrored booking again. False when the booking is
+    /// not a mirror of that router.
+    pub(super) fn touch_origin(&self, request_id: &RequestId, origin: u64, now: Instant) -> bool {
+        match self.request_to_origin.get_mut(request_id) {
+            Some(mut entry) if entry.router_id == origin => {
+                entry.announced_at = now;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Mirrored bookings whose owner last announced them more than `max_age` ago.
+    pub(super) fn unannounced_mirrors(
+        &self,
+        now: Instant,
+        max_age: Duration,
+    ) -> Vec<UnannouncedMirror> {
+        let stale: Vec<(RequestId, u64)> = self
+            .request_to_origin
+            .iter()
+            .filter(|entry| now.saturating_duration_since(entry.announced_at) > max_age)
+            .map(|entry| (entry.key().clone(), entry.router_id))
+            .collect();
+        stale
+            .into_iter()
+            .filter_map(|(request_id, origin)| {
+                let booking = self.booking_for(&request_id)?;
+                Some(UnannouncedMirror {
+                    request_id,
+                    booking,
+                    origin,
+                })
+            })
+            .collect()
     }
 
     /// This router's own bookings (those without a peer origin).
@@ -113,14 +169,14 @@ impl RequestIndex {
     pub(super) fn remote_origins(&self) -> FxHashSet<u64> {
         self.request_to_origin
             .iter()
-            .map(|entry| *entry.value())
+            .map(|entry| entry.router_id)
             .collect()
     }
 
     pub(super) fn remote_requests_from(&self, origin: u64) -> Vec<(RequestId, RequestBooking)> {
         self.request_to_origin
             .iter()
-            .filter(|entry| *entry.value() == origin)
+            .filter(|entry| entry.router_id == origin)
             .filter_map(|entry| {
                 let request_id = entry.key().clone();
                 let booking = self.booking_for(&request_id)?;
@@ -243,6 +299,33 @@ mod tests {
             index.lora_for(&"req-1".to_string()),
             Some("adapter".to_string())
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unannounced_mirrors_are_the_ones_their_owner_stopped_announcing() {
+        let index = RequestIndex::default();
+        let worker = WorkerWithDpRank::new(1, 0);
+        let max_age = Duration::from_secs(30);
+        index
+            .try_insert_request("local".to_string(), worker, None)
+            .unwrap();
+        for request_id in ["kept", "dropped"] {
+            index
+                .try_insert_request_from(request_id.to_string(), worker, None, Some(7))
+                .unwrap();
+        }
+
+        tokio::time::advance(Duration::from_secs(20)).await;
+        assert!(index.touch_origin(&"kept".to_string(), 7, Instant::now()));
+        assert!(!index.touch_origin(&"kept".to_string(), 8, Instant::now()));
+        assert!(!index.touch_origin(&"local".to_string(), 7, Instant::now()));
+        tokio::time::advance(Duration::from_secs(15)).await;
+
+        let stale = index.unannounced_mirrors(Instant::now(), max_age);
+        assert_eq!(stale.len(), 1, "a local booking is never a stale mirror");
+        assert_eq!(stale[0].request_id, "dropped");
+        assert_eq!(stale[0].origin, 7);
+        assert_eq!(stale[0].booking.worker, worker);
     }
 
     #[test]

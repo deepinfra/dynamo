@@ -412,6 +412,8 @@ pub struct ActiveSequencesMultiWorker<P: SequencePublisher> {
     worker_type: &'static str,
     /// When each peer router last published a lifecycle event or refresh.
     pub(super) peer_last_seen: Mutex<FxHashMap<u64, Instant>>,
+    /// When each peer router last re-announced one of its mirrored bookings.
+    pub(super) peer_last_refresh: Mutex<FxHashMap<u64, Instant>>,
 }
 
 impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
@@ -557,7 +559,19 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
             replica_request_lease_observer: OnceLock::new(),
             worker_type,
             peer_last_seen: Mutex::new(FxHashMap::default()),
+            peer_last_refresh: Mutex::new(FxHashMap::default()),
         }
+    }
+
+    /// Whether a booking still carries prompt (prefill) load on its worker.
+    pub(super) fn prefill_pending(&self, request_id: &RequestId, worker: WorkerWithDpRank) -> bool {
+        let table = self.workers.read();
+        table.index.get(&worker).is_some_and(|&idx| {
+            table.slots[idx]
+                .sequences
+                .read()
+                .prefill_pending(request_id)
+        })
     }
 
     #[cfg(any(test, feature = "bench"))]
@@ -832,8 +846,11 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
         // within seconds, so under churn those orphans pile up into phantom
         // load on every peer. Publish `Free` for each dropped local booking.
         let dropped_local: Vec<LocalBooking> = if self.replica_sync && !change.removed.is_empty() {
-            let removed: FxHashSet<WorkerWithDpRank> =
-                change.removed.iter().map(|removed| removed.worker).collect();
+            let removed: FxHashSet<WorkerWithDpRank> = change
+                .removed
+                .iter()
+                .map(|removed| removed.worker)
+                .collect();
             self.request_index
                 .local_bookings()
                 .into_iter()
@@ -2144,7 +2161,9 @@ mod tests {
         sequences
             .reconcile_workers([WorkerDpRange::new(1, 0, 1), WorkerDpRange::new(2, 0, 1)])
             .unwrap();
-        sequences.free(&"on-w1".to_string(), Instant::now()).unwrap();
+        sequences
+            .free(&"on-w1".to_string(), Instant::now())
+            .unwrap();
         assert!(publisher.events.lock().unwrap().is_empty());
     }
 
@@ -2191,7 +2210,6 @@ mod tests {
             events[0],
             ActiveSequenceEventData::AddRequest {
                 token_sequence: None,
-                track_prefill_tokens: false,
                 ..
             }
         ));
@@ -2212,7 +2230,7 @@ mod tests {
         publisher.clear();
 
         sequences.apply_replica_batch(vec![
-            replica_refresh("req-1", worker, 99),
+            replica_refresh_with_prompt_load("req-1", worker, 99),
             replica_refresh("req-1", worker, 98),
             replica_refresh("req-1", WorkerWithDpRank::new(2, 0), 99),
         ]);
@@ -2278,6 +2296,122 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn a_mirror_its_live_owner_stopped_announcing_is_dropped() {
+        let worker = WorkerWithDpRank::new(1, 0);
+        let (sequences, _) = make_recording_sequences(HashMap::from([(1, (0, 1))]));
+        let observer = Arc::new(RecordingReplicaLeaseObserver::default());
+        assert!(sequences.set_replica_request_lease_observer(observer.clone()));
+        let silence = Duration::from_secs(30);
+
+        // The owner (router 99) freed "lost-free" but the Free never arrived here.
+        sequences.apply_replica_batch(vec![
+            replica_add("lost-free", worker, vec![1, 2, 3]),
+            replica_add("still-live", worker, vec![4, 5, 6]),
+        ]);
+        for _ in 0..4 {
+            tokio::time::advance(Duration::from_secs(10)).await;
+            sequences.apply_replica_batch(vec![replica_refresh_with_prompt_load(
+                "still-live",
+                worker,
+                99,
+            )]);
+            sequences.refresh_replicas(Instant::now(), silence);
+        }
+
+        assert_eq!(active_request_count(&sequences, worker), 1);
+        assert!(
+            sequences
+                .request_index
+                .booking_for(&"lost-free".to_string())
+                .is_none(),
+            "the owner announces others but no longer this one"
+        );
+        assert!(
+            sequences
+                .request_index
+                .booking_for(&"still-live".to_string())
+                .is_some()
+        );
+        assert!(observer.events.lock().unwrap().iter().any(|event| matches!(
+            event,
+            ObservedReplicaLeaseEvent::Completed(booking) if booking.request_id == "lost-free"
+        )));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mirrors_of_a_peer_that_never_refreshes_wait_for_the_silence_purge() {
+        let worker = WorkerWithDpRank::new(1, 0);
+        let (sequences, _) = make_recording_sequences(HashMap::from([(1, (0, 1))]));
+        let silence = Duration::from_secs(30);
+
+        sequences.apply_replica_batch(vec![replica_add("old", worker, vec![1, 2, 3])]);
+        for _ in 0..4 {
+            tokio::time::advance(Duration::from_secs(10)).await;
+            // The peer stays alive with new bookings but never re-announces: it runs
+            // without the refresh, so the age of one mirror says nothing.
+            sequences.apply_replica_batch(vec![replica_add("newer", worker, vec![7, 8, 9])]);
+            sequences.apply_replica_batch(vec![replica_free("newer", worker)]);
+            sequences.refresh_replicas(Instant::now(), silence);
+        }
+
+        assert!(
+            sequences
+                .request_index
+                .booking_for(&"old".to_string())
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn a_refresh_catches_up_a_lost_prefill_completion() {
+        let worker = WorkerWithDpRank::new(1, 0);
+        let (sequences, _) = make_recording_sequences(HashMap::from([(1, (0, 1))]));
+        let request_id = "req-1".to_string();
+        sequences.apply_replica_batch(vec![replica_add("req-1", worker, vec![1, 2, 3])]);
+        assert!(sequences.prefill_pending(&request_id, worker));
+
+        sequences.apply_replica_batch(vec![replica_refresh_with_prompt_load("req-1", worker, 99)]);
+        assert!(
+            sequences.prefill_pending(&request_id, worker),
+            "the owner still has prompt load on it"
+        );
+
+        // The owner finished prefill and its MarkPrefillCompleted was lost.
+        sequences.apply_replica_batch(vec![replica_refresh("req-1", worker, 99)]);
+        assert!(!sequences.prefill_pending(&request_id, worker));
+        assert_eq!(active_request_count(&sequences, worker), 1);
+    }
+
+    #[test]
+    fn a_refresh_says_whether_the_local_booking_still_has_prompt_load() {
+        let worker = WorkerWithDpRank::new(1, 0);
+        let (sequences, publisher) = make_recording_sequences(HashMap::from([(1, (0, 1))]));
+        sequences
+            .add_request(local_sequence_request("local", worker), Instant::now())
+            .unwrap();
+        let announced_prompt_load = || {
+            publisher.clear();
+            sequences.refresh_replicas(Instant::now(), Duration::from_secs(30));
+            let events = publisher.events.lock().unwrap();
+            match events.as_slice() {
+                [
+                    ActiveSequenceEventData::AddRequest {
+                        track_prefill_tokens,
+                        ..
+                    },
+                ] => *track_prefill_tokens,
+                other => panic!("one re-announcement expected, got {other:?}"),
+            }
+        };
+
+        assert!(announced_prompt_load());
+        sequences
+            .mark_prefill_completed(&"local".to_string(), Instant::now())
+            .unwrap();
+        assert!(!announced_prompt_load());
+    }
+
     #[test]
     fn replica_lifecycle_uses_one_local_attempt_generation() {
         let worker = WorkerWithDpRank::new(1, 0);
@@ -2329,6 +2463,24 @@ mod tests {
             *state.removed.lock().unwrap(),
             vec![WorkerWithDpRank::new(1, 0), WorkerWithDpRank::new(1, 1)]
         );
+    }
+
+    /// A refresh from an owner whose booking still carries prompt load.
+    fn replica_refresh_with_prompt_load(
+        request_id: impl Into<String>,
+        worker: WorkerWithDpRank,
+        router_id: u64,
+    ) -> ActiveSequenceEvent {
+        let mut event = replica_refresh(request_id, worker, router_id);
+        let ActiveSequenceEventData::AddRequest {
+            track_prefill_tokens,
+            ..
+        } = &mut event.data
+        else {
+            unreachable!("replica_refresh builds an AddRequest");
+        };
+        *track_prefill_tokens = true;
+        event
     }
 
     fn replica_add(

@@ -43,6 +43,28 @@ fn shared_zmq_context() -> Context {
 /// Default ZMQ HWM is 1000, which limits scalability.
 const ZMQ_SNDHWM: i32 = 100_000; // Send buffer: 100K messages
 const ZMQ_RCVHWM: i32 = 100_000; // Receive buffer: 100K messages
+
+/// Environment override for the buffer between the socket pump and its subscribers.
+const DYN_EVENT_PLANE_SUBSCRIBER_BUFFER: &str = "DYN_EVENT_PLANE_SUBSCRIBER_BUFFER";
+
+/// Messages a subscriber may fall behind the socket pump before it skips ahead and loses
+/// them. 1024 was too small for replica sync under a saturated runtime: a consumer that
+/// stalled for a moment lost booking releases, and its peers' mirrors stayed booked.
+const DEFAULT_SUBSCRIBER_BUFFER: usize = 8192;
+
+fn subscriber_buffer() -> usize {
+    subscriber_buffer_from(
+        std::env::var(DYN_EVENT_PLANE_SUBSCRIBER_BUFFER)
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn subscriber_buffer_from(raw: Option<&str>) -> usize {
+    raw.and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|capacity| *capacity > 0)
+        .unwrap_or(DEFAULT_SUBSCRIBER_BUFFER)
+}
 const ZMQ_SNDTIMEOUT_MS: i32 = 0; // Send timeout: fail fast under pressure
 const ZMQ_RCVTIMEOUT_MS: i32 = 100; // Receive timeout: 100ms (avoids blocking forever)
 
@@ -357,7 +379,7 @@ impl ZmqSubTransport {
             "ZMQ SUB transport connected with configured HWM"
         );
 
-        let (broadcast_tx, _) = broadcast::channel(1024);
+        let (broadcast_tx, _) = broadcast::channel(subscriber_buffer());
         let pump_handle = Self::start_socket_pump(socket, broadcast_tx.clone());
 
         Ok(Self {
@@ -483,7 +505,7 @@ impl ZmqSubTransport {
             "ZMQ SUB transport connected to multiple endpoints with configured HWM"
         );
 
-        let (broadcast_tx, _) = broadcast::channel(1024);
+        let (broadcast_tx, _) = broadcast::channel(subscriber_buffer());
         let pump_handle = Self::start_socket_pump(socket, broadcast_tx.clone());
 
         Ok(Self {
@@ -612,6 +634,21 @@ impl EventTransportRx for ZmqSubTransport {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn subscriber_buffer_falls_back_to_the_default() {
+        assert_eq!(
+            super::subscriber_buffer_from(None),
+            super::DEFAULT_SUBSCRIBER_BUFFER
+        );
+        assert_eq!(super::subscriber_buffer_from(Some(" 65536 ")), 65536);
+        for bad in ["0", "-1", "many", ""] {
+            assert_eq!(
+                super::subscriber_buffer_from(Some(bad)),
+                super::DEFAULT_SUBSCRIBER_BUFFER
+            );
+        }
+    }
+
     use super::*;
     use crate::transports::event_plane::{EventEnvelope, MsgpackCodec};
     use tokio::time::{Duration, timeout};
